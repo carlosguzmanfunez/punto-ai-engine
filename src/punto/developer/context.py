@@ -19,6 +19,7 @@ from typing import Final
 from uuid import UUID
 
 from punto.policy.permissions import is_protected_path
+from punto.schemas.execution import ExecutionTrustLevel
 from punto.tools.errors import (
     BranchPolicyViolationError,
     ProtectedFileError,
@@ -54,6 +55,16 @@ class ExecutionContext:
     environment: str = "local"
     default_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
     attempts_allowed: int = 1
+    #: Nivel de confianza del código que se va a ejecutar.
+    #:
+    #: El valor por defecto es ``TRUSTED_LOCAL`` porque las ejecuciones que
+    #: construyen el contexto sin declararlo son las deterministas de
+    #: ``LocalDeveloperRunner``. Un runner que genere código con IA **no** puede
+    #: confiar en este valor: viene obligado a exigir ``UNTRUSTED_MODEL`` y a
+    #: rechazar el backend local.
+    trust_level: ExecutionTrustLevel = ExecutionTrustLevel.TRUSTED_LOCAL
+    #: Si el trabajo puede acceder a la red. Por defecto **no**.
+    network_access: bool = False
     #: Raíz del workspace ya resuelta (enlaces seguidos). Derivada, no declarada.
     _resolved_root: Path = field(init=False, repr=False, compare=False)
 
@@ -82,6 +93,17 @@ class ExecutionContext:
             raise ValueError("default_timeout_seconds debe ser mayor que cero")
         if self.attempts_allowed < 1:
             raise ValueError("attempts_allowed debe ser al menos 1")
+
+        # Frontera de confianza: el trabajo originado por un modelo nunca declara
+        # acceso a red. Se falla en construcción, no en ejecución.
+        if (
+            self.trust_level is ExecutionTrustLevel.UNTRUSTED_MODEL
+            and self.network_access
+        ):
+            raise ValueError(
+                "UNTRUSTED_MODEL no puede declarar network_access=True: el trabajo "
+                "originado por un modelo se ejecuta sin red"
+            )
 
         object.__setattr__(self, "workspace_path", resolved)
         object.__setattr__(self, "_resolved_root", resolved)
@@ -173,6 +195,11 @@ class ExecutionContext:
     def is_command_allowed(self, executable: str) -> bool:
         """True si el ejecutable está en la allowlist del contexto."""
         return executable.strip().lower() in self.allowed_commands
+
+    @property
+    def is_untrusted(self) -> bool:
+        """True si el trabajo procede de un modelo externo."""
+        return self.trust_level is ExecutionTrustLevel.UNTRUSTED_MODEL
 
 
 __all__ = [

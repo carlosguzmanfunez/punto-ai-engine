@@ -477,6 +477,101 @@ class AuditLogger:
             metadata={"workspace": workspace, "reason": reason},
         )
 
+    # ------------------------------------------- Frontera de confianza (R1)
+    def log_execution_backend_selected(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        backend: str,
+        trust_level: str,
+        sandbox: bool,
+        capabilities: Mapping[str, bool],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra qué backend de ejecución se seleccionó y con qué garantías."""
+        return self.record(
+            AuditEventType.EXECUTION_BACKEND_SELECTED,
+            action="execution_backend_selected",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "workspace": workspace,
+                "backend": backend,
+                "trust_level": trust_level,
+                "sandbox": sandbox,
+                "capabilities": dict(capabilities),
+            },
+        )
+
+    def log_untrusted_execution_blocked(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        detail: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la denegación de ejecución no confiable por una vía no aislada."""
+        return self.record(
+            AuditEventType.UNTRUSTED_EXECUTION_BLOCKED,
+            action="untrusted_execution_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "workspace": workspace,
+                "reason": "UNTRUSTED_EXECUTION_DENIED",
+                "detail": detail,
+            },
+        )
+
+    def log_sandbox_required(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        detail: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que la ejecución exigía un sandbox y no había ninguno apto."""
+        return self.record(
+            AuditEventType.SANDBOX_REQUIRED,
+            action="sandbox_required",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={"workspace": workspace, "reason": "SANDBOX_REQUIRED", "detail": detail},
+        )
+
+    def log_environment_sanitized(
+        self,
+        *,
+        task_id: UUID,
+        backend: str,
+        variable_names: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el saneamiento del entorno del proceso hijo.
+
+        Se registran **únicamente los nombres** de las variables que puede recibir
+        el proceso hijo. Nunca se registran valores ni el entorno completo.
+        """
+        return self.record(
+            AuditEventType.ENVIRONMENT_SANITIZED,
+            action="environment_sanitized",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "backend": backend,
+                "variable_names": list(variable_names),
+                "values_logged": False,
+                "inherited_full_environment": False,
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

@@ -167,23 +167,35 @@ def test_arguments_are_not_split_by_the_shell(ai_context: ExecutionContext) -> N
     assert result.stdout.strip() == "2 dos palabras"
 
 
-def test_shell_module_never_enables_shell_true() -> None:
-    """El código no habilita ``shell=True`` en ningún punto.
+def test_no_module_enables_shell_true() -> None:
+    """Ningún módulo del motor habilita ``shell=True``.
 
-    Se inspecciona el **árbol sintáctico**, no el texto: el docstring menciona
-    ``shell=True`` precisamente para documentar que está prohibido, y una
-    comprobación textual daría un falso positivo.
+    Se inspecciona el **árbol sintáctico** de todo ``src/punto`` —no el texto, y
+    no un único archivo—: así la garantía no depende de en qué módulo viva hoy la
+    llamada a ``subprocess``, y el docstring que menciona ``shell=True`` para
+    documentar que está prohibido no produce un falso positivo.
     """
-    source = Path(shell_module.__file__).read_text(encoding="utf-8")
-    calls = [
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-    ]
-    shell_keywords = [
-        keyword for call in calls for keyword in call.keywords if keyword.arg == "shell"
-    ]
+    source_root = Path(shell_module.__file__).resolve().parents[1]
+    spawn_modules: list[str] = []
+    shell_keywords: list[ast.keyword] = []
 
+    for path in sorted(source_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            spawns = (
+                isinstance(function, ast.Attribute)
+                and function.attr in {"Popen", "call", "check_output", "run"}
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "subprocess"
+            )
+            if spawns:
+                spawn_modules.append(path.name)
+            shell_keywords.extend(key for key in node.keywords if key.arg == "shell")
+
+    assert spawn_modules, "no se encontró ningún punto de lanzamiento de procesos"
     assert shell_keywords, "no se encontró ningún argumento shell= explícito"
     for keyword in shell_keywords:
         assert isinstance(keyword.value, ast.Constant)

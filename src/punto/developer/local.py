@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from punto.common import utc_now
+from punto.developer.backend import ExecutionBackend
 from punto.developer.base import DeveloperRunner
 from punto.schemas.execution import (
     CommandResult,
@@ -31,11 +32,15 @@ from punto.tools.errors import (
     DeveloperExecutionError,
     ExecutionLimitExceededError,
     ProtectedFileError,
+    SandboxRequiredError,
+    SandboxUnavailableError,
+    UntrustedExecutionDeniedError,
     WorkspaceViolationError,
 )
 from punto.tools.filesystem import FilesystemTool
 from punto.tools.git import GitWorkspace
 from punto.tools.shell import ShellRunner
+from punto.tools.shell_policy import sanitized_environment_names
 from punto.tools.validator import Validator
 
 if TYPE_CHECKING:
@@ -58,10 +63,20 @@ class _ValidationFailed(DeveloperExecutionError):
 
 
 class LocalDeveloperRunner(DeveloperRunner):
-    """Ejecutor determinista de recetas, sin IA y sin red."""
+    """Ejecutor determinista de recetas, sin IA y sin red.
 
-    def __init__(self, *, audit: AuditLogger | None = None) -> None:
+    Usa ``TrustedLocalBackend``, que solo admite trabajo ``TRUSTED_LOCAL``. Nunca
+    puede ejecutar trabajo originado por un modelo.
+    """
+
+    def __init__(
+        self,
+        *,
+        audit: AuditLogger | None = None,
+        backend: ExecutionBackend | None = None,
+    ) -> None:
         self._audit = audit
+        self._backend = backend
 
     @property
     def generates_code_with_ai(self) -> bool:
@@ -86,6 +101,20 @@ class LocalDeveloperRunner(DeveloperRunner):
 
         self._log_started(task, context, branch)
 
+        # --- Frontera de confianza: se resuelve ANTES de tocar nada ------------
+        try:
+            backend = self.resolve_backend(context, self._backend)
+        except UntrustedExecutionDeniedError as exc:
+            return self._blocked_by_trust(
+                task, context, reason="UNTRUSTED_EXECUTION_DENIED", error=str(exc)
+            )
+        except (SandboxRequiredError, SandboxUnavailableError) as exc:
+            return self._blocked_by_trust(
+                task, context, reason="SANDBOX_REQUIRED", error=str(exc)
+            )
+
+        self._log_backend_selected(task, context, backend)
+
         try:
             if task.task_id != context.task_id:
                 raise DeveloperExecutionError(
@@ -95,7 +124,7 @@ class LocalDeveloperRunner(DeveloperRunner):
 
             self._assert_declared_file_budget(task, context)
 
-            shell = ShellRunner(context)
+            shell = ShellRunner(context, backend=backend)
             git = GitWorkspace(context, shell)
             cursor = 0
 
@@ -302,6 +331,73 @@ class LocalDeveloperRunner(DeveloperRunner):
         return result
 
     # ------------------------------------------------------------------ auditoría
+    def _blocked_by_trust(
+        self,
+        task: DeveloperTask,
+        context: ExecutionContext,
+        *,
+        reason: str,
+        error: str,
+    ) -> DeveloperExecutionResult:
+        """Falla de forma **cerrada**: no se ejecuta nada y se audita el motivo.
+
+        No hay degradación a ejecución local: si el trabajo no confiable no puede
+        ejecutarse de forma aislada, simplemente no se ejecuta.
+        """
+        workspace = str(context.workspace_root)
+        if self._audit is not None:
+            if reason == "SANDBOX_REQUIRED":
+                self._audit.log_sandbox_required(
+                    task_id=task.task_id, workspace=workspace, detail=error
+                )
+            else:
+                self._audit.log_untrusted_execution_blocked(
+                    task_id=task.task_id, workspace=workspace, detail=error
+                )
+
+        result = DeveloperExecutionResult(
+            task_id=task.task_id,
+            status=DeveloperRunStatus.BLOCKED,
+            workspace=workspace,
+            branch=context.branch_name,
+            error=f"{reason}: {error}",
+            cost_usd=DETERMINISTIC_COST_USD,
+            attempts_used=0,
+        )
+        self._log_finished(result)
+        return result
+
+    def _log_backend_selected(
+        self, task: DeveloperTask, context: ExecutionContext, backend: ExecutionBackend
+    ) -> None:
+        """Registra el backend elegido y el saneamiento del entorno."""
+        if self._audit is None:
+            return
+
+        capabilities = backend.capabilities
+        self._audit.log_execution_backend_selected(
+            task_id=task.task_id,
+            workspace=str(context.workspace_root),
+            backend=backend.name,
+            trust_level=context.trust_level.value,
+            sandbox=backend.requires_sandbox,
+            capabilities={
+                "filesystem_isolated": capabilities.filesystem_isolated,
+                "environment_isolated": capabilities.environment_isolated,
+                "network_isolated": capabilities.network_isolated,
+                "process_isolated": capabilities.process_isolated,
+            },
+        )
+
+        # El entorno saneado es responsabilidad del backend local. Se registran
+        # solo los nombres de variable, jamás sus valores.
+        if not backend.requires_sandbox:
+            self._audit.log_environment_sanitized(
+                task_id=task.task_id,
+                backend=backend.name,
+                variable_names=sanitized_environment_names(),
+            )
+
     def _log_started(
         self, task: DeveloperTask, context: ExecutionContext, branch: str
     ) -> None:

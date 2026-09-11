@@ -40,6 +40,11 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEVELOPER_RUN_COMPLETED: "developer_run",
     AuditEventType.DEVELOPER_RUN_FAILED: "developer_run",
     AuditEventType.DEVELOPER_RUN_BLOCKED: "developer_run",
+    # --- Frontera de confianza (ENGINE-1.R1) ----------------------------------
+    AuditEventType.EXECUTION_BACKEND_SELECTED: "execution_backend",
+    AuditEventType.UNTRUSTED_EXECUTION_BLOCKED: "execution_backend",
+    AuditEventType.SANDBOX_REQUIRED: "execution_backend",
+    AuditEventType.ENVIRONMENT_SANITIZED: "execution_environment",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

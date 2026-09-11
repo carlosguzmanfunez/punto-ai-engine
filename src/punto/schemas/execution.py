@@ -38,6 +38,76 @@ class DeveloperRunStatus(StrEnum):
     TIMEOUT = "TIMEOUT"
 
 
+class ExecutionTrustLevel(StrEnum):
+    """Nivel de confianza del código que se va a ejecutar.
+
+    La distinción es la frontera de seguridad de ENGINE-1.R1:
+
+    - ``TRUSTED_LOCAL``: trabajo determinista declarado por nosotros. Puede
+      ejecutarse en el host.
+    - ``UNTRUSTED_MODEL``: trabajo originado por un modelo externo. **Nunca**
+      puede ejecutarse en el host: exige un backend con aislamiento real.
+    """
+
+    TRUSTED_LOCAL = "TRUSTED_LOCAL"
+    UNTRUSTED_MODEL = "UNTRUSTED_MODEL"
+
+
+class SandboxCapabilities(BaseModel):
+    """Aislamientos que un backend debe garantizar para admitir trabajo no confiable.
+
+    Para ``UNTRUSTED_MODEL`` **los cuatro** deben ser ``True``. Si falta uno, la
+    ejecución no está autorizada: no se degrada a ejecución local.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    filesystem_isolated: bool = Field(
+        default=False, description="El código no puede leer ni escribir fuera de su zona."
+    )
+    environment_isolated: bool = Field(
+        default=False, description="El código no ve variables de entorno del host."
+    )
+    network_isolated: bool = Field(
+        default=False, description="El código no puede abrir sockets ni alcanzar la red."
+    )
+    process_isolated: bool = Field(
+        default=False, description="El código no puede afectar ni observar otros procesos."
+    )
+
+    def satisfies_untrusted(self) -> bool:
+        """True solo si los cuatro aislamientos están garantizados."""
+        return (
+            self.filesystem_isolated
+            and self.environment_isolated
+            and self.network_isolated
+            and self.process_isolated
+        )
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        """Nombres de los aislamientos que faltan."""
+        candidates = (
+            ("filesystem_isolated", self.filesystem_isolated),
+            ("environment_isolated", self.environment_isolated),
+            ("network_isolated", self.network_isolated),
+            ("process_isolated", self.process_isolated),
+        )
+        return tuple(name for name, present in candidates if not present)
+
+
+#: Capacidades honestas de un backend que **no** es un sandbox.
+NO_SANDBOX_CAPABILITIES: SandboxCapabilities = SandboxCapabilities()
+
+#: Capacidades exigidas a un backend que pretenda admitir trabajo no confiable.
+FULL_SANDBOX_CAPABILITIES: SandboxCapabilities = SandboxCapabilities(
+    filesystem_isolated=True,
+    environment_isolated=True,
+    network_isolated=True,
+    process_isolated=True,
+)
+
+
 class FileOperation(StrEnum):
     """Operación aplicada a un archivo del workspace."""
 
@@ -260,6 +330,9 @@ class DeveloperTask(BaseModel):
 
 
 __all__ = [
+    "BLOCKED_EXIT_CODE",
+    "FULL_SANDBOX_CAPABILITIES",
+    "NO_SANDBOX_CAPABILITIES",
     "SPAWN_FAILURE_EXIT_CODE",
     "TIMEOUT_EXIT_CODE",
     "CommandRequest",
@@ -269,9 +342,11 @@ __all__ = [
     "DeveloperExecutionResult",
     "DeveloperRunStatus",
     "DeveloperTask",
+    "ExecutionTrustLevel",
     "FileChange",
     "FileOperation",
     "FileWrite",
+    "SandboxCapabilities",
     "TextReplacement",
     "ValidationCheck",
     "ValidationResult",

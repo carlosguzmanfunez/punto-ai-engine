@@ -19,7 +19,8 @@
 | --- | --- | --- |
 | **ENGINE-0** | Núcleo constitucional determinista: autoridad, política, riesgo, presupuesto, Human Gate, máquina de estados, auditoría, CAMUS y API mínima. | ✅ **CERRADA** |
 | **ENGINE-1** | Capa de ejecución controlada: `DeveloperRunner`, `ExecutionContext`, Filesystem, Shell, Git, Validator, `LocalDeveloperRunner`, auditoría de ejecución, fixture y demo real. | ✅ Implementada |
-| **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz. | ⏳ Futura |
+| **ENGINE-1.R1** | Frontera de ejecución confiable: separación `TRUSTED_LOCAL` / `UNTRUSTED_MODEL`, `ExecutionBackend`, `TrustedLocalBackend`, contrato `SandboxedBackend`, entorno saneado y fallo cerrado. | ✅ Implementada |
+| **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz y **exigiendo sandbox**. | ⏳ Futura |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -690,6 +691,24 @@ sin sustituir las operaciones centrales por mocks:
 | §25.29-30 | `DeveloperRunner` es inyectable; CAMUS sin runner conserva ENGINE-0. |
 | §25.31 | Cold imports de todos los módulos nuevos en subprocesos independientes. |
 
+`tests/test_execution_trust.py` (ENGINE-1.R1) sostiene la frontera de confianza:
+
+| Invariante | Verifica |
+| --- | --- |
+| §15.1 | `TRUSTED_LOCAL` + `LocalDeveloperRunner` sigue funcionando. |
+| §15.2 | `UNTRUSTED_MODEL` + `TrustedLocalBackend` → BLOCK (incluso llamando al backend directamente). |
+| §15.3 | Runner que genera código con IA + contexto `TRUSTED_LOCAL` → BLOCK. |
+| §15.4 | Runner de IA sin sandbox → BLOCK. |
+| §15.5 | No existe degradación sandbox → local. |
+| §15.6 | Un secreto del proceso padre no llega al hijo. |
+| §15.7 | El `PATH` del hijo se reconstruye, no se hereda. |
+| §15.8/§15.10 | `python` y `pytest` funcionan en ejecución local confiable. |
+| §15.9/§15.11 | `python` y `pytest` quedan bloqueados para el backend local con trabajo no confiable. |
+| §15.12 | Capacidades incompletas no acreditan `UNTRUSTED_MODEL`. |
+| §15.13 | Capacidades completas sí lo acreditan. |
+| §15.14 | La auditoría no registra valores secretos. |
+| §15.16 | Cold imports de los módulos nuevos. |
+
 ---
 
 ## 14. Configuración
@@ -774,13 +793,17 @@ CAMUS
   ↓
 DeveloperRunner            interfaz abstracta, provider-agnostic
   ↓
-ExecutionContext           workspace, rama, comandos y límites
+ExecutionContext           workspace, rama, comandos, confianza y límites
   ↓
 Tool Layer
   ├── Filesystem
   ├── Shell
   ├── Git
   └── Validator
+        ↓
+   ExecutionBackend        ENGINE-1.R1: frontera de confianza
+        ├── TrustedLocalBackend   (host; solo TRUSTED_LOCAL)
+        └── SandboxedBackend      (aislado; obligatorio para UNTRUSTED_MODEL)
 ```
 
 ENGINE-1 implementa `LocalDeveloperRunner` (determinista, sin IA). ENGINE-2
@@ -924,7 +947,110 @@ sin privilegios, fuera del alcance de esta fase.
 
 ---
 
-## 18. Licencia
+## 18. ENGINE-1.R1 — Untrusted Execution Boundary
+
+`ShellRunner` ejecuta en el host mediante `subprocess`. Aunque use `shell=False`,
+confine rutas y aplique una allowlist, **no es un sandbox**: `python` y `pytest`
+ejecutan código, y ese código podría leer archivos del usuario, variables de
+entorno, tokens del proceso o abrir sockets. Antes de conectar un modelo hay que
+separar dos cosas que hasta ahora eran la misma.
+
+### Niveles de confianza
+
+| Nivel | Origen | Backend admitido |
+| --- | --- | --- |
+| `TRUSTED_LOCAL` | Trabajo determinista declarado por nosotros | `TrustedLocalBackend` (host) |
+| `UNTRUSTED_MODEL` | Código originado por un modelo externo | **Solo** un `SandboxedBackend` apto |
+
+`ExecutionContext.trust_level` declara el nivel. El valor por defecto es
+`TRUSTED_LOCAL`, que es correcto para las recetas deterministas de
+`LocalDeveloperRunner`; un runner que genere código con IA **no** puede confiar en
+ese valor, porque el *enforcement* le obliga a exigir `UNTRUSTED_MODEL`.
+
+```
+DeveloperRunner.resolve_backend(context, backend)
+        │
+        ├── generates_code_with_ai = True  → exige UNTRUSTED_MODEL + SandboxedBackend
+        │                                     si falta → BLOCK (SANDBOX_REQUIRED)
+        └── generates_code_with_ai = False → exige TRUSTED_LOCAL
+```
+
+### Backends
+
+| Backend | Aislamiento | Niveles | Estado |
+| --- | --- | --- | --- |
+| `TrustedLocalBackend` | **Ninguno**, declarado honestamente | Solo `TRUSTED_LOCAL` | Implementado |
+| `SandboxedBackend` | Los cuatro aislamientos exigidos | Ambos | **Contrato, sin implementación real** |
+
+`TrustedLocalBackend` **rechaza** `UNTRUSTED_MODEL` antes de mirar la allowlist: la
+denegación no depende de qué comando sea. La comprobación vive en el backend, así
+que tampoco se esquiva llamándolo directamente.
+
+**No existe degradación** de sandbox a ejecución local. Si se requiere
+aislamiento y no hay ninguno apto: `SandboxUnavailableError` / `SandboxRequiredError`
+y `BLOCKED` con razón `SANDBOX_REQUIRED`. No se finge un sandbox que no existe.
+
+### Capacidades del sandbox
+
+`SandboxCapabilities` exige **los cuatro** para acreditar trabajo no confiable:
+
+| Aislamiento | Requerido |
+| --- | --- |
+| `filesystem_isolated` | ✅ |
+| `environment_isolated` | ✅ |
+| `network_isolated` | ✅ |
+| `process_isolated` | ✅ |
+
+Si falta uno, `satisfies_untrusted()` es `False`, `assert_sandbox_capabilities()`
+falla y un backend concreto no puede declararse sandbox.
+
+Sobre la red: `TrustedLocalBackend` declara `network_isolated: False` porque **no
+puede** garantizarlo a nivel de sistema operativo. Bloquear `curl`/`wget` por
+allowlist no impide que Python abra un socket, así que no se presenta como
+protección. `ExecutionContext.network_access` es `False` por defecto, y un
+contexto `UNTRUSTED_MODEL` no puede declararlo en `True` (falla en construcción).
+
+### Entorno del proceso hijo
+
+Se eliminó por completo la herencia de `dict(os.environ)`. El entorno se
+construye con **allowlist**:
+
+- se copian solo `SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `PATHEXT`, `COMSPEC`,
+  `LANG`, `LC_ALL`, `TZ` (las que existan);
+- `PATH` se **reconstruye**: directorio del ejecutable + directorios del sistema;
+- `TEMP`/`TMP` se **redirigen** a una zona propia (`punto-exec-*`);
+- se fijan `PYTHONIOENCODING=utf-8` y `PYTHONDONTWRITEBYTECODE=1`.
+
+Los patrones sensibles (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`,
+`DATABASE_URL`, `AWS_*`, `AZURE_*`, `GOOGLE_*`, `SSH_*`) son una **segunda
+barrera**: aunque una variable estuviera en la allowlist por error, no se
+propaga. La defensa principal es la allowlist, no la lista negra.
+
+### Detección de runtimes de contenedor
+
+`detect_container_runtimes()` informa de `docker_available` y `podman_available`
+usando solo `shutil.which` (no ejecuta nada ni modifica el sistema). Servirá para
+elegir la implementación real del sandbox más adelante.
+
+### Alcance de lo que protegen los guards de filesystem
+
+Los guards de workspace (traversal, rutas absolutas, enlaces, archivos
+constitucionales, `.git`) protegen las **llamadas a las herramientas**. **No**
+garantizan que código Python ejecutado localmente no abra directamente
+`C:\Users\...` o `/home/...`. Esa garantía corresponde al `SandboxedBackend`, y
+por eso el trabajo no confiable no se ejecuta en el host.
+
+### Invariante para ENGINE-2
+
+`DeepSeekDeveloperRunner` declarará `generates_code_with_ai = True`, y con ello
+quedará obligado por código a: exigir `UNTRUSTED_MODEL`, requerir un
+`SandboxedBackend` apto, y devolver `BLOCKED` con razón `SANDBOX_REQUIRED` si no
+lo hay. Sin excepciones y sin fallback.
+
+---
+
+## 19. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
+
 

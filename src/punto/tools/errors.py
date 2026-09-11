@@ -96,6 +96,48 @@ class DeveloperRunnerNotConfiguredError(DeveloperExecutionError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Frontera de confianza (ENGINE-1.R1)
+# ---------------------------------------------------------------------------
+class TrustBoundaryError(DeveloperExecutionError):
+    """Base de los errores de la frontera entre ejecución confiable y no confiable."""
+
+
+class UntrustedExecutionDeniedError(TrustBoundaryError):
+    """Se intentó ejecutar trabajo no confiable por una vía que no lo admite.
+
+    Es la denegación dura: un backend local confiable **nunca** ejecuta código
+    originado por un modelo, aunque el comando esté en la allowlist
+    (``python`` y ``pytest`` no son un sandbox).
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"Ejecución no confiable denegada: {detail}")
+
+
+class SandboxRequiredError(TrustBoundaryError):
+    """El trabajo exige un backend aislado y el backend disponible no lo es.
+
+    No existe degradación: si se requiere sandbox y no hay uno apto, se falla.
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"SANDBOX_REQUIRED: {detail}")
+
+
+class SandboxUnavailableError(TrustBoundaryError):
+    """No hay ninguna implementación real de sandbox disponible.
+
+    Se declara explícitamente en lugar de simular aislamiento inexistente.
+    """
+
+    def __init__(self, detail: str = "no hay backend aislado implementado") -> None:
+        self.detail = detail
+        super().__init__(f"Sandbox no disponible: {detail}")
+
+
 __all__ = [
     "BranchPolicyViolationError",
     "CommandNotAllowedError",
@@ -103,5 +145,9 @@ __all__ = [
     "DeveloperRunnerNotConfiguredError",
     "ExecutionLimitExceededError",
     "ProtectedFileError",
+    "SandboxRequiredError",
+    "SandboxUnavailableError",
+    "TrustBoundaryError",
+    "UntrustedExecutionDeniedError",
     "WorkspaceViolationError",
 ]

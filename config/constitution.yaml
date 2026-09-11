@@ -1,0 +1,134 @@
+# ============================================================================
+# PUNTO AI ENGINE - CONSTITUCIÓN V0.1
+# ============================================================================
+# Documento raíz. Define los principios no negociables del motor y los límites
+# duros de CAMUS. Este archivo es PROTEGIDO: ninguna acción autónoma puede
+# modificarlo (ver `protected_files`). La protección también existe en código
+# determinista en `punto.policy.permissions` y `punto.policy.policy_engine`.
+# ============================================================================
+
+version: "0.1.0"
+name: "PUNTO AI ENGINE"
+phase: "ENGINE-0"
+
+principles:
+  - id: autonomy_without_unnecessary_interruption
+    priority: 1
+    statement: >-
+      PUNTO AI ENGINE no debe solicitar intervención humana para decisiones
+      técnicas reversibles que estén dentro de sus permisos, presupuesto y
+      nivel de riesgo autorizado. Debe analizar, decidir, ejecutar, verificar y
+      corregir autónomamente. Solo debe detenerse ante Human Gate, límites
+      excedidos, riesgo alto/crítico o imposibilidad de continuar con seguridad.
+    enforced_by:
+      - "punto.policy.policy_engine.PolicyEngine.evaluate"
+      - "punto.orchestrator.camus.Camus.run"
+
+  - id: deterministic_core
+    priority: 2
+    statement: >-
+      El núcleo V0.1 es completamente local y determinista. No utiliza IA, no
+      consulta proveedores externos y no depende de la red. Toda decisión es
+      reproducible a partir de sus entradas.
+    enforced_by:
+      - "punto.orchestrator.camus.Camus"
+
+  - id: default_deny
+    priority: 3
+    statement: >-
+      Toda acción desconocida se rechaza. Ninguna acción recibe autoridad
+      autónoma por defecto; la ausencia de catálogo es motivo de rechazo y nunca
+      de concesión.
+    enforced_by:
+      - "punto.policy.authority.AuthorityCatalog.level_for_action"
+
+  - id: constitutional_immutability
+    priority: 4
+    statement: >-
+      CAMUS no puede modificar sus propias reglas de autoridad ni sus permisos.
+      Los archivos constitucionales están protegidos incluso frente a acciones
+      técnicas, reversibles y de riesgo bajo.
+    enforced_by:
+      - "punto.policy.permissions.is_protected_path"
+      - "punto.policy.policy_engine.PolicyEngine.evaluate"
+
+  - id: human_gate_for_irreversible
+    priority: 5
+    statement: >-
+      Las acciones de nivel 3 (humano) y las de riesgo alto o crítico requieren
+      aprobación humana explícita antes de cualquier ejecución.
+    enforced_by:
+      - "punto.policy.human_gate.HumanGate"
+      - "punto.policy.risk.RiskEngine.requires_human_gate"
+
+  - id: audit_everything
+    priority: 6
+    statement: >-
+      Toda creación de tarea, transición de estado, bloqueo y decisión de
+      política genera un evento de auditoría inmutable en memoria.
+    enforced_by:
+      - "punto.audit.logger.AuditLogger"
+
+# ----------------------------------------------------------------------------
+# Límites duros de CAMUS. Estas prohibiciones se verifican en código
+# determinista, no solo en documentación.
+# ----------------------------------------------------------------------------
+camus_prohibitions:
+  - id: cannot_modify_constitution
+    description: "CAMUS no puede modificar config/constitution.yaml."
+    enforced: true
+  - id: cannot_modify_permissions
+    description: "CAMUS no puede modificar config/permissions.yaml."
+    enforced: true
+  - id: cannot_self_elevate_authority
+    description: "CAMUS no puede autoelevar su nivel de autoridad."
+    enforced: true
+  - id: cannot_bypass_human_gate
+    description: "CAMUS no puede saltarse el Human Gate."
+    enforced: true
+  - id: cannot_deploy_production_without_approval
+    description: "CAMUS no puede desplegar producción sin aprobación humana."
+    enforced: true
+  - id: cannot_authorize_prohibited_actions
+    description: "CAMUS no puede autorizar acciones constitucionalmente prohibidas."
+    enforced: true
+
+# ----------------------------------------------------------------------------
+# Archivos constitucionalmente protegidos. Se comparan por ruta normalizada
+# (posix, sin prefijo ./, en minúsculas) y por nombre base.
+# ----------------------------------------------------------------------------
+protected_files:
+  - path: "config/constitution.yaml"
+    reason: "Define los principios no negociables y los límites de CAMUS."
+  - path: "config/permissions.yaml"
+    reason: "Define el catálogo de autoridad y la protección constitucional."
+
+# Rutas adicionales que tampoco pueden modificarse autónomamente.
+additional_protected_paths:
+  - "config/risk-rules.yaml"
+  - "config/budgets.yaml"
+  - "config/environments.yaml"
+
+# ----------------------------------------------------------------------------
+# Reglas duras de decisión (espejo determinista en PolicyEngine).
+# ----------------------------------------------------------------------------
+hard_rules:
+  unknown_action: "DENY"
+  authority_level_3: "HUMAN_GATE"
+  risk_high_or_critical: "HUMAN_GATE"
+  protected_file_modification: "REJECT"
+  budget_exceeded: "REJECT"
+  time_exceeded: "REJECT"
+  files_changed_exceeded: "REJECT"
+  production_impact: "HUMAN_GATE"
+  legal_impact: "HUMAN_GATE"
+  business_impact: "HUMAN_GATE"
+
+# ----------------------------------------------------------------------------
+# Estados terminales y de bloqueo (espejo de TaskStatus).
+# ----------------------------------------------------------------------------
+governance:
+  require_review_for_level_1: true
+  require_human_for_level_2_above_budget: true
+  allow_autonomous_repair: true
+  max_autonomous_repairs: 3

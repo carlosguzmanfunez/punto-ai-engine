@@ -1,0 +1,209 @@
+# ============================================================================
+# PUNTO AI ENGINE - CATÁLOGO DE AUTORIDAD Y PERMISOS V0.1
+# ============================================================================
+# Define qué acciones puede ejecutar el motor y con qué nivel de autoridad.
+# Este archivo es PROTEGIDO: ninguna acción autónoma puede modificarlo.
+#
+# NIVELES DE AUTORIDAD
+#   0 = LEVEL_0_AUTONOMOUS         ejecución autónoma directa
+#   1 = LEVEL_1_AUTONOMOUS_REVIEW  ejecución autónoma + revisión posterior
+#   2 = LEVEL_2_CAMUS              decisión de CAMUS, sujeta a límites
+#   3 = LEVEL_3_HUMAN              Human Gate obligatorio
+#
+# DEFAULT DENY: toda acción no listada aquí se rechaza. Nunca se asigna
+# LEVEL 0 por defecto.
+# ============================================================================
+
+version: "0.1.0"
+
+default_authority_level: null   # DEFAULT DENY explícito.
+unknown_action_policy: "DENY"
+
+levels:
+  - level: 0
+    name: "LEVEL_0_AUTONOMOUS"
+    description: "Trabajo técnico reversible dentro de presupuesto y riesgo autorizado."
+  - level: 1
+    name: "LEVEL_1_AUTONOMOUS_REVIEW"
+    description: "Cambios técnicos que requieren revisión posterior obligatoria."
+  - level: 2
+    name: "LEVEL_2_CAMUS"
+    description: "Decisiones arquitectónicas relevantes evaluadas por CAMUS."
+  - level: 3
+    name: "LEVEL_3_HUMAN"
+    description: "Acciones irreversibles, de producción, legales o financieras."
+
+# ----------------------------------------------------------------------------
+# Catálogo de acciones -> nivel de autoridad
+# ----------------------------------------------------------------------------
+actions:
+  # ---------------------------- LEVEL 0 -------------------------------------
+  create_file:
+    level: 0
+    description: "Crear un archivo nuevo en el repositorio o workspace."
+    category: "code"
+  modify_file:
+    level: 0
+    description: "Modificar un archivo existente no protegido."
+    category: "code"
+  refactor_code:
+    level: 0
+    description: "Refactorizar código sin cambiar comportamiento observable."
+    category: "code"
+  run_tests:
+    level: 0
+    description: "Ejecutar la suite de pruebas local."
+    category: "verification"
+  fix_bug:
+    level: 0
+    description: "Corregir un defecto reproducido por pruebas."
+    category: "code"
+  create_branch:
+    level: 0
+    description: "Crear una rama de trabajo local."
+    category: "git"
+  create_commit:
+    level: 0
+    description: "Crear un commit local en la rama de trabajo."
+    category: "git"
+  create_documentation:
+    level: 0
+    description: "Crear o actualizar documentación."
+    category: "docs"
+  simulate_failure:
+    level: 0
+    description: >-
+      Acción catalogada cuyo resultado de ejecución simulada es siempre un fallo
+      determinista. Existe para poder ejercitar y auditar la ruta de reparación
+      (REPAIRING) sin introducir aleatoriedad ni dependencias externas.
+    category: "verification"
+
+  # ---------------------------- LEVEL 1 -------------------------------------
+  install_dependency:
+    level: 1
+    description: "Instalar una dependencia declarada en el proyecto."
+    category: "dependencies"
+  modify_secondary_api:
+    level: 1
+    description: "Modificar una API secundaria o interna."
+    category: "api"
+  modify_dev_schema:
+    level: 1
+    description: "Modificar un esquema de datos en entorno de desarrollo."
+    category: "data"
+  modify_major_component:
+    level: 1
+    description: "Modificar un componente principal del sistema."
+    category: "architecture"
+
+  # ---------------------------- LEVEL 2 -------------------------------------
+  replace_library:
+    level: 2
+    description: "Sustituir una librería por otra equivalente."
+    category: "architecture"
+  secondary_architecture_change:
+    level: 2
+    description: "Cambio arquitectónico secundario y reversible."
+    category: "architecture"
+  remove_noncritical_module:
+    level: 2
+    description: "Eliminar un módulo no crítico."
+    category: "architecture"
+  major_refactor:
+    level: 2
+    description: "Refactor mayor con impacto amplio pero reversible."
+    category: "architecture"
+
+  # ---------------------------- LEVEL 3 -------------------------------------
+  deploy_production:
+    level: 3
+    description: "Desplegar en producción."
+    category: "operations"
+  production_database_delete:
+    level: 3
+    description: "Eliminar datos de la base de datos de producción."
+    category: "data"
+  irreversible_delete:
+    level: 3
+    description: "Eliminación irreversible de recursos."
+    category: "operations"
+  payment:
+    level: 3
+    description: "Ejecutar un pago."
+    category: "financial"
+  financial_action:
+    level: 3
+    description: "Cualquier acción con impacto financiero."
+    category: "financial"
+  legal_change:
+    level: 3
+    description: "Cambio con implicación legal o contractual."
+    category: "legal"
+  business_model_change:
+    level: 3
+    description: "Cambio en el modelo de negocio."
+    category: "business"
+  master_secret_change:
+    level: 3
+    description: "Rotación o cambio de secretos maestros."
+    category: "security"
+  high_security_risk:
+    level: 3
+    description: "Acción con riesgo de seguridad elevado."
+    category: "security"
+
+# ----------------------------------------------------------------------------
+# Grupos de acciones que siempre requieren revisión o human gate.
+# ----------------------------------------------------------------------------
+review_required_levels: [1]
+human_required_levels: [3]
+
+# Acciones que nunca pueden ejecutarse autónomamente, sea cual sea su nivel.
+never_autonomous:
+  - deploy_production
+  - production_database_delete
+  - irreversible_delete
+  - payment
+  - financial_action
+  - legal_change
+  - business_model_change
+  - master_secret_change
+  - high_security_risk
+
+# ----------------------------------------------------------------------------
+# Archivos protegidos (espejo de constitution.yaml). Se comparan por ruta
+# normalizada y por nombre base.
+# ----------------------------------------------------------------------------
+protected_files:
+  - "config/constitution.yaml"
+  - "config/permissions.yaml"
+
+# ----------------------------------------------------------------------------
+# Operaciones prohibidas sobre archivos protegidos.
+# ----------------------------------------------------------------------------
+protected_file_operations:
+  - create_file
+  - modify_file
+  - refactor_code
+  - fix_bug
+  - irreversible_delete
+  - create_commit
+  - install_dependency
+
+# ----------------------------------------------------------------------------
+# Reglas de autoelevación: CAMUS no puede elevar su propia autoridad.
+# ----------------------------------------------------------------------------
+self_elevation:
+  forbidden: true
+  actions:
+    - modify_file
+    - create_file
+    - refactor_code
+  # Objetivos que modifican las reglas de autoridad, el presupuesto o el riesgo
+  # del propio motor. CAMUS no puede reescribirlos: hacerlo equivaldría a
+  # autoelevar su autoridad.
+  targets:
+    - "config/constitution.yaml"
+    - "config/permissions.yaml"
+    - "config/budgets.yaml"
+    - "config/risk-rules.yaml"

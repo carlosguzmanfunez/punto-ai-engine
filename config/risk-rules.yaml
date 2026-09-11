@@ -1,0 +1,69 @@
+# ============================================================================
+# PUNTO AI ENGINE - REGLAS DE RIESGO V0.1
+# ============================================================================
+# El Risk Engine combina el riesgo DECLARADO en la ActionRequest con el riesgo
+# CALCULADO a partir de umbrales objetivos. El resultado efectivo es el máximo
+# de ambos: una acción nunca puede reducir su riesgo declarándose conservadora.
+#
+# HIGH y CRITICAL requieren Human Gate por defecto.
+# ============================================================================
+
+version: "0.1.0"
+
+levels:
+  - name: "LOW"
+    rank: 0
+    description: "Cambio técnico reversible, local, sin impacto externo."
+    requires_human_gate: false
+  - name: "MEDIUM"
+    rank: 1
+    description: "Cambio técnico reversible con alcance moderado."
+    requires_human_gate: false
+  - name: "HIGH"
+    rank: 2
+    description: "Cambio de alto impacto o con riesgo de seguridad elevado."
+    requires_human_gate: true
+  - name: "CRITICAL"
+    rank: 3
+    description: "Cambio irreversible, legal, financiero o sobre producción."
+    requires_human_gate: true
+
+# ----------------------------------------------------------------------------
+# Umbrales objetivos usados por el cálculo determinista de riesgo.
+# ----------------------------------------------------------------------------
+thresholds:
+  low:
+    max_cost_usd: 1.0
+    max_estimated_minutes: 15
+    max_files_changed: 5
+  medium:
+    max_cost_usd: 10.0
+    max_estimated_minutes: 60
+    max_files_changed: 20
+  high:
+    max_cost_usd: 100.0
+    max_estimated_minutes: 240
+    max_files_changed: 100
+  # Por encima de `high` el riesgo calculado es CRITICAL.
+
+# ----------------------------------------------------------------------------
+# Disparadores que fuerzan un nivel de riesgo mínimo.
+# ----------------------------------------------------------------------------
+escalators:
+  production_impact: "CRITICAL"
+  legal_impact: "HIGH"
+  business_impact: "HIGH"
+  irreversible: "HIGH"
+  not_reversible: "HIGH" # alias explícito de `reversible == false`
+  files_changed_on_protected_path: "CRITICAL"
+  unknown_action: "CRITICAL"
+
+# ----------------------------------------------------------------------------
+# Reglas de decisión de riesgo.
+# ----------------------------------------------------------------------------
+rules:
+  require_human_for: ["HIGH", "CRITICAL"]
+  autonomous_max_level: "MEDIUM"
+  # Una acción técnica y reversible nunca baja de MEDIUM si toca > 20 archivos.
+  force_medium_when:
+    min_files_changed: 20

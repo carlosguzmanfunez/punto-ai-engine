@@ -1,0 +1,57 @@
+# ============================================================================
+# PUNTO AI ENGINE - MODELOS V0.1
+# ============================================================================
+# ENGINE-0 es determinista y NO utiliza IA. Este archivo existe para congelar
+# el contrato de configuración de modelos, pero permanece DESHABILITADO: el
+# Model Router está explícitamente prohibido en esta fase.
+#
+# NO se conecta: OpenAI, Anthropic, Claude Code, ni ningún agente LLM.
+# ============================================================================
+
+version: "0.1.0"
+
+# Bandera maestra. Debe permanecer en false durante ENGINE-0.
+llm_enabled: false
+model_router_enabled: false
+
+# Proveedores prohibidos en esta fase. La presencia de cualquiera de estas
+# claves en el entorno no habilita nada; solo documenta la prohibición.
+forbidden_providers:
+  - "openai"
+  - "anthropic"
+  - "claude-code"
+  - "google"
+  - "mistral"
+  - "cohere"
+
+# Catálogo declarativo (inerte en ENGINE-0). Ningún componente lo consume.
+models: []
+
+# Agentes previstos para fases posteriores. Todos deshabilitados.
+agents:
+  - id: "camus"
+    role: "orchestrator"
+    implementation: "deterministic"
+    llm_required: false
+    enabled: true
+  - id: "qa_agent"
+    role: "quality_assurance"
+    implementation: "llm"
+    llm_required: true
+    enabled: false
+  - id: "security_agent"
+    role: "security"
+    implementation: "llm"
+    llm_required: true
+    enabled: false
+  - id: "reviewer_agent"
+    role: "review"
+    implementation: "llm"
+    llm_required: true
+    enabled: false
+
+# Política de activación para fases futuras (no aplicada en ENGINE-0).
+activation_policy:
+  requires_human_approval: true
+  requires_engine_phase: "ENGINE-2"
+  note: "Prohibido en ENGINE-0 por mandato de la fase."

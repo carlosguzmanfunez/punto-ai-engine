@@ -1,0 +1,64 @@
+# ============================================================================
+# PUNTO AI ENGINE - PRESUPUESTOS V0.1
+# ============================================================================
+# Límites duros por nivel de autoridad. Exceder cualquiera de ellos convierte
+# la acción en NO AUTORIZADA (el Policy Engine la rechaza y el Task Manager la
+# bloquea con el BlockedReason correspondiente).
+#
+# IMPORTANTE: estos límites son techos de nivel. Si la ActionRequest declara un
+# presupuesto más estricto, prevalece el más restrictivo de los dos.
+# ============================================================================
+
+version: "0.1.0"
+
+currency: "USD"
+
+# Techo absoluto del motor, independientemente del nivel de autoridad.
+global:
+  max_cost_usd: 100.0
+  max_execution_minutes: 240
+  max_files_changed: 100
+  max_attempts: 5
+
+# Límites por nivel de autoridad.
+levels:
+  0:
+    max_cost_usd: 1.0
+    max_execution_minutes: 15
+    max_files_changed: 5
+    max_attempts: 3
+  1:
+    max_cost_usd: 5.0
+    max_execution_minutes: 30
+    max_files_changed: 15
+    max_attempts: 3
+  2:
+    max_cost_usd: 25.0
+    max_execution_minutes: 120
+    max_files_changed: 50
+    max_attempts: 4
+  3:
+    max_cost_usd: 100.0
+    max_execution_minutes: 240
+    max_files_changed: 100
+    max_attempts: 5
+
+# ----------------------------------------------------------------------------
+# Presupuesto por defecto aplicado a tareas nuevas si no se especifica otro.
+# ----------------------------------------------------------------------------
+defaults:
+  authority_level: 0
+  max_cost_usd: 1.0
+  max_execution_minutes: 15
+  max_files_changed: 5
+  max_attempts: 3
+
+# ----------------------------------------------------------------------------
+# Comportamiento al exceder un límite.
+# ----------------------------------------------------------------------------
+enforcement:
+  on_cost_exceeded: "BLOCK"          # -> BlockedReason.MAX_COST_EXCEEDED
+  on_time_exceeded: "BLOCK"          # -> BlockedReason.MAX_TIME_EXCEEDED
+  on_files_exceeded: "BLOCK"         # -> BlockedReason.MAX_FILES_CHANGED
+  on_attempts_exceeded: "BLOCK"      # -> BlockedReason.MAX_ATTEMPTS_EXCEEDED
+  allow_soft_warning_margin: 0.0     # sin margen: determinista y estricto

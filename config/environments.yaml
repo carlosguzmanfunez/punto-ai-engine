@@ -1,0 +1,100 @@
+# ============================================================================
+# PUNTO AI ENGINE - ENTORNOS V0.1
+# ============================================================================
+# Define los entornos lógicos. ENGINE-0 solo opera en `local`. Los entornos
+# remotos existen como contrato declarativo y NO están conectados.
+# ============================================================================
+
+version: "0.1.0"
+
+default_environment: "local"
+
+environments:
+  local:
+    description: "Entorno local de desarrollo. Único entorno activo en ENGINE-0."
+    active: true
+    persistence: "memory"
+    allow_production_impact: false
+    allow_network: false
+    allow_external_integrations: false
+    human_gate_required: false
+    api:
+      host: "127.0.0.1"
+      port: 8000
+      reload: true
+    config_dir: "config"
+
+  test:
+    description: "Entorno de pruebas automatizadas (pytest). En memoria."
+    active: true
+    persistence: "memory"
+    allow_production_impact: false
+    allow_network: false
+    allow_external_integrations: false
+    human_gate_required: false
+    api:
+      host: "127.0.0.1"
+      port: 0
+      reload: false
+    config_dir: "config"
+
+  staging:
+    description: "Preproducción. NO CONECTADO en ENGINE-0."
+    active: false
+    persistence: "external"
+    allow_production_impact: false
+    allow_network: true
+    allow_external_integrations: false
+    human_gate_required: true
+    api:
+      host: "0.0.0.0"
+      port: 8000
+      reload: false
+    config_dir: "config"
+
+  production:
+    description: "Producción. NO CONECTADO en ENGINE-0. Requiere Human Gate."
+    active: false
+    persistence: "external"
+    allow_production_impact: true
+    allow_network: true
+    allow_external_integrations: true
+    human_gate_required: true
+    api:
+      host: "0.0.0.0"
+      port: 8000
+      reload: false
+    config_dir: "config"
+
+# ----------------------------------------------------------------------------
+# Integraciones externas: TODAS prohibidas en ENGINE-0.
+# ----------------------------------------------------------------------------
+integrations:
+  openai:
+    enabled: false
+    phase_required: "ENGINE-2"
+  anthropic:
+    enabled: false
+    phase_required: "ENGINE-2"
+  claude_code:
+    enabled: false
+    phase_required: "ENGINE-2"
+  neon:
+    enabled: false
+    phase_required: "ENGINE-3"
+  github_api:
+    enabled: false
+    phase_required: "ENGINE-1"
+  vercel:
+    enabled: false
+    phase_required: "ENGINE-1"
+  redis:
+    enabled: false
+    phase_required: "ENGINE-3"
+  temporal:
+    enabled: false
+    phase_required: "ENGINE-3"
+
+enforcement:
+  block_inactive_environments: true
+  block_disabled_integrations: true

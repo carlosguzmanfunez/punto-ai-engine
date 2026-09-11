@@ -1,0 +1,26 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.pyc
+
+# Caché de herramientas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Variables de entorno
+.env
+.env.*
+!.env.example
+
+# Artefactos de construcción
+dist/
+build/
+*.egg-info/

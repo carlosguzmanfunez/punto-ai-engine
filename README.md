@@ -104,6 +104,24 @@ Engine
 └── Camus(task_manager, policy_engine, human_gate, audit, state_machine, planner)
 ```
 
+### Higiene de importaciones (`__init__.py` ligeros)
+
+Los `__init__.py` de los paquetes internos **no** provocan cargas eager de módulos
+de alto nivel. `punto.orchestrator.__init__` reexporta únicamente los módulos hoja
+(`planner` y `state_machine`); **no** reexporta `camus`, porque `camus` importa
+`punto.tasks.manager` y `punto.tasks.manager` importa
+`punto.orchestrator.state_machine`. Reexportarlo eagermente cerraba un ciclo en
+frío (`tasks.manager → orchestrator → camus → tasks.manager`).
+
+CAMUS se importa siempre desde su módulo concreto:
+
+```python
+from punto.orchestrator.camus import Camus   # correcto
+```
+
+Garantía verificada: **cada módulo principal se importa desde un intérprete
+limpio**, en cualquier orden (ver `tests/test_cold_imports.py`).
+
 ---
 
 ## 3. Niveles de autoridad
@@ -607,6 +625,18 @@ garantías constitucionales del gate:
 | R2.3 | Un gate de nivel 3 reanuda en `IN_PROGRESS` y recorre las fases restantes. |
 | R2.4 | Un gate creado desde `SECURITY` reanuda en `REVIEW` y termina en `COMPLETED`, sin `REVIEW → QA`. |
 | R2.7 | La auditoría reconstruye tarea → gate → decisión → aprobación → autorización → estado retomado. |
+
+`tests/test_cold_imports.py` (ENGINE-0.R3) vigila la higiene de importaciones.
+Cada caso se ejecuta en un **subproceso Python nuevo**, porque dentro del mismo
+intérprete el orden de imports previos ocultaría el ciclo:
+
+| Invariante | Verifica |
+| --- | --- |
+| R3 | Cada módulo principal se importa desde un intérprete limpio (exit code 0). |
+| R3 | `tasks.manager → orchestrator.camus` funciona en un proceso nuevo. |
+| R3 | `orchestrator.camus → tasks.manager` funciona en un proceso nuevo. |
+| R3 | Todos los módulos, en orden inverso y en un proceso nuevo, importan sin fallar. |
+| R3 | `punto.orchestrator` no carga `camus` ni `tasks.manager` de forma eager. |
 
 ---
 

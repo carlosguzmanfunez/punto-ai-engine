@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimal-python-project"
+version = "0.1.0"
+description = "Fixture mínimo para la capa de ejecución de PUNTO AI ENGINE (ENGINE-1)."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

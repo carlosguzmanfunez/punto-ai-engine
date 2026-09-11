@@ -44,6 +44,18 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.policy.human_gate",
     "punto.policy.policy_engine",
     "punto.api.app",
+    # --- ENGINE-1: capa de ejecución controlada ------------------------------
+    "punto.schemas.execution",
+    "punto.tools",
+    "punto.tools.errors",
+    "punto.tools.filesystem",
+    "punto.tools.git",
+    "punto.tools.shell",
+    "punto.tools.validator",
+    "punto.developer",
+    "punto.developer.base",
+    "punto.developer.context",
+    "punto.developer.local",
 )
 
 

@@ -5,7 +5,7 @@
 # el contrato de configuración de modelos, pero permanece DESHABILITADO: el
 # Model Router está explícitamente prohibido en esta fase.
 #
-# NO se conecta: OpenAI, Anthropic, Claude Code, ni ningún agente LLM.
+# NO se conecta: OpenAI ni ningún agente LLM.
 # ============================================================================
 
 version: "0.1.0"
@@ -18,8 +18,6 @@ model_router_enabled: false
 # claves en el entorno no habilita nada; solo documenta la prohibición.
 forbidden_providers:
   - "openai"
-  - "anthropic"
-  - "claude-code"
   - "google"
   - "mistral"
   - "cohere"

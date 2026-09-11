@@ -27,6 +27,19 @@ class AuditEventType(StrEnum):
     TASK_CANCELLED = "TASK_CANCELLED"
     ACTION_EXECUTED = "ACTION_EXECUTED"
 
+    # --- Developer Execution Layer (ENGINE-1) ---------------------------------
+    #: No forman parte de ``REQUIRED_EVENT_TYPES``: se añaden sin romper el
+    #: contrato constitucional de ENGINE-0.
+    DEVELOPER_RUN_STARTED = "DEVELOPER_RUN_STARTED"
+    FILE_CHANGED = "FILE_CHANGED"
+    COMMAND_EXECUTED = "COMMAND_EXECUTED"
+    COMMAND_BLOCKED = "COMMAND_BLOCKED"
+    VALIDATION_COMPLETED = "VALIDATION_COMPLETED"
+    GIT_COMMIT_CREATED = "GIT_COMMIT_CREATED"
+    DEVELOPER_RUN_COMPLETED = "DEVELOPER_RUN_COMPLETED"
+    DEVELOPER_RUN_FAILED = "DEVELOPER_RUN_FAILED"
+    DEVELOPER_RUN_BLOCKED = "DEVELOPER_RUN_BLOCKED"
+
 
 class AuditEvent(BaseModel):
     """Evento de auditoría inmutable.

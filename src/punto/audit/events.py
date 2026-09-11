@@ -28,6 +28,18 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.HUMAN_GATE_RESOLVED: "human_approval",
     AuditEventType.HUMAN_GATE_RESUME_AUTHORIZED: "human_approval",
     AuditEventType.ACTION_EXECUTED: "action",
+    # --- Developer Execution Layer (ENGINE-1) ---------------------------------
+    #: Todos se registran sobre el ``task_id``, de modo que
+    #: ``AuditLogger.by_resource(task_id)`` reconstruye la ejecución completa.
+    AuditEventType.DEVELOPER_RUN_STARTED: "developer_run",
+    AuditEventType.FILE_CHANGED: "file",
+    AuditEventType.COMMAND_EXECUTED: "command",
+    AuditEventType.COMMAND_BLOCKED: "command",
+    AuditEventType.VALIDATION_COMPLETED: "validation",
+    AuditEventType.GIT_COMMIT_CREATED: "commit",
+    AuditEventType.DEVELOPER_RUN_COMPLETED: "developer_run",
+    AuditEventType.DEVELOPER_RUN_FAILED: "developer_run",
+    AuditEventType.DEVELOPER_RUN_BLOCKED: "developer_run",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

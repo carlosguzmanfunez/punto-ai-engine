@@ -4,19 +4,32 @@
 
 | Campo | Valor |
 | --- | --- |
-| Fase | **ENGINE-0** (bootstrap constitucional) |
+| Fase | **ENGINE-1** (capa de ejecución controlada) |
+| Fase anterior | **ENGINE-0 — CERRADA** (núcleo constitucional) |
 | Versión | `0.1.0` |
 | Python | `>= 3.12` |
 | Persistencia | En memoria (sin base de datos) |
-| IA / LLM | **Deshabilitada** en esta fase |
+| IA / LLM | **Deshabilitada**: ENGINE-1 no conecta ningún modelo |
 | Integraciones externas | **Ninguna** |
 | Red | No requerida |
 
-ENGINE-0 no es un agente inteligente. Es el **esqueleto de gobernanza** sobre el
-que se construirán las fases posteriores: autoridad, política, riesgo,
-presupuesto, Human Gate, máquina de estados, auditoría y un orquestador
-determinista llamado **CAMUS**. Todo el comportamiento es local, reproducible y
-verificable por pruebas.
+**Estado de las fases**
+
+| Fase | Contenido | Estado |
+| --- | --- | --- |
+| **ENGINE-0** | Núcleo constitucional determinista: autoridad, política, riesgo, presupuesto, Human Gate, máquina de estados, auditoría, CAMUS y API mínima. | ✅ **CERRADA** |
+| **ENGINE-1** | Capa de ejecución controlada: `DeveloperRunner`, `ExecutionContext`, Filesystem, Shell, Git, Validator, `LocalDeveloperRunner`, auditoría de ejecución, fixture y demo real. | ✅ Implementada |
+| **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz. | ⏳ Futura |
+
+ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
+tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
+sobre un repositorio local de prueba sin ningún modelo de IA. Todo el
+comportamiento es local, reproducible y verificable por pruebas.
+
+> **Proveedor de IA.** El Developer AI principal de PUNTO AI ENGINE será
+> **DeepSeek**, integrado en ENGINE-2. ENGINE-1 no conecta ningún proveedor de
+> modelo: su ejecutor es determinista.
+
 
 ---
 
@@ -65,6 +78,7 @@ src/punto/
 │   ├── decision.py        ActionRequest, HumanApprovalRequest
 │   ├── policy.py          PolicyDecision, PolicyOutcome
 │   ├── result.py          ExecutionResult, TaskExecutionRecord
+│   ├── execution.py       DeveloperTask, DeveloperExecutionResult, CommandResult, ...
 │   └── audit.py           AuditEvent, AuditEventType
 ├── policy/                Gobernanza determinista
 │   ├── config_loader.py   Carga de YAML con caché y errores duros
@@ -81,11 +95,24 @@ src/punto/
 ├── tasks/
 │   ├── manager.py         TaskManager en memoria
 │   └── transitions.py     Reexportación de la máquina de estados
+├── developer/             ENGINE-1: frontera de ejecución
+│   ├── base.py            DeveloperRunner (interfaz abstracta)
+│   ├── context.py         ExecutionContext (workspace, rama, límites)
+│   └── local.py           LocalDeveloperRunner (determinista, sin IA)
+├── tools/                 ENGINE-1: Tool Layer confinada
+│   ├── errors.py          Taxonomía de errores (módulo hoja)
+│   ├── filesystem.py      FilesystemTool (confinado al workspace)
+│   ├── shell.py           ShellRunner (allowlist, default deny)
+│   ├── git.py             GitWorkspace (local, sin remoto)
+│   └── validator.py       Validator (checks reales)
 ├── audit/
 │   ├── events.py          Catálogo de eventos obligatorios
 │   └── logger.py          AuditLogger append-only en memoria
 └── api/
     └── app.py             API FastAPI + contenedor `Engine`
+
+fixtures/
+└── minimal-python-project/   Proyecto Python mínimo usado como target de prueba
 ```
 
 ### Contenedor `Engine`
@@ -638,6 +665,31 @@ intérprete el orden de imports previos ocultaría el ciclo:
 | R3 | Todos los módulos, en orden inverso y en un proceso nuevo, importan sin fallar. |
 | R3 | `punto.orchestrator` no carga `camus` ni `tasks.manager` de forma eager. |
 
+`tests/test_workspace_isolation.py`, `test_shell_policy.py`, `test_git_workspace.py`,
+`test_validator.py` y `test_developer_runner.py` (ENGINE-1) verifican la capa de
+ejecución con operaciones **reales** (archivos reales, Git real, `pytest` real),
+sin sustituir las operaciones centrales por mocks:
+
+| Invariante | Verifica |
+| --- | --- |
+| §25.1-2 | Leer y escribir dentro del workspace funciona. |
+| §25.3-5 | `..`, ruta absoluta externa y escape por enlace (junction/symlink) se bloquean. |
+| §25.6-7 | `config/constitution.yaml` y `config/permissions.yaml` se bloquean y no se modifican. |
+| §25.8-9 | Comando allowlisted se ejecuta; desconocido se deniega por default deny. |
+| §25.10 | No se usa `shell=True` (verificado por AST) y los metacaracteres no se interpretan. |
+| §25.11-13 | Timeout detectado; `stdout` y `stderr` capturados y nunca ocultos. |
+| §25.14-15 | No se escribe en `main`; la rama `ai/...` se crea correctamente. |
+| §25.16-18 | `git diff`, `git diff --stat` y `git commit` funcionan. |
+| §25.19 | Misión 1 (`hello.txt`) completa: archivo, contenido exacto, rama y commit. |
+| §25.20 | Misión 2 (`add()` + test) pasa `pytest` y commitea. |
+| §25.21-22 | El Validator falla si un check falla y solo pasa si todos se ejecutan bien. |
+| §25.23-24 | `max_files_changed` y `max_execution_minutes` producen BLOCKED/TIMEOUT. |
+| §25.25-26 | No existe ruta de `git push` ni de mutación de remotos. |
+| §25.27 | Coste = 0.00 USD. |
+| §25.28 | La ejecución deja traza de auditoría completa ligada al `task_id`. |
+| §25.29-30 | `DeveloperRunner` es inyectable; CAMUS sin runner conserva ENGINE-0. |
+| §25.31 | Cold imports de todos los módulos nuevos en subprocesos independientes. |
+
 ---
 
 ## 14. Configuración
@@ -669,15 +721,15 @@ necesita sobreescribir la configuración por defecto.
 
 ---
 
-## 15. Restricciones de ENGINE-0
+## 15. Restricciones del motor (ENGINE-0 / ENGINE-1)
 
 Explícitas y verificadas, no aspiracionales:
 
 - **Sin IA.** `llm_enabled: false` y `model_router_enabled: false`. El Model
-  Router está prohibido en esta fase.
+  Router está prohibido. ENGINE-1 no conecta ningún modelo: su ejecutor es
+  determinista.
 - **Sin integraciones externas.** Todas deshabilitadas en
-  `config/environments.yaml`: OpenAI, Anthropic, Claude Code, Neon, GitHub API,
-  Vercel, Redis, Temporal.
+  `config/environments.yaml`: OpenAI, Neon, GitHub API, Vercel, Redis, Temporal.
 - **Sin persistencia externa.** Todo vive en memoria; se pierde al reiniciar el
   proceso.
 - **Sin secretos de terceros.** ENGINE-0 no requiere ninguna clave.
@@ -695,18 +747,184 @@ El endpoint `GET /engine` expone este estado de forma verificable:
 
 **ENGINE-0 entrega:** el núcleo constitucional determinista con autoridad,
 política, riesgo, presupuesto, Human Gate, máquina de estados, auditoría, CAMUS
-y una API HTTP mínima, con su suite de pruebas.
+y una API HTTP mínima, con su suite de pruebas. **Cerrada.**
 
-**ENGINE-0 no entrega:** ningún agente inteligente, ninguna conexión externa,
-ninguna persistencia y ningún despliegue.
+**ENGINE-1 entrega:** la capa de ejecución controlada descrita en la sección 17.
+**No entrega** ningún agente inteligente, ninguna conexión externa y ninguna
+persistencia.
 
 Las fases posteriores habilitarán capacidades de forma progresiva y siempre bajo
 aprobación humana, según lo declarado en `config/environments.yaml`:
 `github_api` y `vercel` (ENGINE-1), LLM y Model Router (ENGINE-2), Neon, Redis y
 Temporal (ENGINE-3).
 
+**ENGINE-2 será DEEPSEEK DEVELOPER INTEGRATION.** La integración del modelo se
+hará implementando `DeepSeekDeveloperRunner` sobre la interfaz `DeveloperRunner`
+que ya existe, sin tocar el núcleo, el Policy Engine ni el Human Gate.
+
 ---
 
-## 17. Licencia
+## 17. ENGINE-1 — Controlled Developer Execution Layer
+
+Capa segura capaz de ejecutar trabajo **real** sobre un repositorio local de
+prueba, todavía **sin IA externa**.
+
+```
+CAMUS
+  ↓
+DeveloperRunner            interfaz abstracta, provider-agnostic
+  ↓
+ExecutionContext           workspace, rama, comandos y límites
+  ↓
+Tool Layer
+  ├── Filesystem
+  ├── Shell
+  ├── Git
+  └── Validator
+```
+
+ENGINE-1 implementa `LocalDeveloperRunner` (determinista, sin IA). ENGINE-2
+añadirá `DeepSeekDeveloperRunner` sobre la misma frontera:
+
+```
+CAMUS → DeveloperRunner → DeepSeekDeveloperRunner → DeepSeek → Tool Layer
+```
+
+### Componentes
+
+| Componente | Módulo | Responsabilidad |
+| --- | --- | --- |
+| `DeveloperRunner` | `punto/developer/base.py` | Interfaz abstracta `execute(task, context) -> DeveloperExecutionResult`. No conoce ningún proveedor. |
+| `LocalDeveloperRunner` | `punto/developer/local.py` | Ejecutor determinista de recetas. **No genera código con IA.** |
+| `ExecutionContext` | `punto/developer/context.py` | Autoridad de seguridad: resuelve el workspace, confina rutas, protege los archivos constitucionales y bloquea escrituras fuera de `ai/`. |
+| `FilesystemTool` | `punto/tools/filesystem.py` | `read_text`, `write_text`, `create_file`, `replace_text`, `list_files`, `delete_file`. Verifica por relectura. |
+| `ShellRunner` | `punto/tools/shell.py` | Comandos estructurados, allowlist, **default deny**, `shell=False`, timeout determinista. |
+| `GitWorkspace` | `punto/tools/git.py` | `status`, `current_branch`, `create_branch`, `diff`, `diff_stat`, `add`, `commit`, `head_sha`. **Sin remoto.** |
+| `Validator` | `punto/tools/validator.py` | Ejecuta los checks declarados; PASS solo si todos se ejecutaron de verdad. |
+| `DeveloperExecutionResult` | `punto/schemas/execution.py` | Evidencia estructurada: estado, workspace, rama, archivos, comandos, validación y commit. |
+
+### Flujo de una tarea
+
+```
+recibir tarea estructurada
+→ preparar workspace (copia del fixture)
+→ crear rama ai/<task-id>-<slug>       (nunca main)
+→ modificar archivos                   (confinados al workspace)
+→ ejecutar comandos                    (allowlist)
+→ ejecutar tests                       (Validator)
+→ validar resultado
+→ crear commit local
+→ producir evidencia estructurada
+```
+
+### Seguridad del workspace
+
+- **Ninguna herramienta opera fuera de `workspace_path`.** La comprobación se
+  hace sobre la ruta **resuelta** (`Path.resolve()`), de modo que detecta `..`,
+  rutas absolutas externas y escapes por enlace —junction en Windows o symlink en
+  POSIX—. No se compara texto sin resolver.
+- Los archivos constitucionales (`config/constitution.yaml`,
+  `config/permissions.yaml`) se bloquean **con independencia del workspace**, por
+  ruta normalizada y por nombre base.
+- El tool de archivos no escribe dentro de `.git`.
+- `GitWorkspace` verifica que el repositorio sea exactamente el workspace: un
+  workspace anidado en otro repositorio no puede operar sobre el padre.
+
+### Seguridad del shell
+
+- **Nunca `shell=True`**: los comandos son listas de argumentos, sin
+  interpretación de metacaracteres.
+- **Default deny** con allowlist: `python`, `pytest`, `ruff`, `mypy`, `git`.
+- Prohibidos explícitamente: `powershell`, `pwsh`, `cmd`, `bash`, `sh`, `curl`,
+  `wget`, `ssh`, `scp`, `reg`, `format`, `shutdown` y otros.
+- No se admiten rutas de ejecutable (solo nombres), y `python` se resuelve al
+  intérprete actual para no depender del `PATH`.
+- `git` no puede hablar con un remoto (`push`, `fetch`, `pull`, `clone`,
+  `remote`), ni reconfigurarse (`config`), ni redirigir el repositorio (`-C`,
+  `--git-dir`, `--work-tree`).
+- Timeout determinista por comando; `stdout` y `stderr` se capturan siempre y el
+  `stderr` nunca se oculta.
+
+### Seguridad de Git
+
+- Cada tarea trabaja en `ai/<task-id>-<slug>`.
+- Escribir código en `main`/`master` está **bloqueado**. Crear la rama de tarea
+  desde `main` sí está permitido: lo prohibido es escribir en `main`.
+- **No existe** ninguna operación de remoto en la API de `GitWorkspace`. No es que
+  esté deshabilitada: no está implementada, y la política de shell la rechaza
+  igualmente por la vía del comando.
+
+> **Nota sobre niveles.** El push de *este* repositorio PUNTO AI ENGINE a `main`
+> lo realiza el ejecutor técnico de la sesión de desarrollo, no el
+> `DeveloperRunner` como capacidad del motor. Son dos niveles distintos.
+
+### Autoridad
+
+`DeveloperRunner` **no decide** si una acción está permitida. La jerarquía es:
+
+```
+Policy Engine → CAMUS → DeveloperRunner
+```
+
+El runner rechaza lo que viole restricciones técnicas, pero **nunca eleva
+permisos**. No puede ejecutar acciones de nivel 3, desplegar, pagar, cambiar el
+modelo de negocio, rotar secretos maestros, modificar la constitución ni
+autoelevar autoridad.
+
+### Integración con CAMUS (opt-in)
+
+`DeveloperRunner` es una **dependencia inyectable**. Si no se inyecta, CAMUS se
+comporta exactamente como en ENGINE-0:
+
+```python
+from punto.developer.local import LocalDeveloperRunner
+
+camus = Camus(..., developer_runner=LocalDeveloperRunner(audit=audit))
+resultado = camus.execute_developer_task(task, context)
+```
+
+La API HTTP **no** expone la capa de desarrollo: no existe `POST /developer/run`
+ni `POST /execute`. La superficie HTTP sigue siendo la de ENGINE-0.
+
+### Límites y coste
+
+Se aplican `max_files_changed`, `max_execution_minutes` y `max_attempts`. Superar
+un límite produce `BLOCKED` (o `TIMEOUT` cuando la causa es el tiempo), nunca una
+continuación silenciosa.
+
+El coste es **0.00 USD**: `LocalDeveloperRunner` no consume ningún modelo externo.
+
+### Validación placeholder
+
+ENGINE-1 introduce un **Validator real** para los checks declarados en la receta
+(`pytest`, `ruff`, `mypy`…). No obstante, los estados `QA`, `SECURITY` y `REVIEW`
+del flujo de CAMUS siguen siendo `DETERMINISTIC_PLACEHOLDER_VALIDATION`: ENGINE-1
+valida la máquina de estados y los checks declarados, pero **no** incorpora
+todavía agentes reales de QA, seguridad o revisión. Llegarán en fases posteriores.
+
+### Auditoría de ejecución
+
+Eventos añadidos (no forman parte de `REQUIRED_EVENT_TYPES`, para no romper el
+contrato de ENGINE-0): `DEVELOPER_RUN_STARTED`, `FILE_CHANGED`,
+`COMMAND_EXECUTED`, `COMMAND_BLOCKED`, `VALIDATION_COMPLETED`,
+`GIT_COMMIT_CREATED`, `DEVELOPER_RUN_COMPLETED`, `DEVELOPER_RUN_FAILED`,
+`DEVELOPER_RUN_BLOCKED`.
+
+Todos se registran sobre el `task_id`, de modo que
+`AuditLogger.by_resource(task_id)` reconstruye la ejecución completa con el
+workspace, la acción y el resultado de cada paso.
+
+### Limitaciones residuales (declaradas)
+
+No se pretende construir un sandbox de sistema operativo. La allowlist admite
+`python`, y `python -c "<código>"` puede ejecutar código arbitrario: ENGINE-1
+impide la **ejecución irrestricta accidental**, no el abuso deliberado desde
+dentro del proceso. Un aislamiento fuerte requeriría contenedores o un usuario
+sin privilegios, fuera del alcance de esta fase.
+
+---
+
+## 18. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
+

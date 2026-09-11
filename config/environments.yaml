@@ -73,12 +73,6 @@ integrations:
   openai:
     enabled: false
     phase_required: "ENGINE-2"
-  anthropic:
-    enabled: false
-    phase_required: "ENGINE-2"
-  claude_code:
-    enabled: false
-    phase_required: "ENGINE-2"
   neon:
     enabled: false
     phase_required: "ENGINE-3"

@@ -10,12 +10,14 @@ consultas devuelven tuplas en ese mismo orden.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from punto.common import deep_freeze
 from punto.schemas.audit import AuditEvent, AuditEventType
 from punto.schemas.enums import AuditResult
+from punto.schemas.execution import CommandResult, FileChange, ValidationResult
 
 from .events import DEFAULT_ACTOR, RESOURCE_BY_EVENT
 
@@ -288,6 +290,191 @@ class AuditLogger:
                 "cost_usd": cost_usd,
                 "elapsed_minutes": elapsed_minutes,
             },
+        )
+
+    # ------------------------------------------- Developer Execution (ENGINE-1)
+    def log_developer_run_started(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        branch: str,
+        runner: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una ejecución de desarrollo."""
+        return self.record(
+            AuditEventType.DEVELOPER_RUN_STARTED,
+            action="developer_run_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={"workspace": workspace, "branch": branch, "runner": runner},
+        )
+
+    def log_file_changed(
+        self, *, task_id: UUID, change: FileChange, actor: str | None = None
+    ) -> AuditEvent:
+        """Registra un cambio de archivo dentro del workspace."""
+        return self.record(
+            AuditEventType.FILE_CHANGED,
+            action=f"file_{change.operation.value.lower()}",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "path": change.path,
+                "operation": change.operation.value,
+                "bytes_written": change.bytes_written,
+                "verified": change.verified,
+                "workspace": str(Path(change.absolute_path).parent),
+            },
+        )
+
+    def log_command_executed(
+        self, *, task_id: UUID, result: CommandResult, actor: str | None = None
+    ) -> AuditEvent:
+        """Registra un comando ejecutado, con su resultado completo."""
+        return self.record(
+            AuditEventType.COMMAND_EXECUTED,
+            action=f"command:{result.command}",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if result.succeeded else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "name": result.name,
+                "command": result.command,
+                "args": list(result.args),
+                "cwd": result.cwd,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "duration_ms": result.duration_ms,
+                # El stderr se conserva truncado pero nunca se omite.
+                "stderr": result.stderr[:2000],
+                "workspace": result.cwd,
+            },
+        )
+
+    def log_command_blocked(
+        self,
+        *,
+        task_id: UUID,
+        executable: str,
+        args: tuple[str, ...] = (),
+        reason: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un comando denegado por la política de shell."""
+        return self.record(
+            AuditEventType.COMMAND_BLOCKED,
+            action=f"command_blocked:{executable}",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={"command": executable, "args": list(args), "reason": reason},
+        )
+
+    def log_validation_completed(
+        self, *, task_id: UUID, validation: ValidationResult, actor: str | None = None
+    ) -> AuditEvent:
+        """Registra el veredicto agregado de la validación."""
+        return self.record(
+            AuditEventType.VALIDATION_COMPLETED,
+            action="validate",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if validation.passed else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "passed": validation.passed,
+                "total_checks": validation.total,
+                "failed_checks": list(validation.failed_checks),
+                "duration_ms": validation.duration_ms,
+            },
+        )
+
+    def log_git_commit_created(
+        self,
+        *,
+        task_id: UUID,
+        branch: str,
+        commit_sha: str,
+        message: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la creación de un commit local."""
+        return self.record(
+            AuditEventType.GIT_COMMIT_CREATED,
+            action="git_commit",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={"branch": branch, "commit_sha": commit_sha, "message": message},
+        )
+
+    def log_developer_run_completed(
+        self,
+        *,
+        task_id: UUID,
+        status: str,
+        workspace: str,
+        branch: str,
+        files_changed: int,
+        commands_executed: int,
+        commit_sha: str | None,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una ejecución de desarrollo."""
+        return self.record(
+            AuditEventType.DEVELOPER_RUN_COMPLETED,
+            action="developer_run_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "status": status,
+                "workspace": workspace,
+                "branch": branch,
+                "files_changed": files_changed,
+                "commands_executed": commands_executed,
+                "commit_sha": commit_sha,
+            },
+        )
+
+    def log_developer_run_failed(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        error: str,
+        status: str = "FAILED",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una ejecución que terminó en fallo o por timeout."""
+        return self.record(
+            AuditEventType.DEVELOPER_RUN_FAILED,
+            action="developer_run_failed",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={"workspace": workspace, "error": error, "status": status},
+        )
+
+    def log_developer_run_blocked(
+        self,
+        *,
+        task_id: UUID,
+        workspace: str,
+        reason: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una ejecución detenida por una restricción de seguridad."""
+        return self.record(
+            AuditEventType.DEVELOPER_RUN_BLOCKED,
+            action="developer_run_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={"workspace": workspace, "reason": reason},
         )
 
     # -------------------------------------------------------------------- read

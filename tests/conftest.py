@@ -7,13 +7,18 @@ producción.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import UUID, uuid4
 
 import pytest
 
 from punto.api.app import Engine, create_app
 from punto.audit.logger import AuditLogger
+from punto.developer.context import ExecutionContext
+from punto.developer.local import LocalDeveloperRunner
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
@@ -29,6 +34,123 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
+#: Directorio del proyecto fixture. **Nunca** se modifica: los tests y las demos
+#: copian su contenido a un workspace temporal.
+FIXTURE_PROJECT_DIR: Path = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "minimal-python-project"
+)
+
+#: Identidad usada al preparar los repositorios de prueba.
+FIXTURE_AUTHOR: tuple[str, str] = ("PUNTO Fixture", "fixture@punto.local")
+
+
+def run_git(workspace: Path, *args: str) -> str:
+    """Ejecuta Git en el workspace. Solo para **preparar** escenarios de prueba.
+
+    No es la vía del DeveloperRunner: aquí se usa subprocess directamente porque
+    el objetivo es montar el estado inicial, no demostrar la capa de ejecución.
+    """
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} falló: {completed.stderr}")
+    return completed.stdout
+
+
+def init_git_workspace(workspace: Path, *, branch: str = "main") -> None:
+    """Inicializa ``workspace`` como repositorio Git con un commit inicial."""
+    name, email = FIXTURE_AUTHOR
+    run_git(workspace, "init", "-b", branch)
+    run_git(workspace, "add", "-A")
+    run_git(
+        workspace,
+        "-c",
+        f"user.name={name}",
+        "-c",
+        f"user.email={email}",
+        "commit",
+        "-m",
+        "chore: fixture inicial",
+    )
+
+
+@pytest.fixture(scope="session")
+def fixture_project() -> Path:
+    """Directorio del proyecto fixture, intacto."""
+    return FIXTURE_PROJECT_DIR
+
+
+@pytest.fixture
+def workspace(tmp_path: Path, fixture_project: Path) -> Path:
+    """Copia el fixture a un workspace temporal con Git inicializado en ``main``.
+
+    El fixture fuente nunca se toca: cada prueba trabaja sobre su propia copia.
+    """
+    destination = tmp_path / "workspace"
+    shutil.copytree(fixture_project, destination)
+    init_git_workspace(destination)
+    return destination
+
+
+@pytest.fixture
+def task_id() -> UUID:
+    """Identificador de tarea para los escenarios de desarrollo."""
+    return uuid4()
+
+
+@pytest.fixture
+def context(task_id: UUID, workspace: Path) -> ExecutionContext:
+    """Contexto de ejecución sobre el workspace temporal, en ``main``.
+
+    Se declara ``main`` a propósito: el runner debe crear su rama de tarea antes
+    de escribir, y el guard de escritura debe seguir bloqueando ``main``.
+    """
+    return ExecutionContext(task_id=task_id, workspace_path=workspace, branch_name="main")
+
+
+@pytest.fixture
+def ai_context(task_id: UUID, workspace: Path) -> ExecutionContext:
+    """Contexto ya situado en una rama de tarea (escrituras permitidas)."""
+    return ExecutionContext(
+        task_id=task_id, workspace_path=workspace, branch_name="ai/task-branch"
+    )
+
+
+@pytest.fixture
+def developer_runner(audit_logger: AuditLogger) -> LocalDeveloperRunner:
+    """Runner determinista con auditoría."""
+    return LocalDeveloperRunner(audit=audit_logger)
+
+
+@pytest.fixture
+def camus_with_developer(
+    task_manager: TaskManager,
+    policy_engine: PolicyEngine,
+    human_gate: HumanGate,
+    audit_logger: AuditLogger,
+    state_machine: StateMachine,
+    developer_runner: LocalDeveloperRunner,
+) -> Camus:
+    """CAMUS con la frontera de ejecución de ENGINE-1 inyectada (opt-in)."""
+    return Camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        audit=audit_logger,
+        state_machine=state_machine,
+        planner=Planner(),
+        developer_runner=developer_runner,
+    )
+
 
 
 @pytest.fixture(scope="session")

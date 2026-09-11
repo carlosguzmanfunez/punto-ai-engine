@@ -23,6 +23,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
+from punto.developer.base import DeveloperRunner
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
@@ -35,13 +36,17 @@ from punto.schemas.enums import (
     TaskPriority,
     TaskStatus,
 )
+from punto.schemas.execution import DeveloperExecutionResult, DeveloperRunStatus
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
 from punto.schemas.result import ExecutionResult
 from punto.schemas.task import Task
 from punto.tasks.manager import TaskManager
+from punto.tools.errors import DeveloperRunnerNotConfiguredError
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
+    from punto.developer.context import ExecutionContext
+    from punto.schemas.execution import DeveloperTask
 
 
 class CamusOutcome(StrEnum):
@@ -151,6 +156,7 @@ class Camus:
         audit: AuditLogger,
         state_machine: StateMachine | None = None,
         planner: Planner | None = None,
+        developer_runner: DeveloperRunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -158,6 +164,9 @@ class Camus:
         self._audit = audit
         self._machine = state_machine or StateMachine()
         self._planner = planner or Planner()
+        #: Frontera de ejecución real (ENGINE-1). Inyectable y **opt-in**: si es
+        #: ``None``, el comportamiento es exactamente el de ENGINE-0.
+        self._developer = developer_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -184,6 +193,63 @@ class Camus:
     def planner(self) -> Planner:
         """Planificador en uso."""
         return self._planner
+
+    @property
+    def developer_runner(self) -> DeveloperRunner | None:
+        """Frontera de ejecución inyectada, si existe (ENGINE-1)."""
+        return self._developer
+
+    # ------------------------------------------------------------- ENGINE-1
+    def execute_developer_task(
+        self, task: DeveloperTask, context: ExecutionContext
+    ) -> DeveloperExecutionResult:
+        """Ejecuta una tarea de desarrollo delegando en el ``DeveloperRunner``.
+
+        CAMUS **no** ejecuta nada por sí mismo: consulta el Policy Engine y, solo
+        si la acción está permitida sin intervención humana, delega en el runner
+        inyectado. La jerarquía es Policy Engine -> CAMUS -> DeveloperRunner.
+
+        Los archivos declarados por la receta se someten al Policy Engine, de modo
+        que la protección constitucional y los presupuestos se aplican **antes**
+        de tocar el disco (además de la protección propia del tool de archivos).
+
+        Raises:
+            DeveloperRunnerNotConfiguredError: si no hay runner inyectado.
+        """
+        if self._developer is None:
+            raise DeveloperRunnerNotConfiguredError()
+
+        declared_files = [spec.path for spec in task.files]
+        declared_files.extend(replacement.path for replacement in task.replacements)
+
+        request = ActionRequest(
+            action=task.action,
+            files_changed=declared_files,
+            task_id=str(context.task_id),
+            risk_level=task.risk_level,
+            estimated_minutes=context.max_execution_minutes,
+            estimated_cost=context.max_cost_usd,
+        )
+        decision = self._policy.evaluate(request, PolicyEvaluationContext(actor="camus"))
+        self._audit.log_policy_decision(decision, resource_id=context.task_id)
+
+        if not decision.allowed or decision.requires_human:
+            self._audit.log_developer_run_blocked(
+                task_id=context.task_id,
+                workspace=str(context.workspace_root),
+                reason=decision.reason,
+            )
+            return DeveloperExecutionResult(
+                task_id=context.task_id,
+                status=DeveloperRunStatus.BLOCKED,
+                workspace=str(context.workspace_root),
+                branch=context.branch_name,
+                error=f"Policy Engine denegó la ejecución: {decision.reason}",
+                cost_usd=0.0,
+                attempts_used=0,
+            )
+
+        return self._developer.execute(task, context)
 
     # ------------------------------------------------------------------- main
     def process(

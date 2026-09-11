@@ -13,6 +13,7 @@ REQUIRED_EVENT_TYPES: Final[tuple[AuditEventType, ...]] = (
     AuditEventType.TASK_BLOCKED,
     AuditEventType.POLICY_DECISION,
     AuditEventType.HUMAN_GATE_CREATED,
+    AuditEventType.HUMAN_GATE_RESUME_AUTHORIZED,
 )
 
 #: Recurso lógico asociado a cada tipo de evento.
@@ -25,6 +26,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.POLICY_DECISION: "policy_decision",
     AuditEventType.HUMAN_GATE_CREATED: "human_approval",
     AuditEventType.HUMAN_GATE_RESOLVED: "human_approval",
+    AuditEventType.HUMAN_GATE_RESUME_AUTHORIZED: "human_approval",
     AuditEventType.ACTION_EXECUTED: "action",
 }
 

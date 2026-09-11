@@ -202,8 +202,9 @@ determinista y estricto. Cada exceso se bloquea con su `BlockedReason`:
 
 ## 7. Máquina de estados
 
-La tabla `TRANSITION_TABLE` es la **autoridad única**: no hay transiciones
-implícitas ni "cualquier estado a cualquier estado".
+La tabla `TRANSITION_TABLE` es la **autoridad única** de las transiciones
+**normales**: no hay transiciones implícitas ni "cualquier estado a cualquier
+estado".
 
 ```
 NEW → ANALYZING → PLANNING → READY → IN_PROGRESS → QA → SECURITY → REVIEW → APPROVED → COMPLETED
@@ -216,6 +217,25 @@ Estados auxiliares: `REPAIRING`, `FAILED`, `BLOCKED`, `HUMAN_APPROVAL`,
 recorrer análisis, planificación, ejecución, QA, seguridad, revisión y
 aprobación antes de completarse. Bloquear una tarea exige un motivo explícito
 (`BlockedReason`).
+
+### Transición normal vs. transición autorizada por Human Gate
+
+Son dos cosas distintas y viven en **tablas separadas**:
+
+| Tabla | Contenido | Quién puede invocarla |
+| --- | --- | --- |
+| `TRANSITION_TABLE` | Transiciones normales. Desde `HUMAN_APPROVAL` solo `BLOCKED` y `CANCELLED` (abortar). | `TaskManager.transition_task()` |
+| `HUMAN_GATE_RESUME_TABLE` | Reanudaciones desde `HUMAN_APPROVAL`: `APPROVED`, `IN_PROGRESS`, `READY`, `REVIEW`. | `TaskManager.resume_from_human_approval()` **con autorización** |
+
+Consecuencia: desde `HUMAN_APPROVAL` la vía genérica **solo permite abortar**.
+Ninguna llamada genérica puede conseguir el efecto de una reanudación, ni
+siquiera desde dentro del proceso. `StateMachine.assert_can_transition` distingue
+ambos casos y lanza `HumanGateAuthorizationRequired` cuando el par es una
+reanudación.
+
+Los estados de reanudación válidos se declaran una sola vez, en
+`punto.schemas.enums.HUMAN_GATE_RESUME_STATUSES`, y de ahí los consumen tanto la
+máquina de estados como el Human Gate.
 
 ---
 
@@ -230,7 +250,7 @@ CAMUS **no usa IA** en esta fase. Es un orquestador determinista que:
 5. genera eventos de auditoría en cada paso;
 6. se bloquea cuando corresponde;
 7. genera un Human Gate cuando corresponde;
-8. reanuda la tarea tras la resolución humana.
+8. reanuda la tarea tras la resolución humana, **desde el estado autorizado**.
 
 Resultados posibles (`CamusOutcome`):
 
@@ -244,6 +264,23 @@ Resultados posibles (`CamusOutcome`):
 La acción catalogada `simulate_failure` produce siempre un fallo determinista:
 existe para poder ejercitar y auditar la ruta de reparación (`REPAIRING`) sin
 introducir aleatoriedad ni dependencias externas.
+
+### Continuación tras un Human Gate
+
+`Camus.resume()` no muta `status` ni usa `transition_task()` para salir de
+`HUMAN_APPROVAL`: obtiene la autorización del gate y la aplica por la vía
+protegida. La continuación la decide **una única rutina basada en el estado
+actual** (`Camus._continue_after_authorization`), nunca una suposición fija, de
+modo que una fase ya superada no se repite:
+
+| Estado autorizado | Continuación |
+| --- | --- |
+| `IN_PROGRESS` | `IN_PROGRESS → QA → SECURITY → REVIEW → APPROVED → COMPLETED` |
+| `SECURITY` | `SECURITY → REVIEW → APPROVED → COMPLETED` |
+| `REVIEW` | `REVIEW → APPROVED → COMPLETED` |
+| `READY` | `READY → IN_PROGRESS` y, desde ahí, la primera secuencia |
+
+Nunca hay camino hacia atrás: **`REVIEW → QA` es imposible**.
 
 ### Validación placeholder (`DETERMINISTIC_PLACEHOLDER_VALIDATION`)
 
@@ -300,10 +337,46 @@ determinista y **sin efectos** (no hay respaldo por posición en el historial).
 
 ### Invariante de superficie (R1.1)
 
-Ninguna ruta HTTP puede sacar una tarea de `HUMAN_APPROVAL`. La máquina de
-estados sigue admitiendo `HUMAN_APPROVAL → APPROVED` como transición *interna*
-(disponible para CAMUS y el Task Manager), pero el endpoint genérico de
-transiciones fue **eliminado**: un estado solo cambia a través del dominio.
+Ninguna ruta HTTP puede sacar una tarea de `HUMAN_APPROVAL`. El endpoint genérico
+de transiciones fue **eliminado**: un estado solo cambia a través del dominio.
+
+### Invariante de dominio (R2.1)
+
+La garantía **no** depende de que la API esté reducida: también es imposible
+saltarse el Human Gate **desde dentro del proceso**.
+
+```
+HumanGate.authorize_resume()        comprueba APPROVED y emite la autorización
+        ↓
+HumanApprovalProof                  objeto inmutable, no fabricable
+        ↓
+TaskManager.resume_from_human_approval()
+        ↓
+StateMachine.resume_transition()    única vía hacia un estado de continuación
+```
+
+- `HumanApprovalProof` lleva exactamente `approval_id`, `task_id`,
+  `policy_decision_id` y `resume_status`. Un centinela privado en su
+  construcción hace que **no pueda fabricarse** fuera del gate.
+- `PENDING` y `REJECTED` no producen autorización: `authorize_resume()` delega en
+  `assert_executable()` y falla antes de emitir nada.
+- El destino lo fija la **solicitud**, no quien reanuda: `resume_from_human_approval()`
+  no acepta un estado destino como parámetro. Redirigir la reanudación es
+  imposible por construcción.
+- Una autorización emitida para TASK-A no puede aplicarse a TASK-B: se verifica
+  el `task_id` tanto al emitirla como al consumirla.
+- `TaskManager.transition_task()` lanza `HumanGateAuthorizationRequired` si se
+  intenta cualquier reanudación desde `HUMAN_APPROVAL`.
+
+```python
+# Correcto: autorización emitida por el gate y aplicada por la vía protegida.
+authorization = human_gate.authorize_resume(approval.id, task_id=task.id)
+task = task_manager.resume_from_human_approval(task.id, authorization=authorization)
+
+# Imposible: la vía genérica no puede reanudar.
+task_manager.transition_task(task.id, TaskStatus.APPROVED)
+# -> HumanGateAuthorizationRequired
+```
 
 ---
 
@@ -319,7 +392,27 @@ Eventos mínimos obligatorios (`REQUIRED_EVENT_TYPES`):
 `HUMAN_GATE_CREATED`.
 
 Además: `TASK_COMPLETED`, `TASK_CANCELLED`, `HUMAN_GATE_RESOLVED`,
-`ACTION_EXECUTED`.
+`HUMAN_GATE_RESUME_AUTHORIZED`, `ACTION_EXECUTED`.
+
+### Trazabilidad de la cadena constitucional
+
+`HUMAN_GATE_RESUME_AUTHORIZED` se registra en el punto de enforcement
+(`TaskManager.resume_from_human_approval`) y lleva `task_id`,
+`policy_decision_id`, `from_status` y `resume_status`. Con él, la auditoría
+permite reconstruir la cadena completa sin persistencia externa:
+
+```
+tarea → gate → decisión de política → aprobación → autorización de reanudación → estado retomado
+```
+
+| Paso | Evento | Recurso |
+| --- | --- | --- |
+| tarea | `TASK_CREATED` | `task` |
+| decisión | `POLICY_DECISION` (+ `policy_decision_id`) | `task` |
+| gate | `HUMAN_GATE_CREATED` (+ `task_id`) | `human_approval` |
+| aprobación | `HUMAN_GATE_RESOLVED` | `human_approval` |
+| autorización | `HUMAN_GATE_RESUME_AUTHORIZED` (+ `policy_decision_id`) | `human_approval` |
+| estado retomado | `TASK_TRANSITION` (`HUMAN_APPROVAL` → `resume_status`) | `task` |
 
 ---
 
@@ -498,6 +591,22 @@ garantías constitucionales del gate:
 | R1.4 | `APPROVED` sí autoriza la reanudación. |
 | R1.4 | La aprobación de TASK-A no autoriza ni altera TASK-B. |
 | R1.5 | La validación simulada queda marcada como placeholder en la auditoría. |
+
+`tests/test_domain_hardening.py` (ENGINE-0.R2) cierra el invariante en el dominio:
+
+| Invariante | Verifica |
+| --- | --- |
+| R2.1 | `transition_task()` genérico no puede salir de `HUMAN_APPROVAL` a ningún destino de continuación. |
+| R2.1 | Desde `HUMAN_APPROVAL` la vía genérica solo permite abortar (`BLOCKED`/`CANCELLED`). |
+| R2.1 | Una autorización no puede fabricarse fuera del Human Gate. |
+| R2.1 | `PENDING` no produce autorización de reanudación. |
+| R2.1 | `REJECTED` no produce autorización de reanudación. |
+| R2.1 | Una aprobación válida sí autoriza la reanudación por la vía protegida. |
+| R2.1 | Una autorización de TASK-A no sirve para TASK-B. |
+| R2.1 | El destino de reanudación no puede redirigirse. |
+| R2.3 | Un gate de nivel 3 reanuda en `IN_PROGRESS` y recorre las fases restantes. |
+| R2.4 | Un gate creado desde `SECURITY` reanuda en `REVIEW` y termina en `COMPLETED`, sin `REVIEW → QA`. |
+| R2.7 | La auditoría reconstruye tarea → gate → decisión → aprobación → autorización → estado retomado. |
 
 ---
 

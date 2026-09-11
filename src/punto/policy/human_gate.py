@@ -2,7 +2,8 @@
 
 Punto único de parada humana del motor. En ENGINE-0 el gate vive en memoria: no
 hay UI, ni notificaciones, ni persistencia externa. La solicitud queda registrada
-con su estado y puede resolverse de forma programática (API) o por prueba.
+con su estado y puede resolverse de forma programática (API de dominio) o por
+prueba.
 
 Garantías constitucionales implementadas aquí:
 
@@ -13,32 +14,40 @@ Garantías constitucionales implementadas aquí:
 - Solo una solicitud ``APPROVED`` autoriza; ``PENDING`` y ``REJECTED`` no.
 - Cada solicitud conserva el ``policy_decision_id`` de la decisión que la
   originó, de modo que resolverla nunca mezcla el historial de otras tareas.
+- La reanudación exige una autorización explícita: ``authorize_resume`` es el
+  **único** emisor de :class:`HumanApprovalProof`, y una prueba no puede
+  fabricarse a mano.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import Final
 from uuid import UUID
 
 from punto.common import utc_now
 from punto.schemas.decision import HumanApprovalRequest
 from punto.schemas.enums import (
+    HUMAN_GATE_RESUME_STATUSES,
     ApprovalStatus,
     AuditResult,
     RiskLevel,
     TaskStatus,
 )
 
-#: Estados válidos a los que puede reanudarse una tarea aprobada. Impide que una
-#: aprobación humana redirija la tarea a un estado incoherente.
-RESUMABLE_STATUSES: frozenset[TaskStatus] = frozenset(
-    {
-        TaskStatus.APPROVED,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.READY,
-        TaskStatus.REVIEW,
-    }
-)
+#: Estados válidos a los que puede reanudarse una tarea aprobada.
+#:
+#: Se toma de :data:`punto.schemas.enums.HUMAN_GATE_RESUME_STATUSES`, la fuente
+#: única de verdad que también alimenta la tabla de reanudación de la máquina de
+#: estados. Se declara en ``schemas`` —y no aquí— porque importar
+#: ``punto.orchestrator`` desde ``punto.policy`` provocaría un ciclo de
+#: importación (``orchestrator/__init__`` carga ``camus``, que carga este módulo).
+RESUMABLE_STATUSES: frozenset[TaskStatus] = HUMAN_GATE_RESUME_STATUSES
+
+#: Centinela de emisión de autorizaciones. Solo este módulo lo conoce, de modo
+#: que un ``HumanApprovalProof`` no puede construirse fuera del Human Gate.
+_PROOF_ISSUER: Final[object] = object()
 
 
 class HumanGateError(RuntimeError):
@@ -55,6 +64,34 @@ class HumanGateNotFoundError(HumanGateError):
     def __init__(self, approval_id: UUID) -> None:
         self.approval_id = approval_id
         super().__init__(f"Solicitud de aprobación no encontrada: {approval_id}")
+
+
+@dataclass(frozen=True, slots=True)
+class HumanApprovalProof:
+    """Autorización inmutable para reanudar una tarea desde ``HUMAN_APPROVAL``.
+
+    La emite **exclusivamente** :meth:`HumanGate.authorize_resume`, y solo cuando
+    la solicitud está en estado ``APPROVED``. Es el único objeto que
+    ``TaskManager.resume_from_human_approval`` acepta como autorización.
+
+    El campo ``issuer`` es un centinela privado: construir la prueba a mano falla
+    de forma determinista, de modo que ninguna capa interna puede fabricarse una
+    autorización para saltarse el Human Gate.
+    """
+
+    approval_id: UUID
+    task_id: UUID
+    policy_decision_id: UUID
+    resume_status: TaskStatus
+    issuer: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.issuer is not _PROOF_ISSUER:
+            msg = (
+                "HumanApprovalProof solo puede ser emitido por "
+                "HumanGate.authorize_resume(); una autorización no puede fabricarse."
+            )
+            raise HumanGateError(msg)
 
 
 class HumanGate:
@@ -216,6 +253,69 @@ class HumanGate:
             raise HumanGateNotApprovedError(msg)
         return approval
 
+    def authorize_resume(
+        self, approval_id: UUID, *, task_id: UUID | None = None
+    ) -> HumanApprovalProof:
+        """Emite la autorización de reanudación de una solicitud aprobada.
+
+        Es el **único** punto de emisión de :class:`HumanApprovalProof`. El estado
+        de reanudación autorizado se toma de la propia solicitud, así que quien
+        reanuda no puede elegir un destino distinto del que se aprobó.
+
+        Args:
+            approval_id: Solicitud que se va a reanudar.
+            task_id: Tarea sobre la que se pretende reanudar. Si se indica y no
+                coincide con la de la solicitud, se rechaza: una autorización
+                emitida para una tarea no sirve para otra.
+
+        Returns:
+            La autorización, lista para ``TaskManager.resume_from_human_approval``.
+
+        Raises:
+            HumanGateNotApprovedError: si la solicitud no existe o no está
+                ``APPROVED`` (``PENDING`` y ``REJECTED`` nunca autorizan).
+            HumanGateError: si la tarea no coincide, si la solicitud no declara un
+                ``policy_decision_id`` o si su ``resume_status`` no es un destino
+                de reanudación autorizado.
+        """
+        # ``assert_executable`` concentra la comprobación de APPROVED: PENDING y
+        # REJECTED fallan aquí, antes de emitir nada.
+        approval = self.assert_executable(approval_id)
+
+        if task_id is not None and approval.task_id != task_id:
+            msg = (
+                f"La autorización de la solicitud {approval.id} pertenece a la tarea "
+                f"{approval.task_id} y no puede aplicarse a {task_id}."
+            )
+            raise HumanGateError(msg)
+
+        if approval.policy_decision_id is None:
+            msg = (
+                f"La solicitud {approval.id} no está vinculada a ninguna "
+                "PolicyDecision: no puede autorizar una reanudación."
+            )
+            raise HumanGateError(msg)
+
+        if approval.resume_status is None:
+            msg = f"La solicitud {approval.id} no declara estado de reanudación."
+            raise HumanGateError(msg)
+
+        resume_status = TaskStatus(approval.resume_status)
+        if resume_status not in RESUMABLE_STATUSES:
+            msg = (
+                f"Estado de reanudación no autorizado: {resume_status.value}. "
+                f"Válidos: {sorted(status.value for status in RESUMABLE_STATUSES)}"
+            )
+            raise HumanGateError(msg)
+
+        return HumanApprovalProof(
+            approval_id=approval.id,
+            task_id=approval.task_id,
+            policy_decision_id=approval.policy_decision_id,
+            resume_status=resume_status,
+            issuer=_PROOF_ISSUER,
+        )
+
     # ------------------------------------------------------------------ utils
     def audit_result_for(self, approval_id: UUID) -> AuditResult:
         """Resultado de auditoría correspondiente al estado de una solicitud."""
@@ -242,6 +342,7 @@ class HumanGate:
 
 __all__ = [
     "RESUMABLE_STATUSES",
+    "HumanApprovalProof",
     "HumanGate",
     "HumanGateError",
     "HumanGateNotApprovedError",

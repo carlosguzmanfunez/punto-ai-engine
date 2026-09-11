@@ -457,8 +457,10 @@ def test_camus_empty_objective_is_rejected(camus: Camus) -> None:
 def test_camus_records_every_required_event(camus: Camus) -> None:
     """El ciclo completo de CAMUS produce todos los eventos mínimos exigidos."""
     camus.process_request(objective="Crear archivo", action="create_file")
-    camus.process_request(objective="Desplegar", action="deploy_production")
+    gated = camus.process_request(objective="Desplegar", action="deploy_production")
     camus.process_request(objective="Acción desconocida", action="accion_inexistente")
+    assert gated.human_approval is not None
+    camus.resume(gated.human_approval.id, approved=True, resolved_by="carlos")
 
     types = camus.audit.types_present()
 

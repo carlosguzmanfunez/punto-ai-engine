@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from punto.orchestrator.planner import Planner, TaskPlan
-from punto.orchestrator.state_machine import StateMachine
+from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
@@ -158,7 +158,6 @@ class Camus:
         self._audit = audit
         self._machine = state_machine or StateMachine()
         self._planner = planner or Planner()
-        self._resume_status: dict[UUID, TaskStatus] = {}
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -311,18 +310,15 @@ class Camus:
 
         # Garantía de dominio: solo una solicitud ``APPROVED`` autoriza la
         # reanudación. ``PENDING`` y ``REJECTED`` no habilitan la ejecución.
-        self._gate.assert_executable(approval_id)
+        # ``authorize_resume`` es el único emisor de la prueba de reanudación y se
+        # niega a emitirla si el gate no está aprobado.
+        authorization = self._gate.authorize_resume(approval_id, task_id=task.id)
 
-        resumed = self._continue_after_approval(task)
-        if resumed.status is TaskStatus.HUMAN_APPROVAL:
-            return CamusResult(
-                task=resumed,
-                decision=decision,
-                outcome=CamusOutcome.BLOCKED,
-                blocked_reason=BlockedReason.HUMAN_DECISION_REQUIRED,
-                human_approval=approval,
-                detail="No existe una ruta de reanudación válida para el estado actual",
-            )
+        # La tarea sale de HUMAN_APPROVAL EXCLUSIVAMENTE por el camino protegido.
+        # El estado destino lo fija la autorización, no este llamante.
+        resumed = self._tasks.resume_from_human_approval(
+            task.id, authorization=authorization
+        )
 
         execution = self._simulate_execution(
             action=approval.action, task=resumed, risk=approval.risk
@@ -341,7 +337,7 @@ class Camus:
             elapsed_minutes=execution.elapsed_minutes,
         )
 
-        final = self._advance_through_phases(resumed, approval.action, human_approved=True)
+        final = self._continue_after_authorization(resumed, approval.action)
         outcome = (
             CamusOutcome.COMPLETED
             if final.status is TaskStatus.COMPLETED
@@ -353,7 +349,7 @@ class Camus:
             outcome=outcome,
             human_approval=approval,
             execution=execution,
-            detail="Human Gate aprobado y tarea reanudada",
+            detail="Human Gate aprobado y tarea reanudada desde su estado autorizado",
         )
 
     # --------------------------------------------------------------- internals
@@ -454,7 +450,6 @@ class Camus:
             reason=decision.reason,
         )
         gated = self._tasks.request_human_approval(task.id, reason=decision.reason)
-        self._resume_status[task.id] = TaskStatus.IN_PROGRESS
         return CamusResult(
             task=gated,
             decision=decision,
@@ -510,15 +505,7 @@ class Camus:
                 detail="presupuesto excedido tras la ejecución",
             )
 
-        final = self._advance_through_phases(task, request.action)
-        return CamusResult(
-            task=final,
-            decision=decision,
-            outcome=CamusOutcome.COMPLETED,
-            execution=execution,
-            plan=plan,
-            detail="tarea completada de forma autónoma",
-        )
+        return self._advance_autonomously(task, request.action, decision, plan, execution)
 
     def _advance_to_ready(self, task: Task, decision: PolicyDecision, plan: TaskPlan) -> None:
         """Avanza la tarea por las etapas de análisis, planificación y preparación."""
@@ -539,34 +526,88 @@ class Camus:
             ),
         )
 
-    def _advance_through_phases(
-        self, task: Task, action: str, *, human_approved: bool = False
-    ) -> Task:
-        """Recorre QA, seguridad, revisión, aprobación y cierre.
+    def _advance_autonomously(
+        self,
+        task: Task,
+        action: str,
+        decision: PolicyDecision,
+        plan: TaskPlan,
+        execution: ExecutionResult,
+    ) -> CamusResult:
+        """Cierra una ejecución autónoma: QA, seguridad, control y cierre.
 
         **ENGINE-0 no tiene agentes reales.** Las fases ``QA``, ``SECURITY`` y
-        ``REVIEW`` las recorre
-        :meth:`_run_placeholder_validation` / :meth:`_close_with_placeholder_review`,
-        que son una *validación placeholder determinista*: verifican únicamente
-        la legalidad de la secuencia en la máquina de estados, no la calidad del
-        resultado. Ver :data:`DETERMINISTIC_PLACEHOLDER_VALIDATION`.
+        ``REVIEW`` las recorren :meth:`_run_placeholder_validation` y
+        :meth:`_close_with_placeholder_review`, que son una *validación
+        placeholder determinista*: verifican únicamente la legalidad de la
+        secuencia en la máquina de estados, no la calidad del resultado. Ver
+        :data:`DETERMINISTIC_PLACEHOLDER_VALIDATION`.
 
-        La fase de seguridad es el punto de control antes de la revisión: si el
-        riesgo efectivo de la acción exige aprobación humana, se crea el Human
-        Gate en lugar de completar la tarea de forma autónoma.
-
-        Args:
-            human_approved: ``True`` cuando la ejecución viene de un Human Gate
-                ya aprobado. En ese caso **no** se vuelve a evaluar la acción
-                contra el nivel de autoridad: la decisión humana ya la autorizó
-                y volver a evaluarla produciría un bucle de aprobaciones.
+        ``SECURITY`` es el punto de control antes de la revisión: si el riesgo
+        efectivo exige aprobación humana, se crea el Human Gate y la tarea queda
+        detenida en ``HUMAN_APPROVAL`` (no se declara completada).
         """
         task = self._run_placeholder_validation(task, action)
-        if not human_approved:
-            review_decision = self._evaluate_action(task, action)
-            if review_decision.requires_human:
-                return self._gate_at_security(task, action, review_decision)
-        return self._close_with_placeholder_review(task, action)
+        review_decision = self._evaluate_action(task, action)
+
+        if review_decision.requires_human:
+            gated, approval = self._gate_at_security(task, action, review_decision)
+            return CamusResult(
+                task=gated,
+                decision=decision,
+                outcome=CamusOutcome.HUMAN_APPROVAL_REQUIRED,
+                human_approval=approval,
+                execution=execution,
+                plan=plan,
+                detail=review_decision.reason,
+            )
+
+        final = self._close_with_placeholder_review(task, action)
+        return CamusResult(
+            task=final,
+            decision=decision,
+            outcome=CamusOutcome.COMPLETED,
+            execution=execution,
+            plan=plan,
+            detail="tarea completada de forma autónoma",
+        )
+
+    def _continue_after_authorization(self, task: Task, action: str) -> Task:
+        """Continúa el flujo autorizado desde el estado actual, sin retroceder.
+
+        Punto **único** de continuación tras un Human Gate aprobado. La secuencia
+        se decide por el estado en el que el Human Gate dejó la tarea (es decir,
+        por el ``resume_status`` que la autorización fijó), no por una suposición
+        fija, de modo que nunca se repite una fase ya superada:
+
+        - ``IN_PROGRESS`` → QA → SECURITY → REVIEW → APPROVED → COMPLETED
+        - ``SECURITY``    → REVIEW → APPROVED → COMPLETED
+        - ``REVIEW``      → APPROVED → COMPLETED
+        - ``READY``       → IN_PROGRESS y, desde ahí, la primera secuencia
+
+        La acción ya fue autorizada por una persona, así que **no** se vuelve a
+        evaluar contra el nivel de autoridad en el punto de control de seguridad:
+        reevaluarla produciría un bucle de aprobaciones.
+
+        Raises:
+            InvalidTransitionError: si el estado actual no admite continuación.
+        """
+        if task.status is TaskStatus.READY:
+            task = self._tasks.resume_task(
+                task.id,
+                TaskStatus.IN_PROGRESS,
+                reason="reanudación autorizada por Human Gate",
+            )
+
+        if task.status is TaskStatus.IN_PROGRESS:
+            task = self._run_placeholder_validation(task, action)
+
+        if task.status in (TaskStatus.SECURITY, TaskStatus.REVIEW):
+            return self._close_with_placeholder_review(task, action)
+
+        # Estado sin continuación definida: la autorización no puede inventarse
+        # un camino hacia adelante.
+        raise InvalidTransitionError(task.status, TaskStatus.REVIEW)
 
     def _run_placeholder_validation(self, task: Task, action: str) -> Task:
         """``QA`` + ``SECURITY`` simulados. **No** son QA ni seguridad reales.
@@ -592,15 +633,20 @@ class Camus:
     def _close_with_placeholder_review(self, task: Task, action: str) -> Task:
         """``REVIEW`` + ``APPROVED`` + cierre, todos simulados.
 
+        Acepta la tarea en ``SECURITY`` o ya en ``REVIEW``. Nunca retrocede a
+        ``QA`` ni repite una transición ya aplicada: una tarea reanudada en
+        ``REVIEW`` solo recorre la revisión final y el cierre.
+
         Placeholder determinista de ENGINE-0: **no** existe un revisor real que
         evalúe el resultado. La aprobación se declara por construcción. Los PASS
         reales de QA, Security y Reviewer llegarán en fases posteriores.
         """
-        self._tasks.transition_task(
-            task.id,
-            TaskStatus.REVIEW,
-            reason=f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: revisión simulada de {action}",
-        )
+        if task.status is TaskStatus.SECURITY:
+            task = self._tasks.transition_task(
+                task.id,
+                TaskStatus.REVIEW,
+                reason=f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: revisión simulada de {action}",
+            )
         self._tasks.transition_task(
             task.id,
             TaskStatus.APPROVED,
@@ -624,8 +670,18 @@ class Camus:
         self._audit.log_policy_decision(decision, resource_id=task.id)
         return decision
 
-    def _gate_at_security(self, task: Task, action: str, decision: PolicyDecision) -> Task:
-        """Crea el Human Gate desde el estado ``SECURITY`` y detiene la tarea."""
+    def _gate_at_security(
+        self, task: Task, action: str, decision: PolicyDecision
+    ) -> tuple[Task, HumanApprovalRequest]:
+        """Crea el Human Gate desde el estado ``SECURITY`` y detiene la tarea.
+
+        El estado de reanudación autorizado es ``REVIEW``: al aprobarse, la tarea
+        vuelve a ``REVIEW`` y solo recorre la revisión final y el cierre. Nunca
+        retrocede a ``QA``, que es una fase ya superada.
+
+        Returns:
+            La tarea en ``HUMAN_APPROVAL`` y la solicitud de aprobación creada.
+        """
         approval = self._gate.request(
             task_id=task.id,
             action=action,
@@ -642,8 +698,8 @@ class Camus:
             risk=decision.effective_risk.name,
             reason=decision.reason,
         )
-        self._resume_status[task.id] = TaskStatus.REVIEW
-        return self._tasks.request_human_approval(task.id, reason=decision.reason)
+        gated = self._tasks.request_human_approval(task.id, reason=decision.reason)
+        return gated, approval
 
     def _handle_execution_failure(
         self,
@@ -701,18 +757,6 @@ class Camus:
             execution=execution,
             plan=plan,
             detail="fallo de ejecución sin intentos disponibles",
-        )
-
-    def _continue_after_approval(self, task: Task) -> Task:
-        """Reanuda una tarea aprobada de forma coherente con su estado previo."""
-        if task.status is not TaskStatus.HUMAN_APPROVAL:
-            return task
-
-        target = self._resume_status.get(task.id, TaskStatus.IN_PROGRESS)
-        if not self._machine.can_transition(task.status, target):
-            return task
-        return self._tasks.resume_from_human_approval(
-            task.id, target, reason="aprobación humana concedida"
         )
 
     @staticmethod

@@ -4,6 +4,7 @@ from punto.policy.authority import AuthorityCatalog, AuthorityRule, UnknownActio
 from punto.policy.budgets import BudgetBreach, BudgetLimits, BudgetPolicy
 from punto.policy.config_loader import ConfigError, ConfigLoader, load_yaml_file
 from punto.policy.human_gate import (
+    HumanApprovalProof,
     HumanGate,
     HumanGateError,
     HumanGateNotApprovedError,
@@ -34,6 +35,7 @@ __all__ = [
     "BudgetPolicy",
     "ConfigError",
     "ConfigLoader",
+    "HumanApprovalProof",
     "HumanGate",
     "HumanGateError",
     "HumanGateNotApprovedError",

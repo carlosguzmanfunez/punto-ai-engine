@@ -203,6 +203,36 @@ class AuditLogger:
             },
         )
 
+    def log_human_gate_resume_authorized(
+        self,
+        *,
+        approval_id: UUID,
+        task_id: UUID,
+        policy_decision_id: UUID,
+        resume_status: str,
+        from_status: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la autorización de reanudación emitida para un Human Gate.
+
+        Es el punto que hace reconstruible la cadena constitucional completa:
+        tarea -> gate -> decisión de política -> aprobación -> autorización de
+        reanudación -> estado retomado.
+        """
+        return self.record(
+            AuditEventType.HUMAN_GATE_RESUME_AUTHORIZED,
+            action="authorize_resume",
+            resource_id=approval_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "task_id": str(task_id),
+                "policy_decision_id": str(policy_decision_id),
+                "from_status": from_status,
+                "resume_status": resume_status,
+            },
+        )
+
     def log_task_completed(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la finalización de una tarea."""
         return self.record(

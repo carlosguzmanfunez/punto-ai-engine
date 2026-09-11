@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from punto.common import utc_now
-from punto.orchestrator.state_machine import StateMachine
+from punto.orchestrator.state_machine import (
+    HumanGateAuthorizationRequired,
+    StateMachine,
+)
+from punto.policy.human_gate import HumanApprovalProof
 from punto.schemas.enums import (
     AuthorityLevel,
     BlockedReason,
@@ -170,16 +174,97 @@ class TaskManager:
     ) -> Task:
         """Transiciona una tarea a un estado válido y audita el cambio.
 
+        **Invariante de dominio:** esta operación es genérica y por eso **no**
+        puede sacar una tarea de ``HUMAN_APPROVAL`` hacia un estado de
+        continuación (``APPROVED``, ``IN_PROGRESS``, ``READY``, ``REVIEW``). Esas
+        salidas son reanudaciones y exigen una autorización humana verificable:
+        usar :meth:`resume_from_human_approval`.
+
+        Desde ``HUMAN_APPROVAL`` solo se admiten las salidas de aborto
+        (``BLOCKED``/``CANCELLED``), que no autorizan ninguna ejecución.
+
         Raises:
             TaskNotFoundError: si la tarea no existe.
+            HumanGateAuthorizationRequired: si se intenta una reanudación sin
+                autorización humana.
             InvalidTransitionError: si la transición no está permitida.
             ValueError: si se entra en ``BLOCKED`` sin motivo.
         """
         task = self.get_task(task_id)
+        if self._state_machine.can_resume_from_human_approval(task.status, target):
+            raise HumanGateAuthorizationRequired(task.status, target, task_id=task.id)
+
         previous = task.status
         updated = self._state_machine.transition(task, target, blocked_reason=blocked_reason)
         self._tasks[updated.id] = updated
         self._audit.log_task_transition(updated, previous_status=previous.value, reason=reason)
+        return updated
+
+    def resume_from_human_approval(
+        self,
+        task_id: UUID,
+        *,
+        authorization: HumanApprovalProof,
+    ) -> Task:
+        """Reanuda una tarea desde ``HUMAN_APPROVAL`` con autorización humana.
+
+        Es la **única** vía por la que una tarea puede salir de ``HUMAN_APPROVAL``
+        hacia un estado de continuación. El estado destino lo determina la propia
+        autorización (``resume_status``), no quien llama: no hay forma de
+        redirigir la reanudación.
+
+        Args:
+            task_id: Tarea a reanudar.
+            authorization: Autorización emitida por
+                :meth:`punto.policy.human_gate.HumanGate.authorize_resume`.
+
+        Returns:
+            La tarea en el estado autorizado.
+
+        Raises:
+            TaskNotFoundError: si la tarea no existe.
+            HumanGateAuthorizationRequired: si la tarea no está en
+                ``HUMAN_APPROVAL``, si la autorización pertenece a otra tarea o si
+                el estado autorizado no es alcanzable.
+        """
+        task = self.get_task(task_id)
+
+        if authorization.task_id != task.id:
+            raise HumanGateAuthorizationRequired(
+                task.status, authorization.resume_status, task_id=task.id
+            )
+
+        if task.status is not HUMAN_GATE_STATUS:
+            raise HumanGateAuthorizationRequired(
+                task.status, authorization.resume_status, task_id=task.id
+            )
+
+        if not self._state_machine.can_resume_from_human_approval(
+            task.status, authorization.resume_status
+        ):
+            raise HumanGateAuthorizationRequired(
+                task.status, authorization.resume_status, task_id=task.id
+            )
+
+        self._audit.log_human_gate_resume_authorized(
+            approval_id=authorization.approval_id,
+            task_id=task.id,
+            policy_decision_id=authorization.policy_decision_id,
+            resume_status=authorization.resume_status.value,
+            from_status=task.status.value,
+        )
+
+        previous = task.status
+        updated = self._state_machine.resume_transition(task, authorization.resume_status)
+        self._tasks[updated.id] = updated
+        self._audit.log_task_transition(
+            updated,
+            previous_status=previous.value,
+            reason=(
+                "reanudación autorizada por Human Gate hacia "
+                f"{authorization.resume_status.value}"
+            ),
+        )
         return updated
 
     def can_transition(self, task_id: UUID, target: TaskStatus) -> bool:
@@ -252,16 +337,6 @@ class TaskManager:
     ) -> Task:
         """Mueve una tarea al estado ``HUMAN_APPROVAL``."""
         return self.transition_task(task_id, HUMAN_GATE_STATUS, reason=reason)
-
-    def resume_from_human_approval(
-        self,
-        task_id: UUID,
-        target: TaskStatus,
-        *,
-        reason: str = "aprobación humana concedida",
-    ) -> Task:
-        """Reanuda una tarea aprobada hacia un estado coherente con el previo."""
-        return self.transition_task(task_id, target, reason=reason)
 
     def complete_task(self, task_id: UUID, *, reason: str = "tarea completada") -> Task:
         """Completa una tarea.

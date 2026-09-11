@@ -82,6 +82,23 @@ class TaskStatus(StrEnum):
 
 _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED})
 
+#: Estados a los que una **reanudación autorizada por Human Gate** puede llevar
+#: una tarea que está en ``HUMAN_APPROVAL``.
+#:
+#: Fuente única de verdad, declarada aquí —y no en el orquestador ni en la
+#: política— porque ambos la necesitan: la máquina de estados construye con ella
+#: su tabla de reanudación y el Human Gate valida con ella el ``resume_status``
+#: que autoriza. ``punto.schemas.enums`` no importa nada de ``punto.policy`` ni
+#: de ``punto.orchestrator``, así que es el único lugar común libre de ciclos.
+HUMAN_GATE_RESUME_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.APPROVED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.READY,
+        TaskStatus.REVIEW,
+    }
+)
+
 
 class TaskPriority(StrEnum):
     """Prioridad de una tarea."""
@@ -124,6 +141,7 @@ class AuditResult(StrEnum):
 
 
 __all__ = [
+    "HUMAN_GATE_RESUME_STATUSES",
     "ApprovalStatus",
     "AuditResult",
     "AuthorityLevel",

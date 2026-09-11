@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from punto.common import utc_now
-from punto.schemas.enums import BlockedReason, TaskStatus
+from punto.schemas.enums import HUMAN_GATE_RESUME_STATUSES, BlockedReason, TaskStatus
 from punto.schemas.task import Task
 
 if TYPE_CHECKING:
@@ -79,19 +79,11 @@ TRANSITION_TABLE: Final[Mapping[TaskStatus, frozenset[TaskStatus]]] = MappingPro
             {TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED}
         ),
         # --- Human Gate ------------------------------------------------------
-        # El retorno concreto se limita dinámicamente a los estados declarados en
-        # RESUMABLE_STATUSES (``punto.policy.human_gate``), de modo que una tarea
-        # aprobada reanuda de forma coherente con su estado previo.
-        TaskStatus.HUMAN_APPROVAL: frozenset(
-            {
-                TaskStatus.APPROVED,
-                TaskStatus.IN_PROGRESS,
-                TaskStatus.READY,
-                TaskStatus.REVIEW,
-                TaskStatus.BLOCKED,
-                TaskStatus.CANCELLED,
-            }
-        ),
+        # Solo salidas de ABORTO (``BLOCKED``/``CANCELLED``). Las salidas de
+        # reanudación **no** están aquí: exigirían autorización humana y viven en
+        # ``HUMAN_GATE_RESUME_TABLE``. Una llamada genérica no puede, por tanto,
+        # sacar una tarea de ``HUMAN_APPROVAL`` hacia un estado de continuación.
+        TaskStatus.HUMAN_APPROVAL: frozenset({TaskStatus.BLOCKED, TaskStatus.CANCELLED}),
         # --- Estados auxiliares ---------------------------------------------
         TaskStatus.BLOCKED: frozenset(
             {
@@ -122,6 +114,17 @@ HUMAN_GATE_ENTRY_STATUSES: Final[frozenset[TaskStatus]] = frozenset(
     {TaskStatus.IN_PROGRESS, TaskStatus.SECURITY, TaskStatus.REVIEW}
 )
 
+#: Transiciones de **reanudación autorizada** por Human Gate.
+#:
+#: Deliberadamente separadas de :data:`TRANSITION_TABLE`. Una transición normal
+#: y una transición autorizada por Human Gate son cosas distintas: la primera la
+#: decide la máquina, la segunda exige además una autorización humana verificable
+#: (``HumanApprovalProof`` emitida por ``HumanGate``). Mantenerlas en tablas
+#: separadas hace imposible conseguir el mismo efecto con una llamada genérica.
+HUMAN_GATE_RESUME_TABLE: Final[Mapping[TaskStatus, frozenset[TaskStatus]]] = MappingProxyType(
+    {TaskStatus.HUMAN_APPROVAL: HUMAN_GATE_RESUME_STATUSES}
+)
+
 #: Transiciones explícitamente prohibidas (se documentan para auditoría).
 FORBIDDEN_TRANSITIONS: Final[tuple[tuple[TaskStatus, TaskStatus], ...]] = (
     (TaskStatus.NEW, TaskStatus.COMPLETED),
@@ -145,6 +148,38 @@ class InvalidTransitionError(ValueError):
         super().__init__(
             f"Transición inválida: {current.value} -> {target.value}. "
             f"Estados permitidos desde {current.value}: {allowed}."
+        )
+
+
+class HumanGateAuthorizationRequired(InvalidTransitionError):
+    """Se intentó salir de ``HUMAN_APPROVAL`` sin autorización humana válida.
+
+    Es un subtipo de :class:`InvalidTransitionError` para que el manejo de
+    errores existente siga funcionando, pero con un diagnóstico específico: la
+    transición no es "inexistente", es una transición de **reanudación** que solo
+    puede ejecutarse con una autorización emitida por el Human Gate.
+
+    Es la garantía de dominio que impide que un componente interno, un agente o
+    una herramienta futura salten el Human Gate llamando a
+    ``TaskManager.transition_task()``.
+    """
+
+    def __init__(
+        self,
+        current: TaskStatus,
+        target: TaskStatus,
+        *,
+        task_id: object = "",
+    ) -> None:
+        super().__init__(current, target)
+        self.task_id = str(task_id)
+        # Se reemplaza el mensaje genérico: ``APPROVED`` sí es un destino válido
+        # desde ``HUMAN_APPROVAL``, pero solo por la vía autorizada.
+        self.args = (
+            f"Salida de {current.value} hacia {target.value} bloqueada: requiere "
+            "autorización de Human Gate. Usa "
+            "TaskManager.resume_from_human_approval() con un HumanApprovalProof "
+            "emitido por HumanGate.authorize_resume().",
         )
 
 
@@ -181,13 +216,44 @@ class StateMachine:
         return self._table.get(status, frozenset())
 
     def can_transition(self, current: TaskStatus, target: TaskStatus) -> bool:
-        """True si la transición es válida."""
+        """True si la transición **normal** es válida.
+
+        Las transiciones de reanudación autorizadas por Human Gate quedan
+        deliberadamente fuera: ver :meth:`can_resume_from_human_approval`.
+        """
         return target in self.allowed_from(current)
 
+    def resume_targets_from(self, status: TaskStatus) -> frozenset[TaskStatus]:
+        """Estados a los que una reanudación autorizada puede llevar desde ``status``."""
+        return HUMAN_GATE_RESUME_TABLE.get(status, frozenset())
+
+    def can_resume_from_human_approval(self, current: TaskStatus, target: TaskStatus) -> bool:
+        """True si la transición es una **reanudación autorizada** por Human Gate.
+
+        No implica que exista autorización: solo que el par origen/destino es
+        legal *si* se presenta un ``HumanApprovalProof`` válido.
+        """
+        return target in self.resume_targets_from(current)
+
     def assert_can_transition(self, current: TaskStatus, target: TaskStatus) -> None:
-        """Valida la transición o lanza :class:`InvalidTransitionError`."""
-        if not self.can_transition(current, target):
-            raise InvalidTransitionError(current, target)
+        """Valida la transición normal o lanza :class:`InvalidTransitionError`.
+
+        Si el par es una transición de reanudación (legal solo con autorización
+        humana), se lanza :class:`HumanGateAuthorizationRequired` para que el
+        diagnóstico sea inequívoco.
+        """
+        if self.can_transition(current, target):
+            return
+        if self.can_resume_from_human_approval(current, target):
+            raise HumanGateAuthorizationRequired(current, target)
+        raise InvalidTransitionError(current, target)
+
+    def assert_can_resume_from_human_approval(
+        self, current: TaskStatus, target: TaskStatus
+    ) -> None:
+        """Valida una reanudación autorizada o lanza la excepción correspondiente."""
+        if not self.can_resume_from_human_approval(current, target):
+            raise HumanGateAuthorizationRequired(current, target)
 
     def transition(
         self,
@@ -197,7 +263,7 @@ class StateMachine:
         blocked_reason: BlockedReason | None = None,
         clear_blocked_reason: bool = True,
     ) -> Task:
-        """Devuelve una nueva tarea con la transición aplicada.
+        """Devuelve una nueva tarea con la transición **normal** aplicada.
 
         La máquina es pura: no muta la tarea recibida, sino que produce una
         versión coherente. El ``TaskManager`` es quien reemplaza la tarea
@@ -213,11 +279,44 @@ class StateMachine:
 
         Raises:
             InvalidTransitionError: si la transición no está en la tabla.
+            HumanGateAuthorizationRequired: si es una reanudación que exige
+                autorización humana explícita.
             ValueError: si se entra en ``BLOCKED`` sin motivo, o si se intenta
                 salir de ``BLOCKED`` sin limpiar el motivo.
         """
         self.assert_can_transition(task.status, target)
+        return self._apply_change(
+            task,
+            target,
+            blocked_reason=blocked_reason,
+            clear_blocked_reason=clear_blocked_reason,
+        )
 
+    def resume_transition(self, task: Task, target: TaskStatus) -> Task:
+        """Devuelve una nueva tarea con una **reanudación autorizada** aplicada.
+
+        Solo es legal si el par ``(task.status, target)`` está en
+        :data:`HUMAN_GATE_RESUME_TABLE`. No comprueba la autorización humana: de
+        eso se encarga ``TaskManager.resume_from_human_approval``, que es su
+        único consumidor y exige un ``HumanApprovalProof`` válido.
+
+        Raises:
+            HumanGateAuthorizationRequired: si el par no es una reanudación legal.
+        """
+        self.assert_can_resume_from_human_approval(task.status, target)
+        return self._apply_change(
+            task, target, blocked_reason=None, clear_blocked_reason=True
+        )
+
+    def _apply_change(
+        self,
+        task: Task,
+        target: TaskStatus,
+        *,
+        blocked_reason: BlockedReason | None,
+        clear_blocked_reason: bool,
+    ) -> Task:
+        """Materializa una transición ya validada por cualquiera de las dos vías."""
         if target is TaskStatus.BLOCKED and blocked_reason is None:
             msg = "Toda entrada en BLOCKED requiere un BlockedReason explícito"
             raise ValueError(msg)
@@ -254,7 +353,10 @@ class StateMachine:
 __all__ = [
     "FORBIDDEN_TRANSITIONS",
     "HUMAN_GATE_ENTRY_STATUSES",
+    "HUMAN_GATE_RESUME_STATUSES",
+    "HUMAN_GATE_RESUME_TABLE",
     "TRANSITION_TABLE",
+    "HumanGateAuthorizationRequired",
     "InvalidTransitionError",
     "StateMachine",
     "allowed_transitions",

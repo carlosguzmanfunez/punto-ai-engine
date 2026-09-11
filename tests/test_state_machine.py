@@ -10,6 +10,7 @@ import pytest
 from punto.orchestrator.state_machine import (
     FORBIDDEN_TRANSITIONS,
     TRANSITION_TABLE,
+    HumanGateAuthorizationRequired,
     InvalidTransitionError,
     StateMachine,
     allowed_transitions,
@@ -211,7 +212,12 @@ def test_level_3_action_can_reach_human_approval(state_machine: StateMachine) ->
 
 
 def test_human_approval_can_resume_to_previous_state(state_machine: StateMachine) -> None:
-    """HUMAN_APPROVAL reanuda de forma coherente con el estado previo."""
+    """HUMAN_APPROVAL reanuda de forma coherente con el estado previo.
+
+    La reanudación **no** es una transición normal: exige autorización humana y
+    solo es alcanzable por ``StateMachine.resume_transition``. La vía genérica la
+    rechaza con :class:`HumanGateAuthorizationRequired`.
+    """
     for resume_target in (
         TaskStatus.IN_PROGRESS,
         TaskStatus.REVIEW,
@@ -219,8 +225,42 @@ def test_human_approval_can_resume_to_previous_state(state_machine: StateMachine
         TaskStatus.APPROVED,
     ):
         task = _new_task(status=TaskStatus.HUMAN_APPROVAL)
-        task = _apply(state_machine, task, resume_target)
-        assert task.status is resume_target
+
+        assert state_machine.can_transition(TaskStatus.HUMAN_APPROVAL, resume_target) is False
+        assert (
+            state_machine.can_resume_from_human_approval(TaskStatus.HUMAN_APPROVAL, resume_target)
+            is True
+        )
+        with pytest.raises(HumanGateAuthorizationRequired):
+            _apply(state_machine, task, resume_target)
+
+        resumed = state_machine.resume_transition(task, resume_target)
+
+        assert resumed.status is resume_target
+
+
+def test_human_approval_generic_exit_is_abort_only(state_machine: StateMachine) -> None:
+    """Desde HUMAN_APPROVAL la vía genérica solo permite abortar la tarea."""
+    assert allowed_transitions(TaskStatus.HUMAN_APPROVAL) == frozenset(
+        {TaskStatus.BLOCKED, TaskStatus.CANCELLED}
+    )
+
+
+def test_resume_is_only_legal_from_human_approval(state_machine: StateMachine) -> None:
+    """Una reanudación autorizada solo es legal desde HUMAN_APPROVAL."""
+    for origin in (
+        TaskStatus.NEW,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.SECURITY,
+        TaskStatus.REVIEW,
+        TaskStatus.APPROVED,
+        TaskStatus.BLOCKED,
+    ):
+        assert state_machine.can_resume_from_human_approval(origin, TaskStatus.APPROVED) is False
+        with pytest.raises(HumanGateAuthorizationRequired):
+            state_machine.resume_transition(
+                _new_task(status=origin), TaskStatus.APPROVED
+            )
 
 
 def test_human_approval_rejection_leads_to_cancellation(state_machine: StateMachine) -> None:

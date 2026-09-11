@@ -165,6 +165,15 @@ class HumanApprovalRequest(BaseModel):
         default=None,
         description="Resultado de política que originó la solicitud.",
     )
+    policy_decision_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Identificador de la PolicyDecision que originó esta solicitud. Es el "
+            "vínculo inequívoco entre la aprobación y la decisión que la motivó: "
+            "reanudar una tarea nunca debe depender del historial global de "
+            "decisiones, que mezclaría tareas concurrentes."
+        ),
+    )
 
     @property
     def is_pending(self) -> bool:

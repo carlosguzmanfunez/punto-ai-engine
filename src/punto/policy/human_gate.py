@@ -11,6 +11,8 @@ Garantías constitucionales implementadas aquí:
 - Una solicitud resuelta no puede volver a resolverse (``resolve`` es idempotente
   en el sentido de que rechaza la doble resolución).
 - Solo una solicitud ``APPROVED`` autoriza; ``PENDING`` y ``REJECTED`` no.
+- Cada solicitud conserva el ``policy_decision_id`` de la decisión que la
+  originó, de modo que resolverla nunca mezcla el historial de otras tareas.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ class HumanGate:
         reason: str,
         resume_status: TaskStatus = TaskStatus.IN_PROGRESS,
         policy_outcome: str | None = None,
+        policy_decision_id: UUID | None = None,
     ) -> HumanApprovalRequest:
         """Crea una solicitud de aprobación pendiente.
 
@@ -82,6 +85,9 @@ class HumanGate:
             reason: Motivo por el que se solicita la aprobación.
             resume_status: Estado al que debe reanudarse la tarea si se aprueba.
             policy_outcome: Resultado de política que originó la solicitud.
+            policy_decision_id: Identificador de la ``PolicyDecision`` que originó
+                la solicitud. Vincula la aprobación a la decisión exacta, de modo
+                que resolverla nunca dependa del historial global de decisiones.
 
         Returns:
             La solicitud creada, en estado ``PENDING``.
@@ -101,6 +107,7 @@ class HumanGate:
             status=ApprovalStatus.PENDING,
             resume_status=resume_status.value,
             policy_outcome=policy_outcome,
+            policy_decision_id=policy_decision_id,
         )
         self._requests[approval.id] = approval
         self._by_task.setdefault(task_id, []).append(approval.id)

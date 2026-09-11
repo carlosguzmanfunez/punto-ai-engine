@@ -1,6 +1,12 @@
 """Subpaquete orquestador: CAMUS, planificador y máquina de estados."""
 
-from punto.orchestrator.camus import Camus, CamusOutcome, CamusResult, RequestOverrides
+from punto.orchestrator.camus import (
+    DETERMINISTIC_PLACEHOLDER_VALIDATION,
+    Camus,
+    CamusOutcome,
+    CamusResult,
+    RequestOverrides,
+)
 from punto.orchestrator.planner import (
     CANONICAL_FLOW,
     EXECUTION_PHASES,
@@ -22,6 +28,7 @@ from punto.orchestrator.state_machine import (
 
 __all__ = [
     "CANONICAL_FLOW",
+    "DETERMINISTIC_PLACEHOLDER_VALIDATION",
     "EXECUTION_PHASES",
     "FORBIDDEN_TRANSITIONS",
     "HUMAN_GATE_ENTRY_STATUSES",

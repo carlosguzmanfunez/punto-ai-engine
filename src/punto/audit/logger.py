@@ -142,6 +142,7 @@ class AuditLogger:
             result=AuditResult.SUCCESS if decision.allowed else AuditResult.DENIED,
             actor=actor,
             metadata={
+                "policy_decision_id": str(decision.id),
                 "allowed": decision.allowed,
                 "outcome": decision.outcome.value,
                 "authority_level": decision.authority_level.name,

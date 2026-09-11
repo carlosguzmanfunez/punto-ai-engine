@@ -12,7 +12,12 @@ from pydantic import ValidationError
 
 from punto.audit.events import REQUIRED_EVENT_TYPES, AuditEventType
 from punto.audit.logger import AuditLogger
-from punto.orchestrator.camus import Camus, CamusOutcome, RequestOverrides
+from punto.orchestrator.camus import (
+    DETERMINISTIC_PLACEHOLDER_VALIDATION,
+    Camus,
+    CamusOutcome,
+    RequestOverrides,
+)
 from punto.orchestrator.state_machine import InvalidTransitionError
 from punto.policy.human_gate import HumanGate, HumanGateError
 from punto.schemas.enums import (
@@ -477,6 +482,33 @@ def test_camus_failed_execution_leads_to_repairing(camus: Camus) -> None:
     assert TaskStatus.IN_PROGRESS.value in transitions
     assert result.task.status is TaskStatus.IN_PROGRESS
     assert result.blocked_reason is BlockedReason.MAX_ATTEMPTS_EXCEEDED
+
+
+def test_camus_marks_simulated_validation_as_placeholder(camus: Camus) -> None:
+    """QA/SECURITY/REVIEW son placeholders explícitos, no validaciones reales.
+
+    ENGINE-0 no tiene agentes: los estados de verificación se recorren mediante
+    ``DETERMINISTIC_PLACEHOLDER_VALIDATION``. La marca debe quedar registrada en
+    la auditoría para que nadie confunda esta simulación con un QA real.
+    """
+    result = camus.process_request(objective="Crear archivo", action="create_file")
+
+    transitions = [
+        event
+        for event in camus.audit.by_resource(result.task.id)
+        if event.event_type is AuditEventType.TASK_TRANSITION
+    ]
+    reasons_by_status = {
+        event.metadata_dict["to"]: event.metadata_dict["reason"] for event in transitions
+    }
+
+    for simulated in (TaskStatus.QA, TaskStatus.SECURITY, TaskStatus.REVIEW):
+        assert DETERMINISTIC_PLACEHOLDER_VALIDATION in reasons_by_status[simulated.value]
+    assert DETERMINISTIC_PLACEHOLDER_VALIDATION in reasons_by_status[TaskStatus.APPROVED.value]
+
+    # Las fases de ejecución reales no llevan la marca de simulación.
+    for executed in (TaskStatus.ANALYZING, TaskStatus.PLANNING, TaskStatus.READY):
+        assert DETERMINISTIC_PLACEHOLDER_VALIDATION not in reasons_by_status[executed.value]
 
 
 def test_human_gate_rejects_invalid_resume_status() -> None:

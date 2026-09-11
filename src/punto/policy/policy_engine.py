@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 from punto.common import normalize_path
 from punto.policy.authority import (
@@ -165,6 +166,10 @@ class PolicyEngine:
         self._environments = dict(environments or {})
         self._environment = environment
         self._decisions: list[PolicyDecision] = []
+        #: Índice por identificador. Permite recuperar *la* decisión que originó
+        #: un artefacto concreto (por ejemplo un Human Gate) sin recurrir a la
+        #: posición en el historial, que con tareas concurrentes es ambiguo.
+        self._decisions_by_id: dict[UUID, PolicyDecision] = {}
 
     # ------------------------------------------------------------------ loaders
     @classmethod
@@ -222,6 +227,16 @@ class PolicyEngine:
     def decisions(self) -> tuple[PolicyDecision, ...]:
         """Historial en memoria de decisiones emitidas."""
         return tuple(self._decisions)
+
+    def decision_by_id(self, decision_id: UUID) -> PolicyDecision | None:
+        """Recupera una decisión emitida por su identificador.
+
+        Es la vía de acceso **exclusiva** para asociar una decisión a un
+        artefacto derivado (Human Gate). Devuelve ``None`` si la decisión no
+        pertenece a este motor, de modo que el llamante no pueda caer de vuelta
+        en "la última decisión emitida".
+        """
+        return self._decisions_by_id.get(decision_id)
 
     @property
     def protected_paths(self) -> tuple[str, ...]:
@@ -427,8 +442,9 @@ class PolicyEngine:
 
     # ------------------------------------------------------------------ helpers
     def _record(self, decision: PolicyDecision) -> None:
-        """Registra la decisión en el historial en memoria."""
+        """Registra la decisión en el historial y en el índice por identificador."""
         self._decisions.append(decision)
+        self._decisions_by_id[decision.id] = decision
 
     def _effective_breaches(
         self,

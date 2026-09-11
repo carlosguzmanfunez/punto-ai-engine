@@ -1,18 +1,36 @@
 """API FastAPI mínima del núcleo constitucional (ENGINE-0).
 
+Superficie pública deliberadamente reducida. ENGINE-0 **no** expone ninguna ruta
+capaz de manipular directamente el estado de una tarea ni de resolver un Human
+Gate: el estado solo cambia a través del dominio (``Camus`` + ``PolicyEngine`` +
+``HumanGate``). En particular, *no existe* un endpoint genérico de transiciones.
+
 Endpoints:
 
-- ``GET  /health``            estado del motor y versión.
-- ``POST /tasks``             crea una tarea y la procesa con CAMUS.
-- ``GET  /tasks``             lista las tareas en memoria.
-- ``GET  /tasks/{task_id}``    detalle de una tarea.
+- ``GET  /health``             estado del motor y versión.
+- ``GET  /engine``             información ampliada e integridad constitucional.
+- ``POST /tasks``              crea una tarea y la procesa con CAMUS.
+- ``GET  /tasks``              lista las tareas en memoria.
+- ``GET  /tasks/{task_id}``     detalle de una tarea (solo lectura).
+- ``GET  /human-gate``         introspección de solicitudes de aprobación.
+- ``GET  /human-gate/{id}``     detalle de una solicitud (solo lectura).
+- ``POST /policy/evaluate``    evalúa una acción sin crear tarea (solo lectura).
+- ``GET  /policy/authority``   catálogo de autoridad activo (solo lectura).
+- ``GET  /audit/events``       eventos de auditoría (solo lectura).
+
+Invariante de la superficie HTTP: ninguna ruta puede sacar una tarea de
+``HUMAN_APPROVAL`` sin una ``HumanApprovalRequest`` en estado ``APPROVED``. La
+única vía autorizada es ``Camus.resume()``, que valida el gate y recupera la
+``PolicyDecision`` vinculada a esa solicitud concreta.
 
 Persistencia exclusivamente en memoria. Sin integraciones externas, sin IA.
 
 Códigos de error:
 
 - ``404`` tarea o solicitud de aprobación inexistente.
-- ``409`` transición de estado inválida para el estado actual.
+- ``405`` método no permitido sobre una ruta existente (p. ej. ``POST`` sobre
+  ``/tasks/{task_id}``): no hay ruta de mutación que atender.
+- ``409`` conflicto de dominio.
 - ``422`` petición inválida (validación de esquema).
 - ``503`` configuración del motor no disponible.
 """
@@ -22,7 +40,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -164,25 +182,6 @@ class TaskCreateRequest(BaseModel):
     max_attempts: int | None = Field(default=None, ge=0, description="Intentos máximos permitidos.")
     project_id: UUID | None = Field(default=None, description="Proyecto de la tarea.")
     parent_task_id: UUID | None = Field(default=None, description="Tarea padre, si aplica.")
-
-
-class TransitionRequest(BaseModel):
-    """Cuerpo de ``POST /tasks/{task_id}/transitions``."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    target: TaskStatus = Field(..., description="Estado destino.")
-    reason: str = Field(default="", description="Motivo de la transición.")
-
-
-class ApprovalResolveRequest(BaseModel):
-    """Cuerpo de ``POST /human-gate/{approval_id}/resolve``."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    approved: bool = Field(..., description="True para aprobar, False para rechazar.")
-    resolved_by: str = Field(default="human", min_length=1, description="Actor que resuelve.")
-    note: str | None = Field(default=None, description="Nota de resolución.")
 
 
 class PolicyEvaluateRequest(BaseModel):
@@ -336,7 +335,13 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
 
     @application.get("/tasks/{task_id}", tags=["tasks"], summary="Detalle de una tarea")
     def get_task(task_id: UUID) -> dict[str, Any]:
-        """Devuelve el detalle de una tarea."""
+        """Devuelve el detalle de una tarea.
+
+        Solo lectura. No existe un endpoint público de transición: el estado de
+        una tarea únicamente cambia a través del dominio (CAMUS), de modo que
+        ninguna ruta HTTP puede sacar una tarea de ``HUMAN_APPROVAL`` sin una
+        aprobación humana válida.
+        """
         task = engine.task_manager.get_task(task_id)
         return {
             **_task_summary(task),
@@ -345,16 +350,6 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
                 state.value for state in engine.task_manager.allowed_transitions(task.id)
             ),
         }
-
-    @application.post(
-        "/tasks/{task_id}/transitions",
-        tags=["tasks"],
-        summary="Transicionar una tarea",
-    )
-    def transition_task(task_id: UUID, payload: TransitionRequest) -> dict[str, Any]:
-        """Aplica una transición de estado validada por la máquina de estados."""
-        task = engine.task_manager.transition_task(task_id, payload.target, reason=payload.reason)
-        return _task_summary(task)
 
     # -------------------------------------------------------------- human gate
     @application.get("/human-gate", tags=["human-gate"], summary="Listar Human Gates")
@@ -376,7 +371,13 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
         summary="Detalle de un Human Gate",
     )
     def get_human_gate(approval_id: UUID) -> dict[str, Any]:
-        """Devuelve el detalle de una solicitud de aprobación humana."""
+        """Devuelve el detalle de una solicitud de aprobación humana.
+
+        Solo lectura. La resolución del gate **no** se expone por HTTP en
+        ENGINE-0: se realiza exclusivamente a través de la lógica de dominio
+        ``Camus.resume()``, que exige que la solicitud esté ``APPROVED`` y
+        recupera la ``PolicyDecision`` vinculada a *esa* solicitud.
+        """
         approval = engine.human_gate.get(approval_id)
         if approval is None:
             raise HTTPException(
@@ -384,37 +385,6 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
                 detail=f"Solicitud de aprobación no encontrada: {approval_id}",
             )
         return _approval_payload(approval)
-
-    @application.post(
-        "/human-gate/{approval_id}/resolve",
-        tags=["human-gate"],
-        summary="Resolver un Human Gate",
-    )
-    def resolve_human_gate(
-        approval_id: UUID,
-        payload: Annotated[ApprovalResolveRequest, Body()],
-    ) -> dict[str, Any]:
-        """Aprueba o rechaza una solicitud y continúa o cierra la tarea."""
-        result = engine.camus.resume(
-            approval_id,
-            approved=payload.approved,
-            resolved_by=payload.resolved_by,
-            note=payload.note,
-        )
-        return {
-            "task_id": str(result.task.id),
-            "status": result.task.status.value,
-            "outcome": result.outcome.value,
-            "blocked_reason": (
-                result.blocked_reason.value if result.blocked_reason is not None else None
-            ),
-            "human_approval": (
-                _approval_payload(result.human_approval)
-                if result.human_approval is not None
-                else None
-            ),
-            "detail": result.detail,
-        }
 
     # ------------------------------------------------------------------ policy
     @application.post("/policy/evaluate", tags=["policy"], summary="Evaluar una acción")
@@ -573,6 +543,10 @@ def _approval_payload(approval: HumanApprovalRequest) -> dict[str, Any]:
         "reason": approval.reason,
         "status": approval.status.value,
         "resume_status": approval.resume_status,
+        "policy_outcome": approval.policy_outcome,
+        "policy_decision_id": (
+            str(approval.policy_decision_id) if approval.policy_decision_id else None
+        ),
         "requested_at": approval.requested_at.isoformat(),
         "resolved_at": approval.resolved_at.isoformat() if approval.resolved_at else None,
         "resolved_by": approval.resolved_by,
@@ -604,11 +578,9 @@ app = create_app()
 
 
 __all__ = [
-    "ApprovalResolveRequest",
     "Engine",
     "PolicyEvaluateRequest",
     "TaskCreateRequest",
-    "TransitionRequest",
     "app",
     "create_app",
     "get_engine",

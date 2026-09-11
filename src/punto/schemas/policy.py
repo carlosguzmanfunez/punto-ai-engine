@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,10 +28,22 @@ class PolicyDecision(BaseModel):
 
     Es inmutable: una vez emitida, una decisión no puede reescribirse. Cualquier
     reevaluación produce un objeto nuevo y un evento de auditoría nuevo.
+
+    Cada decisión lleva un ``id`` propio. Ese identificador es el único vínculo
+    admitido entre una decisión y los artefactos que dependen de ella (por
+    ejemplo un Human Gate): permite recuperar *la* decisión que originó un
+    artefacto concreto sin depender de la posición en el historial global.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    id: UUID = Field(
+        default_factory=uuid4,
+        description=(
+            "Identificador único de la decisión. Es la referencia inequívoca que "
+            "usan los artefactos derivados (Human Gate) para recuperarla."
+        ),
+    )
     allowed: bool = Field(
         ...,
         description="True solo si la acción puede ejecutarse sin aprobación humana previa.",

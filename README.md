@@ -245,6 +245,25 @@ La acción catalogada `simulate_failure` produce siempre un fallo determinista:
 existe para poder ejercitar y auditar la ruta de reparación (`REPAIRING`) sin
 introducir aleatoriedad ni dependencias externas.
 
+### Validación placeholder (`DETERMINISTIC_PLACEHOLDER_VALIDATION`)
+
+**ENGINE-0 no tiene agentes reales.** Los estados `QA`, `SECURITY` y `REVIEW` se
+recorren mediante una **validación placeholder determinista**, encapsulada en
+`Camus._run_placeholder_validation()` y `Camus._close_with_placeholder_review()`
+y marcada con la constante `DETERMINISTIC_PLACEHOLDER_VALIDATION`.
+
+Qué hace y qué **no** hace:
+
+- **Sí**: comprueba que la máquina de estados admita la secuencia y que el riesgo
+  efectivo no exija Human Gate.
+- **No**: no ejecuta pruebas reales, no inspecciona artefactos y ningún revisor
+  evalúa el resultado. No es QA real, ni Security real, ni Reviewer real.
+
+La marca aparece en el motivo de cada transición simulada, de modo que la
+auditoría distingue sin ambigüedad una validación simulada de una real. Los PASS
+reales de QA, Security y Reviewer se implementarán en fases posteriores y
+sustituirán a este placeholder.
+
 ---
 
 ## 9. Aprobación humana (Human Gate)
@@ -252,10 +271,39 @@ introducir aleatoriedad ni dependencias externas.
 - Las acciones de nivel 3 y el riesgo HIGH/CRITICAL **no se ejecutan** sin
   aprobación explícita.
 - Cada solicitud es `PENDING`, `APPROVED` o `REJECTED`; no puede resolverse dos
-  veces (segunda resolución → `409`).
+  veces (segunda resolución → error de dominio).
 - Al aprobar, la tarea reanuda un estado coherente con su estado previo
   (`RESUMABLE_STATUSES`). Al rechazar, la tarea se cancela.
-- `assert_executable` impide ejecutar una acción cuyo gate siga sin aprobar.
+- `assert_executable` impide ejecutar una acción cuyo gate siga sin aprobar:
+  `PENDING` y `REJECTED` **no** autorizan ejecución; solo `APPROVED` lo hace.
+- **La resolución no se expone por HTTP en ENGINE-0.** La única vía autorizada es
+  la lógica de dominio `Camus.resume()`. La API solo ofrece introspección `GET`.
+
+### Aislamiento de la decisión (R1.2)
+
+Cada `HumanApprovalRequest` conserva el `policy_decision_id` de la
+`PolicyDecision` que originó el gate, y el `PolicyEngine` mantiene un índice
+`decision_by_id()`. Al reanudar, `Camus.resume()` recupera **exclusivamente** esa
+decisión.
+
+```python
+# Correcto: la decisión vinculada a ESTA solicitud.
+decision = self._policy.decision_by_id(approval.policy_decision_id)
+
+# Prohibido: la última decisión global pertenece a otra tarea si hay
+# varias tareas concurrentes, y mezclaría sus datos.
+decision = self._policy.decisions[-1]
+```
+
+Si una solicitud no está vinculada a ninguna decisión, `resume()` falla de forma
+determinista y **sin efectos** (no hay respaldo por posición en el historial).
+
+### Invariante de superficie (R1.1)
+
+Ninguna ruta HTTP puede sacar una tarea de `HUMAN_APPROVAL`. La máquina de
+estados sigue admitiendo `HUMAN_APPROVAL → APPROVED` como transición *interna*
+(disponible para CAMUS y el Task Manager), pero el endpoint genérico de
+transiciones fue **eliminado**: un estado solo cambia a través del dominio.
 
 ---
 
@@ -277,29 +325,43 @@ Además: `TASK_COMPLETED`, `TASK_CANCELLED`, `HUMAN_GATE_RESOLVED`,
 
 ## 11. API HTTP
 
+Superficie pública **deliberadamente reducida**. ENGINE-0 no expone ninguna ruta
+capaz de manipular el estado de una tarea ni de resolver un Human Gate.
+
 | Método | Ruta | Descripción |
 | --- | --- | --- |
 | `GET` | `/health` | Estado del motor y versión. |
 | `GET` | `/engine` | Entorno, contadores e informe de integridad constitucional. |
 | `POST` | `/tasks` | Crea una tarea y la procesa con CAMUS (`201`). |
 | `GET` | `/tasks` | Lista tareas en memoria (filtros `status`, `project_id`, `limit`). |
-| `GET` | `/tasks/{task_id}` | Detalle de una tarea y transiciones permitidas. |
-| `POST` | `/tasks/{task_id}/transitions` | Aplica una transición validada. |
-| `GET` | `/human-gate` | Lista solicitudes de aprobación (`pending_only`). |
-| `GET` | `/human-gate/{approval_id}` | Detalle de una solicitud. |
-| `POST` | `/human-gate/{approval_id}/resolve` | Aprueba o rechaza y continúa o cierra la tarea. |
+| `GET` | `/tasks/{task_id}` | Detalle de una tarea (solo lectura). |
+| `GET` | `/human-gate` | Introspección de solicitudes de aprobación (`pending_only`). |
+| `GET` | `/human-gate/{approval_id}` | Detalle de una solicitud (solo lectura). |
 | `POST` | `/policy/evaluate` | Evalúa una acción sin crear tarea ni ejecutar nada. |
 | `GET` | `/policy/authority` | Catálogo de autoridad activo por nivel. |
 | `GET` | `/audit/events` | Eventos de auditoría (`limit`, `resource_id`). |
 
 Documentación interactiva en `/docs`; esquema OpenAPI en `/openapi.json`.
 
+### Rutas eliminadas en ENGINE-0.R1
+
+| Ruta eliminada | Motivo |
+| --- | --- |
+| `POST /tasks/{task_id}/transitions` | Permitía forzar `HUMAN_APPROVAL → APPROVED` saltándose el Human Gate. |
+| `POST /human-gate/{approval_id}/resolve` | Mutaba el gate sin pasar por la lógica de dominio; el gate no necesita interfaz externa en esta fase. |
+
+Ninguna de las dos existe ya: responden `404`/`405` según el enrutado, y el
+estado de la tarea permanece intacto. La única vía autorizada para resolver un
+Human Gate es `Camus.resume()`, que exige un gate `APPROVED` y recupera la
+decisión vinculada a esa solicitud concreta.
+
 ### Códigos de error
 
 | Código | Significado |
 | --- | --- |
-| `404` | Tarea o solicitud de aprobación inexistente. |
-| `409` | Transición de estado inválida o Human Gate ya resuelto. |
+| `404` | Tarea, solicitud de aprobación o ruta inexistente. |
+| `405` | Método no permitido sobre una ruta de solo lectura. |
+| `409` | Conflicto de dominio. |
 | `422` | Petición inválida (validación de esquema). |
 | `503` | Configuración del motor no disponible. |
 
@@ -369,7 +431,18 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/tasks `
 ```
 
 Una acción de nivel 3 (por ejemplo `deploy_production`) devuelve
-`outcome = "HUMAN_APPROVAL_REQUIRED"` junto con un `human_approval_id`.
+`outcome = "HUMAN_APPROVAL_REQUIRED"` junto con un `human_approval_id`. La
+aprobación de esa tarea se realiza por dominio (`Camus.resume()`), no por HTTP:
+
+```python
+from punto.api.app import Engine
+
+engine = Engine(environment="local")
+result = engine.camus.process_request(objective="Desplegar", action="deploy_production")
+assert result.human_approval is not None
+resumed = engine.camus.resume(result.human_approval.id, approved=True, resolved_by="carlos")
+assert resumed.task.status.value == "COMPLETED"
+```
 
 ---
 
@@ -410,6 +483,21 @@ prueba, y cubre los casos numerados del contrato constitucional:
 | 13–14 | Constitución y permisos están protegidos. |
 | 15 | Default deny para acción desconocida. |
 | 16–18 | Presupuesto de costo, tiempo y archivos. |
+
+Además, `tests/test_human_gate_invariants.py` (ENGINE-0.R1) sostiene las
+garantías constitucionales del gate:
+
+| Invariante | Verifica |
+| --- | --- |
+| R1.1 | Ningún endpoint genérico permite sacar una tarea de `HUMAN_APPROVAL`. |
+| R1.1 | El endpoint de transiciones y el de resolución de gate ya no existen (`404`/`405`). |
+| R1.2/R1.3 | TASK-A se reanuda con **su** decisión aunque TASK-B haya emitido otra después. |
+| R1.2 | Sin vínculo de decisión, `resume()` falla sin efectos (no hay respaldo por posición). |
+| R1.4 | `PENDING` no autoriza ejecución. |
+| R1.4 | `REJECTED` no autoriza ejecución. |
+| R1.4 | `APPROVED` sí autoriza la reanudación. |
+| R1.4 | La aprobación de TASK-A no autoriza ni altera TASK-B. |
+| R1.5 | La validación simulada queda marcada como placeholder en la auditoría. |
 
 ---
 

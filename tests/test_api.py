@@ -213,102 +213,111 @@ def test_get_task_with_invalid_uuid_returns_422(client: TestClient) -> None:
     assert client.get("/tasks/no-es-un-uuid").status_code == 422
 
 
-def test_invalid_transition_returns_409(client: TestClient) -> None:
-    """Una transición imposible devuelve 409 con el detalle del conflicto."""
+# ---------------------------------------------------------------------------
+# R1.1 - La API no expone ninguna ruta capaz de transicionar una tarea
+# ---------------------------------------------------------------------------
+def test_transitions_endpoint_does_not_exist(client: TestClient) -> None:
+    """El endpoint genérico de transiciones fue eliminado de la API pública.
+
+    Era la vía por la que un consumidor podía forzar ``HUMAN_APPROVAL ->
+    APPROVED`` saltándose el Human Gate. La ruta ya no existe en absoluto
+    (Starlette responde 404; 405 si el método no coincide con una ruta viva), y
+    en ningún caso el estado de la tarea cambia.
+    """
     created = client.post(
-        "/tasks", json={"objective": "Transicionar", "action": "create_file"}
+        "/tasks", json={"objective": "Desplegar", "action": "deploy_production"}
     ).json()
+    assert created["status"] == "HUMAN_APPROVAL"
 
     response = client.post(
         f"/tasks/{created['id']}/transitions",
-        json={"target": "ANALYZING"},
+        json={"target": "APPROVED", "reason": "bypass"},
     )
 
-    assert response.status_code == 409
-    payload = response.json()
-    assert payload["current"] == "COMPLETED"
-    assert payload["target"] == "ANALYZING"
+    assert response.status_code in {404, 405}
+
+    detail = client.get(f"/tasks/{created['id']}").json()
+    assert detail["status"] == "HUMAN_APPROVAL"
 
 
-def test_valid_transition_is_applied(client: TestClient) -> None:
-    """Una transición válida se aplica a través de la API."""
+def test_no_http_route_can_move_a_task_out_of_human_approval(client: TestClient) -> None:
+    """Ninguna ruta HTTP permite sacar una tarea de ``HUMAN_APPROVAL``."""
     created = client.post(
-        "/tasks",
-        json={"objective": "Pendiente", "action": "deploy_production"},
+        "/tasks", json={"objective": "Desplegar", "action": "deploy_production"}
     ).json()
+    task_id = created["id"]
 
-    response = client.post(
-        f"/tasks/{created['id']}/transitions",
-        json={"target": "CANCELLED", "reason": "cancelada por prueba"},
-    )
+    attempts = {
+        "transitions": client.post(f"/tasks/{task_id}/transitions", json={"target": "APPROVED"}),
+        "approve": client.post(f"/tasks/{task_id}/approve"),
+        "status": client.post(f"/tasks/{task_id}/status", json={"status": "APPROVED"}),
+        "patch": client.patch(f"/tasks/{task_id}", json={"status": "APPROVED"}),
+        "put": client.put(f"/tasks/{task_id}", json={"status": "APPROVED"}),
+    }
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "CANCELLED"
+    unsafe = {
+        name: response.status_code
+        for name, response in attempts.items()
+        if response.status_code not in {404, 405}
+    }
+    assert unsafe == {}
+
+    assert client.get(f"/tasks/{task_id}").json()["status"] == "HUMAN_APPROVAL"
 
 
 # ---------------------------------------------------------------------------
-# Human Gate por API
+# R1.1 - El Human Gate no se resuelve por HTTP en ENGINE-0
 # ---------------------------------------------------------------------------
-def test_human_gate_can_be_approved_through_api(client: TestClient) -> None:
-    """Un Human Gate aprobado por API reanuda y completa la tarea."""
+def test_human_gate_resolve_endpoint_does_not_exist(client: TestClient) -> None:
+    """La resolución del Human Gate por HTTP fue eliminada de ENGINE-0.
+
+    La especificación original ya indicaba que el gate no necesitaba interfaz
+    externa. Sin endpoint de resolución, la única vía es ``Camus.resume()``, que
+    exige una solicitud ``APPROVED`` y valida la decisión vinculada.
+    """
     created = client.post(
         "/tasks", json={"objective": "Desplegar", "action": "deploy_production"}
     ).json()
     approval_id = created["human_approval_id"]
     assert approval_id is not None
 
-    pending = client.get("/human-gate", params={"pending_only": True}).json()
-    assert pending["total"] == 1
-    assert pending["items"][0]["id"] == approval_id
+    resolve = client.post(f"/human-gate/{approval_id}/resolve", json={"approved": True})
+    assert resolve.status_code == 404
 
-    response = client.post(
-        f"/human-gate/{approval_id}/resolve",
-        json={"approved": True, "resolved_by": "carlos"},
-    )
+    # Tampoco se puede mutar la solicitud con otros métodos sobre la ruta GET.
+    patch = client.patch(f"/human-gate/{approval_id}", json={"status": "APPROVED"})
+    assert patch.status_code == 405
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["outcome"] == "COMPLETED"
-    assert payload["status"] == "COMPLETED"
-
-    detail = client.get(f"/tasks/{created['id']}").json()
-    assert detail["status"] == "COMPLETED"
+    # El gate sigue pendiente y la tarea sigue esperando decisión humana.
+    assert client.get(f"/human-gate/{approval_id}").json()["status"] == "PENDING"
+    assert client.get(f"/tasks/{created['id']}").json()["status"] == "HUMAN_APPROVAL"
 
 
-def test_human_gate_rejection_cancels_the_task(client: TestClient) -> None:
-    """Un Human Gate rechazado por API cancela la tarea."""
-    created = client.post(
-        "/tasks",
-        json={"objective": "Eliminar base de producción", "action": "production_database_delete"},
-    ).json()
-
-    response = client.post(
-        f"/human-gate/{created['human_approval_id']}/resolve",
-        json={"approved": False, "resolved_by": "carlos", "note": "no autorizado"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["outcome"] == "REJECTED"
-    assert response.json()["status"] == "CANCELLED"
-
-
-def test_human_gate_double_resolution_returns_409(client: TestClient) -> None:
-    """Resolver dos veces el mismo gate devuelve 409."""
+def test_human_gate_introspection_is_read_only(client: TestClient) -> None:
+    """La introspección GET expone el vínculo del gate con su PolicyDecision."""
     created = client.post(
         "/tasks", json={"objective": "Desplegar", "action": "deploy_production"}
     ).json()
-    approval_id = created["human_approval_id"]
-    client.post(f"/human-gate/{approval_id}/resolve", json={"approved": True})
 
-    response = client.post(f"/human-gate/{approval_id}/resolve", json={"approved": True})
+    pending = client.get("/human-gate", params={"pending_only": True}).json()
+    assert pending["total"] == 1
+    item = pending["items"][0]
 
-    assert response.status_code == 409
+    assert item["id"] == created["human_approval_id"]
+    assert item["task_id"] == created["id"]
+    assert item["status"] == "PENDING"
+    assert item["is_pending"] is True
+    # Vínculo inequívoco con la decisión que originó el gate (R1.2).
+    assert item["policy_decision_id"] is not None
+
+    detail = client.get(f"/human-gate/{item['id']}").json()
+    assert detail["policy_decision_id"] == item["policy_decision_id"]
+    assert detail["resolved_at"] is None
 
 
 def test_unknown_human_gate_returns_404(client: TestClient) -> None:
     """Un gate inexistente devuelve 404."""
     assert client.get(f"/human-gate/{uuid4()}").status_code == 404
-    assert client.post(f"/human-gate/{uuid4()}/resolve", json={"approved": True}).status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -370,14 +379,23 @@ def test_engine_endpoint_reports_no_llm(client: TestClient) -> None:
 
 
 def test_openapi_schema_is_available(client: TestClient) -> None:
-    """El esquema OpenAPI se genera correctamente."""
+    """El esquema OpenAPI se genera y no expone rutas de mutación de estado."""
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
     paths = response.json()["paths"]
     assert "/health" in paths
+    assert "/engine" in paths
     assert "/tasks" in paths
     assert "/tasks/{task_id}" in paths
+
+    # Rutas eliminadas en ENGINE-0.R1: ninguna permite manipular el estado.
+    assert "/tasks/{task_id}/transitions" not in paths
+    assert "/human-gate/{approval_id}/resolve" not in paths
+
+    # Sobre una tarea individual solo se admite lectura.
+    assert set(paths["/tasks/{task_id}"]) == {"get"}
+    assert set(paths["/human-gate/{approval_id}"]) == {"get"}
 
 
 def test_state_is_isolated_between_apps(fastapi_app: FastAPI) -> None:

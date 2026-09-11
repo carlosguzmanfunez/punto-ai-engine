@@ -20,12 +20,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import StateMachine
-from punto.policy.human_gate import HumanGate, HumanGateNotFoundError
+from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import (
@@ -122,6 +122,21 @@ def _blocked_reason_from_decision(decision: PolicyDecision) -> BlockedReason:
         if marker in haystack:
             return reason
     return BlockedReason.UNKNOWN
+
+
+#: Marca explícita de la validación **simulada** de ENGINE-0.
+#:
+#: ENGINE-0 no tiene agentes reales. Los estados ``QA``, ``SECURITY`` y
+#: ``REVIEW`` se recorren aquí como una *validación placeholder determinista*:
+#: únicamente se comprueba que la máquina de estados admita la secuencia y que el
+#: riesgo efectivo no exija Human Gate. **No** se ejecuta ninguna prueba real, no
+#: se inspecciona ningún artefacto y ningún revisor evalúa el resultado.
+#:
+#: Los PASS reales de QA, Security y Reviewer se implementarán en fases
+#: posteriores y sustituirán a este placeholder. Hasta entonces, esta marca
+#: aparece en los motivos de transición para que la auditoría distinga sin
+#: ambigüedad una validación simulada de una validación real.
+DETERMINISTIC_PLACEHOLDER_VALIDATION: Final[str] = "DETERMINISTIC_PLACEHOLDER_VALIDATION"
 
 
 class Camus:
@@ -262,6 +277,10 @@ class Camus:
         if approval is None:
             raise HumanGateNotFoundError(approval_id)
 
+        # La decisión se resuelve ANTES de mutar el gate: si la solicitud no está
+        # vinculada a una decisión válida, la operación falla sin efectos.
+        decision = self._decision_for_approval(approval)
+
         self._gate.resolve(approval_id, approved=approved, resolved_by=resolved_by, note=note)
         self._audit.log_human_gate_resolved(
             approval_id=approval.id,
@@ -271,10 +290,6 @@ class Camus:
         )
 
         task = self._tasks.get_task(approval.task_id)
-        decision = self._policy.decisions[-1] if self._policy.decisions else None
-        if decision is None:  # pragma: no cover - defensivo
-            msg = "No existe una decisión de política registrada para reanudar la tarea"
-            raise ValueError(msg)
 
         if not approved:
             closed = self._tasks.close_task(
@@ -293,6 +308,10 @@ class Camus:
                 human_approval=approval,
                 detail="Human Gate rechazado",
             )
+
+        # Garantía de dominio: solo una solicitud ``APPROVED`` autoriza la
+        # reanudación. ``PENDING`` y ``REJECTED`` no habilitan la ejecución.
+        self._gate.assert_executable(approval_id)
 
         resumed = self._continue_after_approval(task)
         if resumed.status is TaskStatus.HUMAN_APPROVAL:
@@ -355,6 +374,37 @@ class Camus:
             task_id=str(task.id),
         )
 
+    def _decision_for_approval(self, approval: HumanApprovalRequest) -> PolicyDecision:
+        """Recupera *la* decisión de política que originó esta solicitud.
+
+        Garantía de aislamiento entre tareas: la decisión se busca por el
+        identificador que quedó vinculado a la solicitud en el momento de crear
+        el gate. **Nunca** se usa la última decisión del historial global
+        (``PolicyEngine.decisions[-1]``): con varias tareas concurrentes esa
+        posición pertenece a otra tarea y mezclaría sus datos.
+
+        Raises:
+            HumanGateError: si la solicitud no está vinculada a una decisión o si
+                la decisión referenciada no pertenece a este motor.
+        """
+        decision_id = approval.policy_decision_id
+        if decision_id is None:
+            msg = (
+                f"La solicitud de aprobación {approval.id} no está vinculada a "
+                "ninguna PolicyDecision: no se puede reanudar sin la decisión que "
+                "la originó."
+            )
+            raise HumanGateError(msg)
+
+        decision = self._policy.decision_by_id(decision_id)
+        if decision is None:  # pragma: no cover - defensivo
+            msg = (
+                f"La PolicyDecision {decision_id} referenciada por la solicitud "
+                f"{approval.id} no existe en este Policy Engine."
+            )
+            raise HumanGateError(msg)
+        return decision
+
     def _handle_rejection(self, task: Task, decision: PolicyDecision) -> CamusResult:
         """Bloquea la tarea rechazada por política y registra la auditoría."""
         blocked_reason = _blocked_reason_from_decision(decision)
@@ -394,6 +444,7 @@ class Camus:
             reason=decision.reason,
             resume_status=TaskStatus.IN_PROGRESS,
             policy_outcome=decision.outcome.value,
+            policy_decision_id=decision.id,
         )
         self._audit.log_human_gate_created(
             approval_id=approval.id,
@@ -493,6 +544,13 @@ class Camus:
     ) -> Task:
         """Recorre QA, seguridad, revisión, aprobación y cierre.
 
+        **ENGINE-0 no tiene agentes reales.** Las fases ``QA``, ``SECURITY`` y
+        ``REVIEW`` las recorre
+        :meth:`_run_placeholder_validation` / :meth:`_close_with_placeholder_review`,
+        que son una *validación placeholder determinista*: verifican únicamente
+        la legalidad de la secuencia en la máquina de estados, no la calidad del
+        resultado. Ver :data:`DETERMINISTIC_PLACEHOLDER_VALIDATION`.
+
         La fase de seguridad es el punto de control antes de la revisión: si el
         riesgo efectivo de la acción exige aprobación humana, se crea el Human
         Gate en lugar de completar la tarea de forma autónoma.
@@ -503,16 +561,54 @@ class Camus:
                 contra el nivel de autoridad: la decisión humana ya la autorizó
                 y volver a evaluarla produciría un bucle de aprobaciones.
         """
-        self._tasks.transition_task(task.id, TaskStatus.QA, reason=f"verificación de {action}")
-        self._tasks.transition_task(
-            task.id, TaskStatus.SECURITY, reason="comprobación de seguridad"
-        )
+        task = self._run_placeholder_validation(task, action)
         if not human_approved:
             review_decision = self._evaluate_action(task, action)
             if review_decision.requires_human:
                 return self._gate_at_security(task, action, review_decision)
-        self._tasks.transition_task(task.id, TaskStatus.REVIEW, reason="revisión final")
-        self._tasks.transition_task(task.id, TaskStatus.APPROVED, reason="resultado aprobado")
+        return self._close_with_placeholder_review(task, action)
+
+    def _run_placeholder_validation(self, task: Task, action: str) -> Task:
+        """``QA`` + ``SECURITY`` simulados. **No** son QA ni seguridad reales.
+
+        Placeholder determinista de ENGINE-0: solo hace avanzar la máquina de
+        estados. Devuelve la tarea en ``SECURITY``, que es el punto donde CAMUS
+        decide si procede un Human Gate.
+        """
+        self._tasks.transition_task(
+            task.id,
+            TaskStatus.QA,
+            reason=f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: QA simulado de {action}",
+        )
+        return self._tasks.transition_task(
+            task.id,
+            TaskStatus.SECURITY,
+            reason=(
+                f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: "
+                f"comprobación de seguridad simulada de {action}"
+            ),
+        )
+
+    def _close_with_placeholder_review(self, task: Task, action: str) -> Task:
+        """``REVIEW`` + ``APPROVED`` + cierre, todos simulados.
+
+        Placeholder determinista de ENGINE-0: **no** existe un revisor real que
+        evalúe el resultado. La aprobación se declara por construcción. Los PASS
+        reales de QA, Security y Reviewer llegarán en fases posteriores.
+        """
+        self._tasks.transition_task(
+            task.id,
+            TaskStatus.REVIEW,
+            reason=f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: revisión simulada de {action}",
+        )
+        self._tasks.transition_task(
+            task.id,
+            TaskStatus.APPROVED,
+            reason=(
+                f"{DETERMINISTIC_PLACEHOLDER_VALIDATION}: resultado declarado "
+                "aprobado sin revisor real"
+            ),
+        )
         return self._tasks.complete_task(task.id, reason="tarea completada de forma autónoma")
 
     def _evaluate_action(self, task: Task, action: str) -> PolicyDecision:
@@ -537,6 +633,7 @@ class Camus:
             reason=decision.reason,
             resume_status=TaskStatus.REVIEW,
             policy_outcome=decision.outcome.value,
+            policy_decision_id=decision.id,
         )
         self._audit.log_human_gate_created(
             approval_id=approval.id,
@@ -656,4 +753,10 @@ class Camus:
         )
 
 
-__all__ = ["Camus", "CamusOutcome", "CamusResult", "RequestOverrides"]
+__all__ = [
+    "DETERMINISTIC_PLACEHOLDER_VALIDATION",
+    "Camus",
+    "CamusOutcome",
+    "CamusResult",
+    "RequestOverrides",
+]

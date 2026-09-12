@@ -709,6 +709,182 @@ class AuditLogger:
             metadata={"runtime": runtime, "image": image},
         )
 
+    # ------------------------------------------- Integración de modelo (R3)
+    def log_model_request_started(
+        self,
+        *,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        attempt: int,
+        prompt_chars: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una llamada al modelo.
+
+        Se registra el **tamaño** del prompt, nunca su contenido ni la credencial.
+        """
+        return self.record(
+            AuditEventType.MODEL_REQUEST_STARTED,
+            action="model_request_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "provider": provider,
+                "model": model,
+                "attempt": attempt,
+                "prompt_chars": prompt_chars,
+            },
+        )
+
+    def log_model_request_completed(
+        self,
+        *,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        attempt: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        latency_ms: int,
+        transport_retries: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una llamada completada con su consumo y latencia."""
+        return self.record(
+            AuditEventType.MODEL_REQUEST_COMPLETED,
+            action="model_request_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "provider": provider,
+                "model": model,
+                "attempt": attempt,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "latency_ms": latency_ms,
+                "transport_retries": transport_retries,
+            },
+        )
+
+    def log_model_request_failed(
+        self,
+        *,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        attempt: int,
+        error: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una llamada fallida. El detalle ya llega redactado."""
+        return self.record(
+            AuditEventType.MODEL_REQUEST_FAILED,
+            action="model_request_failed",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "provider": provider,
+                "model": model,
+                "attempt": attempt,
+                "error": error[:500],
+            },
+        )
+
+    def log_developer_proposal_received(
+        self,
+        *,
+        task_id: UUID,
+        attempt: int,
+        summary: str,
+        change_paths: Sequence[str],
+        assumptions: Sequence[str] = (),
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la propuesta recibida del modelo.
+
+        Se registran rutas y supuestos, nunca el contenido generado: el código
+        completo no pertenece al log de auditoría.
+        """
+        return self.record(
+            AuditEventType.DEVELOPER_PROPOSAL_RECEIVED,
+            action="developer_proposal_received",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "summary": summary[:300],
+                "change_paths": list(change_paths),
+                "assumptions": [item[:200] for item in assumptions],
+            },
+        )
+
+    def log_developer_proposal_rejected(
+        self,
+        *,
+        task_id: UUID,
+        attempt: int,
+        reason: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta rechazada sin aplicar nada."""
+        return self.record(
+            AuditEventType.DEVELOPER_PROPOSAL_REJECTED,
+            action="developer_proposal_rejected",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={"attempt": attempt, "reason": reason[:500]},
+        )
+
+    def log_developer_attempt(
+        self,
+        *,
+        task_id: UUID,
+        attempt: int,
+        phase: str,
+        detail: str = "",
+        failed_check: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el ciclo de vida de un intento de desarrollo.
+
+        Args:
+            phase: ``started``, ``failed``, ``repair_requested`` o ``passed``.
+        """
+        mapping = {
+            "started": (AuditEventType.DEVELOPER_ATTEMPT_STARTED, AuditResult.PENDING),
+            "failed": (AuditEventType.DEVELOPER_ATTEMPT_FAILED, AuditResult.FAILURE),
+            "repair_requested": (
+                AuditEventType.DEVELOPER_REPAIR_REQUESTED,
+                AuditResult.PENDING,
+            ),
+            "passed": (AuditEventType.DEVELOPER_ATTEMPT_PASSED, AuditResult.SUCCESS),
+        }
+        if phase not in mapping:
+            msg = f"Fase de intento desconocida: {phase}"
+            raise ValueError(msg)
+        event_type, result = mapping[phase]
+        return self.record(
+            event_type,
+            action=f"developer_attempt_{phase}",
+            resource_id=task_id,
+            result=result,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "phase": phase,
+                "detail": detail[:300],
+                "failed_check": failed_check,
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

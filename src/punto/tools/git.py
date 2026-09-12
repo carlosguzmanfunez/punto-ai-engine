@@ -197,6 +197,28 @@ class GitWorkspace:
             return self.checkout(target)
         return self.create_branch(target)
 
+    # ------------------------------------------------------------------ rollback
+    def reset_hard(self, revision: str) -> str:
+        """Restaura el árbol de trabajo a ``revision``, descartando cambios.
+
+        Se usa para el rollback al estado base de la rama de tarea cuando una
+        ejecución termina en fallo.
+
+        Returns:
+            El SHA resultante.
+        """
+        self._run("reset", ["reset", "--hard", revision], f"git reset --hard {revision}")
+        return self.head_sha()
+
+    def clean_untracked(self) -> None:
+        """Elimina los archivos no rastreados del workspace.
+
+        Complementa a :meth:`reset_hard`: los archivos creados por una propuesta
+        no están en el índice, así que un ``reset`` por sí solo no dejaría el
+        workspace como estaba.
+        """
+        self._run("clean", ["clean", "-fd"], "git clean -fd")
+
     # ------------------------------------------------------------------ internos
     def _assert_repo_root(self) -> None:
         """Verifica que el repositorio Git sea exactamente el workspace autorizado.

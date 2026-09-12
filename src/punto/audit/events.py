@@ -52,6 +52,16 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.SANDBOX_RUN_COMPLETED: "sandbox",
     AuditEventType.SANDBOX_RUN_FAILED: "sandbox",
     AuditEventType.SANDBOX_DESTROYED: "sandbox",
+    # --- Integración de modelo (ENGINE-2) -------------------------------------
+    AuditEventType.MODEL_REQUEST_STARTED: "model_request",
+    AuditEventType.MODEL_REQUEST_COMPLETED: "model_request",
+    AuditEventType.MODEL_REQUEST_FAILED: "model_request",
+    AuditEventType.DEVELOPER_PROPOSAL_RECEIVED: "developer_proposal",
+    AuditEventType.DEVELOPER_PROPOSAL_REJECTED: "developer_proposal",
+    AuditEventType.DEVELOPER_ATTEMPT_STARTED: "developer_attempt",
+    AuditEventType.DEVELOPER_ATTEMPT_FAILED: "developer_attempt",
+    AuditEventType.DEVELOPER_REPAIR_REQUESTED: "developer_attempt",
+    AuditEventType.DEVELOPER_ATTEMPT_PASSED: "developer_attempt",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

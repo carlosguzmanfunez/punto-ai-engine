@@ -1189,7 +1189,145 @@ o es `.git`.
 
 ---
 
-## 20. Licencia
+## 20. ENGINE-2 — DeepSeek Developer Integration
+
+ENGINE-2 conecta un **Developer AI real** al ciclo controlado de ENGINE-1. El
+modelo **genera**; PUNTO decide **qué se toca, dónde, cuántas veces y si pasa**.
+
+### Componentes
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `DeepSeekClient` | `src/punto/providers/deepseek.py` | Única salida HTTP del motor. Habla con la API de DeepSeek y devuelve `ModelCompletion`. |
+| `DeepSeekDeveloperRunner` | `src/punto/developer/deepseek.py` | Orquesta el ciclo completo: contexto → propuesta → validación → sandbox → reparación → commit. |
+| Prompts versionados | `src/punto/developer/prompts.py` | `DEVELOPER_PROMPT_VERSION = "1.0.0"`, sistema, usuario y reparación. |
+| Tipos de propuesta | `src/punto/schemas/execution.py` | `DeveloperProposal`, `ProposedFileChange`, `ProposalOperation`, `ModelUsage`. |
+| Puerta viva | `tests/integration/test_deepseek_live.py` | Única prueba que exige una llamada real a la API. |
+
+El cliente vive en `punto.providers`, un paquete deliberadamente **sin
+re-exportaciones**: importarlo no arrastra `httpx` ni la cadena del runner.
+
+### Flujo de una tarea
+
+```
+CAMUS → Policy Engine → DeepSeekDeveloperRunner → DeepSeek API
+      → DeveloperProposal → validación atómica → Filesystem Tool
+      → ContainerSandboxBackend → pytest / ruff / mypy
+           ├── falla  → propuesta de reparación → sandbox (bucle acotado)
+           └── pasa   → commit local en rama aislada
+      → DeveloperExecutionResult → CAMUS
+```
+
+### El modelo propone, PUNTO decide
+
+El modelo **no tiene herramientas**. No puede llamar funciones, ni ejecutar
+comandos, ni leer ni escribir archivos, ni hablar con Git. Su única salida es un
+objeto JSON con una lista de cambios. Todo lo demás lo hace el motor:
+
+| Decisión | Quién |
+| --- | --- |
+| Qué archivos puede tocar | `DeveloperTask.allowed_files` (allowlist cerrada por tarea) |
+| Qué operaciones existen | `CREATE` y `REPLACE`. **No existe `DELETE`** |
+| Cuánto contexto ve | `max_context_bytes` (por defecto 200 000) y `MAX_CONTEXT_FILE_CHARS` |
+| Cuántas llamadas al modelo | `ModelLimits.max_model_calls` (por defecto 6) |
+| Cuánto puede gastar | `max_input_tokens` (200 000) y `max_output_tokens` (60 000) |
+| Dónde se ejecuta | `ContainerSandboxBackend` verificado (nunca el host) |
+| Si la tarea pasa | El validador (`pytest`, `ruff`, `mypy`) dentro del contenedor |
+
+Una propuesta se **valida entera o se rechaza entera**: si un solo cambio tiene
+traversal (`../`), ruta absoluta, archivo protegido, ruta duplicada, archivo
+fuera de la allowlist o un `REPLACE` sin contenido, **no se aplica ninguno**. La
+atomicidad está probada por pruebas parametrizadas, no declarada.
+
+### Restricciones estructurales
+
+- **Ningún endpoint HTTP de developer.** La superficie de la API sigue igual que
+  en ENGINE-0; el runner se invoca por código, no por red entrante.
+- **Sin tool-calling.** El contrato con el modelo es texto entra, JSON sale
+  (`response_format={"type": "json_object"}`).
+- **Sin modelos heredados.** `deepseek-chat` y `deepseek-reasoner` se rechazan en
+  `DeepSeekConfig.__post_init__` con `DeepSeekModelNotSupportedError`.
+  Soportados: `deepseek-v4-pro` (por defecto) y `deepseek-v4-flash`.
+- **Sin degradación del sandbox.** Si Podman no está disponible, la ejecución se
+  **BLOQUEA** con `SANDBOX_REQUIRED`; no hay caída al host.
+
+### Red
+
+El motor habla con **un solo destino externo**: `https://api.deepseek.com`
+(configurable con `DEEPSEEK_BASE_URL`). La cabecera es
+`Authorization: Bearer <clave>`. No hay proxies, ni telemetría, ni llamadas de
+descubrimiento.
+
+El contenedor, en cambio, **no tiene red**: `--network none`. El modelo puede
+pedir cualquier cosa; el código que produce se ejecuta sin salida a Internet.
+
+### Bucle de reparación
+
+Cuando el validador falla, la evidencia (salida de `pytest`/`ruff`/`mypy`
+recortada a `MAX_EVIDENCE_CHARS`) se devuelve al modelo junto con la propuesta
+anterior y se pide una corrección. El bucle está acotado por
+`max_model_calls`. Agotado el presupuesto, el workspace se **revierte**
+(`git reset --hard <base>` + limpieza de no rastreados) y la tarea se reporta
+como fallida: nunca queda un estado a medias.
+
+### Uso de tokens
+
+Cada llamada devuelve `ModelUsage` (`prompt_tokens`, `completion_tokens`,
+`total_tokens`, `prompt_cache_hit_tokens`, `prompt_cache_miss_tokens`). El
+runner los acumula con `merged()` y **corta** con `MAX_TOKENS_EXCEEDED` si se
+pasa del presupuesto. El consumo real queda en el `DeveloperExecutionResult` y
+en la auditoría.
+
+### Auditoría
+
+Se registran, sin secretos: `MODEL_REQUEST_STARTED/COMPLETED/FAILED`,
+`DEVELOPER_PROPOSAL_RECEIVED/REJECTED`,
+`DEVELOPER_ATTEMPT_STARTED/FAILED/REPAIR_REQUESTED/PASSED`. Todo texto que
+provenga del modelo o de la API pasa por `redact_secrets()` antes de tocar el
+log: la clave nunca aparece, ni siquiera en un mensaje de error de la API.
+
+### Configuración
+
+La clave se lee del entorno. **No se escribe nunca en el repositorio.**
+
+```bash
+# .env (fuera del control de versiones)
+DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-pro
+```
+
+Si la clave no está, el motor no inventa: reporta
+`CREDENTIAL_REQUIRED: DEEPSEEK_API_KEY`.
+
+### Pruebas
+
+| Comando | Qué cubre | Necesita |
+| --- | --- | --- |
+| `pytest` | Suite completa, con cliente falso y sandbox real | Podman |
+| `pytest tests/test_deepseek_integration.py -q` | Cliente (transporte simulado), propuesta, atomicidad, bucle de reparación, límites, rollback, auditoría | Podman |
+| `pytest tests/integration/test_deepseek_live.py -q` | **Puerta viva**: una llamada real a la API | `DEEPSEEK_API_KEY` |
+
+La suite por defecto **ignora** `tests/integration` (`--ignore=tests/integration`)
+para que un entorno sin credenciales siga siendo verde. La puerta viva se ejecuta
+a propósito y **falla de forma explícita** con
+`CREDENTIAL_REQUIRED: DEEPSEEK_API_KEY` cuando la clave no está: no se salta en
+silencio, no se marca `xfail`, no se declara PASS sin llamada real.
+
+**Estado:** la puerta viva no se ha podido ejecutar en este entorno porque
+`DEEPSEEK_API_KEY` no está disponible. ENGINE-2 **no se declara PASS**.
+
+### Limitación declarada
+
+Los identificadores `deepseek-v4-pro` y `deepseek-v4-flash` provienen del
+mandato y están fijados en el código. No se han podido contrastar contra la API
+real sin credencial. Si el proveedor usa otro identificador, la puerta viva lo
+hará visible de inmediato con `DeepSeekModelNotSupportedError` o un error de la
+API; no se ha asumido que existan.
+
+---
+
+## 21. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

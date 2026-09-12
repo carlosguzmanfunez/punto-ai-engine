@@ -221,6 +221,39 @@ class ValidationResult(BaseModel):
         return len(self.checks)
 
 
+class ModelUsage(BaseModel):
+    """Consumo real de tokens reportado por el proveedor."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    prompt_cache_hit_tokens: int | None = Field(default=None, ge=0)
+    prompt_cache_miss_tokens: int | None = Field(default=None, ge=0)
+
+    def merged(self, other: ModelUsage) -> ModelUsage:
+        """Suma acumulativa de dos consumos."""
+        return ModelUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            prompt_cache_hit_tokens=_add_optional(
+                self.prompt_cache_hit_tokens, other.prompt_cache_hit_tokens
+            ),
+            prompt_cache_miss_tokens=_add_optional(
+                self.prompt_cache_miss_tokens, other.prompt_cache_miss_tokens
+            ),
+        )
+
+
+def _add_optional(left: int | None, right: int | None) -> int | None:
+    """Suma dos contadores opcionales, devolviendo ``None`` si ambos faltan."""
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)
+
+
 class DeveloperExecutionResult(BaseModel):
     """Evidencia estructurada de una ejecución de desarrollo."""
 
@@ -249,6 +282,22 @@ class DeveloperExecutionResult(BaseModel):
         description="Coste de la ejecución. ENGINE-1 es siempre 0.0: no hay modelo externo.",
     )
     attempts_used: int = Field(default=1, ge=0, description="Intentos consumidos.")
+
+    # --- ENGINE-2: proveedor de modelo ---
+    provider: str = Field(
+        default="", description="Proveedor del modelo usado (vacío si no hubo modelo)."
+    )
+    model: str = Field(default="", description="Modelo usado (vacío si no hubo modelo).")
+    model_calls: int = Field(
+        default=0, ge=0, description="Llamadas al modelo realizadas (incluye reparaciones)."
+    )
+    usage: ModelUsage = Field(
+        default_factory=ModelUsage, description="Consumo acumulado de tokens."
+    )
+    rolled_back: bool = Field(
+        default=False,
+        description="True si el workspace se restauró al estado base tras un fallo.",
+    )
 
     @property
     def succeeded(self) -> bool:
@@ -299,12 +348,12 @@ class CommandSpec(BaseModel):
 
 
 class DeveloperTask(BaseModel):
-    """Tarea de desarrollo estructurada y determinista.
+    """Tarea de desarrollo estructurada.
 
-    No contiene texto generado por IA: declara exactamente qué archivos escribir,
-    qué reemplazos aplicar, qué contenido verificar, qué checks ejecutar y con qué
-    mensaje commitear. El ``action`` permite que CAMUS la someta al Policy Engine
-    antes de delegar en el ``DeveloperRunner``.
+    En ENGINE-1 la receta es determinista (``files``, ``replacements``). En
+    ENGINE-2 el ``DeveloperRunner`` puede generar los cambios con un modelo: la
+    tarea declara entonces el **contexto** que se le entrega y PUNTO decide qué se
+    escribe y qué se ejecuta.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -328,6 +377,73 @@ class DeveloperTask(BaseModel):
     validations: tuple[CommandSpec, ...] = Field(default=(), description="Checks de validación.")
     commit_message: str = Field(..., min_length=1, description="Mensaje del commit local.")
 
+    # --- ENGINE-2: contexto controlado para un runner que genera código ---
+    acceptance_criteria: tuple[str, ...] = Field(
+        default=(), description="Criterios de aceptación que la propuesta debe cumplir."
+    )
+    context_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos del workspace que se entregan al modelo como contexto. "
+            "Ninguno más se envía: el repositorio completo nunca se vuelca."
+        ),
+    )
+    allowed_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Rutas que el modelo puede proponer modificar. Una propuesta que toque "
+            "cualquier otra ruta se rechaza. Si está vacío, se derivan de "
+            "``context_files``."
+        ),
+    )
+    max_context_bytes: int = Field(
+        default=200_000, gt=0, description="Límite de bytes de contexto enviado al modelo."
+    )
+
+
+# ---------------------------------------------------------------------------
+# ENGINE-2: propuesta del modelo
+# ---------------------------------------------------------------------------
+class ProposalOperation(StrEnum):
+    """Operación que el modelo puede proponer sobre un archivo.
+
+    ENGINE-2 V1 no admite borrado: un modelo no debe poder eliminar archivos.
+    """
+
+    CREATE = "CREATE"
+    REPLACE = "REPLACE"
+
+
+class ProposedFileChange(BaseModel):
+    """Cambio concreto propuesto por el modelo sobre un archivo."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str = Field(..., min_length=1, description="Ruta relativa al workspace.")
+    operation: ProposalOperation = Field(..., description="CREATE o REPLACE.")
+    content: str = Field(default="", description="Contenido COMPLETO tras el cambio.")
+
+
+class DeveloperProposal(BaseModel):
+    """Propuesta estructurada que devuelve el modelo.
+
+    El modelo **no** ejecuta nada: propone. PUNTO valida la propuesta completa
+    antes de aplicar nada.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    summary: str = Field(..., min_length=1, description="Resumen del cambio propuesto.")
+    changes: tuple[ProposedFileChange, ...] = Field(
+        default=(), description="Cambios propuestos."
+    )
+    validation_notes: tuple[str, ...] = Field(
+        default=(), description="Notas del modelo sobre la validación."
+    )
+    assumptions: tuple[str, ...] = Field(
+        default=(), description="Supuestos declarados por el modelo."
+    )
+
 
 __all__ = [
     "BLOCKED_EXIT_CODE",
@@ -340,12 +456,16 @@ __all__ = [
     "CommandSpec",
     "ContentAssertion",
     "DeveloperExecutionResult",
+    "DeveloperProposal",
     "DeveloperRunStatus",
     "DeveloperTask",
     "ExecutionTrustLevel",
     "FileChange",
     "FileOperation",
     "FileWrite",
+    "ModelUsage",
+    "ProposalOperation",
+    "ProposedFileChange",
     "SandboxCapabilities",
     "TextReplacement",
     "ValidationCheck",

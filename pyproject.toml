@@ -22,6 +22,8 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "pydantic>=2.8",
   "PyYAML>=6.0.1",
+  # ENGINE-2: cliente HTTP propio para la API de DeepSeek (sin SDK de terceros).
+  "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -44,7 +46,12 @@ where = ["src"]
 minversion = "8.0"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --strict-markers --strict-config"
+# El live gate de DeepSeek vive en tests/integration y se ejecuta aparte:
+# hace llamadas reales a la API, que no deben correr en cada suite.
+addopts = "-ra --strict-markers --strict-config --ignore=tests/integration"
+markers = [
+  "integration: pruebas que dependen de un servicio externo real (DeepSeek API)",
+]
 # Las advertencias se tratan como errores, con una única excepción explícita:
 # la deprecación de Starlette sobre `httpx` en su TestClient, que no depende de
 # este proyecto y no afecta al comportamiento del motor.

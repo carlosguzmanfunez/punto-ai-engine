@@ -26,7 +26,13 @@ from punto.schemas.qa import (
     QAPlan,
     QAStatus,
 )
-from qa_support import ACCEPTANCE_CRITERIA, make_task, plan_payload
+from qa_support import (
+    ACCEPTANCE_CRITERIA,
+    coverage_entry,
+    make_task,
+    plan_payload,
+    qa_case,
+)
 
 
 def check(
@@ -237,6 +243,120 @@ def test_skipped_case_is_not_treated_as_covered() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Frontera exacta del token (ENGINE-4.1)
+# ---------------------------------------------------------------------------
+def test_prefix_token_does_not_collide_on_failure() -> None:
+    """§1: el fallo de ``QU-10`` no se atribuye también a ``QU-1``.
+
+    ``qu_1`` es substring de ``qu_10``: con una búsqueda de substring, un solo fallo
+    marcaba dos casos.
+    """
+    output = (
+        "FAILED tests/test_x.py::test_qu_10_below - assert -10 == 0\n"
+        "PASSED tests/test_x.py::test_qu_1_below\n"
+    )
+
+    mapping = case_failures_from_output(
+        output, ("QU-1", "QU-10"), file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert mapping["QU-10"] is QAFailureCategory.PRODUCT_FAILURE
+    assert mapping["QU-1"] is None
+
+
+def test_prefix_token_does_not_collide_in_the_other_direction() -> None:
+    """§1: el fallo de ``QU-1`` no se atribuye a ``QU-10``."""
+    output = (
+        "FAILED tests/test_x.py::test_qu_1_below - assert -5 == 0\n"
+        "PASSED tests/test_x.py::test_qu_10_below\n"
+    )
+
+    mapping = case_failures_from_output(
+        output, ("QU-1", "QU-10"), file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert mapping["QU-1"] is QAFailureCategory.PRODUCT_FAILURE
+    assert mapping["QU-10"] is None
+
+
+def test_both_cases_are_attributed_when_both_pass() -> None:
+    """Ambos casos con sus propias pruebas en verde quedan cubiertos."""
+    output = (
+        "PASSED tests/test_x.py::test_qu_1_below\n"
+        "PASSED tests/test_x.py::test_qu_10_below\n"
+    )
+
+    mapping = case_failures_from_output(
+        output, ("QU-1", "QU-10"), file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert mapping == {"QU-1": None, "QU-10": None}
+
+
+def test_parameterized_node_is_attributed_to_its_case() -> None:
+    """§5.8: ``test_qu_1_boundary[param]`` sigue perteneciendo a ``QU-1``."""
+    output = "FAILED tests/test_x.py::test_qu_1_boundary[param] - assert 1 == 2\n"
+
+    mapping = case_failures_from_output(
+        output, ("QU-1", "QU-10"), file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert mapping["QU-1"] is QAFailureCategory.PRODUCT_FAILURE
+    assert mapping["QU-10"] is QAFailureCategory.QA_TEST_FAILURE
+
+
+def test_longer_token_is_not_attributed_to_the_shorter_one() -> None:
+    """Un caso sin pruebas propias no se da por cubierto por otro parecido."""
+    output = "PASSED tests/test_x.py::test_qu_100_other\n"
+
+    mapping = case_failures_from_output(
+        output, ("QU-1", "QU-100"), file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert mapping["QU-100"] is None
+    assert mapping["QU-1"] is QAFailureCategory.QA_TEST_FAILURE
+
+
+def test_attribution_is_deterministic() -> None:
+    """§5.9: repetir la atribución produce exactamente el mismo resultado."""
+    output = (
+        "FAILED tests/test_x.py::test_qu_10_below - assert -10 == 0\n"
+        "PASSED tests/test_x.py::test_qu_1_below\n"
+        "SKIPPED [1] tests/test_x.py::test_qu_2_skipped: motivo\n"
+    )
+    case_ids = ("QU-1", "QU-2", "QU-10")
+
+    first = case_failures_from_output(
+        output, case_ids, file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+    second = case_failures_from_output(
+        output, case_ids, file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+    third = case_failures_from_output(
+        output, case_ids, file_failure=QAFailureCategory.PRODUCT_FAILURE
+    )
+
+    assert first == second == third
+    assert first["QU-10"] is QAFailureCategory.PRODUCT_FAILURE
+    assert first["QU-1"] is None
+    assert first["QU-2"] is QAFailureCategory.QA_TEST_FAILURE
+
+
+def test_node_matching_helper_rejects_prefix_collisions() -> None:
+    """La frontera exacta se comprueba directamente, sobre nodo y sobre contenido."""
+    from punto.qa.report import content_defines_case, node_matches_case
+
+    assert node_matches_case("tests/test_x.py::test_qu_1_below", "QU-1") is True
+    assert node_matches_case("tests/test_x.py::test_qu_10_below", "QU-1") is False
+    assert node_matches_case("tests/test_x.py::test_qu_1[param]", "QU-1") is True
+    assert node_matches_case("tests/test_x.py::TestCls::test_qu_1_x", "QU-1") is True
+
+    assert content_defines_case("def test_qu_1_below() -> None:\n    pass\n", "QU-1") is True
+    assert content_defines_case("def test_qu_10_below() -> None:\n    pass\n", "QU-1") is False
+    assert content_defines_case("# test_qu_1 solo en un comentario\n", "QU-1") is False
+
+
+# ---------------------------------------------------------------------------
 # Cobertura
 # ---------------------------------------------------------------------------
 def test_coverage_marks_covered_criteria(correct_workspace: object) -> None:
@@ -307,6 +427,52 @@ def test_coverage_never_loses_a_criterion(correct_workspace: object) -> None:
 
     assert len(coverage) == len(ACCEPTANCE_CRITERIA)
     assert all(item.status is AcceptanceCoverageStatus.NOT_EXECUTED for item in coverage)
+
+
+def test_colliding_cases_do_not_cross_criteria(correct_workspace: object) -> None:
+    """La cobertura final no cruza criterios cuando los casos son prefijos entre sí."""
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        test_content=(
+            "def test_qu_1_below() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_10_other() -> None:\n"
+            "    assert True\n"
+        ),
+        cases=(
+            qa_case("QU-1", "límite inferior", "AC-1", expected="clamp(-5, 0, 10) == 0"),
+            qa_case("QU-2", "límite superior", "AC-2", expected="clamp(15, 0, 10) == 10"),
+            qa_case("QU-10", "rango interior", "AC-3", expected="clamp(5, 0, 10) == 5"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=("QU-1",)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=("QU-2",)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-10",)),
+        ),
+    )
+    payload["test_file_changes"][0]["test_case_ids"] = ["QU-1", "QU-2", "QU-10"]
+    colliding_plan = QAPlan(
+        task_id=uuid4(),
+        project_id=uuid4(),
+        summary=payload["summary"],
+        test_cases=tuple(payload["test_cases"]),
+        test_file_changes=tuple(payload["test_file_changes"]),
+        checks=tuple(payload["checks"]),
+        coverage_mapping=tuple(payload["coverage_mapping"]),
+    )
+
+    coverage = compute_coverage(
+        task,
+        colliding_plan,
+        case_outcomes={
+            "QU-1": None,
+            "QU-2": None,
+            "QU-10": QAFailureCategory.PRODUCT_FAILURE,
+        },
+    )
+
+    assert coverage[2].status is AcceptanceCoverageStatus.FAILED
+    assert coverage[0].status is AcceptanceCoverageStatus.COVERED
 
 
 # ---------------------------------------------------------------------------

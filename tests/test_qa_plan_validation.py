@@ -354,6 +354,167 @@ def test_plan_cannot_declare_its_own_status() -> None:
     assert "status" in str(caught.value)
 
 
+# ---------------------------------------------------------------------------
+# Colisión de tokens normalizados (ENGINE-4.1)
+# ---------------------------------------------------------------------------
+def test_prefix_case_ids_are_valid_together(correct_workspace: object) -> None:
+    """§5.1: ``QU-1`` y ``QU-10`` conviven: son tokens distintos."""
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        test_content=(
+            "def test_qu_1_below() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_2_above() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_10_within() -> None:\n"
+            "    assert True\n"
+        ),
+        cases=(
+            qa_case("QU-1", "límite inferior", "AC-1", expected="clamp(-5, 0, 10) == 0"),
+            qa_case("QU-2", "límite superior", "AC-2", expected="clamp(15, 0, 10) == 10"),
+            qa_case("QU-10", "rango interior", "AC-3", expected="clamp(5, 0, 10) == 5"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=("QU-1",)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=("QU-2",)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-10",)),
+        ),
+    )
+    payload["test_file_changes"][0]["test_case_ids"] = ["QU-1", "QU-2", "QU-10"]
+
+    validation = validate_qa_plan(proposal(payload), task, registry=DEFAULT_CHECK_REGISTRY)
+
+    assert validation.valid, validation.violations
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("QU-1", "QU_1"),
+        ("QU.1", "QU_1"),
+        ("QU-1", "qu 1"),
+        ("Case-1", "case_1"),
+    ],
+)
+def test_normalized_token_collision_is_rejected(
+    correct_workspace: object, first: str, second: str
+) -> None:
+    """§2: dos identificadores distintos con el mismo token se rechazan.
+
+    Sus pruebas serían indistinguibles en ejecución y un fallo podría atribuirse al caso
+    equivocado. Se rechaza el plan entero en lugar de convivir con la ambigüedad.
+    """
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        cases=(
+            qa_case(first, "primer caso", "AC-1", expected="el primero se observa"),
+            qa_case(second, "segundo caso", "AC-2", expected="el segundo se observa"),
+            qa_case("QU-3", "tercer caso", "AC-3", expected="el tercero se observa"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=(first,)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=(second,)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-3",)),
+        ),
+    )
+    payload["test_file_changes"][0]["test_case_ids"] = [first, second, "QU-3"]
+
+    violations = validate_qa_plan(proposal(payload), task, registry=DEFAULT_CHECK_REGISTRY)
+
+    assert not violations.valid
+    assert any("normalized test token collision" in item for item in violations.violations)
+
+
+def test_longer_test_does_not_satisfy_the_shorter_case(correct_workspace: object) -> None:
+    """§4: ``test_qu_10`` no satisface la declaración del caso ``QU-1``."""
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        test_content=(
+            "def test_qu_10_below() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_2_above() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_3_within() -> None:\n"
+            "    assert True\n"
+        ),
+        cases=(
+            qa_case("QU-1", "límite inferior", "AC-1", expected="clamp(-5, 0, 10) == 0"),
+            qa_case("QU-2", "límite superior", "AC-2", expected="clamp(15, 0, 10) == 10"),
+            qa_case("QU-3", "rango interior", "AC-3", expected="clamp(5, 0, 10) == 5"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=("QU-1",)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=("QU-2",)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-3",)),
+        ),
+    )
+
+    violations = validate_qa_plan(proposal(payload), task, registry=DEFAULT_CHECK_REGISTRY)
+
+    assert not violations.valid
+    assert any("test_qu_1" in item for item in violations.violations)
+
+
+def test_case_is_not_satisfied_by_a_comment(correct_workspace: object) -> None:
+    """La validación textual exige una definición, no una mención en un comentario."""
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        test_content=(
+            "# test_qu_1 pendiente de implementar\n"
+            "def test_qu_2_above() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_3_within() -> None:\n"
+            "    assert True\n"
+        ),
+        cases=(
+            qa_case("QU-1", "límite inferior", "AC-1", expected="clamp(-5, 0, 10) == 0"),
+            qa_case("QU-2", "límite superior", "AC-2", expected="clamp(15, 0, 10) == 10"),
+            qa_case("QU-3", "rango interior", "AC-3", expected="clamp(5, 0, 10) == 5"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=("QU-1",)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=("QU-2",)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-3",)),
+        ),
+    )
+
+    violations = validate_qa_plan(proposal(payload), task, registry=DEFAULT_CHECK_REGISTRY)
+
+    assert not violations.valid
+    assert any("test_qu_1" in item for item in violations.violations)
+
+
+def test_parameterized_definition_satisfies_the_case(correct_workspace: object) -> None:
+    """Un caso implementado con parametrización sigue validando."""
+    task = make_task(correct_workspace)  # type: ignore[arg-type]
+    payload = plan_payload(
+        test_content=(
+            "import pytest\n\n\n"
+            "@pytest.mark.parametrize('value,expected', [(0, 0), (15, 10)])\n"
+            "def test_qu_1_boundary(value: int, expected: int) -> None:\n"
+            "    assert expected in (0, 10)\n\n\n"
+            "def test_qu_2_above() -> None:\n"
+            "    assert True\n\n\n"
+            "def test_qu_3_within() -> None:\n"
+            "    assert True\n"
+        ),
+        cases=(
+            qa_case("QU-1", "límite inferior", "AC-1", expected="clamp(-5, 0, 10) == 0"),
+            qa_case("QU-2", "límite superior", "AC-2", expected="clamp(15, 0, 10) == 10"),
+            qa_case("QU-3", "rango interior", "AC-3", expected="clamp(5, 0, 10) == 5"),
+        ),
+        coverage=(
+            coverage_entry("AC-1", ACCEPTANCE_CRITERIA[0], cases=("QU-1",)),
+            coverage_entry("AC-2", ACCEPTANCE_CRITERIA[1], cases=("QU-2",)),
+            coverage_entry("AC-3", ACCEPTANCE_CRITERIA[2], cases=("QU-3",)),
+        ),
+    )
+
+    validation = validate_qa_plan(proposal(payload), task, registry=DEFAULT_CHECK_REGISTRY)
+
+    assert validation.valid, validation.violations
+
+
 def test_validation_error_carries_every_violation() -> None:
     """El error de validación lleva todas las violaciones, no solo la primera."""
     validation = QAValidation(("uno", "dos", "tres"))

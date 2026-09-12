@@ -14,7 +14,7 @@ from typing import Final
 
 from punto.qa.checks import ValidationCheckRegistry
 from punto.qa.paths import PathKind, classify_path, normalize_relative_path
-from punto.qa.report import normalize_case_token
+from punto.qa.report import content_defines_case, normalize_case_token
 from punto.schemas.qa import (
     MAX_TEST_FILES,
     AcceptanceCoverageStatus,
@@ -85,6 +85,22 @@ def validate_qa_plan(
         violations.append(f"qa_plan: identificador de caso duplicado {duplicate!r}")
     known_cases = set(case_ids)
 
+    # Unicidad del **token normalizado**: ``QU-1`` y ``QU_1`` son identificadores
+    # distintos que producen la misma función de prueba, así que en ejecución serían
+    # indistinguibles y un fallo podría atribuirse al caso equivocado. Se rechaza el plan
+    # entero en lugar de convivir con una ambigüedad silenciosa.
+    token_owners: dict[str, str] = {}
+    for case_id in case_ids:
+        token = normalize_case_token(case_id)
+        owner = token_owners.get(token)
+        if owner is None:
+            token_owners[token] = case_id
+            continue
+        violations.append(
+            f"qa_plan: normalized test token collision: los casos {owner!r} y {case_id!r} "
+            f"producen el mismo token {token!r}, y sus pruebas serían indistinguibles"
+        )
+
     for case in proposal.test_cases:
         if len(case.expected_behavior.strip()) < MIN_EXPECTED_BEHAVIOR_CHARS:
             violations.append(
@@ -126,8 +142,12 @@ def validate_qa_plan(
             # Convención mecánica: la función de prueba lleva el identificador del caso
             # en minúsculas con guiones bajos. Es lo que permite atribuir cada fallo a
             # su criterio en lugar de declarar roto todo el archivo.
-            token = f"test_{normalize_case_token(case_id)}"
-            if token not in test_file.content.lower():
+            #
+            # La comprobación es por **frontera exacta**: ``test_qu_10_x`` no satisface
+            # la declaración del caso ``QU-1``. Con una búsqueda de substring, un caso
+            # podría darse por implementado por la prueba de otro.
+            if not content_defines_case(test_file.content, case_id):
+                token = f"test_{normalize_case_token(case_id)}"
                 violations.append(
                     f"qa_plan: el archivo {test_file.path!r} declara el caso {case_id!r} "
                     f"pero no contiene ninguna función {token!r}: la trazabilidad no se "

@@ -140,8 +140,64 @@ def normalize_case_token(case_id: str) -> str:
 
     ``QU-1`` se localiza como ``qu_1``. La convención es deliberadamente mecánica
     para que la trazabilidad se lea del nombre y no dependa de una interpretación.
+
+    Dos identificadores distintos pueden normalizar igual (``QU-1`` y ``QU_1``). Eso no
+    se resuelve aquí: el plan se rechaza en la validación, porque dos casos con el mismo
+    token serían indistinguibles en la ejecución.
     """
     return "".join(char if char.isalnum() else "_" for char in case_id.strip().lower())
+
+
+def case_token_pattern(token: str) -> re.Pattern[str]:
+    """Expresión que reconoce el token de un caso en un **nodo de pytest**.
+
+    Reconoce ``ruta::test_qu_1_x``, ``ruta::test_qu_1`` y ``ruta::test_qu_1_x[param]``,
+    pero **no** ``ruta::test_qu_10_x``: el token debe terminar en el final del nombre,
+    en un guion bajo o en el corchete de una parametrización.
+
+    Sin esa frontera, ``qu_1`` es substring de ``qu_10`` y el fallo de un caso se
+    atribuiría también a otro: exactamente el defecto que esta regla cierra.
+    """
+    return re.compile(rf"(?:^|::)test_{re.escape(token)}(?:_|$|\[)")
+
+
+def case_definition_pattern(token: str) -> re.Pattern[str]:
+    """Expresión que reconoce el token de un caso en el **contenido** de un archivo.
+
+    Es la misma semántica de frontera que en los nodos, pero **agnóstica del lenguaje**:
+    PUNTO es un motor general, así que la trazabilidad no puede exigir sintaxis de
+    Python. Reconoce ``def test_qu_1_x()``, ``it('test_qu_1_x')`` y
+    ``test('test_qu_1_x')`` por igual, y en todos los casos rechaza ``test_qu_10_x``.
+
+    La frontera excluye letras y dígitos pero **no** el guion bajo: ``test_qu_1_x``
+    pertenece a ``QU-1`` y ``test_qu_10_x`` no. Así ``qu_1`` nunca se satisface con
+    ``qu_10``.
+    """
+    return re.compile(rf"(?<![0-9A-Za-z_])test_{re.escape(token)}(?![0-9A-Za-z])")
+
+
+def node_matches_case(node: str, case_id: str) -> bool:
+    """True si el nodo de pytest pertenece **exactamente** a ese caso."""
+    return bool(case_token_pattern(normalize_case_token(case_id)).search(node.lower()))
+
+
+#: Prefijos que convierten una línea en un comentario, en los lenguajes soportados.
+_COMMENT_PREFIXES: Final[tuple[str, ...]] = ("#", "//", "*", "/*")
+
+
+def content_defines_case(content: str, case_id: str) -> bool:
+    """True si el contenido define la prueba **exactamente** de ese caso.
+
+    Se ignoran las líneas de comentario: mencionar un caso no es implementarlo.
+    """
+    pattern = case_definition_pattern(normalize_case_token(case_id))
+    for raw_line in content.splitlines():
+        line = raw_line.strip().lower()
+        if not line or line.startswith(_COMMENT_PREFIXES):
+            continue
+        if pattern.search(line):
+            return True
+    return False
 
 
 def parse_pytest_outcomes(output: str) -> dict[str, str]:
@@ -186,17 +242,27 @@ def case_failures_from_output(
     - todas pasaron → ``None`` (cubierto);
     - se omitió o no se observó → ``QA_TEST_FAILURE`` (evidencia no concluyente), que es
       lo conservador: «declarado pero no demostrado» no es «cubierto»;
-    - el archivo entero no produjo resultados (error de colección) → el fallo del
-      archivo.
+    - el archivo entero no produjo **ningún** resultado (error de colección) → el fallo
+      del archivo.
+
+    El emparejamiento es por **frontera exacta**, no por substring: ``test_qu_10_x`` no
+    pertenece a ``QU-1``, y ``test_qu_1_x[param]`` sí pertenece a ``QU-1``.
+
+    Cuando el archivo sí produjo resultados, un caso sin nodo propio **no** hereda el
+    fallo de otro: heredar un ``PRODUCT_FAILURE`` ajeno sería atribuir a un caso un
+    defecto que no se demostró contra él.
     """
     outcomes = parse_pytest_outcomes(output)
     mapping: dict[str, QAFailureCategory | None] = {}
     for case_id in case_ids:
-        token = normalize_case_token(case_id)
-        matching = {node: result for node, result in outcomes.items() if token in node.lower()}
+        matching = {
+            node: result
+            for node, result in outcomes.items()
+            if node_matches_case(node, case_id)
+        }
         if not matching:
             mapping[case_id] = (
-                file_failure if file_failure is not None else QAFailureCategory.QA_TEST_FAILURE
+                file_failure if not outcomes else QAFailureCategory.QA_TEST_FAILURE
             )
             continue
         if any(result in ("FAILED", "ERROR") for result in matching.values()):
@@ -617,11 +683,15 @@ __all__ = [
     "QATestFileOutcome",
     "build_findings",
     "build_report",
+    "case_definition_pattern",
     "case_failures_from_output",
+    "case_token_pattern",
     "classify_check_failure",
     "compute_coverage",
+    "content_defines_case",
     "determine_status",
     "is_pytest_check",
+    "node_matches_case",
     "normalize_case_token",
     "parse_pytest_outcomes",
     "worst_failure",

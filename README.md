@@ -1719,7 +1719,15 @@ La trazabilidad es **mecánica**, no interpretativa:
   caso) o `UNTESTABLE` (con un motivo). **Ningún criterio puede desaparecer**;
 - cada función de prueba lleva el identificador de su caso en el nombre
   (`test_qu_1_...`). Sin esa convención, PUNTO rechaza el plan: la trazabilidad tiene
-  que poder comprobarse, no suponerse.
+  que poder comprobarse, no suponerse;
+- el emparejamiento es por **frontera exacta**, no por substring: `test_qu_10_x` no
+  pertenece a `QU-1`, y `test_qu_1_x[param]` sí pertenece a `QU-1`. La frontera es
+  agnóstica del lenguaje (`def test_qu_1_x`, `it('test_qu_1_x')`), porque PUNTO es un
+  motor general;
+- dos identificadores que normalizan al mismo token (`QU-1` y `QU_1`) se rechazan: sus
+  pruebas serían indistinguibles y un fallo podría atribuirse al caso equivocado;
+- un caso sin prueba observada **no** hereda el fallo de otro: se marca como no
+  concluyente.
 
 Esa convención permite atribuir cada fallo al caso —y por tanto al criterio— que lo
 produjo. Un QA que declara roto todo el contrato porque una sola aserción falló es un

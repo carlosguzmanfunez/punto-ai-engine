@@ -885,6 +885,275 @@ class AuditLogger:
             },
         )
 
+    # --------------------------------- Architect y planificación (ENGINE-3)
+    def log_architect_request_started(
+        self,
+        *,
+        project_id: UUID,
+        project_name: str,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        max_attempts: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una planificación de arquitectura."""
+        return self.record(
+            AuditEventType.ARCHITECT_REQUEST_STARTED,
+            action="architect_request_started",
+            resource_id=project_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_name": project_name[:200],
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "max_attempts": max_attempts,
+            },
+        )
+
+    def log_architect_plan_received(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        components: int,
+        requirements: int,
+        capabilities: int,
+        open_questions: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la recepción de un diseño del Architect.
+
+        Se registran recuentos y no el contenido: el diseño completo no pertenece al
+        log de auditoría.
+        """
+        return self.record(
+            AuditEventType.ARCHITECT_PLAN_RECEIVED,
+            action="architect_plan_received",
+            resource_id=project_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "components": components,
+                "requirements": requirements,
+                "capabilities": capabilities,
+                "open_questions": open_questions,
+            },
+        )
+
+    def log_architect_plan_accepted(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        style: str,
+        model_calls: int,
+        total_tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un diseño aceptado tras superar los invariantes."""
+        return self.record(
+            AuditEventType.ARCHITECT_PLAN_ACCEPTED,
+            action="architect_plan_accepted",
+            resource_id=project_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "architecture_style": style[:200],
+                "model_calls": model_calls,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_architect_plan_rejected(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un diseño rechazado, con las violaciones concretas."""
+        return self.record(
+            AuditEventType.ARCHITECT_PLAN_REJECTED,
+            action="architect_plan_rejected",
+            resource_id=project_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "violations": [item[:300] for item in violations],
+                "violation_count": len(violations),
+                "detail": detail[:300],
+            },
+        )
+
+    def log_planner_request_started(
+        self,
+        *,
+        project_id: UUID,
+        project_name: str,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        max_attempts: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una planificación de trabajo."""
+        return self.record(
+            AuditEventType.PLANNER_REQUEST_STARTED,
+            action="planner_request_started",
+            resource_id=project_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_name": project_name[:200],
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "max_attempts": max_attempts,
+            },
+        )
+
+    def log_roadmap_received(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        milestones: int,
+        epics: int,
+        tasks: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la recepción de un roadmap del Planner."""
+        return self.record(
+            AuditEventType.ROADMAP_RECEIVED,
+            action="roadmap_received",
+            resource_id=project_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "milestones": milestones,
+                "epics": epics,
+                "tasks": tasks,
+            },
+        )
+
+    def log_task_graph_accepted(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        tasks: int,
+        ready_tasks: int,
+        model_calls: int,
+        total_tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un grafo de tareas aceptado (DAG válido)."""
+        return self.record(
+            AuditEventType.TASK_GRAPH_ACCEPTED,
+            action="task_graph_accepted",
+            resource_id=project_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "tasks": tasks,
+                "ready_tasks": ready_tasks,
+                "model_calls": model_calls,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_task_graph_rejected(
+        self,
+        *,
+        project_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un grafo de tareas rechazado, con las violaciones concretas."""
+        return self.record(
+            AuditEventType.TASK_GRAPH_REJECTED,
+            action="task_graph_rejected",
+            resource_id=project_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "attempt": attempt,
+                "violations": [item[:300] for item in violations],
+                "violation_count": len(violations),
+                "detail": detail[:300],
+            },
+        )
+
+    def log_project_plan_completed(
+        self,
+        *,
+        project_id: UUID,
+        status: str,
+        milestones: int,
+        epics: int,
+        tasks: int,
+        ready_tasks: int,
+        capability_gaps: int,
+        model_calls: int,
+        attempts: int,
+        total_tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una planificación de proyecto."""
+        return self.record(
+            AuditEventType.PROJECT_PLAN_COMPLETED,
+            action="project_plan_completed",
+            resource_id=project_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "status": status,
+                "milestones": milestones,
+                "epics": epics,
+                "tasks": tasks,
+                "ready_tasks": ready_tasks,
+                "capability_gaps": capability_gaps,
+                "model_calls": model_calls,
+                "attempts": attempts,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_project_plan_blocked(
+        self,
+        *,
+        project_id: UUID,
+        reason: str,
+        detail: str = "",
+        violations: Sequence[str] = (),
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una planificación bloqueada o fallida, con su motivo."""
+        return self.record(
+            AuditEventType.PROJECT_PLAN_BLOCKED,
+            action="project_plan_blocked",
+            resource_id=project_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "reason": reason[:300],
+                "detail": detail[:500],
+                "violations": [item[:300] for item in violations],
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

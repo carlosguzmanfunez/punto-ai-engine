@@ -62,6 +62,19 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEVELOPER_ATTEMPT_FAILED: "developer_attempt",
     AuditEventType.DEVELOPER_REPAIR_REQUESTED: "developer_attempt",
     AuditEventType.DEVELOPER_ATTEMPT_PASSED: "developer_attempt",
+    # --- Architect y planificación de proyecto (ENGINE-3) ---------------------
+    #: Todos se registran sobre el ``project_id``, de modo que
+    #: ``AuditLogger.by_resource(project_id)`` reconstruye la planificación entera.
+    AuditEventType.ARCHITECT_REQUEST_STARTED: "architect_request",
+    AuditEventType.ARCHITECT_PLAN_RECEIVED: "architecture_plan",
+    AuditEventType.ARCHITECT_PLAN_REJECTED: "architecture_plan",
+    AuditEventType.ARCHITECT_PLAN_ACCEPTED: "architecture_plan",
+    AuditEventType.PLANNER_REQUEST_STARTED: "planner_request",
+    AuditEventType.ROADMAP_RECEIVED: "roadmap",
+    AuditEventType.TASK_GRAPH_REJECTED: "task_graph",
+    AuditEventType.TASK_GRAPH_ACCEPTED: "task_graph",
+    AuditEventType.PROJECT_PLAN_COMPLETED: "project_plan",
+    AuditEventType.PROJECT_PLAN_BLOCKED: "project_plan",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

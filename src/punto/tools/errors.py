@@ -138,12 +138,84 @@ class SandboxUnavailableError(TrustBoundaryError):
         super().__init__(f"Sandbox no disponible: {detail}")
 
 
+# ---------------------------------------------------------------------------
+# Capa de planificación (ENGINE-3)
+# ---------------------------------------------------------------------------
+class PlanningError(RuntimeError):
+    """Base de los errores de la capa de planificación.
+
+    Deliberadamente **no** hereda de :class:`DeveloperExecutionError`: planificar no
+    es ejecutar. Un plan inválido no es un fallo de ejecución y la auditoría debe
+    poder distinguirlos.
+    """
+
+
+class PlanningValidationError(PlanningError):
+    """El plan propuesto incumple un invariante determinista.
+
+    Lleva la lista completa de violaciones: PUNTO rechaza el plan entero y devuelve
+    todas las razones al modelo, no solo la primera.
+    """
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(f"Plan inválido ({len(self.violations)} violación/es): {detail}")
+
+
+class PlanningCycleError(PlanningError):
+    """El grafo de tareas contiene un ciclo de dependencias."""
+
+    def __init__(self, cycle: str) -> None:
+        self.cycle = cycle
+        super().__init__(f"Ciclo de dependencias en el grafo de tareas: {cycle}")
+
+
+class PlanningLimitExceededError(PlanningError):
+    """Se superó un límite declarado de la planificación."""
+
+    def __init__(self, limit: str, observed: object, allowed: object) -> None:
+        self.limit = limit
+        self.observed = observed
+        self.allowed = allowed
+        super().__init__(
+            f"Límite de planificación excedido ({limit}): observado {observed!r}, "
+            f"permitido {allowed!r}"
+        )
+
+
+class ArchitectRunnerNotConfiguredError(PlanningError):
+    """No hay ningún ``ArchitectRunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay ArchitectRunner configurado: inyecta uno en Camus("
+            "architect_runner=...) para planificar proyectos."
+        )
+
+
+class PlannerRunnerNotConfiguredError(PlanningError):
+    """No hay ningún ``PlannerRunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay PlannerRunner configurado: inyecta uno en Camus("
+            "planner_runner=...) para planificar proyectos."
+        )
+
+
 __all__ = [
+    "ArchitectRunnerNotConfiguredError",
     "BranchPolicyViolationError",
     "CommandNotAllowedError",
     "DeveloperExecutionError",
     "DeveloperRunnerNotConfiguredError",
     "ExecutionLimitExceededError",
+    "PlannerRunnerNotConfiguredError",
+    "PlanningCycleError",
+    "PlanningError",
+    "PlanningLimitExceededError",
+    "PlanningValidationError",
     "ProtectedFileError",
     "SandboxRequiredError",
     "SandboxUnavailableError",

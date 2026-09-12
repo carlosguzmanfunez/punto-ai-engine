@@ -39,11 +39,13 @@ from punto.providers.deepseek import (
     DeepSeekBalanceError,
     DeepSeekClient,
     DeepSeekConfig,
+    DeepSeekError,
     DeepSeekInvalidResponseError,
     DeepSeekModelNotSupportedError,
     DeepSeekRateLimitError,
     DeepSeekServerError,
     DeepSeekTimeoutError,
+    DeepSeekTruncatedResponseError,
     ModelCompletion,
     parse_proposal_json,
 )
@@ -294,16 +296,52 @@ def test_invalid_json_body_fails() -> None:
         client.complete_json(system_prompt="s", user_prompt="u")
 
 
-def test_empty_content_fails() -> None:
-    """§21.5: contenido vacío falla."""
-    body = chat_body("")
+def test_truncated_response_is_reported_as_truncation() -> None:
+    """Un JSON cortado por el límite de salida se reporta como truncamiento.
+
+    Sin esta distinción, el motor veía un error de sintaxis («unterminated string») y
+    lo trataba como una propuesta reparable: gastaba intentos repitiendo la misma
+    petición con el mismo presupuesto, que vuelve a cortarse igual.
+    """
+    body = chat_body('{"summary": "a medias')
+    body["choices"][0]["finish_reason"] = "length"
+    body["choices"][0]["message"]["reasoning_content"] = "razonamiento interno"
     client = DeepSeekClient(
         DeepSeekConfig(api_key=FAKE_KEY),
         transport=make_transport(lambda _r: json_response(200, body)),
     )
 
-    with pytest.raises(DeepSeekInvalidResponseError):
+    with pytest.raises(DeepSeekTruncatedResponseError) as caught:
         client.complete_json(system_prompt="s", user_prompt="u")
+
+    message = str(caught.value)
+    assert "truncada" in message
+    assert "length" in message
+    assert "max_tokens" in message
+
+
+def test_truncation_is_a_kind_of_invalid_response() -> None:
+    """El truncamiento sigue siendo un fallo del proveedor, no del contrato."""
+    assert issubclass(DeepSeekTruncatedResponseError, DeepSeekInvalidResponseError)
+    assert issubclass(DeepSeekTruncatedResponseError, DeepSeekError)
+
+
+def test_empty_content_fails() -> None:
+    """§21.5: contenido vacío falla, y el error dice por qué."""
+    body = chat_body("")
+    body["choices"][0]["message"]["reasoning_content"] = "razonamiento interno"
+    client = DeepSeekClient(
+        DeepSeekConfig(api_key=FAKE_KEY),
+        transport=make_transport(lambda _r: json_response(200, body)),
+    )
+
+    with pytest.raises(DeepSeekInvalidResponseError) as caught:
+        client.complete_json(system_prompt="s", user_prompt="u")
+
+    message = str(caught.value)
+    assert "contenido vacío" in message
+    assert "finish_reason" in message
+    assert "razonamiento=presente" in message
 
 
 def test_proposal_schema_validation_rejects_bad_payload() -> None:

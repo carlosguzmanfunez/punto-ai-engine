@@ -59,6 +59,17 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.developer.context",
     "punto.developer.local",
     "punto.developer.sandbox",
+    # --- ENGINE-3: capa de planificación -------------------------------------
+    "punto.schemas.planning",
+    "punto.planning",
+    "punto.planning.capabilities",
+    "punto.planning.graph",
+    "punto.architect",
+    "punto.architect.base",
+    "punto.architect.prompts",
+    "punto.planner",
+    "punto.planner.base",
+    "punto.planner.prompts",
 )
 
 
@@ -112,6 +123,29 @@ def test_every_module_imports_in_reverse_declaration_order() -> None:
     code = "\n".join(f"import {module}" for module in reversed(COLD_IMPORT_MODULES))
 
     result = run_in_fresh_interpreter(code)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_planning_packages_do_not_eagerly_load_their_runners() -> None:
+    """``punto.architect`` y ``punto.planner`` no arrastran el cliente HTTP.
+
+    Misma regla que en ENGINE-1.R3: los ``__init__`` internos no reexportan. Importar
+    el paquete de un rol no debe cargar ``httpx`` ni la implementación de DeepSeek.
+    """
+    result = run_in_fresh_interpreter(
+        "import sys\n"
+        "import punto.architect\n"
+        "import punto.planner\n"
+        "import punto.planning\n"
+        "assert 'httpx' not in sys.modules, 'la planificacion arrastro httpx'\n"
+        "assert 'punto.architect.deepseek' not in sys.modules, (\n"
+        "    'punto.architect cargo su runner de DeepSeek de forma eager'\n"
+        ")\n"
+        "assert 'punto.planner.deepseek' not in sys.modules, (\n"
+        "    'punto.planner cargo su runner de DeepSeek de forma eager'\n"
+        ")"
+    )
 
     assert result.returncode == 0, result.stderr
 

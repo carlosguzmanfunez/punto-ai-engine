@@ -1368,7 +1368,300 @@ respondió sin `DeepSeekModelNotSupportedError` y devolvió ese mismo identifica
 
 ---
 
-## 21. Licencia
+## 21. ENGINE-3 — Architect + Project Planning Layer
+
+ENGINE-3 cambia el propósito del motor: deja de estar diseñado alrededor de un
+proyecto concreto y se convierte en un **motor general de creación de software**.
+
+```
+Usuario: "Quiero crear una plataforma para administrar clínicas dentales"
+        ↓
+      CAMUS  →  Architect  →  Planner  →  Developer  →  Sandbox  →  QA …
+```
+
+ENGINE-3 construye los dos primeros roles y los conecta a CAMUS. Convierte una
+intención humana en estructuras deterministas y validadas:
+
+```
+ProjectIntent → ProjectSpec → ArchitecturePlan → Roadmap → TaskGraph
+```
+
+**Todavía no ejecuta nada.** El Developer de ENGINE-2 seguirá siendo el ejecutor
+cuando CAMUS le entregue trabajo; ENGINE-3 diseña y planifica.
+
+### Separación de roles
+
+La separación está en **interfaces y esquemas**, no solo en los prompts:
+
+| Rol | Responde | No hace |
+| --- | --- | --- |
+| Architect | qué sistema debemos construir | no escribe archivos, no ejecuta, no decide autoridad |
+| Planner | cómo dividirlo en trabajo ejecutable | no elige arquitectura, no escribe código, no ejecuta |
+| Developer | cómo implementar una tarea concreta | no decide la arquitectura global |
+| CAMUS | qué está permitido y qué ocurre después | no inventa implementaciones |
+
+### Componentes nuevos
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `ArchitectRunner` | `src/punto/architect/base.py` | Interfaz provider-agnostic del diseño |
+| `DeepSeekArchitectRunner` | `src/punto/architect/deepseek.py` | Implementación real con repair loop |
+| `PlannerRunner` | `src/punto/planner/base.py` | Interfaz provider-agnostic de la planificación |
+| `DeepSeekPlannerRunner` | `src/punto/planner/deepseek.py` | Implementación real, con ensamblado determinista |
+| Esquemas | `src/punto/schemas/planning.py` | Contratos de datos, con id, versión y timestamp |
+| Invariantes | `src/punto/planning/graph.py` | Reglas deterministas del plan |
+| Capacidades | `src/punto/planning/capabilities.py` | Qué puede ejecutar PUNTO hoy y qué no |
+| Prompts | `src/punto/architect/prompts.py`, `src/punto/planner/prompts.py` | Contratos versionados |
+
+`punto.planning` no importa nada de `punto.architect` ni de `punto.planner`: son los
+roles los que dependen de las reglas, nunca al revés. Los `__init__` de los tres
+paquetes no reexportan: importar un rol no arrastra `httpx`.
+
+### ProjectIntent
+
+Solo `name` y `description` son obligatorios. Todo lo demás —objetivo de negocio,
+usuarios, capacidades, restricciones, stack preferido, despliegue, requisitos no
+funcionales, integraciones, presupuesto, notas— es opcional: **no se obliga a la
+persona a declarar datos técnicos que el Architect puede inferir**.
+
+### ProjectSpec y preguntas abiertas
+
+El Architect transforma lenguaje humano en especificación estructurada: problema,
+objetivos, usuarios, requisitos funcionales y no funcionales (con id trazable y
+criterio de aceptación), supuestos, restricciones, fuera de alcance, criterios de
+éxito, riesgos y preguntas abiertas **clasificadas**:
+
+| Clasificación | ¿Bloquea la planificación? | ¿Quién decide? |
+| --- | --- | --- |
+| `TECHNICAL_INFERABLE` | No | El motor |
+| `BUSINESS_DECISION` | No | Una persona, antes de ejecutar |
+| `LEGAL_DECISION` | No | Una persona, antes de ejecutar |
+| `FINANCIAL_DECISION` | No | Una persona, antes de ejecutar |
+| `MISSING_CRITICAL_INFORMATION` | **Sí** | Una persona, antes de planificar |
+
+Solo el último tipo detiene el plan. Las decisiones de negocio, legales y financieras
+se **registran y se difieren**: no se convierten en Human Gate de planificación.
+
+### ArchitecturePlan
+
+Estilo arquitectónico, componentes con responsabilidad y dependencias, servicios,
+módulos, almacenes de datos, integraciones externas, interfaces, fronteras de
+seguridad, topología, observabilidad, estrategia de pruebas, elecciones
+tecnológicas, alternativas consideradas y riesgos.
+
+Cada decisión tecnológica guarda `decision`, `reason`, `alternatives`, `tradeoffs` y
+`confidence`. **Nunca se almacena cadena de pensamiento**: decisiones resumidas y
+justificables.
+
+### ProjectCapabilityProfile y huecos
+
+Como el motor es general, **no se asume Python**. El Architect declara lo que el
+sistema elegido necesita (lenguajes, frameworks, bases de datos, gestores de
+paquetes, validadores, destinos de despliegue y perfiles de ejecución) y PUNTO lo
+compara con lo que puede ejecutar de verdad.
+
+| Estado | Significado |
+| --- | --- |
+| `AVAILABLE` | Demostrado en ENGINE-1.R3: `python312`, `git`, `podman`, `pytest`, `ruff`, `mypy`, `sqlite` |
+| `MISSING` | PUNTO sabe que no lo tiene (`node20`, `postgres`, `vercel`, `eslint`, `pip`…) |
+| `UNKNOWN` | PUNTO no tiene información: **se trata como no disponible**, jamás como disponible |
+
+Un hueco **no bloquea la planificación** (§17): se registra con las tareas que lo
+exigen para poder construir después el perfil de ejecución necesario. Lo que nunca se
+hace es improvisar una ejecución en el host como sustituto.
+
+La normalización de nombres es deliberadamente tolerante, porque los modelos escriben
+la misma tecnología de muchas formas: `Node.js` → `node20`, `typescript5.4` →
+`typescript`, `LANGUAGE: TypeScript 5.x` → `typescript`, `Node.js 20 LTS` → `node20`.
+Una capacidad que PUNTO no conoce conserva su nombre legible (`aws ecs/fargate`), no
+una versión mutilada.
+
+### Roadmap y TaskGraph
+
+```
+Milestone → Epic → Task
+```
+
+Cada tarea declara id, título, objetivo, descripción, criterios de aceptación,
+dependencias, archivos permitidos y de contexto, checks de validación, capacidades
+requeridas, riesgo, autoridad, complejidad, qué produce y su estado.
+
+El Planner propone; **PUNTO cablea las relaciones**: `Epic.task_ids` sale de
+`task.epic_id` y `Milestone.epic_ids` de `epic.milestone_id`, de modo que el modelo
+no puede declarar un enlace que no exista.
+
+La resolución del grafo es determinista y **no consulta al modelo**:
+
+| Consulta | Significado |
+| --- | --- |
+| `ready_tasks()` | Pendientes con **todas** sus dependencias en `DONE` |
+| `completed_tasks()` | Terminadas |
+| `blocked_tasks()` | Fallidas o bloqueadas, y todo lo que depende de ellas |
+| `next_tasks(n)` | Las primeras `n` listas, en orden del plan |
+| `topological_order()` | Orden determinista; falla si hay ciclo, diciendo cuál |
+
+### Invariantes de planificación
+
+El Planner puede proponer; PUNTO valida. No se acepta automáticamente:
+
+- ciclos de dependencias, identificadores duplicados, dependencias inexistentes,
+  tareas que dependen de sí mismas;
+- tareas sin criterios de aceptación, o con criterios y objetivos vagos
+  («Crear backend»);
+- milestones sin trabajo, epics huérfanos, tareas fuera de su epic;
+- archivos constitucionalmente protegidos en `allowed_files`;
+- capacidades exigidas por una tarea que no estén declaradas en el perfil;
+- riesgo alto o crítico declarado con autoridad autónoma;
+- planes desmedidos (más de 120 tareas).
+
+Un plan inválido no se «arregla»: se devuelven **todas** las violaciones al rol
+correspondiente para que proponga de nuevo dentro de su presupuesto.
+
+### Bucles de reparación
+
+`architect_max_attempts` y `planner_max_attempts` (3 por defecto) acotan cuántas veces
+puede reintentar cada rol. Igual que en ENGINE-2, se separan dos cosas que no son lo
+mismo:
+
+- **reintentos del proveedor**: los aplica el cliente HTTP ante fallos transitorios de
+  red; no consumen intentos de reparación;
+- **intentos de reparación**: los consume el rol cuando su propuesta incumple un
+  invariante.
+
+Agotados los intentos, el estado es `BLOCKED` con las violaciones acumuladas.
+
+### Modelo y routing
+
+Se reutiliza el `DeepSeekClient` de ENGINE-2: **no** se duplica cliente HTTP, ni
+autenticación, ni reintentos. El modelo es configuración, no código:
+
+```bash
+PUNTO_ARCHITECT_MODEL=deepseek-v4-pro
+PUNTO_PLANNER_MODEL=deepseek-v4-flash   # cada rol puede usar otro modelo
+PUNTO_PLANNING_MAX_TOKENS=65536
+```
+
+### Presupuesto de salida: una lección medida
+
+Con `thinking` activo, el razonamiento consume **el mismo** presupuesto que el
+documento JSON. La puerta viva lo midió con `deepseek-v4-pro` y
+`reasoning_effort=high`:
+
+| `max_tokens` | Resultado real |
+| --- | --- |
+| 8 192 | `finish_reason='length'`, JSON cortado a mitad de una cadena |
+| 16 384 | `stop`, JSON válido, ~11 400 tokens de salida (la mayoría razonamiento) |
+| 32 768 | `stop`, JSON válido |
+| 65 536 / 131 072 | aceptado por la API sin objeción |
+
+Dos consecuencias de diseño:
+
+1. el motor pide **65 536** tokens de salida para planificar (configurable con
+   `PUNTO_PLANNING_MAX_TOKENS`);
+2. un truncamiento se detecta y se reporta como tal —`DeepSeekTruncatedResponseError`
+   dice `finish_reason='length'` y el `max_tokens`— en lugar de disfrazarse de error
+   de sintaxis. Repetir la misma petición con el mismo límite no arregla nada, así que
+   **no** se trata como propuesta reparable.
+
+Además el plan está **acotado en el prompt** (máximo 4 milestones, 8 epics y 20
+tareas). Sin cota, el modelo produjo un roadmap de 86 656 caracteres. Un plan enorme
+no es un plan mejor: es un plan que nadie puede auditar.
+
+### Human Gates
+
+El motor decide por sí mismo lo técnico y reversible: framework, estructura de
+carpetas, librería de pruebas, ORM, linter, nombres internos, patrones
+arquitectónicos. **No** se convierte cada duda en un Human Gate.
+
+Los Human Gates siguen las reglas constitucionales ya existentes: negocio crítico,
+legal, financiero, producción, irreversible, riesgo alto o crítico, límites
+excedidos. En ENGINE-3 ninguno de esos casos se dispara todavía: planificar no
+ejecuta. Las preguntas diferidas viajan en el `ProjectPlanResult` para que la decisión
+se tome cuando toque, no antes.
+
+### Persistencia
+
+La persistencia real queda para una fase posterior, pero **todos** los artefactos
+llevan ya id estable (UUID), `created_at` y `schema_version`, de modo que guardarlos
+después no obligue a rediseñar los esquemas. Las tareas usan identificadores legibles
+estables (`T1`, `T2`…) porque son los que referencian las dependencias.
+
+### Auditoría
+
+Eventos nuevos: `ARCHITECT_REQUEST_STARTED`, `ARCHITECT_PLAN_RECEIVED`,
+`ARCHITECT_PLAN_REJECTED`, `ARCHITECT_PLAN_ACCEPTED`, `PLANNER_REQUEST_STARTED`,
+`ROADMAP_RECEIVED`, `TASK_GRAPH_REJECTED`, `TASK_GRAPH_ACCEPTED`,
+`PROJECT_PLAN_COMPLETED` y `PROJECT_PLAN_BLOCKED`.
+
+Se registran recuentos, motivos y violaciones —nunca el diseño completo ni el
+`reasoning_content`— y todo pasa por redacción: la credencial no aparece.
+
+### Generalidad: tres proyectos sintéticos
+
+Las pruebas planifican tres productos de naturaleza distinta con el **mismo código**.
+Ninguno se implementa: solo se planifican.
+
+| Fixture | Tecnología | Huecos detectados |
+| --- | --- | --- |
+| `python-api` (StockFlow) | Python, API REST | `fastapi`, `pip` |
+| `nextjs-saas` (ClientPulse) | TypeScript, Next.js, PostgreSQL | `typescript`, `nextjs`, `postgres`, `npm`, `eslint`, `tsc`, `vitest`, `vercel`, `node20` |
+| `cli` (NotesCLI) | Python, CLI sin dependencias | `pip` |
+
+Un proyecto Rust también se planifica: registra `rust` y `cargo` como huecos y no
+falla. El prompt del Architect no impone ninguna tecnología.
+
+### Pruebas y gates vivos
+
+| Comando | Qué cubre |
+| --- | --- |
+| `pytest` | Suite completa: esquemas, grafo, invariantes, capacidades, runners, CAMUS, generalidad |
+| `pytest tests/integration/test_architect_live.py -q` | **Gate vivo**: idea real → especificación y arquitectura válidas |
+| `pytest tests/integration/test_planner_live.py -q` | **Gate vivo**: arquitectura real → roadmap y DAG válidos |
+| `pytest tests/integration/test_e2e_planning_live.py -q` | **Gate vivo**: idea → plan completo por CAMUS, sin planificación humana |
+
+Los gates de ENGINE-3 necesitan `DEEPSEEK_API_KEY` pero **no** sandbox: planificar no
+ejecuta nada. Sin credencial fallan de forma explícita.
+
+### Evidencia de las llamadas reales
+
+Ejecución completa con `DEEPSEEK_API_KEY` presente: **6 gates, 0 fallos**.
+
+| Gate | Resultado real |
+| --- | --- |
+| Architect: especificación y arquitectura | `deepseek-v4-pro`, 1 llamada, 11 356 tokens, 4 componentes, 12 requisitos, 15 capacidades, 0 preguntas bloqueantes |
+| Architect: clasificación de dudas | 0 preguntas abiertas: no convirtió dudas en bloqueos |
+| Planner: roadmap y grafo | 1 intento, 21 063 tokens, 4 milestones, 8 epics, **20 tareas**, 46 dependencias, `ready=[T1]` |
+| Planner: cobertura de requisitos | los 6 requisitos `MUST` (R-001…R-006) están enlazados por tareas |
+| **End-to-end: idea → plan** | **PASS**: 1 llamada de Architect + 1 de Planner, 31 445 tokens, 20 tareas, **17 huecos de capacidad** registrados, 0 bloqueos, **2 preguntas diferidas** |
+| Determinismo del motor | dos planificaciones de la misma idea: dos PASS, 28 601 y 32 770 tokens |
+
+El gate end-to-end es la primera vez que PUNTO convierte una idea («plataforma web
+para clínicas dentales») en un plan de software completo **sin planificación humana
+manual**: especificación, arquitectura, roadmap y grafo de tareas, todo validado.
+
+Las dos preguntas diferidas de la última ejecución son de negocio y legales: se
+registraron y **no** bloquearon la planificación, que es exactamente el
+comportamiento pedido.
+
+### API
+
+Sin cambios: no se expone planificación por HTTP. `GET /health` → 200 y la misma
+superficie de rutas que en ENGINE-0.
+
+### Limitación declarada
+
+- ENGINE-3 **no ejecuta**: produce un plan validado. Convertir `ready_tasks()` en
+  ejecución real del Developer es una decisión de una fase posterior.
+- Los huecos de capacidad se registran, no se resuelven: PUNTO sigue sin poder
+  ejecutar Node, PostgreSQL ni nada fuera de lo demostrado.
+- La persistencia de planes está pendiente; los artefactos ya están preparados para
+  ella.
+- El modelo elige la tecnología cuando la persona no la declara. Si esa elección no
+  gusta, se corrige declarando restricciones en la intención, no editando el plan.
+
+---
+
+## 22. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

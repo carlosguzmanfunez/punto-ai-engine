@@ -19,13 +19,25 @@ acción marcada como no autónoma.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
+from punto.architect.base import ArchitectRequest, ArchitectRunner
+from punto.common import utc_now
 from punto.developer.base import DeveloperRunner
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
+from punto.planner.base import PlannerRequest, PlannerRunner
+from punto.planning.capabilities import detect_capability_gaps
+from punto.planning.graph import (
+    validate_architecture_plan,
+    validate_capability_profile,
+    validate_project_spec,
+    validate_roadmap,
+    validate_task_graph,
+)
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
@@ -37,11 +49,28 @@ from punto.schemas.enums import (
     TaskStatus,
 )
 from punto.schemas.execution import DeveloperExecutionResult, DeveloperRunStatus
+from punto.schemas.planning import (
+    ArchitecturePlan,
+    ModelExecutionSummary,
+    OpenQuestion,
+    ProjectCapabilityProfile,
+    ProjectIntent,
+    ProjectPlan,
+    ProjectPlanResult,
+    ProjectPlanStatus,
+    ProjectSpec,
+    Roadmap,
+    TaskGraph,
+)
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
 from punto.schemas.result import ExecutionResult
 from punto.schemas.task import Task
 from punto.tasks.manager import TaskManager
-from punto.tools.errors import DeveloperRunnerNotConfiguredError
+from punto.tools.errors import (
+    ArchitectRunnerNotConfiguredError,
+    DeveloperRunnerNotConfiguredError,
+    PlannerRunnerNotConfiguredError,
+)
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
@@ -157,6 +186,8 @@ class Camus:
         state_machine: StateMachine | None = None,
         planner: Planner | None = None,
         developer_runner: DeveloperRunner | None = None,
+        architect_runner: ArchitectRunner | None = None,
+        planner_runner: PlannerRunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -167,6 +198,10 @@ class Camus:
         #: Frontera de ejecución real (ENGINE-1). Inyectable y **opt-in**: si es
         #: ``None``, el comportamiento es exactamente el de ENGINE-0.
         self._developer = developer_runner
+        #: Capa de planificación (ENGINE-3). También **opt-in**: sin ella,
+        #: ``plan_project`` falla de forma explícita en vez de improvisar.
+        self._architect = architect_runner
+        self._planner_runner = planner_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -198,6 +233,268 @@ class Camus:
     def developer_runner(self) -> DeveloperRunner | None:
         """Frontera de ejecución inyectada, si existe (ENGINE-1)."""
         return self._developer
+
+    @property
+    def architect_runner(self) -> ArchitectRunner | None:
+        """Rol Architect inyectado, si existe (ENGINE-3)."""
+        return self._architect
+
+    @property
+    def planner_runner(self) -> PlannerRunner | None:
+        """Rol Planner inyectado, si existe (ENGINE-3)."""
+        return self._planner_runner
+
+    # ------------------------------------------------------------- ENGINE-3
+    def plan_project(self, intent: ProjectIntent) -> ProjectPlanResult:
+        """Convierte una intención humana en un plan de proyecto validado.
+
+        Flujo determinista, con validación de PUNTO en **cada** etapa:
+
+        ``intent`` → Architect → ``ProjectSpec`` + ``ArchitecturePlan`` + perfil →
+        Planner → ``Roadmap`` → ``TaskGraph`` → ``ProjectPlanResult``.
+
+        CAMUS no se fía del runner: revalida la especificación, la arquitectura, el
+        perfil, el roadmap y el grafo por su cuenta. Un artefacto inválido que
+        llegara desde una implementación defectuosa se detecta aquí.
+
+        **No ejecuta al Developer.** ENGINE-3 planifica; ejecutar es una decisión
+        posterior (§16).
+
+        Raises:
+            ArchitectRunnerNotConfiguredError: si no hay Architect inyectado.
+            PlannerRunnerNotConfiguredError: si no hay Planner inyectado.
+        """
+        if self._architect is None:
+            raise ArchitectRunnerNotConfiguredError()
+        if self._planner_runner is None:
+            raise PlannerRunnerNotConfiguredError()
+
+        started_at = utc_now()
+        project_id = intent.id
+
+        architecture_outcome = self._architect.design(
+            ArchitectRequest(project_id=project_id, intent=intent)
+        )
+
+        if architecture_outcome.proposal is None:
+            return self._blocked_plan(
+                intent=intent,
+                started_at=started_at,
+                architect=architecture_outcome.summary,
+                status=(
+                    ProjectPlanStatus.BLOCKED
+                    if architecture_outcome.status is ProjectPlanStatus.BLOCKED
+                    else ProjectPlanStatus.FAILED
+                ),
+                reason="ARCHITECT_FAILED",
+                detail=architecture_outcome.error,
+                violations=architecture_outcome.violations,
+            )
+
+        proposal = architecture_outcome.proposal
+        spec = proposal.project_spec
+        architecture = proposal.architecture
+        profile = proposal.capability_profile
+
+        # Revalidación independiente: la palabra del runner no basta.
+        violations = (
+            validate_project_spec(spec)
+            .merged(validate_architecture_plan(architecture))
+            .merged(validate_capability_profile(profile))
+        )
+        if not violations.valid:
+            return self._blocked_plan(
+                intent=intent,
+                started_at=started_at,
+                architect=architecture_outcome.summary,
+                status=ProjectPlanStatus.BLOCKED,
+                reason="ARCHITECT_PLAN_INVALID",
+                detail="la revalidación independiente de CAMUS encontró violaciones",
+                violations=violations.violations,
+                project_spec=spec,
+                architecture=architecture,
+                capability_profile=profile,
+            )
+
+        # Preguntas realmente bloqueantes: las de información crítica ausente.
+        blocking = spec.blocking_questions
+        if blocking:
+            return self._blocked_plan(
+                intent=intent,
+                started_at=started_at,
+                architect=architecture_outcome.summary,
+                status=ProjectPlanStatus.BLOCKED,
+                reason="MISSING_CRITICAL_INFORMATION",
+                detail="faltan datos sin los cuales el plan no es responsable",
+                violations=tuple(question.question for question in blocking),
+                project_spec=spec,
+                architecture=architecture,
+                capability_profile=profile,
+                blocking_questions=blocking,
+                deferred_questions=spec.deferred_questions,
+            )
+
+        planning_outcome = self._planner_runner.plan(
+            PlannerRequest(
+                project_id=project_id,
+                intent=intent,
+                project_spec=spec,
+                architecture=architecture,
+                capability_profile=profile,
+            )
+        )
+
+        if planning_outcome.roadmap is None or planning_outcome.task_graph is None:
+            return self._blocked_plan(
+                intent=intent,
+                started_at=started_at,
+                architect=architecture_outcome.summary,
+                planner=planning_outcome.summary,
+                status=(
+                    ProjectPlanStatus.BLOCKED
+                    if planning_outcome.status is ProjectPlanStatus.BLOCKED
+                    else ProjectPlanStatus.FAILED
+                ),
+                reason="PLANNER_FAILED",
+                detail=planning_outcome.error,
+                violations=planning_outcome.violations,
+                project_spec=spec,
+                architecture=architecture,
+                capability_profile=profile,
+                deferred_questions=spec.deferred_questions,
+            )
+
+        roadmap = planning_outcome.roadmap
+        graph = planning_outcome.task_graph
+
+        plan_violations = validate_roadmap(
+            roadmap, capability_profile=profile
+        ).merged(validate_task_graph(graph, roadmap=roadmap))
+        if not plan_violations.valid:
+            return self._blocked_plan(
+                intent=intent,
+                started_at=started_at,
+                architect=architecture_outcome.summary,
+                planner=planning_outcome.summary,
+                status=ProjectPlanStatus.BLOCKED,
+                reason="ROADMAP_INVALID",
+                detail="la revalidación independiente de CAMUS encontró violaciones",
+                violations=plan_violations.violations,
+                project_spec=spec,
+                architecture=architecture,
+                capability_profile=profile,
+                roadmap=roadmap,
+                task_graph=graph,
+                deferred_questions=spec.deferred_questions,
+            )
+
+        # Huecos de capacidad: se registran, NO bloquean la planificación (§17).
+        gaps = detect_capability_gaps(profile, roadmap.tasks)
+
+        plan = ProjectPlan(
+            intent=intent,
+            project_spec=spec,
+            architecture=architecture,
+            capability_profile=profile,
+            roadmap=roadmap,
+            task_graph=graph,
+            capability_gaps=gaps,
+            deferred_questions=spec.deferred_questions,
+            notes=(*proposal.notes,),
+        )
+
+        usage = architecture_outcome.summary.usage.merged(planning_outcome.summary.usage)
+        attempts = (
+            architecture_outcome.summary.attempts_used + planning_outcome.summary.attempts_used
+        )
+        self._audit.log_project_plan_completed(
+            project_id=project_id,
+            status=ProjectPlanStatus.PASS.value,
+            milestones=len(roadmap.milestones),
+            epics=len(roadmap.epics),
+            tasks=len(roadmap.tasks),
+            ready_tasks=len(graph.ready_tasks()),
+            capability_gaps=len(gaps),
+            model_calls=(
+                architecture_outcome.summary.model_calls + planning_outcome.summary.model_calls
+            ),
+            attempts=attempts,
+            total_tokens=usage.total_tokens,
+        )
+
+        return ProjectPlanResult(
+            project_id=project_id,
+            status=ProjectPlanStatus.PASS,
+            plan=plan,
+            project_spec=spec,
+            architecture=architecture,
+            capability_profile=profile,
+            roadmap=roadmap,
+            task_graph=graph,
+            capability_gaps=gaps,
+            deferred_questions=spec.deferred_questions,
+            architect=architecture_outcome.summary,
+            planner=planning_outcome.summary,
+            model_usage=usage,
+            attempts=attempts,
+            started_at=started_at,
+            completed_at=utc_now(),
+        )
+
+    def _blocked_plan(
+        self,
+        *,
+        intent: ProjectIntent,
+        started_at: datetime,
+        status: ProjectPlanStatus,
+        reason: str,
+        detail: str,
+        architect: ModelExecutionSummary | None = None,
+        planner: ModelExecutionSummary | None = None,
+        violations: tuple[str, ...] = (),
+        project_spec: ProjectSpec | None = None,
+        architecture: ArchitecturePlan | None = None,
+        capability_profile: ProjectCapabilityProfile | None = None,
+        roadmap: Roadmap | None = None,
+        task_graph: TaskGraph | None = None,
+        blocking_questions: tuple[OpenQuestion, ...] = (),
+        deferred_questions: tuple[OpenQuestion, ...] = (),
+    ) -> ProjectPlanResult:
+        """Cierra una planificación sin PASS, con evidencia de lo que sí se produjo."""
+        architect_summary = architect or ModelExecutionSummary()
+        planner_summary = planner or ModelExecutionSummary()
+        usage = architect_summary.usage.merged(planner_summary.usage)
+        gaps = (
+            detect_capability_gaps(capability_profile, roadmap.tasks)
+            if capability_profile is not None and roadmap is not None
+            else ()
+        )
+        self._audit.log_project_plan_blocked(
+            project_id=intent.id,
+            reason=reason,
+            detail=detail,
+            violations=violations,
+        )
+        return ProjectPlanResult(
+            project_id=intent.id,
+            status=status,
+            project_spec=project_spec,
+            architecture=architecture,
+            capability_profile=capability_profile,
+            roadmap=roadmap,
+            task_graph=task_graph,
+            capability_gaps=gaps,
+            blocking_questions=blocking_questions,
+            deferred_questions=deferred_questions,
+            architect=architect_summary,
+            planner=planner_summary,
+            model_usage=usage,
+            attempts=architect_summary.attempts_used + planner_summary.attempts_used,
+            violations=violations,
+            error=f"{reason}: {detail}" if detail else reason,
+            started_at=started_at,
+            completed_at=utc_now(),
+        )
 
     # ------------------------------------------------------------- ENGINE-1
     def execute_developer_task(

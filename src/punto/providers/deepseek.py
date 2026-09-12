@@ -19,6 +19,7 @@ no usa Git, no modifica tareas y no decide autoridad. La clave nunca se registra
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Final
@@ -85,6 +86,19 @@ class DeepSeekInvalidResponseError(DeepSeekError):
     """La respuesta no es JSON válido, está vacía o no trae contenido."""
 
 
+class DeepSeekTruncatedResponseError(DeepSeekInvalidResponseError):
+    """La respuesta se cortó porque se agotó el presupuesto de salida.
+
+    **No** es un incumplimiento del contrato del modelo: es ``max_tokens``. Repetir la
+    misma petición con el mismo límite produce el mismo corte, de modo que el motor lo
+    trata como fallo del proveedor y no como una propuesta reparable.
+
+    Medido con ``deepseek-v4-pro`` y ``thinking`` activo: el razonamiento consume
+    presupuesto de salida y puede agotarlo antes de cerrar el JSON. Un documento
+    estructurado largo necesita por eso un ``max_tokens`` holgado.
+    """
+
+
 class DeepSeekModelNotSupportedError(DeepSeekError):
     """El modelo solicitado no está soportado o es un alias heredado."""
 
@@ -131,6 +145,114 @@ class DeepSeekConfig:
             raise ValueError("timeout_seconds debe ser mayor que cero")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens debe ser mayor que cero")
+
+
+#: Variable de entorno con la credencial compartida por todos los roles.
+API_KEY_ENV: Final[str] = "DEEPSEEK_API_KEY"
+
+#: Variables de entorno que permiten fijar un modelo **por rol** (ENGINE-3 §14).
+#: El routing de modelos es configuración, no código: cada rol puede apuntar a un
+#: modelo distinto sin tocar el motor.
+ARCHITECT_MODEL_ENV: Final[str] = "PUNTO_ARCHITECT_MODEL"
+PLANNER_MODEL_ENV: Final[str] = "PUNTO_PLANNER_MODEL"
+DEVELOPER_MODEL_ENV: Final[str] = "PUNTO_DEVELOPER_MODEL"
+
+#: Variable de entorno del presupuesto de salida de una planificación.
+PLANNING_MAX_TOKENS_ENV: Final[str] = "PUNTO_PLANNING_MAX_TOKENS"
+
+#: Presupuesto de salida por defecto de una planificación.
+#:
+#: Holgado a propósito y **medido**, no adivinado: con ``thinking`` activo el
+#: razonamiento consume el mismo presupuesto que el documento. Medición real con
+#: ``deepseek-v4-pro`` y ``reasoning_effort=high``:
+#:
+#: - un diseño completo de arquitectura necesitó ~11 400 tokens de salida (la mayor
+#:   parte razonamiento): con 8 192 la respuesta se cortaba a mitad de una cadena;
+#: - un roadmap **sin cota de tamaño** llegó a 86 656 caracteres antes de truncarse,
+#:   así que el presupuesto se acompañó de una cota explícita en el prompt del
+#:   Planner (máximo 4 milestones, 8 epics y 20 tareas).
+#:
+#: La API acepta este valor sin objeción (comprobado hasta 131 072).
+DEFAULT_PLANNING_MAX_TOKENS: Final[int] = 65_536
+
+
+def resolve_max_tokens(env_var: str, *, default: int = DEFAULT_PLANNING_MAX_TOKENS) -> int:
+    """Resuelve el presupuesto de salida desde el entorno, validándolo.
+
+    Raises:
+        ValueError: si la variable no es un entero positivo.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_var} debe ser un entero, no {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{env_var} debe ser mayor que cero, no {value}")
+    return value
+
+
+def resolve_model(env_var: str, *, default: str = DEFAULT_MODEL) -> str:
+    """Resuelve el modelo de un rol desde el entorno, validándolo.
+
+    Raises:
+        DeepSeekModelNotSupportedError: si el modelo configurado no está soportado
+            o es un alias heredado.
+    """
+    candidate = os.environ.get(env_var, "").strip() or default
+    if candidate in LEGACY_MODELS or candidate not in SUPPORTED_MODELS:
+        raise DeepSeekModelNotSupportedError(
+            f"{env_var}={candidate!r} no está soportado. Soportados: {sorted(SUPPORTED_MODELS)}"
+        )
+    return candidate
+
+
+def config_from_environment(
+    *,
+    model_env: str | None = None,
+    default_model: str = DEFAULT_MODEL,
+    timeout_seconds: float = 300.0,
+    max_tokens: int | None = None,
+    transport_retries: int = DEFAULT_TRANSPORT_RETRIES,
+) -> DeepSeekConfig:
+    """Construye una configuración real a partir del entorno.
+
+    La credencial **nunca** se escribe en código ni se registra: se lee de
+    ``DEEPSEEK_API_KEY`` y se pasa al cliente.
+
+    Args:
+        model_env: Variable de entorno del modelo del rol. Si es ``None`` se usa
+            ``DEEPSEEK_MODEL``.
+        default_model: Modelo por defecto si no hay variable definida.
+        timeout_seconds: Timeout de la llamada. Es mayor que el del Developer
+            porque una planificación completa produce documentos largos.
+        max_tokens: Tope de tokens de salida. Si es ``None`` se resuelve desde
+            ``PUNTO_PLANNING_MAX_TOKENS`` y, si no está definida, se usa
+            :data:`DEFAULT_PLANNING_MAX_TOKENS`, que es holgado **a propósito**: con
+            ``thinking`` activo el razonamiento consume el mismo presupuesto que el
+            documento y un tope corto trunca el JSON a mitad de una cadena.
+        transport_retries: Reintentos de transporte ante fallos transitorios.
+
+    Raises:
+        DeepSeekAuthError: si ``DEEPSEEK_API_KEY`` está vacía o ausente.
+        DeepSeekModelNotSupportedError: si el modelo configurado no está soportado.
+        ValueError: si ``PUNTO_PLANNING_MAX_TOKENS`` no es un entero positivo.
+    """
+    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    model = resolve_model(model_env, default=default_model) if model_env else default_model
+    resolved_tokens = (
+        resolve_max_tokens(PLANNING_MAX_TOKENS_ENV) if max_tokens is None else max_tokens
+    )
+    return DeepSeekConfig(
+        api_key=api_key,
+        base_url=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_tokens=resolved_tokens,
+        transport_retries=transport_retries,
+    )
 
 
 class DeepSeekClient:
@@ -304,13 +426,31 @@ class DeepSeekClient:
             raise DeepSeekInvalidResponseError("la respuesta no contiene 'message'")
 
         content = message.get("content")
+        finish_reason = first.get("finish_reason")
+        reasoning = message.get("reasoning_content")
+
+        # El truncamiento se detecta ANTES de intentar parsear: un JSON cortado
+        # produce un error de sintaxis engañoso ("unterminated string") que oculta la
+        # causa real, que es el presupuesto de salida.
+        if finish_reason == "length":
+            raise DeepSeekTruncatedResponseError(
+                "respuesta truncada por el límite de tokens de salida "
+                f"(finish_reason='length', contenido de {len(content or '')} caracteres, "
+                f"razonamiento {'presente' if reasoning else 'ausente'}, "
+                f"max_tokens={self._config.max_tokens}). Aumenta max_tokens."
+            )
+
         if not isinstance(content, str) or not content.strip():
-            raise DeepSeekInvalidResponseError("el modelo devolvió contenido vacío")
+            raise DeepSeekInvalidResponseError(
+                "el modelo devolvió contenido vacío "
+                f"(finish_reason={finish_reason!r}, "
+                f"razonamiento={'presente' if reasoning else 'ausente'}, "
+                f"max_tokens={self._config.max_tokens})"
+            )
 
         usage = _parse_usage(body.get("usage"))
         self._last_usage = usage
         model = body.get("model")
-        finish_reason = first.get("finish_reason")
 
         return ModelCompletion(
             content=content,
@@ -395,11 +535,15 @@ def redact_secrets(text: str, *, api_key: str = "") -> str:
 
 
 __all__ = [
+    "API_KEY_ENV",
+    "ARCHITECT_MODEL_ENV",
     "AUTH_HEADER",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "DEFAULT_TRANSPORT_RETRIES",
+    "DEVELOPER_MODEL_ENV",
     "LEGACY_MODELS",
+    "PLANNER_MODEL_ENV",
     "RETRYABLE_STATUS_CODES",
     "SUPPORTED_MODELS",
     "DeepSeekAuthError",
@@ -414,6 +558,8 @@ __all__ = [
     "DeepSeekTimeoutError",
     "DeepSeekTransportError",
     "ModelCompletion",
+    "config_from_environment",
     "parse_proposal_json",
     "redact_secrets",
+    "resolve_model",
 ]

@@ -31,6 +31,7 @@ Nunca se usa ``--privileged``, ``--pid host``, ``--network host``, ``--ipc host`
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -45,6 +46,7 @@ from uuid import uuid4
 
 from punto.common import utc_now
 from punto.developer.backend import SandboxedBackend, assert_sandbox_capabilities
+from punto.policy.permissions import CONSTITUTIONAL_PROTECTED_PATHS
 from punto.schemas.execution import (
     FULL_SANDBOX_CAPABILITIES,
     SPAWN_FAILURE_EXIT_CODE,
@@ -58,6 +60,7 @@ from punto.tools.errors import (
     SandboxUnavailableError,
     WorkspaceViolationError,
 )
+from punto.tools.shell_policy import build_controlled_path, is_sensitive_env_name
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
@@ -132,6 +135,153 @@ def resolve_runtime_binary(runtime: str) -> str | None:
     return None
 
 
+#: Variables que pueden copiarse del host al invocar la CLI del runtime.
+#:
+#: Estrategia principal: **allowlist**. Solo variables de sistema operativo y de
+#: localización, nunca credenciales. ``PATH`` se reconstruye y ``TEMP``/``TMP`` se
+#: redirigen a una zona propia.
+RUNTIME_CLIENT_ENV_ALLOWLIST: Final[frozenset[str]] = frozenset(
+    {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TZ",
+        "WINDIR",
+    }
+)
+
+#: Variables específicas del runtime que **sí** se propagan, por necesidad
+#: demostrada.
+#:
+#: Podman resuelve su configuración y sus conexiones a partir del perfil del
+#: usuario; sin estas variables falla en el arranque con
+#: ``cannot determine user's homedir``. Se comprobó empíricamente: quitarlas rompe
+#: la CLI. Son **rutas**, nunca credenciales, y solo las ve el proceso del cliente
+#: —el contenedor no las recibe porque no se pasan con ``-e``.
+RUNTIME_SPECIFIC_ENV: Final[frozenset[str]] = frozenset(
+    {
+        # Localización del perfil y de la configuración del runtime.
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "USERNAME",
+    }
+)
+
+#: Variables fijadas siempre, para que la invocación sea reproducible.
+RUNTIME_CLIENT_ENV_PINNED: Final[dict[str, str]] = {"PYTHONDONTWRITEBYTECODE": "1"}
+
+#: Directorio temporal propio del proceso para la CLI del runtime.
+_RUNTIME_TEMP: list[Path] = []
+
+
+def _runtime_temp_root() -> Path:
+    """Zona temporal propia donde redirigir ``TEMP``/``TMP`` de la CLI."""
+    if not _RUNTIME_TEMP:
+        created = Path(tempfile.mkdtemp(prefix="punto-runtime-"))
+        atexit.register(shutil.rmtree, created, True)
+        _RUNTIME_TEMP.append(created)
+    root = _RUNTIME_TEMP[0]
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def build_runtime_client_environment(
+    runtime: str, *, executable: str | None = None
+) -> dict[str, str]:
+    """Construye el entorno **mínimo y explícito** del proceso de la CLI.
+
+    El cliente de Podman es también un proceso hijo: si heredara el entorno del
+    host, secretos como ``DEEPSEEK_API_KEY`` o ``GITHUB_TOKEN`` viajarían con él.
+    Este entorno se construye desde cero, con allowlist, y es el que reciben
+    **todas** las invocaciones del runtime.
+
+    Args:
+        runtime: Nombre del runtime.
+        executable: Ruta ya resuelta del binario, si se conoce.
+
+    Returns:
+        El entorno del cliente, sin secretos del host.
+    """
+    binary = executable or resolve_runtime_binary(runtime)
+    directory = Path(binary).parent if binary else None
+
+    env: dict[str, str] = {}
+    for name in sorted(RUNTIME_CLIENT_ENV_ALLOWLIST | RUNTIME_SPECIFIC_ENV):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        # Segunda barrera: aunque una variable estuviera en la allowlist por
+        # error, un nombre sensible no se propaga.
+        if is_sensitive_env_name(name):
+            continue
+        env[name] = value
+
+    env["PATH"] = build_controlled_path(directory)
+    env["TEMP"] = str(_runtime_temp_root())
+    env["TMP"] = env["TEMP"]
+    env.update(RUNTIME_CLIENT_ENV_PINNED)
+    return env
+
+
+def assert_mountable_workspace(candidate: Path | str) -> Path:
+    """Valida que una ruta pueda montarse como workspace de un sandbox.
+
+    Es la última puerta antes de construir ``--mount type=bind``. Aunque el
+    ``ExecutionContext`` ya es la fuente de verdad, un caller confiable puede
+    equivocarse y apuntar a algo demasiado amplio; montar el home del usuario o
+    una raíz de unidad dentro de un contenedor que ejecuta código no confiable
+    sería una fuga grave.
+
+    Se rechaza la ruta si: no existe, no es directorio, es raíz de unidad, es el
+    home del usuario o un ancestro suyo, es un ancestro del repositorio del motor,
+    contiene archivos constitucionales, o es ``.git``.
+
+    Args:
+        candidate: Ruta a validar.
+
+    Returns:
+        La ruta resuelta y validada.
+
+    Raises:
+        WorkspaceViolationError: si la ruta no es un workspace montable.
+    """
+    resolved = Path(candidate).resolve()
+    detail = ""
+
+    if not resolved.exists():
+        detail = "no existe"
+    elif not resolved.is_dir():
+        detail = "no es un directorio"
+    elif resolved.parent == resolved:
+        detail = "es una raíz de unidad"
+    elif resolved.name == ".git":
+        detail = "es el directorio .git"
+    else:
+        home = Path.home().resolve()
+        if resolved == home or home.is_relative_to(resolved):
+            detail = "es el home del usuario o un ancestro suyo"
+        else:
+            engine_root = Path(__file__).resolve().parents[2]
+            if engine_root == resolved or engine_root.is_relative_to(resolved):
+                detail = "es un ancestro del repositorio del motor"
+            else:
+                for protected in CONSTITUTIONAL_PROTECTED_PATHS:
+                    if (resolved / protected).exists():
+                        detail = f"contiene un archivo constitucional ({protected})"
+                        break
+
+    if detail:
+        raise WorkspaceViolationError(str(candidate), str(resolved), detail)
+    return resolved
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxLimits:
     """Límites de recursos aplicados a cada contenedor."""
@@ -183,7 +333,6 @@ class ContainerSandboxBackend(SandboxedBackend):
         runtime: str = DEFAULT_RUNTIME,
         image: str = DEFAULT_IMAGE,
         limits: SandboxLimits | None = None,
-        workspace_path: Path | None = None,
         audit: AuditLogger | None = None,
     ) -> None:
         # Nace NO VERIFICADO: no acredita ningún aislamiento todavía.
@@ -191,11 +340,12 @@ class ContainerSandboxBackend(SandboxedBackend):
         self._runtime = runtime
         self._image = image
         self._limits = limits or SandboxLimits()
-        self._workspace_override = workspace_path
         self._audit = audit
         self._verification: SandboxVerification | None = None
         self._containers: set[str] = set()
         self._commands: list[CommandResult] = []
+        #: Último workspace efectivamente montado (fuente de verdad para recoger).
+        self._last_workspace: Path | None = None
 
     # ------------------------------------------------------------------ estado
     @property
@@ -424,10 +574,12 @@ class ContainerSandboxBackend(SandboxedBackend):
         if not self.is_verified:
             self.verify_capabilities()
 
-        workspace = self._workspace_override or context.workspace_path
+        # Fuente de verdad única: el workspace del contexto de la tarea.
+        workspace = assert_mountable_workspace(context.workspace_path)
+        self._last_workspace = workspace
         result = self._run_in_container(
             request,
-            workspace=Path(workspace),
+            workspace=workspace,
             task_id=str(context.task_id),
             extra_env={},
             max_timeout_seconds=max_timeout_seconds,
@@ -467,12 +619,11 @@ class ContainerSandboxBackend(SandboxedBackend):
         started = time.perf_counter()
         self._containers.add(container)
 
-        # El canario se exporta en el entorno del CLIENTE de podman. Si el
-        # contenedor lo viera, el entorno se estaría heredando y el aislamiento
-        # fallaría. Nunca se pasa con -e.
-        process_env: dict[str, str] | None = None
+        # Entorno mínimo del CLIENTE de Podman: nunca se hereda el del host. El
+        # canario de verificación se añade SOBRE ese entorno mínimo, no sobre una
+        # copia completa del host, y jamas se pasa al contenedor con -e.
+        process_env = build_runtime_client_environment(self._runtime)
         if ENV_CANARY in extra_env:
-            process_env = dict(os.environ)
             process_env[ENV_CANARY] = extra_env[ENV_CANARY]
 
         try:
@@ -628,16 +779,22 @@ class ContainerSandboxBackend(SandboxedBackend):
         Como el workspace se monta por *bind*, los cambios ya están en el host: no
         hace falta copiarlos. Lo que se recoge es el inventario del workspace y los
         comandos ejecutados, más la comprobación de que no quedan contenedores.
+
+        El workspace por defecto es el último que se montó de verdad, de modo que
+        no hay forma de inventariar una ruta distinta de la autorizada.
         """
-        target = workspace or self._workspace_override
+        target = workspace or self._last_workspace
         files: tuple[str, ...] = ()
         resolved = ""
-        if target is not None and Path(target).is_dir():
-            resolved = str(Path(target))
+        if target is not None:
+            # Se valida igual que antes de montar: inventariar el home o una raíz
+            # de unidad también sería una fuga.
+            safe = assert_mountable_workspace(target)
+            resolved = str(safe)
             files = tuple(
                 sorted(
-                    path.relative_to(target).as_posix()
-                    for path in Path(target).rglob("*")
+                    path.relative_to(safe).as_posix()
+                    for path in safe.rglob("*")
                     if path.is_file()
                 )
             )
@@ -699,7 +856,11 @@ class ContainerSandboxBackend(SandboxedBackend):
     def _run_runtime(
         self, arguments: list[str], *, timeout: float
     ) -> subprocess.CompletedProcess[str]:
-        """Ejecuta la CLI del runtime en el host."""
+        """Ejecuta la CLI del runtime en el host, con entorno saneado.
+
+        El cliente de Podman **nunca** hereda el entorno del host: recibe un
+        entorno mínimo explícito construido por allowlist.
+        """
         try:
             return subprocess.run(
                 [self._runtime_binary(), *arguments],
@@ -710,6 +871,7 @@ class ContainerSandboxBackend(SandboxedBackend):
                 timeout=timeout,
                 shell=False,
                 check=False,
+                env=build_runtime_client_environment(self._runtime),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:  # pragma: no cover
             raise SandboxUnavailableError(f"{self._runtime} no ejecutable: {exc}") from exc
@@ -762,6 +924,9 @@ __all__ = [
     "ENV_CANARY",
     "HARDENING_PROBE",
     "KNOWN_RUNTIME_LOCATIONS",
+    "RUNTIME_CLIENT_ENV_ALLOWLIST",
+    "RUNTIME_CLIENT_ENV_PINNED",
+    "RUNTIME_SPECIFIC_ENV",
     "SANDBOX_ALLOWED_EXECUTABLES",
     "SANDBOX_LABEL",
     "SANDBOX_USER",
@@ -769,5 +934,7 @@ __all__ = [
     "SandboxLimits",
     "SandboxRunArtifacts",
     "SandboxVerification",
+    "assert_mountable_workspace",
+    "build_runtime_client_environment",
     "resolve_runtime_binary",
 ]

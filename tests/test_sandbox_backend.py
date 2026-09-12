@@ -50,7 +50,28 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 PODMAN = resolve_runtime_binary("podman")
-requires_podman = pytest.mark.skipif(PODMAN is None, reason="Podman no instalado")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def integration_gate() -> None:
+    """Gate obligatorio: sin Podman operativo, la suite de integracion **FALLA**.
+
+    No se usa ``skipif``: un runtime ausente es un fallo de la fase, no una razon
+    para que la suite quede verde. Un sandbox que no se puede ejecutar no acredita
+    nada, y ocultarlo con un skip seria precisamente lo que el mandato prohibe.
+    """
+    if PODMAN is None:
+        pytest.fail(
+            "Podman NO esta disponible: el sandbox es obligatorio para "
+            "UNTRUSTED_MODEL. Instalalo con: winget install --id RedHat.Podman"
+        )
+    state = podman("machine", "inspect", "--format", "{{.State}}")
+    if state.returncode != 0 or state.stdout.strip().lower() != "running":
+        pytest.fail(
+            "la maquina de Podman no esta en ejecucion "
+            f"(estado: {state.stdout.strip() or state.stderr.strip()}). "
+            "Recuperala con: podman machine start"
+        )
 
 
 def podman(*args: str, timeout: float = 180.0) -> subprocess.CompletedProcess[str]:
@@ -141,7 +162,6 @@ def probe(backend: ContainerSandboxBackend, name: str, workspace: Path) -> dict[
 # ---------------------------------------------------------------------------
 # §18.1 / §18.2 - detección y disponibilidad del runtime
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_podman_runtime_is_detected() -> None:
     """§18.1: el runtime Podman se detecta."""
     assert PODMAN is not None
@@ -149,7 +169,6 @@ def test_podman_runtime_is_detected() -> None:
     assert detect_container_runtimes().podman_available is True
 
 
-@requires_podman
 def test_podman_is_operational() -> None:
     """§18.2: Podman responde y su máquina está en ejecución."""
     version = podman("--version")
@@ -164,7 +183,6 @@ def test_podman_is_operational() -> None:
 # ---------------------------------------------------------------------------
 # §18.3 / §18.4 - preparación y verificación
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_sandbox_prepare_succeeds(sandbox: ContainerSandboxBackend) -> None:
     """§18.3: prepare() comprueba runtime, máquina e imagen."""
     sandbox.prepare()
@@ -172,7 +190,6 @@ def test_sandbox_prepare_succeeds(sandbox: ContainerSandboxBackend) -> None:
     assert image.returncode == 0
 
 
-@requires_podman
 def test_capabilities_are_not_claimed_before_verification() -> None:
     """Un backend recién construido NO acredita aislamiento."""
     fresh = ContainerSandboxBackend()
@@ -182,7 +199,6 @@ def test_capabilities_are_not_claimed_before_verification() -> None:
     assert fresh.verification is None
 
 
-@requires_podman
 def test_capability_verification_is_complete(verified: ContainerSandboxBackend) -> None:
     """§18.4: la verificación acredita los cuatro aislamientos."""
     capabilities = verified.capabilities
@@ -194,7 +210,6 @@ def test_capability_verification_is_complete(verified: ContainerSandboxBackend) 
     assert capabilities.process_isolated is True
 
 
-@requires_podman
 def test_verification_records_every_probe(verified: ContainerSandboxBackend) -> None:
     """La verificación deja constancia de las sondas ejecutadas."""
     verification = verified.verification
@@ -208,7 +223,6 @@ def test_verification_records_every_probe(verified: ContainerSandboxBackend) -> 
 # ---------------------------------------------------------------------------
 # §18.5 - §18.8 - los cuatro aislamientos
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_filesystem_isolation(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -221,7 +235,6 @@ def test_filesystem_isolation(
     assert payload["failures"] == []
 
 
-@requires_podman
 def test_environment_isolation(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -233,7 +246,6 @@ def test_environment_isolation(
     assert payload["failures"] == []
 
 
-@requires_podman
 def test_network_isolation(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -245,7 +257,6 @@ def test_network_isolation(
     assert payload["failures"] == []
 
 
-@requires_podman
 def test_process_isolation(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -260,7 +271,6 @@ def test_process_isolation(
 # ---------------------------------------------------------------------------
 # §18.9 - §18.12 - secretos, montaje y red
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_secret_canary_never_reaches_the_container(
     verified: ContainerSandboxBackend, sandbox_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,7 +295,6 @@ def test_secret_canary_never_reaches_the_container(
         assert name not in environment
 
 
-@requires_podman
 def test_workspace_is_mounted_and_host_paths_are_not(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -314,7 +323,6 @@ def test_workspace_is_mounted_and_host_paths_are_not(
 # ---------------------------------------------------------------------------
 # §18.13 - §18.19 - endurecimiento
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_hardening_is_applied(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -338,7 +346,6 @@ def test_hardening_is_applied(
 # ---------------------------------------------------------------------------
 # §18.20 / §18.21 - timeout y limpieza
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_timeout_destroys_the_container(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -356,7 +363,6 @@ def test_timeout_destroys_the_container(
     assert verified.list_containers() == ()
 
 
-@requires_podman
 def test_cleanup_removes_every_container(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -382,7 +388,6 @@ def test_missing_runtime_blocks() -> None:
         backend.prepare()
 
 
-@requires_podman
 def test_stopped_machine_blocks_and_recovers(sandbox_workspace: Path) -> None:
     """§18.23: con la máquina detenida el sandbox **bloquea** (nunca usa el host).
 
@@ -413,7 +418,6 @@ def test_stopped_machine_blocks_and_recovers(sandbox_workspace: Path) -> None:
 # ---------------------------------------------------------------------------
 # §18.24 / §18.25 - UNTRUSTED_MODEL en el sandbox, nunca en el host
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_untrusted_model_executes_inside_the_sandbox(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -433,7 +437,6 @@ def test_untrusted_model_executes_inside_the_sandbox(
     assert "/workspace" in result.cwd
 
 
-@requires_podman
 def test_untrusted_model_never_reaches_the_host(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -454,7 +457,6 @@ def test_untrusted_model_never_reaches_the_host(
     assert verified.capabilities.satisfies_untrusted() is True
 
 
-@requires_podman
 def test_untrusted_model_resolves_to_the_container_sandbox(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -495,7 +497,6 @@ def test_untrusted_model_resolves_to_the_container_sandbox(
 # ---------------------------------------------------------------------------
 # §18.26 / flujo real de misión - la receta completa dentro del sandbox
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_sandbox_mission_writes_validates_and_collects(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -537,7 +538,6 @@ def test_sandbox_mission_writes_validates_and_collects(
     assert artifacts.containers_remaining == ()
 
 
-@requires_podman
 def test_sandbox_rejects_executables_outside_its_allowlist(
     verified: ContainerSandboxBackend, sandbox_workspace: Path
 ) -> None:
@@ -555,7 +555,6 @@ def test_sandbox_rejects_executables_outside_its_allowlist(
 # ---------------------------------------------------------------------------
 # §18 - auditoría del sandbox
 # ---------------------------------------------------------------------------
-@requires_podman
 def test_sandbox_audit_events(
     sandbox_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

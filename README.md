@@ -1159,6 +1159,34 @@ el automount de WSL2 es lo que permite traducir las rutas del host al montar el
 workspace. El **contenedor no** los ve: esa es la frontera que importa, y está
 probada. En consecuencia, el runtime de Podman es parte de la base de confianza.
 
+### Cierre de fronteras (ENGINE-1.R3.1)
+
+Dos endurecimientos que no dependen del aislamiento del contenedor:
+
+**1. El cliente de Podman tampoco hereda el host.** El proceso hijo de la CLI es
+también un proceso hijo: si heredara el entorno, `DEEPSEEK_API_KEY` o
+`GITHUB_TOKEN` viajarían con él. `build_runtime_client_environment()` construye un
+entorno **mínimo por allowlist** para **todas** las invocaciones del runtime. No se
+usa `dict(os.environ)`, ni `os.environ.copy()`, ni `env=None`.
+
+| Grupo | Variables |
+| --- | --- |
+| Allowlist general | `SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `PATHEXT`, `LANG`, `LC_ALL`, `TZ` |
+| Reconstruidas | `PATH` (dir del binario + sistema) y `TEMP`/`TMP` (zona propia) |
+| Fijadas | `PYTHONDONTWRITEBYTECODE` |
+| Específicas del runtime | `USERPROFILE`, `HOME`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, `APPDATA`, `USERNAME` |
+
+Las específicas están ahí por **necesidad demostrada**: sin ellas Podman falla con
+`cannot determine user's homedir`. Son rutas, nunca credenciales, y solo las ve el
+proceso del cliente — el contenedor no las recibe.
+
+**2. El workspace se deriva solo del contexto.** Se eliminó el override
+`workspace_path`: la única fuente es `ExecutionContext.workspace_path`. Antes de
+construir `--mount type=bind`, `assert_mountable_workspace()` rechaza la ruta si no
+existe, no es directorio, es raíz de unidad, es el home del usuario o un ancestro
+suyo, es un ancestro del repositorio del motor, contiene archivos constitucionales,
+o es `.git`.
+
 ---
 
 ## 20. Licencia

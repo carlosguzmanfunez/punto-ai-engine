@@ -22,6 +22,14 @@ from pydantic import ValidationError
 from punto.audit.logger import AuditLogger
 from punto.developer.context import ExecutionContext
 from punto.developer.deepseek import DeepSeekDeveloperRunner, ModelLimits
+from punto.developer.prompts import (
+    DEVELOPER_PROMPT_VERSION,
+    DEVELOPER_REPAIR_TEMPLATE,
+    DEVELOPER_SYSTEM_PROMPT,
+    DEVELOPER_USER_TEMPLATE,
+    PROPOSAL_FORMAT_REMINDER,
+    REPAIR_AFTER_PROPOSAL_REJECTION,
+)
 from punto.developer.sandbox import ContainerSandboxBackend, SandboxLimits, resolve_runtime_binary
 from punto.providers.deepseek import (
     DEFAULT_BASE_URL,
@@ -714,6 +722,103 @@ def test_delete_operation_does_not_exist(
 
     assert result.status is not DeveloperRunStatus.SUCCESS
     assert (workspace / "app.py").read_text(encoding="utf-8") == before
+
+
+def test_system_prompt_pins_the_proposal_contract() -> None:
+    """§22: el contrato JSON se fija en el prompt; no se improvisa por prueba.
+
+    La primera versión de la puerta viva enviaba un prompt ad-hoc y por eso no
+    detectó que el modelo devolvía ``file_path``/``action``. Estas aserciones
+    atan el prompt de producción a los nombres que el esquema exige.
+    """
+    assert DEVELOPER_PROMPT_VERSION == "1.1.0"
+
+    for exact in (
+        '"summary"',
+        '"changes"',
+        '"path"',
+        '"operation"',
+        '"content"',
+        '"validation_notes"',
+        '"assumptions"',
+    ):
+        assert exact in DEVELOPER_SYSTEM_PROMPT, f"falta {exact} en el prompt de sistema"
+
+    # Los alias que el modelo real usó están prohibidos de forma explícita.
+    for alias in ("file_path", "filename", '"action"'):
+        assert alias in DEVELOPER_SYSTEM_PROMPT, f"no se prohíbe {alias}"
+    assert "listas de strings" in DEVELOPER_SYSTEM_PROMPT
+    assert '"CREATE" o "REPLACE"' in DEVELOPER_SYSTEM_PROMPT
+
+    user_prompt = DEVELOPER_USER_TEMPLATE.format(
+        objective="o",
+        acceptance_criteria="a",
+        allowed_files="f",
+        context="c",
+        format_reminder=PROPOSAL_FORMAT_REMINDER,
+    )
+    repair_prompt = DEVELOPER_REPAIR_TEMPLATE.format(
+        situation=REPAIR_AFTER_PROPOSAL_REJECTION,
+        objective="o",
+        acceptance_criteria="a",
+        allowed_files="f",
+        current_files="x",
+        evidence="e",
+        format_reminder=PROPOSAL_FORMAT_REMINDER,
+    )
+
+    # El recordatorio va al final de ambas peticiones: es lo último que se lee.
+    assert user_prompt.rstrip().endswith("Devuelve únicamente el JSON de la propuesta.")
+    assert PROPOSAL_FORMAT_REMINDER in user_prompt
+    assert PROPOSAL_FORMAT_REMINDER in repair_prompt
+    assert user_prompt.index(PROPOSAL_FORMAT_REMINDER) > user_prompt.index("CONTEXTO")
+    # La reparación de una propuesta rechazada dice la verdad sobre el estado.
+    assert "RECHAZADA antes de aplicarse" in repair_prompt
+    assert "NO se escribió ningún archivo" in repair_prompt
+
+
+def test_schema_deviation_is_repaired_on_second_attempt(
+    sandbox: ContainerSandboxBackend, workspace: Path
+) -> None:
+    """Una propuesta que incumple el contrato se rechaza y se repara.
+
+    Reproduce la desviación real observada en la puerta viva (``file_path`` +
+    ``action`` + notas como string): la propuesta se rechaza ENTERA sin escribir
+    nada, el motivo vuelve al modelo como evidencia y el segundo intento pasa.
+    """
+    deviated = {
+        "summary": "nombres de campo equivocados",
+        "changes": [
+            {"file_path": "app.py", "action": "CREATE", "content": "x = 1\n"},
+        ],
+        "validation_notes": "nota suelta, no lista",
+        "assumptions": "supuesto suelto, no lista",
+    }
+    client = FakeClient([json.dumps(deviated), json.dumps(PROPOSAL_OK)])
+    context = untrusted(workspace)
+    before = (workspace / "app.py").read_text(encoding="utf-8")
+    runner = DeepSeekDeveloperRunner(client=client, backend=sandbox)  # type: ignore[arg-type]
+
+    result = runner.execute(task_for(context), context)
+
+    assert result.status is DeveloperRunStatus.SUCCESS, result.error
+    assert result.model_calls == 2
+    assert result.attempts_used == 2
+    # Atomicidad: el intento rechazado no escribió. Solo se evidencian los dos
+    # archivos del segundo intento, no cuatro.
+    assert [change.path for change in result.files_changed] == [
+        "app.py",
+        "tests/test_math.py",
+    ]
+    assert result.rolled_back is False
+    assert (workspace / "app.py").read_text(encoding="utf-8") != before
+
+    # La segunda petición declara el rechazo (no un fallo de validación) y cita
+    # el motivo real, para que el modelo pueda corregir el contrato.
+    repair_prompt = client.prompts[1]
+    assert "RECHAZADA antes de aplicarse" in repair_prompt
+    assert "file_path" in repair_prompt
+    assert PROPOSAL_FORMAT_REMINDER in repair_prompt
 
 
 # ===========================================================================

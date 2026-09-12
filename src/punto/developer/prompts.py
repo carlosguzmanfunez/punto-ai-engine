@@ -10,7 +10,31 @@ from __future__ import annotations
 from typing import Final
 
 #: Versión del prompt. Cambiarla invalida comparaciones entre ejecuciones.
-DEVELOPER_PROMPT_VERSION: Final[str] = "1.0.0"
+#:
+#: 1.1.0 — la puerta viva (ENGINE-2 §22) demostró que el modelo devolvía
+#: ``file_path``/``action`` en lugar de ``path``/``operation`` y strings sueltos en
+#: ``validation_notes``/``assumptions``. El contrato se fija ahora con nombres
+#: exactos, prohibición explícita de alias y un recordatorio de formato al final de
+#: cada petición.
+DEVELOPER_PROMPT_VERSION: Final[str] = "1.1.0"
+
+#: Recordatorio compacto del contrato JSON, repetido al final de cada petición.
+#:
+#: Va al final a propósito: es lo último que lee el modelo antes de responder.
+PROPOSAL_FORMAT_REMINDER: Final[str] = """\
+FORMATO DE RESPUESTA (nombres de clave EXACTOS, sin texto adicional)
+{
+  "summary": "resumen de una línea",
+  "changes": [
+    {"path": "ruta/relativa.py", "operation": "CREATE", "content": "archivo COMPLETO"}
+  ],
+  "validation_notes": ["nota"],
+  "assumptions": ["supuesto"]
+}
+Recuerda: "path" y "operation" (nunca "file_path", "filename" ni "action");
+"validation_notes" y "assumptions" son SIEMPRE listas de strings, aunque estén
+vacías. Cualquier otra clave provoca el RECHAZO de la propuesta.
+"""
 
 #: Prompt de sistema del Developer.
 #:
@@ -31,7 +55,7 @@ REGLAS OBLIGATORIAS
 
 1. Implementa exclusivamente el OBJETIVO solicitado. Nada más.
 2. Cumple todos los CRITERIOS DE ACEPTACIÓN indicados.
-3. Devuelve ÚNICAMENTE un objeto JSON válido con esta forma exacta:
+3. Devuelve ÚNICAMENTE un objeto JSON válido con EXACTAMENTE estas claves:
    {
      "summary": "string",
      "changes": [
@@ -42,6 +66,13 @@ REGLAS OBLIGATORIAS
      "assumptions": ["string"]
    }
    No añadas texto fuera del JSON. No uses bloques de código.
+   Los nombres de las claves son EXACTOS: usa "path" (nunca "file_path",
+   "filename" ni "file"), "operation" (nunca "action", "op" ni "type") y
+   "content" (nunca "file_content", "new_content" ni "text"). Cualquier clave
+   distinta de las cinco indicadas hace que PUNTO RECHAZA la propuesta entera.
+   "validation_notes" y "assumptions" son SIEMPRE listas de strings; si no hay
+   ninguna, usa [] — nunca un string suelto.
+   "operation" solo admite los valores exactos "CREATE" o "REPLACE".
 4. `content` debe contener el archivo COMPLETO tras el cambio, no un fragmento ni
    un diff.
 5. Solo puedes proponer rutas incluidas en ARCHIVOS PERMITIDOS. No inventes rutas.
@@ -74,12 +105,14 @@ ARCHIVOS PERMITIDOS (solo puedes proponer cambios en estas rutas)
 CONTEXTO DEL PROYECTO
 {context}
 
+{format_reminder}
 Devuelve únicamente el JSON de la propuesta.
 """
 
-#: Plantilla de la petición de reparación, tras un fallo de validación.
+#: Plantilla de la petición de reparación, tras un fallo de validación o el
+#: rechazo de la propuesta anterior.
 DEVELOPER_REPAIR_TEMPLATE: Final[str] = """\
-La propuesta anterior se aplicó pero NO superó la validación en el sandbox.
+{situation}
 
 OBJETIVO
 {objective}
@@ -97,8 +130,20 @@ EVIDENCIA DEL FALLO
 {evidence}
 
 Corrige el problema y devuelve una propuesta NUEVA y COMPLETA con los archivos
-completos. Devuelve únicamente el JSON de la propuesta.
+completos.
+
+{format_reminder}
+Devuelve únicamente el JSON de la propuesta.
 """
+
+#: Situaciones de reparación, para que la petición diga la verdad sobre el estado.
+REPAIR_AFTER_VALIDATION_FAILURE: Final[str] = (
+    "La propuesta anterior se aplicó pero NO superó la validación en el sandbox."
+)
+REPAIR_AFTER_PROPOSAL_REJECTION: Final[str] = (
+    "La propuesta anterior fue RECHAZADA antes de aplicarse: no cumplía el contrato "
+    "JSON o las reglas de rutas. NO se escribió ningún archivo."
+)
 
 
 __all__ = [
@@ -106,4 +151,7 @@ __all__ = [
     "DEVELOPER_REPAIR_TEMPLATE",
     "DEVELOPER_SYSTEM_PROMPT",
     "DEVELOPER_USER_TEMPLATE",
+    "PROPOSAL_FORMAT_REMINDER",
+    "REPAIR_AFTER_PROPOSAL_REJECTION",
+    "REPAIR_AFTER_VALIDATION_FAILURE",
 ]

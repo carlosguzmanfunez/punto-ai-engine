@@ -1286,6 +1286,57 @@ Se registran, sin secretos: `MODEL_REQUEST_STARTED/COMPLETED/FAILED`,
 provenga del modelo o de la API pasa por `redact_secrets()` antes de tocar el
 log: la clave nunca aparece, ni siquiera en un mensaje de error de la API.
 
+### El contrato de la propuesta (`DEVELOPER_PROMPT_VERSION`)
+
+El modelo **no adivina** el formato: el prompt de sistema fija los nombres de clave
+exactos (`path`, `operation`, `content`, `summary`, `validation_notes`,
+`assumptions`), prohíbe los alias (`file_path`, `filename`, `action`) y exige que
+`validation_notes` y `assumptions` sean **listas** de strings. El recordatorio
+(`PROPOSAL_FORMAT_REMINDER`) se repite **al final** de cada petición, porque es lo
+último que el modelo lee antes de responder.
+
+Esto no es decoración: la primera ejecución real de la puerta viva devolvió
+`file_path`/`action` y notas como string suelto, y el esquema lo rechazó. El
+contrato se cerró con nombres exactos y la desviación quedó cubierta por pruebas.
+
+Cuando una propuesta incumple el contrato **no se aplica nada**: se rechaza entera,
+el motivo vuelve al modelo como evidencia y el intento se repite dentro del
+presupuesto que fija PUNTO (`attempts_allowed` y `max_model_calls`). Un rechazo
+cuesta un intento y una llamada; nunca escribe medio cambio.
+
+### Pruebas
+
+| Comando | Qué cubre | Necesita |
+| --- | --- | --- |
+| `pytest` | Suite completa, con cliente falso y sandbox real | Podman |
+| `pytest tests/test_deepseek_integration.py -q` | Cliente (transporte simulado), contrato del prompt, propuesta, atomicidad, reparación, límites, rollback, auditoría | Podman |
+| `pytest tests/integration/test_deepseek_live.py -q` | **Puerta viva**: contrato de producción contra la API real, error estructurado y ciclo completo | `DEEPSEEK_API_KEY` + Podman |
+
+La suite por defecto **ignora** `tests/integration` (`--ignore=tests/integration`)
+para que un entorno sin credenciales siga siendo verde. La puerta viva se ejecuta
+a propósito y **falla de forma explícita** con
+`CREDENTIAL_REQUIRED: DEEPSEEK_API_KEY` cuando la clave no está: no se salta en
+silencio, no se marca `xfail`, no se declara PASS sin llamada real.
+
+La puerta viva envía el **prompt de producción**, no uno escrito para la prueba.
+Esa distinción importa: una versión anterior usaba un prompt ad-hoc y por eso daba
+verde mientras el contrato real fallaba.
+
+### Evidencia de la llamada real
+
+Ejecución con `DEEPSEEK_API_KEY` presente y Podman en marcha (`3 passed`):
+
+| Prueba | Resultado |
+| --- | --- |
+| Contrato de producción → propuesta válida | `deepseek-v4-pro`, 4675 ms, 1191 tokens, `changes = ["hello.py"]` |
+| Credencial inválida | error estructurado, sin filtrar la credencial |
+| Misión real completa | 1 llamada, 1 intento, 1596 tokens, `hello.py` escrito, sandbox PASS, commit local |
+
+La misión real siguió el ciclo del mandato de principio a fin: propuesta del modelo
+→ validación atómica → escritura en el workspace → contenedor verificado →
+`pytest` verde → **commit local** en la rama derivada por PUNTO (`ai/<task_id>-<slug>`),
+sin rollback y **sin push**.
+
 ### Configuración
 
 La clave se lee del entorno. **No se escribe nunca en el repositorio.**
@@ -1300,30 +1351,20 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 Si la clave no está, el motor no inventa: reporta
 `CREDENTIAL_REQUIRED: DEEPSEEK_API_KEY`.
 
-### Pruebas
+La variable debe estar **en el proceso que ejecuta pytest**. Definirla en una sesión
+de PowerShell no la hace visible a procesos ya lanzados desde ella:
 
-| Comando | Qué cubre | Necesita |
-| --- | --- | --- |
-| `pytest` | Suite completa, con cliente falso y sandbox real | Podman |
-| `pytest tests/test_deepseek_integration.py -q` | Cliente (transporte simulado), propuesta, atomicidad, bucle de reparación, límites, rollback, auditoría | Podman |
-| `pytest tests/integration/test_deepseek_live.py -q` | **Puerta viva**: una llamada real a la API | `DEEPSEEK_API_KEY` |
-
-La suite por defecto **ignora** `tests/integration` (`--ignore=tests/integration`)
-para que un entorno sin credenciales siga siendo verde. La puerta viva se ejecuta
-a propósito y **falla de forma explícita** con
-`CREDENTIAL_REQUIRED: DEEPSEEK_API_KEY` cuando la clave no está: no se salta en
-silencio, no se marca `xfail`, no se declara PASS sin llamada real.
-
-**Estado:** la puerta viva no se ha podido ejecutar en este entorno porque
-`DEEPSEEK_API_KEY` no está disponible. ENGINE-2 **no se declara PASS**.
+```powershell
+# Persistente para el usuario: visible a procesos nuevos.
+[Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', $env:DEEPSEEK_API_KEY, 'User')
+```
 
 ### Limitación declarada
 
-Los identificadores `deepseek-v4-pro` y `deepseek-v4-flash` provienen del
-mandato y están fijados en el código. No se han podido contrastar contra la API
-real sin credencial. Si el proveedor usa otro identificador, la puerta viva lo
-hará visible de inmediato con `DeepSeekModelNotSupportedError` o un error de la
-API; no se ha asumido que existan.
+Los identificadores `deepseek-v4-pro` y `deepseek-v4-flash` provienen del mandato.
+`deepseek-v4-pro` quedó **confirmado contra la API real** en la puerta viva:
+respondió sin `DeepSeekModelNotSupportedError` y devolvió ese mismo identificador en
+`completion.model`. `deepseek-v4-flash` sigue sin ejercitarse en vivo.
 
 ---
 

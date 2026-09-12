@@ -39,6 +39,9 @@ from punto.developer.prompts import (
     DEVELOPER_REPAIR_TEMPLATE,
     DEVELOPER_SYSTEM_PROMPT,
     DEVELOPER_USER_TEMPLATE,
+    PROPOSAL_FORMAT_REMINDER,
+    REPAIR_AFTER_PROPOSAL_REJECTION,
+    REPAIR_AFTER_VALIDATION_FAILURE,
 )
 from punto.providers.deepseek import (
     DeepSeekClient,
@@ -215,6 +218,7 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
             context_payload = self._build_context(task, filesystem)
             user_prompt = self._initial_prompt(task, allowed, context_payload)
             evidence = ""
+            situation = REPAIR_AFTER_VALIDATION_FAILURE
 
             for attempt in range(1, context.attempts_allowed + 1):
                 attempts_used = attempt
@@ -228,7 +232,9 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                 prompt = (
                     user_prompt
                     if attempt == 1
-                    else self._repair_prompt(task, allowed, filesystem, evidence)
+                    else self._repair_prompt(
+                        task, allowed, filesystem, evidence, situation
+                    )
                 )
 
                 completion = self._call_model(task, attempt, prompt)
@@ -236,8 +242,23 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                 usage = usage.merged(completion.usage)
                 self._assert_token_budget(usage)
 
-                proposal = self._parse_proposal(task, attempt, completion.content)
-                self._validate_proposal(task, attempt, proposal, allowed)
+                try:
+                    proposal = self._parse_proposal(task, attempt, completion.content)
+                    self._validate_proposal(task, attempt, proposal, allowed)
+                except DeveloperExecutionError as exc:
+                    # La propuesta se rechaza ENTERA y no se escribe nada. El motivo
+                    # vuelve al modelo como evidencia: reparar cuesta un intento y una
+                    # llamada, y ambos presupuestos los fija PUNTO, no el modelo.
+                    evidence = str(exc)
+                    situation = REPAIR_AFTER_PROPOSAL_REJECTION
+                    self._log_attempt(
+                        task, attempt, "failed", detail=evidence, failed_check="proposal"
+                    )
+                    if attempt < context.attempts_allowed:
+                        self._log_attempt(task, attempt, "repair_requested", detail=evidence)
+                    continue
+
+                situation = REPAIR_AFTER_VALIDATION_FAILURE
 
                 outcome = self._apply_and_validate(
                     task, proposal, filesystem, sandbox_shell, context, files
@@ -503,6 +524,7 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
             acceptance_criteria=_bullets(task.acceptance_criteria),
             allowed_files=_bullets(allowed),
             context=context_payload,
+            format_reminder=PROPOSAL_FORMAT_REMINDER,
         )
 
     def _repair_prompt(
@@ -511,6 +533,7 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         allowed: tuple[str, ...],
         filesystem: FilesystemTool,
         evidence: str,
+        situation: str = REPAIR_AFTER_VALIDATION_FAILURE,
     ) -> str:
         """Petición de reparación con el estado actual y la evidencia del fallo."""
         current: list[str] = []
@@ -521,11 +544,13 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                 content = "(no existe todavía)"
             current.append(f"=== {relative} ===\n{content[:MAX_CONTEXT_FILE_CHARS]}")
         return DEVELOPER_REPAIR_TEMPLATE.format(
+            situation=situation,
             objective=task.objective,
             acceptance_criteria=_bullets(task.acceptance_criteria),
             allowed_files=_bullets(allowed),
             current_files="\n\n".join(current) if current else "(sin archivos)",
             evidence=evidence or "(sin evidencia)",
+            format_reminder=PROPOSAL_FORMAT_REMINDER,
         )
 
     def _commit_message(self, task: DeveloperTask) -> str:

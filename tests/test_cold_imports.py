@@ -98,6 +98,17 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.reviewer.gates",
     "punto.reviewer.prompts",
     "punto.reviewer.validation",
+    # --- ENGINE-5.2: multi-proveedor y auditoría cruzada -----------------------
+    "punto.providers.base",
+    "punto.providers.anthropic",
+    "punto.providers.routing",
+    "punto.schemas.cross_audit",
+    "punto.crossaudit",
+    "punto.crossaudit.base",
+    "punto.crossaudit.prompts",
+    "punto.crossaudit.validation",
+    "punto.crossaudit.gates",
+    "punto.crossaudit.claude",
 )
 
 

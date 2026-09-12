@@ -2180,7 +2180,176 @@ superficie de rutas.
 
 ---
 
-## 24. Licencia
+## 24. ENGINE-5.2 — Multi-Provider + Anthropic/Claude + Cross-Model Audit
+
+ENGINE-5.2 convierte a PUNTO en un motor **multi-proveedor**. Hasta aquí el motor hablaba con
+DeepSeek mediante un cliente concreto; ahora hay dos proveedores reales coordinados por CAMUS:
+
+```
+CAMUS
+├── DeepSeek provider    → ARCHITECT, PLANNER, DEVELOPER, QA, SECURITY, REVIEWER
+└── Anthropic provider   → CROSS_AUDITOR (+ VISUAL_ARCHITECT, FRONTEND_SPECIALIST, VISUAL_QA)
+```
+
+Claude **no** se integra «dentro de DeepSeek»: son clientes independientes detrás de un
+contrato común, y cada rol se enruta de forma explícita.
+
+> **ENGINE-5.2 IMPLEMENTATION = PASS · CLAUDE LIVE = PENDING_API_KEY · FINAL CLOSE = PENDING.**
+> *Implementation PASS does not mean Anthropic live connectivity has been verified.* La fase se
+> construyó y se probó sin credencial de Anthropic: la suite estándar usa un transporte falso
+> fiel al contrato real, y las cinco puertas vivas quedan pendientes hasta que exista
+> `ANTHROPIC_API_KEY`.
+
+### Contrato provider-neutral
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `StructuredModelClient` | `src/punto/providers/base.py` | Interfaz mínima: `provider`, `model`, `complete_json`, `redact`, `close` |
+| `MultimodalModelClient` | `src/punto/providers/base.py` | Añade `complete_multimodal_json` y `supports_images` |
+| `ModelCompletion` | `src/punto/providers/base.py` | Resultado común: contenido, proveedor, modelo, usage, latencia, reintentos, `stop_reason`, `request_id` |
+| `ImagePayload` / `ImageLimits` | `src/punto/providers/base.py` | Bytes que controla PUNTO y validación determinista previa |
+
+`ModelCompletion` se **extrajo** del cliente de DeepSeek sin romper nada: `punto.providers
+.deepseek` la reexporta, así que `from punto.providers.deepseek import ModelCompletion` sigue
+funcionando y los seis agentes existentes no cambiaron. Lo que sí se añadió es `provider` y
+`request_id` (con default, sin migración) para que el informe pueda decir **quién** respondió.
+
+Nota documentada: `stop_reason` devuelve el valor **nativo** del proveedor. DeepSeek informa
+`length` y Anthropic `max_tokens` para el mismo fenómeno; traducirlo exigiría verificar en vivo
+la semántica de cada uno, y una tabla inventada sería peor que la asimetría declarada.
+
+### Cliente de Anthropic
+
+`src/punto/providers/anthropic.py` habla la **Messages API nativa** (`POST /v1/messages`,
+`x-api-key`, `anthropic-version: 2023-06-01`), no una traducción al dialecto de OpenAI.
+
+| Aspecto | Comportamiento |
+| --- | --- |
+| Errores | `AnthropicAuthenticationError` (401/403), `AnthropicRateLimitError` (429), `AnthropicServerError` (5xx/529), `AnthropicProviderError` (resto 4xx), `AnthropicTransportError` / `AnthropicTimeoutError`, `AnthropicInvalidResponseError`, `AnthropicTruncatedResponseError` |
+| Reintentos | 401/403 **nunca** (una sola llamada); 429/5xx/529/timeout/red con backoff exponencial acotado |
+| Truncamiento | `stop_reason == "max_tokens"` se detecta **antes** de interpretar el JSON: nunca se reporta un error de sintaxis cuando la causa es el presupuesto |
+| Redacción | clave exacta, cualquier `sk-ant-...`, `x-api-key: ...` y `Bearer ...`; el detalle HTTP se redacta **antes** de recortarlo |
+| Credencial | solo en el proceso que llama: no entra al sandbox, ni al workspace, ni al prompt, ni al registro de auditoría |
+
+La jerarquía se diseñó para ser **equivalente**, no idéntica, a la de DeepSeek: añade
+`AnthropicTimeoutError` (subclase de transporte) y `AnthropicServerError` (subclase de
+proveedor) porque distinguir un 500 de un 400 es información útil. Además,
+`AnthropicAuthenticationError` hereda de `ProviderAuthenticationError`, así que el motor puede
+tratarla como «proveedor no disponible» sin conocer a Anthropic.
+
+### Fundación multimodal
+
+El contrato acepta `texto + imágenes → JSON estructurado`, con los formatos `image/png`,
+`image/jpeg` y `image/webp`. PUNTO controla los bytes: el modelo **nunca** recibe una ruta para
+leer archivos por su cuenta.
+
+Los límites se validan de forma determinista **antes** de construir cualquier petición (por
+defecto: 8 imágenes, 5 MB por imagen, 15 MB en total). Un límite personalizado puede
+**estrechar** lo permitido, nunca ampliarlo: si PUNTO declara que soporta tres formatos,
+aceptar `text/plain` en la configuración sería contradecir su propio contrato.
+
+Todavía **no** hay screenshots reales: eso es ENGINE-5.3. Lo que está listo y probado es todo
+el camino de construcción con transporte falso, para que conectar Chromium sea añadir el
+productor de imágenes, no rediseñar el transporte.
+
+### Routing por rol
+
+| Rol | Proveedor por defecto |
+| --- | --- |
+| ARCHITECT, PLANNER, DEVELOPER, QA, SECURITY, REVIEWER | `deepseek` |
+| CROSS_AUDITOR | `anthropic` |
+| VISUAL_ARCHITECT, FRONTEND_SPECIALIST, VISUAL_QA | `anthropic` (preparados; runner real en ENGINE-5.3) |
+
+`ModelRouter` resuelve la ruta de cada rol desde el entorno (`PUNTO_<ROL>_MODEL` y
+`PUNTO_<ROL>_PROVIDER`), valida que haya exactamente una ruta por rol y expone
+`is_cross_model(roles)`.
+
+### Sin fallback silencioso
+
+La regla más importante de la fase:
+
+| Situación | Resultado |
+| --- | --- |
+| `provider=anthropic` y no hay cliente de Anthropic | `PROVIDER_UNAVAILABLE`; **nunca** DeepSeek |
+| `provider=deepseek` y no hay cliente de DeepSeek | `PROVIDER_UNAVAILABLE`; **nunca** Anthropic |
+| El cliente declarado usa **otro modelo** que la ruta | `PROVIDER_MODEL_MISMATCH`; la ruta y lo que se ejecuta no divergen en silencio |
+
+Un fallback automático convertiría la auditoría cruzada en una auditoría del mismo modelo, que
+es exactamente lo que deja de tener valor. Si algún día hace falta un fallback, tendrá que ser
+una política explícita de CAMUS, no una conveniencia del cliente.
+
+### Auditoría cruzada
+
+`CrossAuditRunner` (abstracto, provider-agnostic) y `ClaudeCrossModelAuditRunner`
+(`src/punto/crossaudit/claude.py`). Su función es auditar **después** de Developer, QA, Security
+y Reviewer, con un proveedor distinto. No sustituye al Reviewer, no ejecuta código, no modifica
+archivos, no hace commits y no repara el producto.
+
+**Gates que Claude no puede anular** (`src/punto/crossaudit/gates.py`):
+
+| Gate | Condición | Efecto |
+| --- | --- | --- |
+| QA | sin informe o `BLOCKED` | **BLOCKED** |
+| QA | `!= PASS` | `CHANGES_REQUESTED` (nunca PASS) |
+| Security | sin informe o `BLOCKED` | **BLOCKED** |
+| Security | `!= PASS` | `CHANGES_REQUESTED` (nunca PASS) |
+| Reviewer | sin informe o `BLOCKED` | **BLOCKED** |
+| Reviewer | `!= APPROVED` | `CHANGES_REQUESTED` |
+| Contexto | falta un archivo modificado | **BLOCKED** |
+| Proveedor | no disponible o error | **BLOCKED** |
+| Hallazgos | alguno `HIGH`/`CRITICAL` | `CHANGES_REQUESTED` |
+| Todo verde | contexto completo y propuesta válida | **PASS** |
+
+Precedencia: bloqueante > cambios pedidos > PASS. El veredicto lo calcula PUNTO y
+`CrossAuditProposal` **no** admite `status`: si el modelo intenta escribirlo, la propuesta se
+rechaza y se le pide de nuevo.
+
+El informe guarda `provider`, `model`, `upstream_providers` y `cross_model`, calculado como un
+hecho: si todos los proveedores coinciden, `cross_model` es `False` y el informe lo dice en
+lugar de adornarse con la palabra «cruzada».
+
+### Fronteras de contexto
+
+La auditoría cruzada **reutiliza** `build_model_review_context()` y
+`resolve_within_workspace()` de ENGINE-5.1/5.1.1: no duplica lectura de archivos. Un hallazgo
+solo puede señalar archivos de `model_visible_files`, los enlaces que escapan del workspace no
+se leen nunca, y si un archivo modificado no cabe en el contexto la auditoría queda `BLOCKED` /
+`CONTEXT_LIMIT_EXCEEDED`. No hay auditoría parcial disfrazada.
+
+### Estado live
+
+| Gate vivo | Estado |
+| --- | --- |
+| A. Autenticación | PENDING_API_KEY |
+| B. JSON estructurado | PENDING_API_KEY |
+| C. Credencial inválida | PENDING_API_KEY |
+| D. Multimodal | PENDING_API_KEY |
+| E. Auditoría cruzada | PENDING_API_KEY |
+
+```
+pytest tests/integration/test_anthropic_live.py -q -s
+```
+
+Sin `ANTHROPIC_API_KEY` esa suite **no se ejecuta** y no se declara nada: no se inventan
+resultados, no se simula que Claude respondió y no se pide la credencial por el chat. La suite
+estándar no depende de ella (vive en `tests/integration`, que el `addopts` ignora) y mantiene
+**0 failed / 0 skipped**.
+
+### Limitación declarada
+
+- ENGINE-5.2 **no** implementa runtime Node, Next.js, TypeScript, Tailwind, Playwright ni
+  Chromium, ni el especialista frontend, ni Visual QA completo: es ENGINE-5.3.
+- El identificador de modelo por defecto (`claude-sonnet-4-5`) **no** está verificado en vivo:
+  `MODEL_AVAILABILITY_UNVERIFIED` es `True` y no existe lista blanca, así que un identificador
+  equivocado se verá como 404 del proveedor y solo los live gates lo confirman.
+- Los tres roles visuales están **preparados** (ruta declarada) pero **sin runner**: sus
+  interfaces llegarán en ENGINE-5.3.
+- No hay routing autónomo ni bucle de reparación: eso es ENGINE-6.
+- Sin fallback entre proveedores, por diseño. Un proveedor caído bloquea; no se sustituye.
+
+---
+
+## 25. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

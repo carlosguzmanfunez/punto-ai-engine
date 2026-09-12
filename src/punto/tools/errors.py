@@ -296,10 +296,47 @@ class ReviewerRunnerNotConfiguredError(ReviewerError):
         )
 
 
+class ProviderRouteError(RuntimeError):
+    """El routing de modelos no puede satisfacer lo que se le pide.
+
+    Cubre dos situaciones que comparten la misma regla: un rol pide un proveedor que no está
+    disponible, o se intenta entregar un cliente de otro proveedor. Ninguna de las dos se
+    resuelve usando otro proveedor: se falla de forma explícita.
+    """
+
+
+class CrossAuditError(RuntimeError):
+    """Base de los errores de la auditoría cruzada."""
+
+
+class CrossAuditValidationError(CrossAuditError):
+    """La propuesta de auditoría cruzada incumple un invariante determinista."""
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(
+            f"Auditoría cruzada inválida ({len(self.violations)} violación/es): {detail}"
+        )
+
+
+class CrossAuditRunnerNotConfiguredError(CrossAuditError):
+    """No hay ningún ``CrossAuditRunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay CrossAuditRunner configurado: injecta uno en Camus("
+            "cross_audit_runner=...) para auditar en cruzado."
+        )
+
+
 __all__ = [
     "ArchitectRunnerNotConfiguredError",
     "BranchPolicyViolationError",
     "CommandNotAllowedError",
+    "CrossAuditError",
+    "CrossAuditRunnerNotConfiguredError",
+    "CrossAuditValidationError",
     "DeveloperExecutionError",
     "DeveloperRunnerNotConfiguredError",
     "ExecutionLimitExceededError",
@@ -309,6 +346,7 @@ __all__ = [
     "PlanningLimitExceededError",
     "PlanningValidationError",
     "ProtectedFileError",
+    "ProviderRouteError",
     "QAError",
     "QARunnerNotConfiguredError",
     "QAValidationError",

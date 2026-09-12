@@ -1861,6 +1861,197 @@ class AuditLogger:
             },
         )
 
+    # ------------------------------------------------------- cross-model audit
+    def log_cross_audit_request_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        upstream_providers: Sequence[str] = (),
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una auditoría cruzada.
+
+        Se registra qué proveedor audita y qué proveedores intervinieron antes: sin eso, un
+        informe «cruzado» no se puede auditar después.
+        """
+        return self.record(
+            AuditEventType.CROSS_AUDIT_REQUEST_STARTED,
+            action="cross_audit_request_started",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "upstream_providers": list(upstream_providers),
+            },
+        )
+
+    def log_cross_audit_proposal_received(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta de auditoría recibida, antes de validarla."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_PROPOSAL_RECEIVED,
+            action="cross_audit_proposal_received",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+            },
+        )
+
+    def log_cross_audit_proposal_accepted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta de auditoría aceptada por PUNTO."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_PROPOSAL_ACCEPTED,
+            action="cross_audit_proposal_accepted",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+            },
+        )
+
+    def log_cross_audit_proposal_rejected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta rechazada con sus violaciones."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_PROPOSAL_REJECTED,
+            action="cross_audit_proposal_rejected",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "violation_count": len(violations),
+                "violations": [item[:300] for item in violations],
+            },
+        )
+
+    def log_cross_audit_finding_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        finding_id: str,
+        severity: str,
+        category: str,
+        file: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un hallazgo de auditoría: recuento y ubicación, nunca su contenido."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_FINDING_RECORDED,
+            action="cross_audit_finding_recorded",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "finding_id": finding_id,
+                "severity": severity,
+                "category": category,
+                "file": file,
+            },
+        )
+
+    def log_cross_audit_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        status: str,
+        provider: str,
+        model: str,
+        upstream_providers: Sequence[str] = (),
+        cross_model: bool = False,
+        findings: int = 0,
+        blocking_findings: int = 0,
+        gates: Sequence[str] = (),
+        attempts: int = 0,
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una auditoría cruzada con su veredicto y su topología."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_COMPLETED,
+            action="cross_audit_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "status": status,
+                "provider": provider,
+                "model": model,
+                "upstream_providers": list(upstream_providers),
+                "cross_model": cross_model,
+                "findings": findings,
+                "blocking_findings": blocking_findings,
+                "gates": list(gates),
+                "attempts": attempts,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_cross_audit_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        reason: str,
+        provider: str = "",
+        model: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una auditoría bloqueada, con su motivo y su proveedor."""
+        return self.record(
+            AuditEventType.CROSS_AUDIT_BLOCKED,
+            action="cross_audit_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "reason": reason[:300],
+                "provider": provider,
+                "model": model,
+                "detail": detail[:500],
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

@@ -107,6 +107,14 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.REVIEW_FINDING_RECORDED: "review_finding",
     AuditEventType.REVIEW_COMPLETED: "review_report",
     AuditEventType.REVIEW_BLOCKED: "review_report",
+    # --- Cross-model audit (ENGINE-5.2) ---------------------------------------
+    AuditEventType.CROSS_AUDIT_REQUEST_STARTED: "cross_audit_request",
+    AuditEventType.CROSS_AUDIT_PROPOSAL_RECEIVED: "cross_audit_proposal",
+    AuditEventType.CROSS_AUDIT_PROPOSAL_REJECTED: "cross_audit_proposal",
+    AuditEventType.CROSS_AUDIT_PROPOSAL_ACCEPTED: "cross_audit_proposal",
+    AuditEventType.CROSS_AUDIT_FINDING_RECORDED: "cross_audit_finding",
+    AuditEventType.CROSS_AUDIT_COMPLETED: "cross_audit_report",
+    AuditEventType.CROSS_AUDIT_BLOCKED: "cross_audit_report",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

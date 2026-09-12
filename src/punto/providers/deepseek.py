@@ -26,6 +26,11 @@ from typing import Any, Final
 
 import httpx
 
+from punto.providers.base import (
+    PROVIDER_DEEPSEEK,
+    ModelCompletion,
+    StructuredModelClient,
+)
 from punto.schemas.execution import ModelUsage
 
 #: URL base oficial.
@@ -101,18 +106,6 @@ class DeepSeekTruncatedResponseError(DeepSeekInvalidResponseError):
 
 class DeepSeekModelNotSupportedError(DeepSeekError):
     """El modelo solicitado no está soportado o es un alias heredado."""
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCompletion:
-    """Resultado estructurado de una llamada al modelo."""
-
-    content: str
-    model: str
-    usage: ModelUsage
-    latency_ms: int
-    finish_reason: str = ""
-    transport_retries: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,8 +251,13 @@ def config_from_environment(
     )
 
 
-class DeepSeekClient:
-    """Cliente mínimo de la API de chat de DeepSeek."""
+class DeepSeekClient(StructuredModelClient):
+    """Cliente mínimo de la API de chat de DeepSeek.
+
+    Cumple el contrato :class:`~punto.providers.base.StructuredModelClient`, así que puede
+    sustituirse por otro proveedor en cualquier punto donde el motor acepte uno. Lo que **no**
+    cambia: sigue siendo el cliente de DeepSeek y solo habla con DeepSeek.
+    """
 
     def __init__(
         self,
@@ -279,6 +277,11 @@ class DeepSeekClient:
         self._last_usage = ModelUsage()
 
     # ------------------------------------------------------------------ estado
+    @property
+    def provider(self) -> str:
+        """Proveedor del modelo."""
+        return PROVIDER_DEEPSEEK
+
     @property
     def model(self) -> str:
         """Modelo configurado."""
@@ -462,6 +465,8 @@ class DeepSeekClient:
             latency_ms=latency_ms,
             finish_reason=str(finish_reason) if isinstance(finish_reason, str) else "",
             transport_retries=transport_retries,
+            provider=PROVIDER_DEEPSEEK,
+            request_id=_response_request_id(response, body),
         )
 
 
@@ -511,6 +516,20 @@ def _parse_usage(raw: object) -> ModelUsage:
         prompt_cache_hit_tokens=number("prompt_cache_hit_tokens"),
         prompt_cache_miss_tokens=number("prompt_cache_miss_tokens"),
     )
+
+
+def _response_request_id(response: httpx.Response, body: dict[str, Any]) -> str:
+    """Identificador de la petición, si el proveedor lo expone.
+
+    Se prefiere la cabecera; si no viene ninguna, se usa el ``id`` del cuerpo (``chatcmpl-...``)
+    para que una llamada a DeepSeek no quede sin identificador reclamable.
+    """
+    for header in ("x-request-id", "request-id"):
+        value = response.headers.get(header)
+        if isinstance(value, str) and value:
+            return value
+    identifier = body.get("id")
+    return identifier if isinstance(identifier, str) else ""
 
 
 def _safe_detail(response: httpx.Response) -> str:

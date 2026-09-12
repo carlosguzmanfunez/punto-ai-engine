@@ -26,6 +26,7 @@ from uuid import UUID
 
 from punto.architect.base import ArchitectRequest, ArchitectRunner
 from punto.common import utc_now
+from punto.crossaudit.base import CrossAuditRunner
 from punto.developer.base import DeveloperRunner
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
@@ -42,6 +43,7 @@ from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFound
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.qa.base import QARunner
 from punto.reviewer.base import ReviewerRunner
+from punto.schemas.cross_audit import CrossAuditReport, CrossAuditTask
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import (
     AuthorityLevel,
@@ -75,6 +77,7 @@ from punto.security.base import SecurityRunner
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import (
     ArchitectRunnerNotConfiguredError,
+    CrossAuditRunnerNotConfiguredError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
     QARunnerNotConfiguredError,
@@ -201,6 +204,7 @@ class Camus:
         qa_runner: QARunner | None = None,
         security_runner: SecurityRunner | None = None,
         reviewer_runner: ReviewerRunner | None = None,
+        cross_audit_runner: CrossAuditRunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -222,6 +226,9 @@ class Camus:
         #: forma explícita en lugar de improvisar una evaluación.
         self._security = security_runner
         self._reviewer = reviewer_runner
+        #: Auditoría cruzada entre proveedores (ENGINE-5.2). Opt-in: sin ella, CAMUS no
+        #: sustituye el rol por otro proveedor, simplemente falla de forma explícita.
+        self._cross_audit = cross_audit_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -337,6 +344,36 @@ class Camus:
                 finding_id=finding.id,
                 severity=finding.severity.value,
                 category=finding.category.value,
+            )
+        return report
+
+    # ----------------------------------------------------------- ENGINE-5.2
+    @property
+    def cross_audit_runner(self) -> CrossAuditRunner | None:
+        """Rol de auditoría cruzada inyectado, si existe (ENGINE-5.2)."""
+        return self._cross_audit
+
+    def cross_audit(self, task: CrossAuditTask) -> CrossAuditReport:
+        """Audita el trabajo con un proveedor **distinto** al que lo construyó.
+
+        Es un rol adicional, no un sustituto del Reviewer: llega después y no puede anular
+        ningún gate previo. CAMUS no audita: delega y registra cada gate con su motivo.
+
+        Raises:
+            CrossAuditRunnerNotConfiguredError: si no hay auditor cruzado inyectado.
+        """
+        if self._cross_audit is None:
+            raise CrossAuditRunnerNotConfiguredError()
+
+        report = self._cross_audit.audit(task)
+        for finding in report.findings:
+            self._audit.log_cross_audit_finding_recorded(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                finding_id=finding.id,
+                severity=finding.severity.value,
+                category=finding.category.value,
+                file=finding.file,
             )
         return report
 

@@ -140,12 +140,39 @@ class AuditResult(StrEnum):
     PENDING = "PENDING"
 
 
+class FindingSeverity(StrEnum):
+    """Gravedad de un hallazgo de un rol de evaluación (ENGINE-5).
+
+    Vive aquí, y no en los esquemas de Security o de Reviewer, porque **ambos** la usan
+    con el mismo significado: un ``HIGH`` de seguridad y un ``HIGH`` de revisión son la
+    misma gravedad y deben compararse con la misma regla.
+    """
+
+    INFO = "INFO"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+    @property
+    def blocks_approval(self) -> bool:
+        """True si la gravedad impide aprobar el trabajo."""
+        return self in _BLOCKING_SEVERITIES
+
+
+#: Gravedades que impiden declarar el trabajo aprobado o seguro.
+_BLOCKING_SEVERITIES: frozenset[FindingSeverity] = frozenset(
+    {FindingSeverity.HIGH, FindingSeverity.CRITICAL}
+)
+
+
 __all__ = [
     "HUMAN_GATE_RESUME_STATUSES",
     "ApprovalStatus",
     "AuditResult",
     "AuthorityLevel",
     "BlockedReason",
+    "FindingSeverity",
     "RiskLevel",
     "TaskPriority",
     "TaskStatus",

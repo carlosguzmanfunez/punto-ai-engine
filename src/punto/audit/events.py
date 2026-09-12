@@ -88,6 +88,25 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.QA_FINDING_RECORDED: "qa_finding",
     AuditEventType.QA_COMPLETED: "qa_report",
     AuditEventType.QA_BLOCKED: "qa_report",
+    # --- Security Agent (ENGINE-5) --------------------------------------------
+    #: Se registran sobre el ``task_id`` auditado.
+    AuditEventType.SECURITY_REQUEST_STARTED: "security_request",
+    AuditEventType.SECURITY_PLAN_RECEIVED: "security_plan",
+    AuditEventType.SECURITY_PLAN_REJECTED: "security_plan",
+    AuditEventType.SECURITY_PLAN_ACCEPTED: "security_plan",
+    AuditEventType.SECURITY_CHECK_STARTED: "security_check",
+    AuditEventType.SECURITY_CHECK_COMPLETED: "security_check",
+    AuditEventType.SECURITY_FINDING_RECORDED: "security_finding",
+    AuditEventType.SECURITY_COMPLETED: "security_report",
+    AuditEventType.SECURITY_BLOCKED: "security_report",
+    # --- Reviewer Agent (ENGINE-5) --------------------------------------------
+    AuditEventType.REVIEW_REQUEST_STARTED: "review_request",
+    AuditEventType.REVIEW_PROPOSAL_RECEIVED: "review_proposal",
+    AuditEventType.REVIEW_PROPOSAL_REJECTED: "review_proposal",
+    AuditEventType.REVIEW_PROPOSAL_ACCEPTED: "review_proposal",
+    AuditEventType.REVIEW_FINDING_RECORDED: "review_finding",
+    AuditEventType.REVIEW_COMPLETED: "review_report",
+    AuditEventType.REVIEW_BLOCKED: "review_report",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

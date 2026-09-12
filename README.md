@@ -1881,7 +1881,241 @@ Sin cambios: QA no se expone por HTTP. `GET /health` → 200 y la misma superfic
 
 ---
 
-## 23. Licencia
+## 23. ENGINE-5 — Independent Security + Reviewer Agents
+
+ENGINE-5 añade los dos roles que faltaban en la cadena: **Security** y **Reviewer**. La
+regla estructural que los separa de todo lo anterior:
+
+```
+Developer ≠ QA ≠ Security ≠ Reviewer
+```
+
+Pueden usar el mismo proveedor y el mismo modelo, pero son roles, interfaces, prompts y
+contratos **separados**. Y ninguno puede anular el veredicto de otro.
+
+```
+Developer → Sandbox → QA → Security → Reviewer → CAMUS
+```
+
+ENGINE-5 construye los agentes y permite a CAMUS invocarlos **explícitamente**. El
+workflow automático de reparación (Developer → QA → reparación → QA → Security → …) llega
+en ENGINE-6.
+
+### Separación de roles
+
+| Rol | Responde | No hace |
+| --- | --- | --- |
+| Developer | ¿cómo lo implemento? | no decide si cumple el contrato |
+| QA | ¿funciona? | no modifica producción, no declara PASS |
+| Security | ¿es seguro usarlo? | no modifica nada, no declara el estado |
+| Reviewer | ¿está listo para aceptarse? | no ejecuta código, no reescribe los informes de otros |
+
+El PASS del Developer y el PASS de QA viajan a Security y al Reviewer como **contexto**,
+nunca como prueba: que algo funcione no lo hace seguro, y que sea seguro no lo hace
+correcto.
+
+### Security Agent
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `SecurityRunner` | `src/punto/security/base.py` | Interfaz provider-agnostic |
+| `DeepSeekSecurityRunner` | `src/punto/security/deepseek.py` | Implementación real |
+| Esquemas | `src/punto/schemas/security.py` | `SecurityTask`, `SecurityPlan`, `SecurityFinding`, `SecurityReport` |
+| Checks deterministas | `src/punto/security/deterministic.py` | Análisis implementado por PUNTO |
+| Registry cerrado | `src/punto/security/checks.py` | Qué se ejecuta y qué no existe |
+| Validación | `src/punto/security/validation.py` | Invariantes del plan y de los hallazgos |
+| Veredicto | `src/punto/security/report.py` | Deduplicación y estado determinista |
+
+**Plan.** El modelo declara qué archivos revisa (`review_targets`), con qué áreas
+(`analysis_areas` de un catálogo de 15: autenticación, autorización, validación de entrada,
+inyección, secretos, criptografía, exposición de datos, riesgo de dependencias, red,
+sistema de archivos, manejo de errores, registro, privacidad, configuración y cadena de
+suministro), qué amenazas busca y qué checks registrados quiere que PUNTO ejecute. No se
+exige que todas las áreas apliquen a toda tarea.
+
+**Hallazgos.** Con `severity`, `category`, `file`, `line`, `evidence`, `impact`,
+`recommendation`, `confidence` y `sources`. La **evidencia es obligatoria** y el archivo
+debe existir dentro del contexto que el agente efectivamente vio: un hallazgo sobre un
+archivo que nadie revisó no es un hallazgo, es una invención. Una línea fuera del archivo
+se descarta, pero el hallazgo se conserva: perder evidencia de seguridad por un desfase de
+una línea sería el peor de los trueques.
+
+**Deduplicación sin perder fuentes.** Si el modelo y un check determinista encuentran el
+mismo problema, es **un** hallazgo con **dos** fuentes: la coincidencia es evidencia más
+fuerte, no ruido. Al fundir se conserva la gravedad más alta.
+
+### Checks deterministas
+
+Implementados por PUNTO. Inspeccionan datos, **no ejecutan código del proyecto**, así que
+corren en proceso confiable:
+
+| Check | Qué busca |
+| --- | --- |
+| `secret-pattern-scan` | Claves de proveedor, tokens `Bearer`, bloques de clave privada, contraseñas y URLs con credenciales |
+| `dangerous-path-scan` | Rutas del sistema y permisos peligrosos (`chmod 777`, `/etc/shadow`, claves SSH) |
+| `python-ast-security` | `eval`, `exec`, `os.system`, `os.popen`, `pickle.loads`, `yaml.load` sin loader seguro y `subprocess` con `shell=True` |
+| `dependency-manifest-inspection` | Dependencias sin versión fijada, **sin red** |
+
+El escáner de secretos **evita los falsos positivos obvios**: canarios de prueba,
+placeholders de `.env.example` y ejemplos de documentación no son hallazgos. Marcarlos
+bloquearía el motor por su propio material didáctico. Y reporta; **nunca elimina** nada.
+
+Los análisis de AST son **evidencia conservadora, no una explotación demostrada**:
+`shell=True` y la ejecución dinámica son `HIGH`; el resto, `MEDIUM`. No sustituyen a un
+scanner industrial y no se presentan como si lo hicieran.
+
+### Scanners que PUNTO no tiene
+
+`bandit`, `semgrep`, `trivy`, `npm-audit` y `osv-scanner` están **registrados pero no
+disponibles**. Pedirlos produce `BLOCKED` / `CAPABILITY_REQUIRED` con el hueco declarado.
+**Nunca** se ejecutan en el host como sustituto, y nunca se finge que los checks internos
+equivalen a ellos.
+
+### Estado de seguridad
+
+| Situación | Estado |
+| --- | --- |
+| Algún hallazgo `HIGH` o `CRITICAL` | **FAIL** |
+| Solo `MEDIUM`, `LOW` o `INFO` | **PASS**, con los hallazgos informados y conservados |
+| Check pedido no disponible, plan irrecuperable o análisis no ejecutable | **BLOCKED** |
+
+El modelo **no** puede escribir el estado: el contrato del plan y de los hallazgos rechaza
+cualquier clave desconocida, incluida `status`. Y un producto vulnerable **no se repara**:
+se reporta. El bucle de reparación solo existe para un plan o un hallazgo estructuralmente
+inválidos.
+
+### Reviewer Agent
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `ReviewerRunner` | `src/punto/reviewer/base.py` | Interfaz provider-agnostic |
+| `DeepSeekReviewerRunner` | `src/punto/reviewer/deepseek.py` | Implementación real |
+| Esquemas | `src/punto/schemas/review.py` | `ReviewTask`, `ReviewProposal`, `ReviewFinding`, `ReviewReport` |
+| **Gates** | `src/punto/reviewer/gates.py` | Las reglas que el modelo no puede anular |
+
+El Reviewer evalúa corrección, mantenibilidad, conformidad arquitectónica, disciplina de
+alcance, riesgo de regresión, claridad, consistencia, deuda técnica introducida,
+adecuación de las pruebas y disposición de seguridad. **No ejecuta código**: QA y Security
+ya lo hicieron.
+
+Sus hallazgos usan categorías propias (`CORRECTNESS`, `ARCHITECTURE`, `MAINTAINABILITY`,
+`SCOPE`, `TESTING`, `PERFORMANCE`, `COMPATIBILITY`, `DOCUMENTATION`, `TECHNICAL_DEBT`) y
+**no duplican** los de seguridad: los **referencian** por identificador.
+
+### Gates no anulables
+
+Esto es lo que hace que el Reviewer sea un rol y no un opinador. Las reglas viven en código:
+
+| Gate | Condición | Efecto |
+| --- | --- | --- |
+| QA | `QAStatus != PASS` | no puede aprobar (`CHANGES_REQUESTED`) |
+| QA | `QAStatus == BLOCKED` | **BLOCKED** |
+| Security | `SecurityStatus == FAIL` | no puede aprobar (`CHANGES_REQUESTED`) |
+| Security | `SecurityStatus == BLOCKED` | **BLOCKED** |
+| Hallazgos | algún `HIGH`/`CRITICAL` de revisión | **CHANGES_REQUESTED** |
+| Falta un informe | sin QA o sin Security | **BLOCKED** |
+| Todo en verde | y sin hallazgo bloqueante | **APPROVED** |
+
+Precedencia: bloqueante > no superado > aprobado. El modelo puede aportar hallazgos y
+valoraciones; **no** puede escribir el veredicto, y ninguna propuesta suya —por limpia que
+sea— convierte un QA fallido o un Security fallido en una aprobación. Hay pruebas
+parametrizadas que lo demuestran caso por caso.
+
+### Evaluación completa
+
+`TaskEvaluation` reúne los cuatro resultados de una tarea (`developer_result`, `qa_report`,
+`security_report`, `review_report`) y expone sus veredictos. Es **solo** una estructura: no
+encadena roles ni dispara nada. Existe para facilitar ENGINE-6 sin diseñar ahora el
+workflow.
+
+### CAMUS
+
+| Operación | Qué hace |
+| --- | --- |
+| `security_task(task)` | Delega la auditoría en el `SecurityRunner` y audita cada hallazgo |
+| `review_task(task)` | Delega la revisión, y registra **cada gate** con su motivo |
+| `evaluate_task(...)` | Agrupa informes existentes en una `TaskEvaluation`; no ejecuta nada |
+
+Sin el rol inyectado, la operación falla de forma explícita. **No hay reparación
+automática**: ENGINE-5 no lanza un Developer nuevo cuando algo falla.
+
+### Auditoría
+
+Security: `SECURITY_REQUEST_STARTED`, `SECURITY_PLAN_RECEIVED`,
+`SECURITY_PLAN_REJECTED`, `SECURITY_PLAN_ACCEPTED`, `SECURITY_CHECK_STARTED`,
+`SECURITY_CHECK_COMPLETED`, `SECURITY_FINDING_RECORDED`, `SECURITY_COMPLETED` y
+`SECURITY_BLOCKED`.
+
+Reviewer: `REVIEW_REQUEST_STARTED`, `REVIEW_PROPOSAL_RECEIVED`,
+`REVIEW_PROPOSAL_REJECTED`, `REVIEW_PROPOSAL_ACCEPTED`, `REVIEW_FINDING_RECORDED`,
+`REVIEW_COMPLETED` y `REVIEW_BLOCKED`. Cada gate se audita por separado: si alguien
+pregunta por qué un cambio no se aprobó, la respuesta está en el registro.
+
+Se registran recuentos, gravedades y motivos —nunca la credencial, el código del proyecto
+ni el de los checks—, y el inicio registra el PASS declarado por el Developer y el estado
+de QA, precisamente para poder auditar que Security no los usó como prueba.
+
+### Generalidad
+
+Security y Reviewer planifican y evalúan conceptualmente Python, Next.js/TypeScript y CLI
+con el mismo código. Un proyecto Node que pida `npm-audit` queda `BLOCKED` por capacidad,
+**no** por un fallback al host.
+
+### Configuración
+
+Cada rol independiente apunta a su propio modelo; si la variable no existe, usa
+`deepseek-v4-pro`. La credencial (`DEEPSEEK_API_KEY`) sigue viviendo solo en el proceso que
+llama al modelo: no entra al sandbox, ni al workspace, ni al código generado, ni al registro
+de auditoría.
+
+| Variable | Rol |
+| --- | --- |
+| `PUNTO_SECURITY_MODEL` | Modelo del Security Agent |
+| `PUNTO_REVIEWER_MODEL` | Modelo del Reviewer Agent |
+
+### Pruebas y gate vivo
+
+| Comando | Qué cubre |
+| --- | --- |
+| `pytest` | Suite completa: checks deterministas, validación, deduplicación, estados, gates, runners, CAMUS y generalidad |
+| `pytest tests/integration/test_engine5_live.py -q` | **Gate vivo**: caso vulnerable rechazado y caso corregido aprobado, con los prompts de producción |
+
+El gate vivo evalúa el **mismo** cambio en dos versiones con DeepSeek real, sandbox real y
+la cadena completa QA → Security → Reviewer:
+
+- **Caso A, vulnerable**: `subprocess.check_output(command, shell=True)`. QA demuestra que
+  la función *funciona* y declara PASS; Security encuentra la inyección de comandos y
+  declara FAIL; el Reviewer **no puede aprobar**;
+- **Caso B, corregido**: `shlex` + lista de comandos permitidos + argumentos estructurados
+  con `shell=False` + `timeout`. QA PASS, Security PASS, Reviewer aprueba.
+
+Ese contraste es el objetivo entero de la fase.
+
+La primera versión del caso B solo cambiaba `shell=True` por `shell=False`, y el gate vivo la
+**rechazó**: Security reportó `CRITICAL` por seguir ejecutando comandos arbitrarios sin lista
+de permitidos, más `MEDIUM` por no acotar el tiempo de ejecución. El motor tenía razón: quitar
+una vulnerabilidad no vuelve seguro un diseño que sigue aceptando cualquier comando. El fixture
+se corrigió cerrando el riesgo, no relajando la puerta.
+
+### API
+
+Sin cambios: Security y Reviewer no se exponen por HTTP. `GET /health` → 200 y la misma
+superficie de rutas.
+
+### Limitación declarada
+
+- ENGINE-5 **no** encadena los roles: cada uno se invoca explícitamente. El workflow
+  automático es ENGINE-6.
+- Los checks deterministas son evidencia acotada, **no** un scanner industrial. Bandit,
+  Semgrep, Trivy, `npm audit` y `osv-scanner` no están disponibles y no se simulan.
+- No hay análisis dinámico ni de secretos históricos (git history): solo el contenido
+  actual del contexto autorizado.
+- El Reviewer no puede verificar nada que QA y Security no hayan cubierto: su valor está en
+  la coherencia global, no en repetir la ejecución.
+
+---
+
+## 24. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

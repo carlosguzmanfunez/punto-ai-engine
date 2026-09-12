@@ -240,6 +240,62 @@ class QARunnerNotConfiguredError(QAError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Security Agent (ENGINE-5)
+# ---------------------------------------------------------------------------
+class SecurityError(RuntimeError):
+    """Base de los errores del rol de seguridad."""
+
+
+class SecurityValidationError(SecurityError):
+    """El plan de seguridad o un hallazgo incumple un invariante determinista."""
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(
+            f"Auditoría de seguridad inválida ({len(self.violations)} violación/es): {detail}"
+        )
+
+
+class SecurityRunnerNotConfiguredError(SecurityError):
+    """No hay ningún ``SecurityRunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay SecurityRunner configurado: inyecta uno en Camus("
+            "security_runner=...) para auditar el trabajo."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reviewer Agent (ENGINE-5)
+# ---------------------------------------------------------------------------
+class ReviewerError(RuntimeError):
+    """Base de los errores del rol de revisión."""
+
+
+class ReviewerValidationError(ReviewerError):
+    """La propuesta de revisión incumple un invariante determinista."""
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(
+            f"Revisión inválida ({len(self.violations)} violación/es): {detail}"
+        )
+
+
+class ReviewerRunnerNotConfiguredError(ReviewerError):
+    """No hay ningún ``ReviewerRunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay ReviewerRunner configurado: injecta uno en Camus("
+            "reviewer_runner=...) para revisar el trabajo."
+        )
+
+
 __all__ = [
     "ArchitectRunnerNotConfiguredError",
     "BranchPolicyViolationError",
@@ -256,8 +312,14 @@ __all__ = [
     "QAError",
     "QARunnerNotConfiguredError",
     "QAValidationError",
+    "ReviewerError",
+    "ReviewerRunnerNotConfiguredError",
+    "ReviewerValidationError",
     "SandboxRequiredError",
     "SandboxUnavailableError",
+    "SecurityError",
+    "SecurityRunnerNotConfiguredError",
+    "SecurityValidationError",
     "TrustBoundaryError",
     "UntrustedExecutionDeniedError",
     "WorkspaceViolationError",

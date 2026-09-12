@@ -1405,6 +1405,462 @@ class AuditLogger:
             },
         )
 
+    # ------------------------------------------- Security Agent (ENGINE-5)
+    def log_security_request_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        changed_files: int,
+        developer_claimed_pass: bool,
+        qa_status: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una auditoría de seguridad.
+
+        Se registra el PASS declarado por el Developer y el estado de QA para poder
+        auditar que Security **no** los usó como prueba.
+        """
+        return self.record(
+            AuditEventType.SECURITY_REQUEST_STARTED,
+            action="security_request_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "changed_files": changed_files,
+                "developer_claimed_pass": developer_claimed_pass,
+                "qa_status": qa_status,
+            },
+        )
+
+    def log_security_plan_received(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        targets: int,
+        checks: int,
+        areas: int,
+        threats: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la recepción de un plan de seguridad, por recuentos."""
+        return self.record(
+            AuditEventType.SECURITY_PLAN_RECEIVED,
+            action="security_plan_received",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "targets": targets,
+                "checks": checks,
+                "areas": areas,
+                "threats": threats,
+            },
+        )
+
+    def log_security_plan_accepted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        targets: Sequence[str],
+        checks: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un plan de seguridad aceptado."""
+        return self.record(
+            AuditEventType.SECURITY_PLAN_ACCEPTED,
+            action="security_plan_accepted",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "targets": [item[:200] for item in targets],
+                "checks": list(checks),
+            },
+        )
+
+    def log_security_plan_rejected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un plan de seguridad rechazado, con sus violaciones."""
+        return self.record(
+            AuditEventType.SECURITY_PLAN_REJECTED,
+            action="security_plan_rejected",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "violations": [item[:300] for item in violations],
+                "violation_count": len(violations),
+            },
+        )
+
+    def log_security_check_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        check: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de un check de seguridad."""
+        return self.record(
+            AuditEventType.SECURITY_CHECK_STARTED,
+            action="security_check_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={"project_id": str(project_id), "check": check},
+        )
+
+    def log_security_check_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        check: str,
+        ran: bool,
+        deterministic: bool,
+        findings: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el resultado de un check de seguridad, sin copiar el código."""
+        return self.record(
+            AuditEventType.SECURITY_CHECK_COMPLETED,
+            action="security_check_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if ran else AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "check": check,
+                "ran": ran,
+                "deterministic": deterministic,
+                "findings": findings,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_security_finding_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        finding_id: str,
+        severity: str,
+        category: str,
+        file: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un hallazgo de seguridad sin copiar su evidencia."""
+        return self.record(
+            AuditEventType.SECURITY_FINDING_RECORDED,
+            action="security_finding_recorded",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "finding_id": finding_id,
+                "severity": severity,
+                "category": category,
+                "file": file[:200],
+            },
+        )
+
+    def log_security_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        status: str,
+        findings: int,
+        blocking_findings: int,
+        highest_severity: str = "",
+        capability_gaps: int = 0,
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una auditoría de seguridad."""
+        return self.record(
+            AuditEventType.SECURITY_COMPLETED,
+            action="security_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "status": status,
+                "findings": findings,
+                "blocking_findings": blocking_findings,
+                "highest_severity": highest_severity,
+                "capability_gaps": capability_gaps,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_security_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        reason: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una auditoría bloqueada, con su motivo."""
+        return self.record(
+            AuditEventType.SECURITY_BLOCKED,
+            action="security_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "reason": reason[:300],
+                "detail": detail[:500],
+            },
+        )
+
+    # ------------------------------------------- Reviewer Agent (ENGINE-5)
+    def log_review_request_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        qa_status: str = "",
+        security_status: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una revisión, con los estados de los gates."""
+        return self.record(
+            AuditEventType.REVIEW_REQUEST_STARTED,
+            action="review_request_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "qa_status": qa_status,
+                "security_status": security_status,
+            },
+        )
+
+    def log_review_proposal_received(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la recepción de una propuesta de revisión."""
+        return self.record(
+            AuditEventType.REVIEW_PROPOSAL_RECEIVED,
+            action="review_proposal_received",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+            },
+        )
+
+    def log_review_proposal_accepted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        status: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta de revisión aceptada y el veredicto calculado."""
+        return self.record(
+            AuditEventType.REVIEW_PROPOSAL_ACCEPTED,
+            action="review_proposal_accepted",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+                "status": status,
+            },
+        )
+
+    def log_review_proposal_rejected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta de revisión rechazada, con sus violaciones."""
+        return self.record(
+            AuditEventType.REVIEW_PROPOSAL_REJECTED,
+            action="review_proposal_rejected",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "violations": [item[:300] for item in violations],
+                "violation_count": len(violations),
+            },
+        )
+
+    def log_review_finding_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        finding_id: str,
+        severity: str,
+        category: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un hallazgo de revisión sin copiar su evidencia."""
+        return self.record(
+            AuditEventType.REVIEW_FINDING_RECORDED,
+            action="review_finding_recorded",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "finding_id": finding_id,
+                "severity": severity,
+                "category": category,
+            },
+        )
+
+    def log_review_gate_evaluated(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        gate: str,
+        passed: bool,
+        blocking: bool,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el resultado de un gate del Reviewer.
+
+        Los gates se auditan uno a uno: si alguien pregunta por qué un cambio no se aprobó,
+        la respuesta está en el registro, no en una interpretación.
+        """
+        return self.record(
+            AuditEventType.REVIEW_COMPLETED if passed else AuditEventType.REVIEW_BLOCKED,
+            action=f"review_gate_{'passed' if passed else 'failed'}",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if passed else AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "gate": gate,
+                "blocking": blocking,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_review_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        status: str,
+        findings: int,
+        blocking_findings: int,
+        gates: Sequence[str],
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una revisión con su veredicto."""
+        event_type = (
+            AuditEventType.REVIEW_COMPLETED
+            if status == "APPROVED"
+            else AuditEventType.REVIEW_BLOCKED
+        )
+        return self.record(
+            event_type,
+            action="review_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "APPROVED" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "status": status,
+                "findings": findings,
+                "blocking_findings": blocking_findings,
+                "gates": list(gates),
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_review_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        reason: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una revisión bloqueada, con su motivo."""
+        return self.record(
+            AuditEventType.REVIEW_BLOCKED,
+            action="review_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "reason": reason[:300],
+                "detail": detail[:500],
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

@@ -41,6 +41,7 @@ from punto.planning.graph import (
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.qa.base import QARunner
+from punto.reviewer.base import ReviewerRunner
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import (
     AuthorityLevel,
@@ -49,6 +50,7 @@ from punto.schemas.enums import (
     TaskPriority,
     TaskStatus,
 )
+from punto.schemas.evaluation import TaskEvaluation, build_task_evaluation
 from punto.schemas.execution import DeveloperExecutionResult, DeveloperRunStatus
 from punto.schemas.planning import (
     ArchitecturePlan,
@@ -66,13 +68,18 @@ from punto.schemas.planning import (
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
 from punto.schemas.qa import QAReport, QATask
 from punto.schemas.result import ExecutionResult
+from punto.schemas.review import ReviewReport, ReviewTask
+from punto.schemas.security import SecurityReport, SecurityTask
 from punto.schemas.task import Task
+from punto.security.base import SecurityRunner
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import (
     ArchitectRunnerNotConfiguredError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
     QARunnerNotConfiguredError,
+    ReviewerRunnerNotConfiguredError,
+    SecurityRunnerNotConfiguredError,
 )
 
 if TYPE_CHECKING:
@@ -192,6 +199,8 @@ class Camus:
         architect_runner: ArchitectRunner | None = None,
         planner_runner: PlannerRunner | None = None,
         qa_runner: QARunner | None = None,
+        security_runner: SecurityRunner | None = None,
+        reviewer_runner: ReviewerRunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -209,6 +218,10 @@ class Camus:
         #: QA independiente (ENGINE-4). Opt-in igual que los demás roles: sin él,
         #: ``evaluate_developer_result`` falla de forma explícita.
         self._qa = qa_runner
+        #: Security y Reviewer (ENGINE-5). Opt-in: sin ellos, sus operaciones fallan de
+        #: forma explícita en lugar de improvisar una evaluación.
+        self._security = security_runner
+        self._reviewer = reviewer_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -255,6 +268,131 @@ class Camus:
     def qa_runner(self) -> QARunner | None:
         """Rol QA inyectado, si existe (ENGINE-4)."""
         return self._qa
+
+    @property
+    def security_runner(self) -> SecurityRunner | None:
+        """Rol Security inyectado, si existe (ENGINE-5)."""
+        return self._security
+
+    @property
+    def reviewer_runner(self) -> ReviewerRunner | None:
+        """Rol Reviewer inyectado, si existe (ENGINE-5)."""
+        return self._reviewer
+
+    # ------------------------------------------------------------- ENGINE-5
+    def security_task(self, task: SecurityTask) -> SecurityReport:
+        """Audita de forma **independiente** el trabajo de un Developer.
+
+        CAMUS no audita nada por sí mismo: delega en el ``SecurityRunner`` inyectado. Los
+        informes de Developer y de QA que viajan en la tarea son **contexto**: que algo
+        funcione no lo hace seguro.
+
+        No lanza reparaciones automáticas: el workflow de orquestación llega después.
+
+        Raises:
+            SecurityRunnerNotConfiguredError: si no hay Security inyectado.
+        """
+        if self._security is None:
+            raise SecurityRunnerNotConfiguredError()
+
+        report = self._security.evaluate(task)
+        for finding in report.findings:
+            self._audit.log_security_finding_recorded(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                finding_id=finding.id,
+                severity=finding.severity.value,
+                category=finding.category.value,
+                file=finding.file,
+            )
+        return report
+
+    def review_task(self, task: ReviewTask) -> ReviewReport:
+        """Revisa un cambio y emite el veredicto, con los gates ya evaluados.
+
+        Los gates que impiden aprobar viven en código, no en el prompt: si QA falló, si
+        Security falló o si alguno quedó bloqueado, el veredicto no puede ser
+        ``APPROVED``. CAMUS no altera ese resultado.
+
+        Raises:
+            ReviewerRunnerNotConfiguredError: si no hay Reviewer inyectado.
+        """
+        if self._reviewer is None:
+            raise ReviewerRunnerNotConfiguredError()
+
+        report = self._reviewer.review(task)
+        for gate in report.gates:
+            self._audit.log_review_gate_evaluated(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                gate=gate.name.value,
+                passed=gate.passed,
+                blocking=gate.blocking,
+                detail=gate.detail,
+            )
+        for finding in report.findings:
+            self._audit.log_review_finding_recorded(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                finding_id=finding.id,
+                severity=finding.severity.value,
+                category=finding.category.value,
+            )
+        return report
+
+    def evaluate_task(
+        self,
+        *,
+        developer_result: DeveloperExecutionResult | None = None,
+        qa_report: QAReport | None = None,
+        security_report: SecurityReport | None = None,
+        review_report: ReviewReport | None = None,
+        task_id: UUID | None = None,
+        project_id: UUID | None = None,
+    ) -> TaskEvaluation:
+        """Reúne en una :class:`TaskEvaluation` los informes que ya existen.
+
+        **No** ejecuta ningún rol ni encadena nada: ENGINE-5 permite invocar los agentes de
+        forma explícita, y el workflow automático llega en ENGINE-6.
+        """
+        resolved_task = next(
+            (
+                candidate
+                for candidate in (
+                    task_id,
+                    None if qa_report is None else qa_report.task_id,
+                    None if security_report is None else security_report.task_id,
+                    None if review_report is None else review_report.task_id,
+                    None if developer_result is None else developer_result.task_id,
+                )
+                if candidate is not None
+            ),
+            None,
+        )
+        if resolved_task is None:
+            msg = "evaluate_task necesita al menos un informe o un task_id"
+            raise ValueError(msg)
+        resolved_project = next(
+            (
+                candidate
+                for candidate in (
+                    project_id,
+                    None if qa_report is None else qa_report.project_id,
+                    None if security_report is None else security_report.project_id,
+                    None if review_report is None else review_report.project_id,
+                )
+                if candidate is not None
+            ),
+            UUID(int=0),
+        )
+        return build_task_evaluation(
+            task_id=resolved_task,
+            project_id=resolved_project,
+            developer_result=developer_result,
+            qa_report=qa_report,
+            security_report=security_report,
+            review_report=review_report,
+        )
 
     # ------------------------------------------------------------- ENGINE-4
     def evaluate_developer_result(self, task: QATask) -> QAReport:

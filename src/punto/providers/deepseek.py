@@ -157,6 +157,8 @@ ARCHITECT_MODEL_ENV: Final[str] = "PUNTO_ARCHITECT_MODEL"
 PLANNER_MODEL_ENV: Final[str] = "PUNTO_PLANNER_MODEL"
 DEVELOPER_MODEL_ENV: Final[str] = "PUNTO_DEVELOPER_MODEL"
 QA_MODEL_ENV: Final[str] = "PUNTO_QA_MODEL"
+SECURITY_MODEL_ENV: Final[str] = "PUNTO_SECURITY_MODEL"
+REVIEWER_MODEL_ENV: Final[str] = "PUNTO_REVIEWER_MODEL"
 
 #: Variable de entorno del presupuesto de salida de una planificación.
 PLANNING_MAX_TOKENS_ENV: Final[str] = "PUNTO_PLANNING_MAX_TOKENS"
@@ -547,6 +549,8 @@ __all__ = [
     "PLANNER_MODEL_ENV",
     "QA_MODEL_ENV",
     "RETRYABLE_STATUS_CODES",
+    "REVIEWER_MODEL_ENV",
+    "SECURITY_MODEL_ENV",
     "SUPPORTED_MODELS",
     "DeepSeekAuthError",
     "DeepSeekBalanceError",

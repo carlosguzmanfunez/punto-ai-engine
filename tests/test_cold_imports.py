@@ -81,6 +81,22 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.qa.prompts",
     "punto.qa.report",
     "punto.qa.validation",
+    # --- ENGINE-5: Security y Reviewer ----------------------------------------
+    "punto.schemas.security",
+    "punto.schemas.review",
+    "punto.schemas.evaluation",
+    "punto.security",
+    "punto.security.base",
+    "punto.security.checks",
+    "punto.security.deterministic",
+    "punto.security.prompts",
+    "punto.security.report",
+    "punto.security.validation",
+    "punto.reviewer",
+    "punto.reviewer.base",
+    "punto.reviewer.gates",
+    "punto.reviewer.prompts",
+    "punto.reviewer.validation",
 )
 
 

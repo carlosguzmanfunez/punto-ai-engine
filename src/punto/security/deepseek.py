@@ -38,6 +38,7 @@ from punto.model_context import (
     MAX_CONTEXT_FILE_CHARS,
     ModelReviewContext,
     build_model_review_context,
+    resolve_within_workspace,
 )
 from punto.planning.capabilities import canonical_capability, capability_status
 from punto.providers.deepseek import (
@@ -194,7 +195,7 @@ class DeepSeekSecurityRunner(SecurityRunner):
                     self._audit_blocked(task, name, "check registrado pero no disponible")
             else:
                 checks, deterministic = self._run_checks(task, plan, workspace)
-                reviewed = self._reviewed_files(plan, deterministic, existing)
+                reviewed = self._reviewed_files(task, plan, deterministic, existing)
                 deterministic_findings = tuple(
                     finding for result in deterministic for finding in result.findings
                 )
@@ -207,11 +208,13 @@ class DeepSeekSecurityRunner(SecurityRunner):
                 model_findings: tuple[SecurityFinding, ...] = ()
                 if not model_context.complete:
                     planning_blocked = True
+                    detail = model_context.omission_detail()
                     error = (
                         f"{BLOCKED_CONTEXT_LIMIT}: el plan declara {len(plan.target_paths)} "
                         f"objetivo(s) y el contexto del modelo admite "
                         f"{len(model_context.visible_paths)}: no se puede auditar con el "
                         "modelo lo que el modelo no recibió"
+                        f"{f' ({detail})' if detail else ''}"
                     )
                     evidence.append(error)
                 else:
@@ -516,20 +519,24 @@ class DeepSeekSecurityRunner(SecurityRunner):
 
     def _reviewed_files(
         self,
+        task: SecurityTask,
         plan: SecurityPlan,
         results: tuple[SecurityCheckResult, ...],
         existing: frozenset[str],
     ) -> tuple[str, ...]:
         """Archivos efectivamente revisados: objetivos válidos más los inspeccionados.
 
-        Solo cuenta lo que existe: un workspace sin archivos no convierte una ruta declarada
-        en un archivo revisado.
+        Solo cuenta lo que existe **y** cuyo destino real sigue dentro del workspace: ni un
+        workspace vacío ni un enlace que escapa convierten una ruta declarada en un archivo
+        revisado. La contención la decide el contexto del modelo, no este método.
         """
         reviewed: list[str] = []
         for path in (*plan.target_paths, *(f for result in results for f in result.scanned)):
             try:
                 relative = normalize_relative_path(path)
             except ValueError:
+                continue
+            if resolve_within_workspace(task.workspace_path, relative) is None:
                 continue
             if relative not in existing:
                 continue

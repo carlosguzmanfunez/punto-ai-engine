@@ -1,16 +1,19 @@
-"""Frontera de contexto del modelo (ENGINE-5.1).
+"""Frontera de contexto del modelo (ENGINE-5.1 y ENGINE-5.1.1).
 
-Dos defectos se cierran aquí, y los dos son de la misma naturaleza: el motor estaba dispuesto
-a aceptar como revisado algo que el modelo **nunca vio**.
+Tres defectos se cierran aquí, y todos son de la misma naturaleza: el motor estaba dispuesto a
+aceptar como revisado algo que el modelo **nunca vio**.
 
 1. **Allowlist vacía = permitir todo.** Un plan podía apuntar a cualquier archivo existente del
    workspace cuando la tarea no declaraba ni un solo archivo revisable.
 2. **Contexto declarado ≠ contexto enviado.** Los validadores aceptaban hallazgos sobre todo
    ``changed_files + context_files``, mientras el prompt solo llevaba los primeros 30.
+3. **Enlace que escapa (ENGINE-5.1.1).** La ruta relativa era válida, pero el destino real
+   estaba fuera del workspace: se leía y se enviaba al modelo contenido de fuera del proyecto.
 
 La regla que se prueba, sin excepciones: *un hallazgo sobre un archivo que el agente no vio es
 una invención*. Una allowlist vacía no autoriza nada, un archivo omitido no se marca como
-revisado, y una revisión a la que le faltó un archivo modificado no se aprueba.
+revisado, una revisión a la que le faltó un archivo modificado no se aprueba, y un enlace que
+sale del workspace no se lee **nunca**.
 
 Todo es determinista: no hay modelo real ni sandbox.
 """
@@ -18,7 +21,9 @@ Todo es determinista: no hay modelo real ni sandbox.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -39,12 +44,14 @@ from engine5_support import (
     security_plan_payload,
 )
 from punto.audit.logger import AuditLogger
+from punto.developer.context import ExecutionContext
 from punto.model_context import (
     BLOCKED_CONTEXT_LIMIT,
     MAX_MODEL_VISIBLE_PATHS,
     MISSING_FILE_MARKER,
     build_model_review_context,
     missing_paths,
+    resolve_within_workspace,
 )
 from punto.reviewer.deepseek import DeepSeekReviewerRunner
 from punto.reviewer.validation import validate_review_proposal
@@ -62,13 +69,18 @@ from punto.schemas.security import (
 )
 from punto.security.checks import DEFAULT_SECURITY_REGISTRY
 from punto.security.deepseek import DeepSeekSecurityRunner
+from punto.security.deterministic import SecurityCheckContext
 from punto.security.validation import (
     validate_findings,
     validate_security_plan,
 )
+from punto.tools.errors import WorkspaceViolationError
 
 #: Secreto real, para comprobar que nunca se lee lo que no está autorizado.
 SECRET_VALUE = "sk-live-9f8e7d6c5b4a3210fedcba9876543210"
+
+#: Canario del archivo externo: si aparece en cualquier salida, la frontera se rompió.
+ESCAPE_CANARY = "MODEL_CONTEXT_ESCAPE_CANARY_12345"
 
 
 def many_files(
@@ -90,6 +102,93 @@ def security_plan_with_targets(targets: tuple[str, ...]) -> SecurityPlanProposal
         {"path": path, "areas": ["INJECTION"]} for path in targets
     ]
     return SecurityPlanProposal.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# Enlaces reales (ENGINE-5.1.1)
+# ---------------------------------------------------------------------------
+def make_junction(link: Path, target: Path) -> bool:
+    """Crea un junction de directorio. Devuelve ``True`` si quedó creado.
+
+    Un junction es un reparse point con la misma semántica de destino que un symlink para
+    esta frontera, y **no** requiere privilegios en Windows.
+    """
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    return created.returncode == 0 and link.exists()
+
+
+def link_file(workspace: Path, link: Path, target: Path) -> tuple[str, str]:
+    """Enlaza ``link`` con ``target`` y devuelve ``(ruta relativa al workspace, mecanismo)``.
+
+    Se prefiere el symlink de archivo, que es el caso que describe el mandato. Sin el
+    privilegio ``SeCreateSymbolicLink`` (WinError 1314) se recurre al junction del directorio
+    que contiene el archivo: mismo destino real, mismo efecto en la frontera. Si ninguna de
+    las dos vías funciona, la prueba **falla**: nunca se salta en silencio.
+    """
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pass
+    else:
+        return link.relative_to(workspace).as_posix(), "symlink"
+
+    junction = link.with_suffix("") if link.suffix else link
+    if make_junction(junction, target.parent):
+        declared = junction.relative_to(workspace) / target.name
+        return declared.as_posix(), "junction"
+    pytest.fail(f"no se pudo crear ningún enlace real hacia {target}")
+
+
+def escape_fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    """Workspace con un archivo visible y un enlace real cuyo destino está **fuera**.
+
+    Returns:
+        ``(workspace, directorio externo, ruta declarada, mecanismo)``.
+    """
+    outside = tmp_path / "exterior"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "canary.txt").write_text(f"{ESCAPE_CANARY}\n", encoding="utf-8")
+    workspace = build_security_project(tmp_path, {"visible.txt": "contenido interno\n"})
+
+    declared, mechanism = link_file(workspace, workspace / "escape.txt", outside / "canary.txt")
+    return workspace, outside, declared, mechanism
+
+
+def internal_link_fixture(tmp_path: Path) -> tuple[Path, str, str]:
+    """Workspace con un enlace real cuyo destino sigue **dentro** del workspace."""
+    workspace = build_security_project(
+        tmp_path, {"sub/data.txt": "contenido interno\n"}
+    )
+    declared, mechanism = link_file(
+        workspace, workspace / "alias.txt", workspace / "sub" / "data.txt"
+    )
+    return workspace, declared, mechanism
+
+
+def nested_escape_fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    """Enlace que escapa situado en un subdirectorio: el escape no tiene que estar en la raíz."""
+    outside = tmp_path / "exterior"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "canary.txt").write_text(f"{ESCAPE_CANARY}\n", encoding="utf-8")
+    workspace = build_security_project(tmp_path, {"nested/keep.txt": "interno\n"})
+
+    declared, mechanism = link_file(
+        workspace, workspace / "nested" / "escape.txt", outside / "canary.txt"
+    )
+    return workspace, outside, declared, mechanism
+
+
+def assert_no_leak(text: str, outside: Path) -> None:
+    """El canario externo y la ruta externa no pueden aparecer en ninguna salida."""
+    assert ESCAPE_CANARY not in text
+    assert outside.as_posix() not in text
+    assert str(outside).replace("\\", "/") not in text
 
 
 # ---------------------------------------------------------------------------
@@ -523,3 +622,215 @@ def test_visible_and_omitted_partition_the_declared_paths(tmp_path: Path, count:
     assert set(context.visible_paths) | set(context.omitted_paths) == set(names)
     assert not set(context.visible_paths) & set(context.omitted_paths)
     assert len(context.visible_paths) == min(count, MAX_MODEL_VISIBLE_PATHS)
+
+
+# ---------------------------------------------------------------------------
+# ENGINE-5.1.1: contención de la lectura por destino real
+# ---------------------------------------------------------------------------
+def test_a_regular_file_inside_the_workspace_is_visible(tmp_path: Path) -> None:
+    """Caso base: un archivo normal dentro del workspace se lee y se envía."""
+    workspace = build_security_project(tmp_path, {"visible.txt": "contenido interno\n"})
+
+    context = build_model_review_context(workspace, ("visible.txt",))
+
+    assert context.visible_paths == ("visible.txt",)
+    assert context.unsafe_paths == ()
+    assert context.omitted_paths == ()
+    assert "contenido interno" in context.content
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_an_internal_link_is_allowed_and_proven(tmp_path: Path, nested: bool) -> None:
+    """Un enlace cuyo destino sigue dentro del workspace se acepta y se lee.
+
+    La política preferida del mandato —enlace interno permitido, externo bloqueado— queda
+    probada en las dos direcciones, no solo en la que bloquea.
+    """
+    root = tmp_path / ("nested" if nested else "root")
+    workspace, declared, mechanism = internal_link_fixture(root)
+
+    context = build_model_review_context(workspace, (declared,))
+
+    assert mechanism in {"symlink", "junction"}
+    assert context.visible_paths == (declared,)
+    assert context.unsafe_paths == ()
+    assert context.complete is True
+    assert "contenido interno" in context.content
+    assert resolve_within_workspace(workspace, declared) is not None
+
+
+def test_an_external_link_is_never_read(tmp_path: Path) -> None:
+    """El defecto: el enlace sale del workspace y su contenido no puede llegar al modelo."""
+    workspace, outside, declared, mechanism = escape_fixture(tmp_path)
+
+    context = build_model_review_context(workspace, (declared,))
+
+    assert mechanism in {"symlink", "junction"}
+    assert context.visible_paths == ()
+    assert context.unsafe_paths == (declared,)
+    assert declared in context.omitted_paths
+    assert context.complete is False
+    assert resolve_within_workspace(workspace, declared) is None
+    assert_no_leak(context.content, outside)
+    assert_no_leak(context.annotated_content(), outside)
+    assert_no_leak(context.omission_detail(), outside)
+
+
+def test_the_external_canary_is_never_exposed(tmp_path: Path) -> None:
+    """§3: el canario externo no aparece en el contexto ni en nada derivado de él."""
+    workspace, outside, declared, _ = escape_fixture(tmp_path)
+    task = make_security_task(workspace, changed_files=(declared,), context_files=(declared,))
+
+    context = build_model_review_context(workspace, task.reviewable_paths)
+    client = FakeEngine5Client([payload(security_plan_payload(path=declared))])
+    report = DeepSeekSecurityRunner(client=client).evaluate(task)  # type: ignore[arg-type]
+
+    assert report.status is SecurityStatus.BLOCKED
+    assert report.model_visible_files == ()
+    assert report.findings == ()
+    assert report.reviewed_files == ()
+    assert_no_leak(context.content, outside)
+    assert_no_leak(context.annotated_content(), outside)
+    assert_no_leak(report.model_dump_json(), outside)
+    assert_no_leak(client.prompts[0], outside)
+
+
+def test_a_nested_external_link_is_never_read(tmp_path: Path) -> None:
+    """El escape no tiene que estar en la raíz: un subdirectorio también se contiene."""
+    workspace, outside, declared, mechanism = nested_escape_fixture(tmp_path)
+
+    context = build_model_review_context(workspace, (declared,))
+
+    assert mechanism in {"symlink", "junction"}
+    assert context.visible_paths == ()
+    assert context.unsafe_paths == (declared,)
+    assert resolve_within_workspace(workspace, declared) is None
+    assert_no_leak(context.annotated_content(), outside)
+
+
+def test_the_external_link_does_not_block_a_clean_review(tmp_path: Path) -> None:
+    """Auxiliar externo: se declara y no se lee, pero no bloquea lo que sí se revisó.
+
+    La política es la de ENGINE-5.1 para auxiliares omitidos: el archivo modificado visible
+    manda, el auxiliar no incluido queda declarado y no se puede citar.
+    """
+    workspace, outside, declared, _ = escape_fixture(tmp_path)
+    (workspace / "runner.py").write_text(CORRECTED_RUNNER, encoding="utf-8")
+    task = make_review_task(
+        workspace,
+        changed_files=("runner.py",),
+        context_files=("runner.py", declared),
+        qa_report=make_qa_report(),
+        security_report=make_security_report(),
+    )
+    client = FakeEngine5Client([payload(review_payload())])
+    report = DeepSeekReviewerRunner(client=client).review(task)  # type: ignore[arg-type]
+
+    assert report.status is ReviewStatus.APPROVED
+    assert report.model_visible_files == ("runner.py",)
+    assert report.omitted_files == (declared,)
+    assert_no_leak(report.model_dump_json(), outside)
+    assert_no_leak(client.prompts[0], outside)
+
+
+def test_an_external_changed_file_blocks_the_review(tmp_path: Path) -> None:
+    """Un archivo **modificado** que escapa no se puede revisar: la revisión se bloquea."""
+    workspace, outside, declared, _ = escape_fixture(tmp_path)
+    task = make_review_task(
+        workspace,
+        changed_files=(declared,),
+        context_files=(),
+        qa_report=make_qa_report(),
+        security_report=make_security_report(),
+    )
+    client = FakeEngine5Client([payload(review_payload())])
+    report = DeepSeekReviewerRunner(client=client).review(task)  # type: ignore[arg-type]
+
+    assert report.status is ReviewStatus.BLOCKED
+    assert report.approved is False
+    assert BLOCKED_CONTEXT_LIMIT in report.error
+    assert report.omitted_files == (declared,)
+    assert client.calls == 0
+    assert_no_leak(report.model_dump_json(), outside)
+
+
+def test_the_containment_rule_is_repeatable_with_links(tmp_path: Path) -> None:
+    """Mismo input con un enlace que escapa ⇒ mismo contexto y mismo conjunto no visible."""
+    workspace, _, declared, _ = escape_fixture(tmp_path)
+    paths = ("visible.txt", declared, "visible.txt")
+
+    first = build_model_review_context(workspace, paths)
+    second = build_model_review_context(workspace, paths)
+
+    assert first == second
+    assert first.visible_paths == ("visible.txt",)
+    assert first.unsafe_paths == (declared,)
+
+
+def test_the_boundary_agrees_with_the_existing_containment_rules(tmp_path: Path) -> None:
+    """§5: la regla no se inventa aquí; coincide con las utilidades ya probadas del motor.
+
+    Se compara contra las dos implementaciones existentes —``ExecutionContext.resolve_path``
+    del Developer y ``SecurityCheckContext.readable`` de los checks deterministas— sobre los
+    mismos fixtures, incluido el enlace que escapa. Tres fronteras, un solo veredicto.
+    """
+    workspace, _, escaping, _ = escape_fixture(tmp_path / "escape")
+    workspace2, internal, _ = internal_link_fixture(tmp_path / "internal")
+    declared = ("visible.txt", escaping, "todavia-no-existe.txt")
+
+    context = ExecutionContext(task_id=uuid4(), workspace_path=workspace, branch_name="ai/x")
+    checks = SecurityCheckContext(workspace=workspace, paths=declared)
+    review = build_model_review_context(workspace, declared)
+    existing = {
+        path.relative_to(workspace).as_posix()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    }
+
+    for relative in declared:
+        try:
+            context.resolve_path(relative)
+        except WorkspaceViolationError:
+            developer_contains = False
+        else:
+            developer_contains = True
+
+        contained = resolve_within_workspace(workspace, relative) is not None
+        # Contención: la misma regla, decidida igual por las dos implementaciones.
+        assert contained is developer_contains, relative
+        # Legibilidad: contención **y** existencia, que es lo que exige el contexto de checks.
+        expected_readable = contained and relative in existing
+        assert (checks.readable(relative) is not None) is expected_readable, relative
+        # Visibilidad: contención. La existencia no la inventa el contexto: la declara.
+        assert (relative in review.visible_set) is contained, relative
+
+    # El enlace externo: las tres fronteras coinciden en rechazarlo.
+    with pytest.raises(WorkspaceViolationError):
+        context.resolve_path(escaping)
+    assert checks.readable(escaping) is None
+    assert resolve_within_workspace(workspace, escaping) is None
+    assert escaping in review.unsafe_paths
+
+    # El enlace interno: las tres coinciden en aceptarlo.
+    context2 = ExecutionContext(
+        task_id=uuid4(), workspace_path=workspace2, branch_name="ai/x"
+    )
+    assert context2.resolve_path(internal) is not None
+    assert SecurityCheckContext(workspace=workspace2, paths=(internal,)).readable(internal)
+    assert resolve_within_workspace(workspace2, internal) is not None
+
+
+def test_resolve_within_workspace_rejects_what_it_must(tmp_path: Path) -> None:
+    """La utilidad compartida: contenida sí, traversal/absoluta/enlace externo no."""
+    workspace, _, escaping, _ = escape_fixture(tmp_path)
+    (workspace / "visible.txt").write_text("x\n", encoding="utf-8")
+
+    assert resolve_within_workspace(workspace, "visible.txt") is not None
+    # El traversal se rechaza **léxicamente** antes de resolver: nunca se llega a leer.
+    assert resolve_within_workspace(workspace, "sub/../visible.txt") is None
+    assert resolve_within_workspace(workspace, "../fuera.txt") is None
+    assert resolve_within_workspace(workspace, "/etc/passwd") is None
+    assert resolve_within_workspace(workspace, "") is None
+    assert resolve_within_workspace(workspace, escaping) is None
+    # Un archivo declarado que no existe sigue estando **dentro**: la frontera no lo inventa.
+    assert resolve_within_workspace(workspace, "todavia-no-existe.txt") is not None

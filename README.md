@@ -1957,6 +1957,7 @@ determinista: `src/punto/model_context.py`.
 | `visible_paths` | Los archivos cuyo contenido se envió al modelo, en orden |
 | `content` | El texto exacto que el modelo recibió |
 | `omitted_paths` | Lo que **no** se envió, declarado; nunca omitido en silencio |
+| `unsafe_paths` | Lo excluido porque su destino real **escapa** del workspace |
 | `truncated_paths` | Los archivos enviados con recorte, declarado |
 | `line_counts` | Cuántas líneas de cada archivo visible pudo ver el modelo |
 
@@ -1964,6 +1965,26 @@ Y los validadores usan **ese** conjunto, no la lista declarada por la tarea:
 
 - un hallazgo de `MODEL_REVIEW` sobre un archivo que no está en `visible_paths` se **rechaza**;
 - un hallazgo `DETERMINISTIC_CHECK` no lo necesita: su evidencia la produce PUNTO.
+
+**La frontera de ruta es léxica y de destino.** `normalize_relative_path()` bloquea rutas
+absolutas y `..`, pero eso no basta: una ruta relativa perfectamente válida puede ser un
+enlace que sale del workspace. Antes de leer nada se resuelve el destino real —siguiendo
+symlinks y junctions— y se exige que siga dentro de la raíz resuelta:
+
+```python
+resolved_candidate.is_relative_to(resolved_workspace)
+```
+
+Un enlace **interno** se acepta y se lee; uno que **escape** no se lee nunca, y ni su
+contenido ni su destino real llegan al prompt, al informe ni a la evidencia: la ruta declarada
+queda en `unsafe_paths` y el archivo se declara omitido. Como un archivo modificado omitido
+bloquea la revisión y un objetivo omitido bloquea la auditoría, un enlace que escapa no puede
+terminar aprobado por accidente.
+
+La regla vive en un solo sitio (`resolve_within_workspace`) y hay una prueba que exige que
+coincida con las dos implementaciones que ya existían en el motor
+(`ExecutionContext.resolve_path` del Developer y `SecurityCheckContext.readable` de los checks
+deterministas) sobre los mismos fixtures, incluido un enlace que escapa.
 
 Dos reglas que cierran los huecos que tenía la fase anterior:
 

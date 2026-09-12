@@ -1,4 +1,4 @@
-"""Frontera de contexto del modelo (ENGINE-5.1).
+"""Frontera de contexto del modelo (ENGINE-5.1 y ENGINE-5.1.1).
 
 El motor solo puede aceptar un hallazgo del modelo sobre un archivo cuyo contenido el
 modelo **recibió**. Ese invariante no puede depender de que un validador y un constructor de
@@ -10,12 +10,19 @@ exactamente:
 - ``visible_paths``: las rutas cuyo contenido se envió al modelo, en orden;
 - ``content``: el texto que el modelo recibió, tal cual;
 - ``omitted_paths``: las rutas que **no** se enviaron, declaradas y no silenciadas;
+- ``unsafe_paths``: las excluidas porque su destino real **escapa** del workspace;
 - ``truncated_paths``: las rutas cuyo contenido se envió recortado;
 - ``line_counts``: cuántas líneas de cada ruta visible pudo ver el modelo.
 
 Regla de la frontera, sin excepciones: **una allowlist vacía no autoriza nada**. Si no hay
 contexto visible, ningún hallazgo del modelo puede señalar un archivo. Y nada se omite en
 silencio: lo que no cabe se declara para que quien decide pueda bloquear.
+
+Frontera de lectura (ENGINE-5.1.1): la comprobación de ruta es **léxica y de destino**. Una
+ruta relativa sin ``..`` puede seguir siendo un enlace que sale del workspace, así que antes
+de leer nada se resuelve el destino real —siguiendo symlinks y junctions— y se exige que
+siga dentro de la raíz resuelta. Un enlace interno se acepta; uno que escape **no se lee
+nunca**, y ni su contenido ni su destino real llegan al prompt ni a la evidencia.
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ class ModelReviewContext:
 
     visible_paths: tuple[str, ...] = ()
     omitted_paths: tuple[str, ...] = ()
+    unsafe_paths: tuple[str, ...] = ()
     truncated_paths: tuple[str, ...] = ()
     content: str = ""
     line_counts: tuple[tuple[str, int], ...] = ()
@@ -75,31 +83,50 @@ class ModelReviewContext:
         return dict(self.line_counts).get(path)
 
     def omission_detail(self) -> str:
-        """Descripción legible de lo omitido, para evidencia y auditoría."""
+        """Descripción legible de lo omitido, para evidencia y auditoría.
+
+        Solo nombra rutas **declaradas** por la tarea. El destino real de un enlace que
+        escapa no se escribe nunca: sería filtrar la disposición del sistema de archivos.
+        """
         if not self.omitted_paths:
             return ""
-        return (
+        listed = ", ".join(self.omitted_paths[:5])
+        suffix = "…" if len(self.omitted_paths) > 5 else ""
+        detail = (
             f"contexto incompleto: {len(self.omitted_paths)} archivo(s) declarado(s) no "
-            f"enviado(s) al modelo ({', '.join(self.omitted_paths[:5])}"
-            f"{'…' if len(self.omitted_paths) > 5 else ''}); el límite es "
+            f"enviado(s) al modelo ({listed}{suffix}); el límite es "
             f"{MAX_MODEL_VISIBLE_PATHS} archivo(s)"
         )
+        if self.unsafe_paths:
+            unsafe = ", ".join(self.unsafe_paths[:5])
+            unsafe_suffix = "…" if len(self.unsafe_paths) > 5 else ""
+            detail = (
+                f"{detail}; {len(self.unsafe_paths)} de ellos resuelven fuera del "
+                f"workspace y fueron rechazados sin leerlos ({unsafe}{unsafe_suffix})"
+            )
+        return detail
 
     def annotated_content(self) -> str:
         """Contenido visible, con las omisiones declaradas dentro del propio contexto.
 
-        El modelo nunca debe creer que vio todo el proyecto cuando no fue así.
+        El modelo nunca debe creer que vio todo el proyecto cuando no fue así, ni que un
+        enlace que sale del workspace es material revisable.
         """
-        if not self.content:
-            return "(no se declararon archivos)"
         if not self.omitted_paths:
-            return self.content
-        return (
-            f"{self.content}\n\n"
-            f"[contexto parcial: {len(self.omitted_paths)} archivo(s) declarado(s) no "
+            return self.content or "(no se declararon archivos)"
+        notes = [
+            f"contexto parcial: {len(self.omitted_paths)} archivo(s) declarado(s) no "
             f"incluido(s) aquí: {', '.join(self.omitted_paths[:5])}"
-            f"{'…' if len(self.omitted_paths) > 5 else ''}]"
-        )
+            f"{'…' if len(self.omitted_paths) > 5 else ''}"
+        ]
+        if self.unsafe_paths:
+            notes.append(
+                f"excluido(s) por resolver fuera del workspace: "
+                f"{', '.join(self.unsafe_paths[:5])}"
+                f"{'…' if len(self.unsafe_paths) > 5 else ''}"
+            )
+        body = self.content or "(no se declararon archivos)"
+        return f"{body}\n\n[{'; '.join(notes)}]"
 
 
 def build_model_review_context(
@@ -116,6 +143,10 @@ def build_model_review_context(
     lo que no entre en el presupuesto queda en ``omitted_paths``: **nunca** se omite en
     silencio, y quien llama decide si eso basta para bloquear la revisión.
 
+    Antes de leer cada archivo se comprueba que su destino **real** siga dentro del
+    workspace (ENGINE-5.1.1). Un enlace que escape no se lee: queda en ``omitted_paths`` y en
+    ``unsafe_paths``, sin que su contenido ni su destino real lleguen a ningún sitio.
+
     Args:
         workspace: Raíz del workspace (solo lectura).
         paths: Rutas declaradas, en orden de prioridad.
@@ -127,6 +158,7 @@ def build_model_review_context(
         El contexto visible, con sus omisiones y recortes declarados.
     """
     root = Path(workspace)
+    resolved_root = _resolved_root(root)
     ordered: list[str] = []
     for raw in _iter_paths(paths):
         try:
@@ -138,6 +170,7 @@ def build_model_review_context(
 
     visible = ordered[:max_paths]
     omitted: list[str] = list(ordered[max_paths:])
+    unsafe: list[str] = []
 
     chunks: list[str] = []
     line_counts: list[tuple[str, int]] = []
@@ -145,7 +178,13 @@ def build_model_review_context(
     total = 0
 
     for relative in visible:
-        body, truncated_at = _read_body(root / relative, relative, max_file_chars)
+        contained = _contained(root, resolved_root, relative)
+        if contained is None:
+            # El enlace sale del workspace: no se lee, no se envía, se declara.
+            omitted.append(relative)
+            unsafe.append(relative)
+            continue
+        body, truncated_at = _read_body(contained, max_file_chars)
         block = f"=== {relative} ===\n{body}"
         if chunks and total + len(block) > max_total_chars:
             # No cabe: se declara omitido en vez de recortarlo en silencio.
@@ -160,10 +199,36 @@ def build_model_review_context(
     return ModelReviewContext(
         visible_paths=tuple(path for path, _ in line_counts),
         omitted_paths=tuple(omitted),
+        unsafe_paths=tuple(unsafe),
         truncated_paths=tuple(truncated),
         content="\n\n".join(chunks),
         line_counts=tuple(line_counts),
     )
+
+
+def resolve_within_workspace(workspace: Path | str, relative: str) -> Path | None:
+    """Resuelve ``relative`` y devuelve su ruta absoluta **solo** si sigue dentro del workspace.
+
+    La comprobación se hace sobre el destino real, siguiendo symlinks y junctions: una ruta
+    relativa sin ``..`` puede apuntar fuera igualmente. Un enlace interno se acepta; uno que
+    escape devuelve ``None``.
+
+    Esta es la regla que usa el contexto del modelo, en un solo sitio, para que Security y
+    Reviewer no tengan que decidirla por su cuenta.
+
+    Args:
+        workspace: Raíz del workspace.
+        relative: Ruta relativa ya declarada por la tarea.
+
+    Returns:
+        La ruta absoluta contenida, o ``None`` si escapa, no es resoluble o no es válida.
+    """
+    try:
+        normalized = normalize_relative_path(relative)
+    except ValueError:
+        return None
+    root = Path(workspace)
+    return _contained(root, _resolved_root(root), normalized)
 
 
 def missing_paths(context: ModelReviewContext, required: Iterable[str]) -> tuple[str, ...]:
@@ -190,8 +255,35 @@ def _iter_paths(paths: Iterable[str]) -> tuple[str, ...]:
     return tuple(str(item) for item in paths)
 
 
-def _read_body(path: Path, relative: str, max_file_chars: int) -> tuple[str, int | None]:
-    """Contenido legible de un archivo, con su recorte declarado si lo hay."""
+def _resolved_root(root: Path) -> Path:
+    """Raíz del workspace con los enlaces ya seguidos.
+
+    Se resuelve **una** vez y se compara contra ella: si el propio workspace se declaró por un
+    enlace, la frontera es su destino real, no su nombre.
+    """
+    try:
+        return root.resolve()
+    except OSError:  # pragma: no cover - depende del sistema de archivos
+        return root
+
+
+def _contained(root: Path, resolved_root: Path, relative: str) -> Path | None:
+    """Ruta absoluta del archivo, o ``None`` si su destino real escapa del workspace.
+
+    Sigue symlinks y junctions antes de decidir. Nunca devuelve una ruta cuya lectura
+    pudiera salir del proyecto, y nunca revela el destino que rechazó.
+    """
+    try:
+        resolved = (root / relative).resolve()
+    except OSError:  # pragma: no cover - depende del sistema de archivos
+        return None
+    if not resolved.is_relative_to(resolved_root):
+        return None
+    return resolved
+
+
+def _read_body(path: Path, max_file_chars: int) -> tuple[str, int | None]:
+    """Contenido legible de un archivo ya contenido, con su recorte declarado si lo hay."""
     if not path.is_file():
         return MISSING_FILE_MARKER, None
     try:
@@ -227,4 +319,5 @@ __all__ = [
     "ModelReviewContext",
     "build_model_review_context",
     "missing_paths",
+    "resolve_within_workspace",
 ]

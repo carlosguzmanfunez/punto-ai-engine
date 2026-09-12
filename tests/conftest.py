@@ -247,3 +247,52 @@ def low_risk_request() -> ActionRequest:
         estimated_minutes=2.0,
         files_changed=["src/punto/example.py"],
     )
+
+
+# ---------------------------------------------------------------------------
+# ENGINE-4: QA independiente
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="session")
+def podman_gate() -> None:
+    """Sin Podman operativo las pruebas de ejecución de QA **fallan**, no se saltan."""
+    from qa_support import PODMAN
+
+    if PODMAN is None:
+        pytest.fail("Podman no disponible: instálalo con winget install --id RedHat.Podman")
+    state = subprocess.run(
+        [PODMAN, "machine", "inspect", "--format", "{{.State}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    if state.stdout.strip().lower() != "running":
+        pytest.fail("la máquina de Podman no está en ejecución: podman machine start")
+
+
+@pytest.fixture(scope="session")
+def qa_sandbox(podman_gate: None) -> Iterator[object]:
+    """Sandbox verificado para ejecutar las pruebas generadas por QA."""
+    from punto.developer.sandbox import ContainerSandboxBackend, SandboxLimits
+
+    backend = ContainerSandboxBackend(limits=SandboxLimits(timeout_seconds=180.0))
+    backend.prepare()
+    backend.verify_capabilities()
+    yield backend
+    backend.destroy()
+
+
+@pytest.fixture
+def defective_workspace(tmp_path: Path) -> Path:
+    """Proyecto sintético con el defecto: no respeta el límite inferior."""
+    from qa_support import DEFECTIVE_CLAMP, build_clamp_project
+
+    return build_clamp_project(tmp_path, DEFECTIVE_CLAMP)
+
+
+@pytest.fixture
+def correct_workspace(tmp_path: Path) -> Path:
+    """Proyecto sintético correcto."""
+    from qa_support import CORRECT_CLAMP, build_clamp_project
+
+    return build_clamp_project(tmp_path, CORRECT_CLAMP)

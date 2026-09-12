@@ -1154,6 +1154,257 @@ class AuditLogger:
             },
         )
 
+    # ---------------------------------------------- QA independiente (ENGINE-4)
+    def log_qa_request_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        acceptance_criteria: int,
+        developer_claimed_pass: bool,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una evaluación de QA.
+
+        Se registra si el Developer **declaró** que su validación pasó, precisamente
+        para poder auditar que QA no lo usó como evidencia.
+        """
+        return self.record(
+            AuditEventType.QA_REQUEST_STARTED,
+            action="qa_request_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "acceptance_criteria": acceptance_criteria,
+                "developer_claimed_pass": developer_claimed_pass,
+            },
+        )
+
+    def log_qa_plan_received(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        test_cases: int,
+        test_files: int,
+        checks: int,
+        coverage: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la recepción de un plan de QA, por recuentos."""
+        return self.record(
+            AuditEventType.QA_PLAN_RECEIVED,
+            action="qa_plan_received",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "test_cases": test_cases,
+                "test_files": test_files,
+                "checks": checks,
+                "coverage": coverage,
+            },
+        )
+
+    def log_qa_plan_accepted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        test_cases: int,
+        checks: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un plan de QA aceptado tras superar los invariantes."""
+        return self.record(
+            AuditEventType.QA_PLAN_ACCEPTED,
+            action="qa_plan_accepted",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "test_cases": test_cases,
+                "checks": list(checks),
+            },
+        )
+
+    def log_qa_plan_rejected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un plan de QA rechazado, con las violaciones concretas."""
+        return self.record(
+            AuditEventType.QA_PLAN_REJECTED,
+            action="qa_plan_rejected",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "violations": [item[:300] for item in violations],
+                "violation_count": len(violations),
+            },
+        )
+
+    def log_qa_execution_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workspace: str,
+        checks: Sequence[str],
+        trust_level: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de la ejecución de los checks en el sandbox."""
+        return self.record(
+            AuditEventType.QA_EXECUTION_STARTED,
+            action="qa_execution_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "workspace": workspace,
+                "checks": list(checks),
+                "trust_level": trust_level,
+            },
+        )
+
+    def log_qa_check_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        check: str,
+        passed: bool,
+        exit_code: int,
+        duration_ms: int,
+        failure: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el resultado de un check de QA.
+
+        Se registran el nombre, el código de salida y la clasificación: nunca el
+        código de las pruebas ni el del producto.
+        """
+        event_type = (
+            AuditEventType.QA_CHECK_COMPLETED if passed else AuditEventType.QA_CHECK_FAILED
+        )
+        return self.record(
+            event_type,
+            action=f"qa_check_{'completed' if passed else 'failed'}",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if passed else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "check": check,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "failure": failure,
+            },
+        )
+
+    def log_qa_finding_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        finding_id: str,
+        severity: str,
+        category: str,
+        acceptance_criterion: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un hallazgo de QA sin copiar su evidencia completa."""
+        return self.record(
+            AuditEventType.QA_FINDING_RECORDED,
+            action="qa_finding_recorded",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "finding_id": finding_id,
+                "severity": severity,
+                "category": category,
+                "acceptance_criterion": acceptance_criterion,
+            },
+        )
+
+    def log_qa_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        status: str,
+        findings: int,
+        product_failures: int,
+        capability_gaps: int,
+        total_tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una evaluación de QA con su veredicto."""
+        return self.record(
+            AuditEventType.QA_COMPLETED,
+            action="qa_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "status": status,
+                "findings": findings,
+                "product_failures": product_failures,
+                "capability_gaps": capability_gaps,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_qa_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        reason: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una evaluación bloqueada, con su motivo."""
+        return self.record(
+            AuditEventType.QA_BLOCKED,
+            action="qa_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "reason": reason[:300],
+                "detail": detail[:500],
+            },
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

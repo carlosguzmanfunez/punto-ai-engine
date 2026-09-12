@@ -1664,7 +1664,216 @@ superficie de rutas que en ENGINE-0.
 
 ---
 
-## 22. Licencia
+## 22. ENGINE-4 — Independent QA Agent
+
+ENGINE-4 añade el primer QA **real e independiente** del motor. Su principio
+constitucional cabe en una línea:
+
+```
+DEVELOPER ≠ QA
+```
+
+El agente que escribe código **no** puede ser la autoridad que decide por sí misma que
+ese código cumple los criterios de aceptación. QA no confirma: intenta **refutar**.
+
+### Separación de roles
+
+| Rol | Hace | No hace |
+| --- | --- | --- |
+| Developer | implementa | no decide si su trabajo cumple el contrato |
+| QA | diseña pruebas independientes y las ejecuta | no modifica producción, no corrige el producto, no hace commits, no redefine criterios, **no declara PASS** |
+| CAMUS | decide qué ocurre con el resultado | no evalúa por sí mismo |
+
+El resultado del Developer viaja en la tarea como **contexto**, nunca como prueba. En
+las pruebas se verifica explícitamente que un `DeveloperExecutionResult` con
+`validation.passed=True` **no** convierte la tarea en aprobada.
+
+### Componentes nuevos
+
+| Componente | Archivo | Responsabilidad |
+| --- | --- | --- |
+| `QARunner` | `src/punto/qa/base.py` | Interfaz provider-agnostic |
+| `DeepSeekQARunner` | `src/punto/qa/deepseek.py` | Implementación real |
+| Esquemas | `src/punto/schemas/qa.py` | `QATask`, `QAPlan`, `QATestCase`, `AcceptanceCoverage`, `QAReport`, `QAFinding` |
+| Guard de rutas | `src/punto/qa/paths.py` | Frontera pruebas / producción |
+| Registry de checks | `src/punto/qa/checks.py` | Qué se puede ejecutar y con qué comando |
+| Validador | `src/punto/qa/validation.py` | Invariantes del plan |
+| Veredicto | `src/punto/qa/report.py` | Clasificación de fallos, cobertura y estado |
+| Overlay | `src/punto/qa/overlay.py` | Workspace desechable |
+| Prompts | `src/punto/qa/prompts.py` | Contrato versionado (`1.0.0`) |
+
+`punto.qa` no reexporta: importarlo no arrastra `httpx` ni el runner de DeepSeek.
+
+### Plan de QA y trazabilidad
+
+QA produce un `QAPlan` con `summary`, `test_cases`, `test_file_changes`, `checks`,
+`coverage_mapping` y `assumptions`. Cada caso declara título, objetivo, tipo
+(`UNIT`, `INTEGRATION`, `REGRESSION`, `STATIC`), los criterios que cubre y el
+comportamiento observable que espera.
+
+La trazabilidad es **mecánica**, no interpretativa:
+
+- cada criterio recibe un identificador determinista (`AC-1`, `AC-2`…) en el orden en
+  que se recibe;
+- cada criterio debe aparecer en `coverage_mapping` como `COVERED` (con al menos un
+  caso) o `UNTESTABLE` (con un motivo). **Ningún criterio puede desaparecer**;
+- cada función de prueba lleva el identificador de su caso en el nombre
+  (`test_qu_1_...`). Sin esa convención, PUNTO rechaza el plan: la trazabilidad tiene
+  que poder comprobarse, no suponerse.
+
+Esa convención permite atribuir cada fallo al caso —y por tanto al criterio— que lo
+produjo. Un QA que declara roto todo el contrato porque una sola aserción falló es un
+mal QA: aquí solo queda `FAILED` el criterio cuya prueba falló de verdad.
+
+### QA genera pruebas, no producción
+
+La frontera se decide por ruta, antes de escribir un byte, y en caso de duda una ruta es
+de producción:
+
+| Clasificación | Ejemplos | ¿QA puede escribir? |
+| --- | --- | --- |
+| `TEST_ONLY` | `tests/…`, `test/…`, `__tests__/…`, `*.test.ts`, `conftest.py`, raíces declaradas por el proyecto | Sí |
+| `PRODUCTION` | `src/…`, `app/…`, `lib/…` | No |
+| `PROTECTED` | configuración constitucional | No |
+| `INVALID` | rutas absolutas, `..`, `.git`, `node_modules`, `.env`, `id_rsa` | No |
+
+Además, QA **nunca sobrescribe** un archivo existente: solo añade archivos nuevos. Si
+pudiera editar la prueba del Developer, podría borrar la evidencia que debe evaluar.
+
+### Registry de checks
+
+QA no devuelve comandos: devuelve **nombres**. Los argumentos los fija PUNTO.
+
+| Disponibles hoy | Registrados pero no disponibles |
+| --- | --- |
+| `pytest`, `ruff`, `mypy`, `python-import` | `vitest`, `jest`, `eslint`, `tsc`, `npm-test` |
+
+Un nombre fuera del registro invalida el plan. No hay `bash -c`, ni `powershell`, ni
+cadenas de shell: el registro es cerrado.
+
+### Workspace efímero
+
+```
+candidate workspace → overlay desechable → pruebas QA → sandbox → evidencia → destruir
+```
+
+La rama aprobada del Developer no se toca. Las pruebas de QA viven en un directorio
+temporal, se ejecutan contra una copia del árbol candidato y desaparecen al terminar:
+**no se commitean**. El overlay es siempre una ruta nueva, así que un fallo se descarta
+entero; y la escritura es atómica: si un archivo del plan no es escribible, no se escribe
+ninguno.
+
+### Ejecución
+
+Todo archivo de prueba generado por QA es código de modelo, así que:
+
+- `ExecutionTrustLevel.UNTRUSTED_MODEL`;
+- `ContainerSandboxBackend` **verificado** (los cuatro aislamientos demostrados);
+- sin red (`--network none`), sin host, **sin fallback**;
+- la credencial vive solo en el proceso del modelo: no entra al overlay ni al sandbox.
+
+### Clasificación de fallos
+
+La distinción que evita el peor error de un QA automático:
+
+| Categoría | Qué significa | Qué ocurre |
+| --- | --- | --- |
+| `PRODUCT_FAILURE` | la implementación no cumple el criterio | **QA FAIL**. No se repara: se reporta |
+| `QA_TEST_FAILURE` | la prueba de QA es inválida (sintaxis, colección, uso) | QA repara **su** prueba, dentro de su presupuesto |
+| `INFRASTRUCTURE_FAILURE` | el entorno no permitió ejecutar (timeout, sandbox, binario) | `BLOCKED` |
+| `CAPABILITY_GAP` | PUNTO no tiene la capacidad necesaria | `BLOCKED` con la capacidad declarada |
+
+Un `PRODUCT_FAILURE` **nunca** se arregla cambiando la expectativa. La petición de
+reparación lo dice explícitamente: «Repara TUS pruebas. Esto NO es un permiso para
+cambiar lo que esperas del producto».
+
+### PASS determinista
+
+El modelo **no puede** escribir el veredicto: el contrato rechaza cualquier clave
+desconocida, incluida `status`. El estado lo calcula PUNTO:
+
+`PASS` solo si el plan es válido, **todos** los criterios obligatorios quedaron
+demostrados por pruebas ejecutadas y superadas, todos los checks se ejecutaron y
+pasaron, y no hay ningún fallo del producto, de infraestructura ni hueco de capacidad
+que impida comprobar algo.
+
+`FAIL` si existe un defecto del producto. `BLOCKED` en cualquier otro caso: sin
+evidencia no hay veredicto, y no se finge PASS.
+
+Los hallazgos (`QAFinding`) llevan gravedad, categoría, criterio afectado, evidencia real
+y una pista de reparación. La gravedad es fija por categoría: `CRITICAL` queda reservado
+para las fases de Security y Reviewer, que aún no existen.
+
+### CAMUS
+
+`Camus.evaluate_developer_result(task)` —y su alias `qa_task(task)`— delega en el
+`QARunner` inyectado y devuelve el `QAReport`. **ENGINE-4 no lanza una reparación
+automática** cuando QA falla: el bucle Developer → QA → reparación pertenece a la fase de
+workflow/orquestación posterior.
+
+### Auditoría
+
+Eventos: `QA_REQUEST_STARTED`, `QA_PLAN_RECEIVED`, `QA_PLAN_REJECTED`,
+`QA_PLAN_ACCEPTED`, `QA_EXECUTION_STARTED`, `QA_CHECK_COMPLETED`, `QA_CHECK_FAILED`,
+`QA_FINDING_RECORDED`, `QA_COMPLETED` y `QA_BLOCKED`.
+
+Se registran recuentos, códigos de salida y categorías —nunca la credencial, el código
+de las pruebas ni el código de producción—, y el inicio registra si el Developer declaró
+su validación superada, precisamente para poder auditar que QA no lo usó como evidencia.
+
+### Generalidad
+
+| Proyecto | Plan de QA | Ejecución |
+| --- | --- | --- |
+| Python REST/API | válido | **ejecutable** (perfil demostrado) |
+| Next.js / TypeScript | válido | `BLOCKED` / `CAPABILITY_REQUIRED` (`node20`, `npm`, `vitest`) |
+| CLI en Python | válido | **ejecutable** |
+
+Que PUNTO no pueda ejecutar Node todavía no es un defecto de QA: es un hueco declarado,
+y **nunca** se resuelve ejecutando Node en el host como sustituto.
+
+### Pruebas y gate vivo
+
+| Comando | Qué cubre |
+| --- | --- |
+| `pytest` | Suite completa: guard de rutas, registry, validador, clasificación, overlay, runner con sandbox real, generalidad y CAMUS |
+| `pytest tests/integration/test_qa_live.py -q` | **Gate vivo**: defecto real detectado, clasificación del fallo, PASS con el producto corregido e independencia Developer/QA |
+
+El gate vivo usa un `clamp` deliberadamente defectuoso
+(`min(value, upper)`, que ignora el límite inferior) con pruebas de Developer que solo
+cubren `value > upper`: el Developer declara su validación superada y QA, con sus
+propias pruebas, encuentra el defecto que esas pruebas no veían.
+
+### Evidencia de las llamadas reales
+
+Ejecución completa con `DEEPSEEK_API_KEY` presente y Podman en marcha: **5 gates, 0
+fallos** (4:24).
+
+| Gate | Resultado real |
+| --- | --- |
+| Implementación defectuosa | `FAIL` — `deepseek-v4-pro` diseñó **5 casos**, 6 173 tokens, cobertura `AC-1 FAILED` / `AC-2 COVERED` / `AC-3 COVERED` |
+| Clasificación del defecto | `PRODUCT_FAILURE` sobre `AC-1` («value < lower devuelve lower») |
+| Implementación corregida | `PASS` — 4 651 tokens, los tres criterios `COVERED` |
+| Independencia | `developer_claimed_pass=True` en ambos casos → QA **FAIL** con el defectuoso y **PASS** con el corregido |
+| Aislamiento | el proyecto queda **byte a byte idéntico** y el overlay se destruye |
+
+### API
+
+Sin cambios: QA no se expone por HTTP. `GET /health` → 200 y la misma superficie de rutas.
+
+### Limitación declarada
+
+- QA **no repara el producto**: detecta y reporta. La reparación automática Developer ↔ QA
+  llega con el workflow de orquestación.
+- Las pruebas que genera QA son efímeras: una fase futura podrá promoverlas al proyecto.
+- Solo se ejecuta lo que tiene perfil demostrado (Python). El resto queda `BLOCKED` por
+  capacidad, nunca por atajo.
+- `E2E` y pruebas de navegador no existen todavía y **no se prometen**: exigirían
+  capacidades que PUNTO no tiene.
+
+---
+
+## 23. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

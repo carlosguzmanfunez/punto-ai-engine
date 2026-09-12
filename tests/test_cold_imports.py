@@ -70,6 +70,17 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.planner",
     "punto.planner.base",
     "punto.planner.prompts",
+    # --- ENGINE-4: QA independiente -------------------------------------------
+    "punto.schemas.qa",
+    "punto.qa",
+    "punto.qa.base",
+    "punto.qa.capabilities",
+    "punto.qa.checks",
+    "punto.qa.overlay",
+    "punto.qa.paths",
+    "punto.qa.prompts",
+    "punto.qa.report",
+    "punto.qa.validation",
 )
 
 
@@ -144,6 +155,25 @@ def test_planning_packages_do_not_eagerly_load_their_runners() -> None:
         ")\n"
         "assert 'punto.planner.deepseek' not in sys.modules, (\n"
         "    'punto.planner cargo su runner de DeepSeek de forma eager'\n"
+        ")"
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_qa_package_does_not_eagerly_load_its_runner() -> None:
+    """``punto.qa`` no arrastra el cliente HTTP ni su runner de DeepSeek.
+
+    Misma regla que en ENGINE-1.R3 y ENGINE-3: los ``__init__`` internos no reexportan.
+    """
+    result = run_in_fresh_interpreter(
+        "import sys\n"
+        "import punto.qa\n"
+        "import punto.qa.checks\n"
+        "import punto.qa.paths\n"
+        "assert 'httpx' not in sys.modules, 'el QA arrastro httpx'\n"
+        "assert 'punto.qa.deepseek' not in sys.modules, (\n"
+        "    'punto.qa cargo su runner de DeepSeek de forma eager'\n"
         ")"
     )
 

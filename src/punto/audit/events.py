@@ -75,6 +75,19 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.TASK_GRAPH_ACCEPTED: "task_graph",
     AuditEventType.PROJECT_PLAN_COMPLETED: "project_plan",
     AuditEventType.PROJECT_PLAN_BLOCKED: "project_plan",
+    # --- QA independiente (ENGINE-4) ------------------------------------------
+    #: Se registran sobre el ``task_id`` evaluado, de modo que
+    #: ``AuditLogger.by_resource(task_id)`` reconstruye la evaluación completa.
+    AuditEventType.QA_REQUEST_STARTED: "qa_request",
+    AuditEventType.QA_PLAN_RECEIVED: "qa_plan",
+    AuditEventType.QA_PLAN_REJECTED: "qa_plan",
+    AuditEventType.QA_PLAN_ACCEPTED: "qa_plan",
+    AuditEventType.QA_EXECUTION_STARTED: "qa_execution",
+    AuditEventType.QA_CHECK_COMPLETED: "qa_check",
+    AuditEventType.QA_CHECK_FAILED: "qa_check",
+    AuditEventType.QA_FINDING_RECORDED: "qa_finding",
+    AuditEventType.QA_COMPLETED: "qa_report",
+    AuditEventType.QA_BLOCKED: "qa_report",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

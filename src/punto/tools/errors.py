@@ -204,6 +204,42 @@ class PlannerRunnerNotConfiguredError(PlanningError):
         )
 
 
+# ---------------------------------------------------------------------------
+# QA independiente (ENGINE-4)
+# ---------------------------------------------------------------------------
+class QAError(RuntimeError):
+    """Base de los errores del rol QA.
+
+    Deliberadamente **no** hereda de ``DeveloperExecutionError``: evaluar no es
+    ejecutar y la auditoría debe poder distinguirlo.
+    """
+
+
+class QAValidationError(QAError):
+    """El plan de QA incumple un invariante determinista.
+
+    Lleva la lista completa de violaciones: PUNTO rechaza el plan entero y devuelve
+    todas las razones al modelo, no solo la primera.
+    """
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(
+            f"Plan de QA inválido ({len(self.violations)} violación/es): {detail}"
+        )
+
+
+class QARunnerNotConfiguredError(QAError):
+    """No hay ningún ``QARunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay QARunner configurado: inyecta uno en Camus("
+            "qa_runner=...) para evaluar el trabajo del Developer."
+        )
+
+
 __all__ = [
     "ArchitectRunnerNotConfiguredError",
     "BranchPolicyViolationError",
@@ -217,6 +253,9 @@ __all__ = [
     "PlanningLimitExceededError",
     "PlanningValidationError",
     "ProtectedFileError",
+    "QAError",
+    "QARunnerNotConfiguredError",
+    "QAValidationError",
     "SandboxRequiredError",
     "SandboxUnavailableError",
     "TrustBoundaryError",

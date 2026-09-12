@@ -40,6 +40,7 @@ from punto.planning.graph import (
 )
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
+from punto.qa.base import QARunner
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import (
     AuthorityLevel,
@@ -63,6 +64,7 @@ from punto.schemas.planning import (
     TaskGraph,
 )
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
+from punto.schemas.qa import QAReport, QATask
 from punto.schemas.result import ExecutionResult
 from punto.schemas.task import Task
 from punto.tasks.manager import TaskManager
@@ -70,6 +72,7 @@ from punto.tools.errors import (
     ArchitectRunnerNotConfiguredError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
+    QARunnerNotConfiguredError,
 )
 
 if TYPE_CHECKING:
@@ -188,6 +191,7 @@ class Camus:
         developer_runner: DeveloperRunner | None = None,
         architect_runner: ArchitectRunner | None = None,
         planner_runner: PlannerRunner | None = None,
+        qa_runner: QARunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -202,6 +206,9 @@ class Camus:
         #: ``plan_project`` falla de forma explícita en vez de improvisar.
         self._architect = architect_runner
         self._planner_runner = planner_runner
+        #: QA independiente (ENGINE-4). Opt-in igual que los demás roles: sin él,
+        #: ``evaluate_developer_result`` falla de forma explícita.
+        self._qa = qa_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -243,6 +250,46 @@ class Camus:
     def planner_runner(self) -> PlannerRunner | None:
         """Rol Planner inyectado, si existe (ENGINE-3)."""
         return self._planner_runner
+
+    @property
+    def qa_runner(self) -> QARunner | None:
+        """Rol QA inyectado, si existe (ENGINE-4)."""
+        return self._qa
+
+    # ------------------------------------------------------------- ENGINE-4
+    def evaluate_developer_result(self, task: QATask) -> QAReport:
+        """Evalúa de forma **independiente** el trabajo de un Developer.
+
+        CAMUS no evalúa nada por sí mismo: delega en el ``QARunner`` inyectado. Tampoco
+        lanza una reparación automática cuando QA falla: en esta fase el resultado se
+        devuelve y la decisión de reparar pertenece al workflow de orquestación
+        posterior (§18).
+
+        El resultado del Developer que viaja en ``task.developer_result`` es
+        **contexto**: que el Developer declarara su validación como superada no
+        convierte la tarea en aprobada, y QA lo demuestra con su propia ejecución.
+
+        Raises:
+            QARunnerNotConfiguredError: si no hay QA inyectado.
+        """
+        if self._qa is None:
+            raise QARunnerNotConfiguredError()
+
+        report = self._qa.evaluate(task)
+        for finding in report.findings:
+            self._audit.log_qa_finding_recorded(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                finding_id=finding.id,
+                severity=finding.severity.value,
+                category=finding.category.value,
+                acceptance_criterion=finding.acceptance_criterion,
+            )
+        return report
+
+    def qa_task(self, task: QATask) -> QAReport:
+        """Alias explícito de :meth:`evaluate_developer_result`."""
+        return self.evaluate_developer_result(task)
 
     # ------------------------------------------------------------- ENGINE-3
     def plan_project(self, intent: ProjectIntent) -> ProjectPlanResult:

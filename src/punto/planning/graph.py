@@ -258,7 +258,8 @@ def validate_task_graph(
     - los identificadores de tarea son únicos;
     - toda dependencia existe dentro del plan;
     - el grafo no contiene ciclos;
-    - una tarea de riesgo alto no se declara autónoma.
+    - una tarea cuyo riesgo exige Human Gate se declara con la **única** autoridad
+      que representa aprobación humana previa: ``LEVEL_3_HUMAN``.
     """
     violations: list[str] = []
 
@@ -279,13 +280,26 @@ def validate_task_graph(
                     f"task_graph: la tarea {task.id!r} depende de {dependency!r}, "
                     "que no existe en el plan"
                 )
+        # Coherencia riesgo/autoridad, decidida aquí y no en el prompt.
+        #
+        # ``RiskLevel.requires_human_gate`` es la regla del motor: HIGH y CRITICAL
+        # exigen aprobación humana. El **único** nivel de autoridad que representa
+        # aprobación humana *previa* es ``LEVEL_3_HUMAN``: ``LEVEL_1_AUTONOMOUS_REVIEW``
+        # es revisión posterior y ``LEVEL_2_CAMUS`` es autoridad del propio orquestador,
+        # así que ninguno de los dos satisface la exigencia.
+        #
+        # Aceptar cualquiera de ellos produciría un plan internamente incoherente: una
+        # tarea que el motor sabe que necesita una persona, declarada como ejecutable
+        # sin ella. No se delega esta comprobación al Policy Engine ni a la buena
+        # voluntad del prompt.
         if (
             task.risk_level.requires_human_gate
-            and task.authority_level is AuthorityLevel.LEVEL_0_AUTONOMOUS
+            and task.authority_level is not AuthorityLevel.LEVEL_3_HUMAN
         ):
             violations.append(
                 f"task_graph: la tarea {task.id!r} declara riesgo "
-                f"{task.risk_level.name} con autoridad autónoma: exige al menos "
+                f"{task.risk_level.name}, que exige Human Gate, con autoridad "
+                f"{task.authority_level.name}: la única autoridad admisible es "
                 f"{AuthorityLevel.LEVEL_3_HUMAN.name}"
             )
         if task.risk_level is RiskLevel.CRITICAL and not task.validation_checks:

@@ -469,22 +469,100 @@ def test_cycle_in_graph_is_rejected() -> None:
     assert any("Ciclo" in item or "ciclo" in item for item in violations.violations)
 
 
-def test_high_risk_with_autonomous_authority_is_rejected() -> None:
-    """§10: un riesgo alto no puede declararse autónomo."""
-    violations = validate_task_graph(
-        TaskGraph(tasks=(plan_task("T1", risk_level="HIGH"),))
+@pytest.mark.parametrize("risk", ["HIGH", "CRITICAL"])
+@pytest.mark.parametrize(
+    "authority",
+    [
+        "LEVEL_0_AUTONOMOUS",
+        "LEVEL_1_AUTONOMOUS_REVIEW",
+        "LEVEL_2_CAMUS",
+    ],
+)
+def test_human_gate_risk_without_human_authority_is_rejected(
+    risk: str, authority: str
+) -> None:
+    """§10: si el riesgo exige Human Gate, la única autoridad admisible es LEVEL_3.
+
+    ``LEVEL_1_AUTONOMOUS_REVIEW`` es revisión **posterior** y ``LEVEL_2_CAMUS`` es
+    autoridad del propio orquestador: ninguna de las dos representa aprobación humana
+    previa. Aceptarlas produciría un plan que se contradice a sí mismo.
+    """
+    graph = TaskGraph(
+        tasks=(
+            plan_task(
+                "T1",
+                risk_level=risk,
+                authority_level=authority,
+                validation_checks=("pytest",),
+            ),
+        )
     )
 
-    assert any("autónoma" in item for item in violations.violations)
+    violations = validate_task_graph(graph)
+
+    assert not violations.valid
+    assert any(
+        "exige Human Gate" in item and "LEVEL_3_HUMAN" in item
+        for item in violations.violations
+    )
 
 
-def test_high_risk_with_human_authority_is_accepted() -> None:
-    """Coherencia correcta: riesgo alto con autoridad humana."""
+@pytest.mark.parametrize("risk", ["HIGH", "CRITICAL"])
+def test_human_gate_risk_with_human_authority_is_accepted(risk: str) -> None:
+    """Coherencia correcta: riesgo que exige Human Gate con autoridad humana."""
     graph = TaskGraph(
-        tasks=(plan_task("T1", risk_level="HIGH", authority_level="LEVEL_3_HUMAN"),)
+        tasks=(
+            plan_task(
+                "T1",
+                risk_level=risk,
+                authority_level="LEVEL_3_HUMAN",
+                validation_checks=("pytest",),
+            ),
+        )
     )
 
     assert validate_task_graph(graph).valid
+
+
+@pytest.mark.parametrize(
+    ("risk", "authority"),
+    [
+        ("LOW", "LEVEL_0_AUTONOMOUS"),
+        ("MEDIUM", "LEVEL_0_AUTONOMOUS"),
+        ("LOW", "LEVEL_1_AUTONOMOUS_REVIEW"),
+        ("MEDIUM", "LEVEL_2_CAMUS"),
+    ],
+)
+def test_risk_without_human_gate_keeps_existing_rules(
+    risk: str, authority: str
+) -> None:
+    """Regresión: LOW y MEDIUM no exigen Human Gate y conservan las reglas previas."""
+    graph = TaskGraph(
+        tasks=(
+            plan_task(
+                "T1",
+                risk_level=risk,
+                authority_level=authority,
+                validation_checks=("pytest",),
+            ),
+        )
+    )
+
+    assert validate_task_graph(graph).valid
+
+
+def test_risk_authority_invariant_is_deterministic() -> None:
+    """El invariante no depende del prompt ni del orden: mismo grafo, mismo veredicto."""
+    graph = TaskGraph(
+        tasks=(plan_task("T1", risk_level="HIGH", authority_level="LEVEL_1_AUTONOMOUS_REVIEW"),)
+    )
+
+    first = validate_task_graph(graph)
+    second = validate_task_graph(graph)
+
+    assert first == second
+    assert any("LEVEL_1_AUTONOMOUS_REVIEW" in item for item in first.violations)
+    assert not first.valid
 
 
 def test_critical_risk_without_validation_checks_is_rejected() -> None:

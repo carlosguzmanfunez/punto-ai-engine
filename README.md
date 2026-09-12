@@ -1511,7 +1511,10 @@ El Planner puede proponer; PUNTO valida. No se acepta automáticamente:
 - milestones sin trabajo, epics huérfanos, tareas fuera de su epic;
 - archivos constitucionalmente protegidos en `allowed_files`;
 - capacidades exigidas por una tarea que no estén declaradas en el perfil;
-- riesgo alto o crítico declarado con autoridad autónoma;
+- riesgo alto o crítico (`requires_human_gate`) sin autoridad humana: la **única**
+  autoridad admisible es `LEVEL_3_HUMAN`; `LEVEL_1_AUTONOMOUS_REVIEW` es revisión
+  posterior y `LEVEL_2_CAMUS` es autoridad del orquestador, así que ninguna de las
+  dos representa aprobación humana previa;
 - planes desmedidos (más de 120 tareas).
 
 Un plan inválido no se «arregla»: se devuelven **todas** las violaciones al rol

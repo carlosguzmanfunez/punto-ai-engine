@@ -1944,6 +1944,43 @@ una línea sería el peor de los trueques.
 mismo problema, es **un** hallazgo con **dos** fuentes: la coincidencia es evidencia más
 fuerte, no ruido. Al fundir se conserva la gravedad más alta.
 
+### Frontera de contexto del modelo (ENGINE-5.1)
+
+Un hallazgo solo vale si el agente **recibió** el archivo. Eso no puede depender de que el
+constructor del prompt y el validador coincidan por casualidad, así que hay una sola fuente
+determinista: `src/punto/model_context.py`.
+
+`build_model_review_context(workspace, paths)` devuelve, para un conjunto de rutas:
+
+| Campo | Qué es |
+| --- | --- |
+| `visible_paths` | Los archivos cuyo contenido se envió al modelo, en orden |
+| `content` | El texto exacto que el modelo recibió |
+| `omitted_paths` | Lo que **no** se envió, declarado; nunca omitido en silencio |
+| `truncated_paths` | Los archivos enviados con recorte, declarado |
+| `line_counts` | Cuántas líneas de cada archivo visible pudo ver el modelo |
+
+Y los validadores usan **ese** conjunto, no la lista declarada por la tarea:
+
+- un hallazgo de `MODEL_REVIEW` sobre un archivo que no está en `visible_paths` se **rechaza**;
+- un hallazgo `DETERMINISTIC_CHECK` no lo necesita: su evidencia la produce PUNTO.
+
+Dos reglas que cierran los huecos que tenía la fase anterior:
+
+1. **Allowlist vacía = no autorizar nada**, nunca autorizar todo. Si la tarea no declara
+   `changed_files` ni `context_files`, ningún objetivo de revisión es admisible, y ninguna
+   auditoría con ese contexto puede terminar en PASS.
+2. **Nada se omite en silencio.** Si el plan de seguridad no cabe en el presupuesto del
+   modelo (30 archivos), la auditoría es `BLOCKED` / `CONTEXT_LIMIT_EXCEEDED`. Si al Reviewer
+   le falta un archivo **modificado**, la revisión es `BLOCKED`: una revisión parcial no se
+   aprueba como si fuera completa. Los `context_files` auxiliares que no caben se declaran
+   en `omitted_files` y no bloquean, pero tampoco se pueden citar como si se hubieran leído.
+
+Security construye el contexto desde los objetivos **del plan**, no recortando la lista
+autorizada: si el plan apunta a un archivo, ese archivo se envía. Y los checks deterministas
+siguen inspeccionando todo el contexto autorizado que su límite permita, porque su evidencia
+no depende del modelo.
+
 ### Checks deterministas
 
 Implementados por PUNTO. Inspeccionan datos, **no ejecutan código del proyecto**, así que
@@ -2078,6 +2115,7 @@ de auditoría.
 | Comando | Qué cubre |
 | --- | --- |
 | `pytest` | Suite completa: checks deterministas, validación, deduplicación, estados, gates, runners, CAMUS y generalidad |
+| `pytest tests/test_context_boundary.py -q` | **Frontera de contexto (ENGINE-5.1)**: allowlist vacía, contexto omitido, visibilidad de hallazgos y revisión incompleta |
 | `pytest tests/integration/test_engine5_live.py -q` | **Gate vivo**: caso vulnerable rechazado y caso corregido aprobado, con los prompts de producción |
 
 El gate vivo evalúa el **mismo** cambio en dos versiones con DeepSeek real, sandbox real y
@@ -2112,6 +2150,12 @@ superficie de rutas.
   actual del contexto autorizado.
 - El Reviewer no puede verificar nada que QA y Security no hayan cubierto: su valor está en
   la coherencia global, no en repetir la ejecución.
+- El presupuesto de contexto del modelo es de 30 archivos por revisión y **no** hay batching
+  por lotes (ENGINE-5.1 prefirió la opción simple y segura): por encima del límite, Security
+  bloquea la auditoría y el Reviewer bloquea la revisión si le faltó un archivo modificado.
+  Un cambio que no quepa en una sola pasada necesita ENGINE-6, no una aprobación a medias.
+- Los `context_files` auxiliares del Reviewer que no caben en el contexto se declaran en
+  `omitted_files` y no bloquean; lo que sí es imposible es citarlos como si se hubieran leído.
 
 ---
 

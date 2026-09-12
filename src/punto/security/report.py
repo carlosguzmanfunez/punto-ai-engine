@@ -168,6 +168,8 @@ def build_security_report(
     completed_at: datetime,
     error: str = "",
     extra_evidence: tuple[str, ...] = (),
+    model_visible_files: tuple[str, ...] = (),
+    omitted_paths: tuple[str, ...] = (),
 ) -> SecurityReport:
     """Compone el informe de seguridad."""
     reasons = extra_evidence
@@ -180,6 +182,8 @@ def build_security_report(
         findings=findings,
         executed_checks=executed_checks,
         reviewed_files=reviewed_files,
+        model_visible_files=model_visible_files,
+        omitted_paths=omitted_paths,
         evidence=reasons,
         capability_gaps=capability_gaps,
         provider=provider,

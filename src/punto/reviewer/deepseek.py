@@ -12,6 +12,13 @@ El modelo puede aportar hallazgos; **no** puede aprobar. Si QA falló o Security
 veredicto es ``CHANGES_REQUESTED`` por mucho que la propuesta diga que todo está perfecto,
 y si alguno quedó ``BLOCKED``, el veredicto es ``BLOCKED``. Esa parte no se negocia ni se
 promptea: es código.
+
+Frontera de contexto (ENGINE-5.1): el Reviewer juzga lo que recibió. El contenido del prompt y
+el conjunto exacto de rutas visibles salen de la misma llamada a
+:func:`~punto.model_context.build_model_review_context`, así que un hallazgo sobre un archivo
+que no se envió se rechaza. Y si algún archivo **modificado** no cabía en el contexto, la
+revisión es ``BLOCKED`` / ``CONTEXT_LIMIT_EXCEEDED``: una revisión parcial no se aprueba como
+si fuera completa.
 """
 
 from __future__ import annotations
@@ -21,6 +28,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from punto.common import utc_now
+from punto.model_context import (
+    BLOCKED_CONTEXT_LIMIT,
+    MAX_CONTEXT_FILE_CHARS,
+    ModelReviewContext,
+    build_model_review_context,
+    missing_paths,
+)
 from punto.providers.deepseek import (
     DeepSeekClient,
     DeepSeekError,
@@ -58,9 +72,6 @@ if TYPE_CHECKING:
 BLOCKED_REVIEW_ATTEMPTS: str = "MAX_REVIEW_ATTEMPTS_EXCEEDED"
 BLOCKED_REVIEW_CALLS: str = "MAX_REVIEW_MODEL_CALLS_EXCEEDED"
 BLOCKED_REVIEW_TOKENS: str = "MAX_REVIEW_TOKENS_EXCEEDED"
-
-#: Máximo de caracteres de un archivo incluido en el contexto de revisión.
-MAX_CONTEXT_FILE_CHARS: int = 40_000
 
 
 def _bullets(items: tuple[str, ...]) -> str:
@@ -135,25 +146,41 @@ class DeepSeekReviewerRunner(ReviewerRunner):
         error = ""
         proposal_missing = False
 
+        # Frontera de contexto (ENGINE-5.1): el Reviewer juzga lo que recibió. Los archivos
+        # **modificados** son obligatorios; lo auxiliar se declara aparte. Una revisión a la
+        # que le faltó un archivo modificado no puede terminar aprobada.
+        context = build_model_review_context(
+            task.workspace_path, (*task.changed_files, *task.context_files)
+        )
+        uncovered = missing_paths(context, task.changed_files)
+
         self._audit_request_started(task)
 
-        try:
-            proposal, attempts, model_calls, usage = self._obtain_proposal(
-                task, usage, model_calls
+        if uncovered:
+            proposal_missing = True
+            error = (
+                f"{BLOCKED_CONTEXT_LIMIT}: {len(uncovered)} archivo(s) modificado(s) quedaron "
+                f"fuera del contexto del modelo ({', '.join(uncovered[:5])}"
+                f"{'…' if len(uncovered) > 5 else ''}): no se aprueba una revisión parcial"
             )
-        except PlanningLimitExceededError as exc:
-            proposal_missing = True
-            error = str(exc)
-        except DeepSeekError as exc:
-            proposal_missing = True
-            error = self._client.redact(str(exc))
-        except (OSError, ValueError) as exc:
-            proposal_missing = True
-            error = str(exc)
-        except ReviewerProposalError as exc:
-            proposal_missing = True
-            violations = exc.violations
-            error = str(exc)
+        else:
+            try:
+                proposal, attempts, model_calls, usage = self._obtain_proposal(
+                    task, context, usage, model_calls
+                )
+            except PlanningLimitExceededError as exc:
+                proposal_missing = True
+                error = str(exc)
+            except DeepSeekError as exc:
+                proposal_missing = True
+                error = self._client.redact(str(exc))
+            except (OSError, ValueError) as exc:
+                proposal_missing = True
+                error = str(exc)
+            except ReviewerProposalError as exc:
+                proposal_missing = True
+                violations = exc.violations
+                error = str(exc)
 
         findings = () if proposal is None else proposal.findings
         blocking = sum(1 for finding in findings if finding.blocks)
@@ -171,10 +198,7 @@ class DeepSeekReviewerRunner(ReviewerRunner):
                     name=ReviewGateName.REVIEW_FINDINGS,
                     passed=False,
                     blocking=True,
-                    detail=(
-                        "no se obtuvo una propuesta de revisión válida: "
-                        f"{error or 'sin detalle'}"
-                    ),
+                    detail=f"revisión no completada: {error or 'sin detalle'}",
                 ),
             )
 
@@ -184,6 +208,7 @@ class DeepSeekReviewerRunner(ReviewerRunner):
             status=status,
             gates=gates,
             proposal=proposal,
+            context=context,
             reasons=reasons,
             error=error if proposal_missing else "",
             violations=violations,
@@ -200,17 +225,20 @@ class DeepSeekReviewerRunner(ReviewerRunner):
 
     # -------------------------------------------------------------- propuesta
     def _obtain_proposal(
-        self, task: ReviewTask, usage: ModelUsage, model_calls: int
+        self,
+        task: ReviewTask,
+        context: ModelReviewContext,
+        usage: ModelUsage,
+        model_calls: int,
     ) -> tuple[ReviewProposal, int, int, ModelUsage]:
         """Pide la propuesta de revisión y la valida, con reparación acotada."""
         existing = self._existing_paths(task)
-        lines = self._file_lines(task)
         security_ids = (
             None
             if task.security_report is None
             else frozenset(finding.id for finding in task.security_report.findings)
         )
-        prompt = self._user_prompt(task)
+        prompt = self._user_prompt(task, context)
         violations: tuple[str, ...] = ()
 
         for attempt in range(1, self._limits.max_attempts + 1):
@@ -236,9 +264,10 @@ class DeepSeekReviewerRunner(ReviewerRunner):
             validation = validate_review_proposal(
                 proposal,
                 task,
+                model_visible_paths=context.visible_set,
                 existing_paths=existing,
                 security_finding_ids=security_ids,
-                file_lines=lines,
+                file_lines=context.line_map(),
             )
             if not validation.valid:
                 violations = validation.violations
@@ -282,8 +311,12 @@ class DeepSeekReviewerRunner(ReviewerRunner):
                 self._limits.max_output_tokens,
             )
 
-    def _user_prompt(self, task: ReviewTask) -> str:
-        """Petición de revisión."""
+    def _user_prompt(self, task: ReviewTask, context: ModelReviewContext) -> str:
+        """Petición de revisión.
+
+        El contenido enviado es **exactamente** el contexto visible registrado: el mismo que
+        después decide si un hallazgo del modelo es admisible.
+        """
         qa_status = "sin informe de QA"
         qa_summary = ""
         if task.qa_report is not None:
@@ -317,7 +350,7 @@ class DeepSeekReviewerRunner(ReviewerRunner):
             project_spec_context=task.project_spec_context or "(no disponible)",
             architecture_context=task.architecture_context or "(no disponible)",
             diff_summary=task.diff_summary or self._diff_summary(task),
-            review_content=self._review_content(task),
+            review_content=context.annotated_content(),
         )
 
     def _repair_prompt(
@@ -353,33 +386,6 @@ class DeepSeekReviewerRunner(ReviewerRunner):
             lines.append(f"- {normalized}: {content.count(chr(10)) + 1} línea(s)")
         return "\n".join(lines) or "(sin archivos modificados)"
 
-    def _review_content(self, task: ReviewTask) -> str:
-        """Contenido de los archivos relevantes, acotado y sin silencios."""
-        root = Path(task.workspace_path)
-        wanted = tuple(dict.fromkeys((*task.changed_files, *task.context_files)))
-        chunks: list[str] = []
-        for relative in wanted[:30]:
-            try:
-                normalized = normalize_relative_path(relative)
-            except ValueError:
-                continue
-            path = root / normalized
-            if not path.is_file():
-                chunks.append(f"=== {normalized} ===\n(no existe)")
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:  # pragma: no cover - depende del sistema de archivos
-                chunks.append(f"=== {normalized} ===\n(no legible)")
-                continue
-            if len(content) > MAX_CONTEXT_FILE_CHARS:
-                content = (
-                    f"{content[:MAX_CONTEXT_FILE_CHARS]}\n"
-                    f"…[recortado de {len(content)} caracteres]"
-                )
-            chunks.append(f"=== {normalized} ===\n{content}")
-        return "\n\n".join(chunks) or "(no se declararon archivos)"
-
     def _existing_paths(self, task: ReviewTask) -> frozenset[str]:
         """Rutas que existen en el workspace."""
         root = Path(task.workspace_path)
@@ -394,25 +400,6 @@ class DeepSeekReviewerRunner(ReviewerRunner):
                     continue
         return frozenset(found)
 
-    def _file_lines(self, task: ReviewTask) -> dict[str, int]:
-        """Número de líneas de cada archivo revisable."""
-        root = Path(task.workspace_path)
-        lines: dict[str, int] = {}
-        for relative in dict.fromkeys((*task.changed_files, *task.context_files)):
-            try:
-                normalized = normalize_relative_path(relative)
-            except ValueError:
-                continue
-            path = root / normalized
-            if not path.is_file():
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:  # pragma: no cover - depende del sistema de archivos
-                continue
-            lines[normalized] = content.count("\n") + 1
-        return lines
-
     # ------------------------------------------------------------------ salida
     def _build_report(
         self,
@@ -421,6 +408,7 @@ class DeepSeekReviewerRunner(ReviewerRunner):
         status: ReviewStatus,
         gates: tuple[ReviewGate, ...],
         proposal: ReviewProposal | None,
+        context: ModelReviewContext,
         reasons: tuple[str, ...],
         error: str,
         violations: tuple[str, ...],
@@ -440,6 +428,11 @@ class DeepSeekReviewerRunner(ReviewerRunner):
         ]
         if reasons:
             summary_parts.append("; ".join(reasons))
+        if context.omitted_paths:
+            summary_parts.append(
+                f"{len(context.omitted_paths)} archivo(s) de contexto fuera del contexto del "
+                "modelo"
+            )
         if error:
             summary_parts.append(error)
         return ReviewReport(
@@ -450,6 +443,8 @@ class DeepSeekReviewerRunner(ReviewerRunner):
             gates=gates,
             findings=findings,
             proposal=proposal,
+            model_visible_files=context.visible_paths,
+            omitted_files=context.omitted_paths,
             architecture_assessment="" if proposal is None else proposal.architecture_assessment,
             maintainability_assessment=(
                 "" if proposal is None else proposal.maintainability_assessment

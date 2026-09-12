@@ -82,6 +82,7 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.qa.report",
     "punto.qa.validation",
     # --- ENGINE-5: Security y Reviewer ----------------------------------------
+    "punto.model_context",
     "punto.schemas.security",
     "punto.schemas.review",
     "punto.schemas.evaluation",

@@ -238,7 +238,7 @@ def test_valid_finding_passes(tmp_path: Path) -> None:
     result = validate_findings(
         findings_proposal(findings_payload((finding_payload(),))),
         task,
-        plan_paths=("runner.py",),
+        model_visible_paths=frozenset({"runner.py"}),
         workspace_files=existing,
         file_lines={"runner.py": 5},
     )
@@ -254,7 +254,8 @@ def test_finding_without_evidence_is_rejected(tmp_path: Path) -> None:
     payload = findings_payload((finding_payload(evidence="   "),))
 
     result = validate_findings(
-        findings_proposal(payload), task, plan_paths=("runner.py",), workspace_files=existing
+        findings_proposal(payload), task, model_visible_paths=frozenset({"runner.py"}),
+            workspace_files=existing
     )
 
     assert not result.valid
@@ -268,7 +269,8 @@ def test_finding_without_impact_is_rejected(tmp_path: Path) -> None:
     payload = findings_payload((finding_payload(impact="  "),))
 
     result = validate_findings(
-        findings_proposal(payload), task, plan_paths=("runner.py",), workspace_files=existing
+        findings_proposal(payload), task, model_visible_paths=frozenset({"runner.py"}),
+            workspace_files=existing
     )
 
     assert not result.valid
@@ -284,7 +286,7 @@ def test_finding_on_a_nonexistent_file_is_rejected(tmp_path: Path) -> None:
     result = validate_findings(
         findings_proposal(payload),
         task,
-        plan_paths=("runner.py", "fantasma.py"),
+        model_visible_paths=frozenset({"runner.py", "fantasma.py"}),
         workspace_files=existing,
     )
 
@@ -301,7 +303,8 @@ def test_finding_outside_the_reviewed_context_is_rejected(tmp_path: Path) -> Non
     payload = findings_payload((finding_payload(file="other.py"),))
 
     result = validate_findings(
-        findings_proposal(payload), task, plan_paths=("runner.py",), workspace_files=existing
+        findings_proposal(payload), task, model_visible_paths=frozenset({"runner.py"}),
+            workspace_files=existing
     )
 
     assert not result.valid
@@ -315,7 +318,8 @@ def test_finding_with_traversal_is_rejected(tmp_path: Path) -> None:
     payload = findings_payload((finding_payload(file="../fuera.py"),))
 
     result = validate_findings(
-        findings_proposal(payload), task, plan_paths=("runner.py",), workspace_files=existing
+        findings_proposal(payload), task, model_visible_paths=frozenset({"runner.py"}),
+            workspace_files=existing
     )
 
     assert not result.valid
@@ -334,7 +338,7 @@ def test_invalid_line_is_dropped_but_the_finding_survives(tmp_path: Path) -> Non
     result = validate_findings(
         findings_proposal(payload),
         task,
-        plan_paths=("runner.py",),
+        model_visible_paths=frozenset({"runner.py"}),
         workspace_files=existing,
         file_lines={"runner.py": 5},
     )
@@ -353,7 +357,8 @@ def test_duplicate_finding_ids_are_rejected(tmp_path: Path) -> None:
     )
 
     result = validate_findings(
-        findings_proposal(payload), task, plan_paths=("runner.py",), workspace_files=existing
+        findings_proposal(payload), task, model_visible_paths=frozenset({"runner.py"}),
+            workspace_files=existing
     )
 
     assert any("duplicado" in item for item in result.violations)

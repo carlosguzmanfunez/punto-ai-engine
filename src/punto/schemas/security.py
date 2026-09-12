@@ -332,6 +332,21 @@ class SecurityReport(BaseModel):
     reviewed_files: tuple[str, ...] = Field(
         default=(), description="Archivos efectivamente revisados."
     )
+    model_visible_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos cuyo contenido recibió el modelo. Un hallazgo MODEL_REVIEW solo puede "
+            "señalar uno de estos."
+        ),
+    )
+    omitted_paths: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos declarados que no llegaron al modelo. Si alguno era un objetivo del "
+            "plan, la auditoría queda BLOCKED por contexto incompleto: nunca se omite en "
+            "silencio."
+        ),
+    )
     evidence: tuple[str, ...] = Field(default=(), description="Notas de evidencia del ciclo.")
     capability_gaps: tuple[CapabilityGap, ...] = Field(
         default=(), description="Capacidades ausentes que impidieron auditar."

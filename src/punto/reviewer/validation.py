@@ -1,8 +1,12 @@
-"""Invariantes de la propuesta de revisión (ENGINE-5 §18 y §22).
+"""Invariantes de la propuesta de revisión (ENGINE-5 §18 y §22, ENGINE-5.1).
 
 El modelo propone hallazgos y valoraciones; PUNTO valida que sean utilizables: evidencia
-real, archivo dentro del contexto revisado y sin duplicar como nuevo un hallazgo que
-Security ya reportó.
+real, archivo **visible al modelo** y sin duplicar como nuevo un hallazgo que Security ya
+reportó.
+
+Frontera (ENGINE-5.1): el conjunto visible es el exacto que llevó el prompt. Un hallazgo
+sobre un archivo que el Reviewer no recibió se rechaza, y una revisión a la que le faltaron
+archivos modificados no puede terminar aprobada.
 """
 
 from __future__ import annotations
@@ -48,7 +52,8 @@ def validate_review_proposal(
     proposal: ReviewProposal,
     task: ReviewTask,
     *,
-    existing_paths: frozenset[str] = frozenset(),
+    model_visible_paths: frozenset[str],
+    existing_paths: frozenset[str] | None = None,
     security_finding_ids: frozenset[str] | None = None,
     file_lines: dict[str, int] | None = None,
 ) -> ReviewValidation:
@@ -57,13 +62,25 @@ def validate_review_proposal(
     Un campo de valoración vacío no es un hallazgo: la revisión tiene que decir algo. Y un
     hallazgo sobre un archivo que el Reviewer no vio es una invención.
 
+    ``model_visible_paths`` es el conjunto **exacto** de rutas cuyo contenido se envió al
+    modelo: ni un superconjunto aproximado ni la lista declarada por la tarea. Si está vacío,
+    ningún hallazgo puede señalar un archivo, porque no se revisó ninguno.
+
+    Un hallazgo necesita las **dos** cosas: que la tarea lo haya declarado y que el modelo lo
+    haya recibido. Declarado sin enviar es una invención; enviado sin declarar sería una
+    frontera que se amplió sola.
+
     ``security_finding_ids`` distingue dos situaciones que no son iguales: ``None``
     significa que no hay informe de seguridad y una referencia no se puede comprobar; un
     conjunto **vacío** significa que el informe existe y no tiene hallazgos, así que
     cualquier referencia está colgando.
+
+    ``existing_paths`` sigue la misma convención: ``None`` es "no se conoce el workspace" y
+    un conjunto vacío es "el workspace no tiene archivos".
     """
     violations: list[str] = []
-    reviewed = set(task.changed_files) | set(task.context_files)
+    declared = _normalized((*task.changed_files, *task.context_files))
+    visible = set(model_visible_paths)
     lines = file_lines or {}
 
     if len(proposal.findings) > MAX_REVIEW_FINDINGS:
@@ -115,13 +132,19 @@ def validate_review_proposal(
                     "constitucional"
                 )
                 continue
-            if reviewed and relative not in reviewed:
+            if relative not in declared:
                 violations.append(
                     f"review_proposal: el hallazgo {finding.id!r} señala {relative!r}, que "
-                    "está fuera del contexto revisado"
+                    "está fuera del contexto declarado por la tarea"
                 )
                 continue
-            if existing_paths and relative not in existing_paths:
+            if relative not in visible:
+                violations.append(
+                    f"review_proposal: el hallazgo {finding.id!r} señala {relative!r}, que "
+                    "está fuera del contexto visible al modelo: su contenido no se envió"
+                )
+                continue
+            if existing_paths is not None and relative not in existing_paths:
                 violations.append(
                     f"review_proposal: el hallazgo {finding.id!r} señala {relative!r}, que "
                     "no existe en el workspace"
@@ -150,6 +173,17 @@ def validate_review_proposal(
             )
 
     return ReviewValidation(tuple(violations))
+
+
+def _normalized(paths: tuple[str, ...]) -> set[str]:
+    """Conjunto normalizado de rutas; las inválidas se descartan y no autorizan nada."""
+    result: set[str] = set()
+    for raw in paths:
+        try:
+            result.add(normalize_relative_path(raw))
+        except ValueError:
+            continue
+    return result
 
 
 __all__ = [

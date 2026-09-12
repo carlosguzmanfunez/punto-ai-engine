@@ -198,6 +198,20 @@ class ReviewReport(BaseModel):
     proposal: ReviewProposal | None = Field(
         default=None, description="Propuesta aceptada del modelo, si la hubo."
     )
+    model_visible_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos cuyo contenido recibió el Reviewer. Un hallazgo del modelo solo puede "
+            "señalar uno de estos."
+        ),
+    )
+    omitted_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos declarados que no llegaron al Reviewer. Si falta un archivo modificado, "
+            "la revisión queda BLOCKED: no se aprueba una revisión parcial."
+        ),
+    )
     architecture_assessment: str = Field(default="", description="Valoración arquitectónica.")
     maintainability_assessment: str = Field(default="", description="Valoración de mantenibilidad.")
     scope_assessment: str = Field(default="", description="Valoración del alcance.")

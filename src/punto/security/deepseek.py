@@ -11,9 +11,18 @@ Ciclo, con la validación de PUNTO en cada frontera:
    evidencia que el modelo no puede fabricar ni omitir (§8 a §10).
 3. PUNTO ejecuta los checks adicionales que el plan pidió; si alguno no está disponible, la
    auditoría es ``BLOCKED`` por capacidad, sin ejecutar nada en el host (§8).
-4. El modelo propone hallazgos sobre el contexto autorizado; PUNTO los valida (§11 y §12).
+4. El modelo propone hallazgos sobre el contexto visible; PUNTO los valida (§11 y §12).
 5. PUNTO deduplica deterministas y del modelo conservando **todas** las fuentes.
 6. PUNTO calcula el estado: ``HIGH``/``CRITICAL`` ⇒ ``FAIL`` (§7).
+
+Frontera de contexto (ENGINE-5.1): el modelo audita lo que recibe. El contenido del prompt de
+hallazgos se construye desde los objetivos **del plan** con
+:func:`~punto.model_context.build_model_review_context`, y ese mismo conjunto exacto es el que
+valida después cada hallazgo. Si el plan no cabe en el presupuesto del modelo, la auditoría es
+``BLOCKED`` / ``CONTEXT_LIMIT_EXCEEDED``: nunca se omite un archivo en silencio ni se marca
+como revisado por el modelo algo que el modelo no vio. Los checks deterministas siguen
+inspeccionando todo el contexto autorizado que su propio límite permita, porque su evidencia
+no depende del modelo.
 
 Un producto vulnerable **no** se repara aquí: se reporta.
 """
@@ -24,6 +33,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from punto.common import utc_now
+from punto.model_context import (
+    BLOCKED_CONTEXT_LIMIT,
+    MAX_CONTEXT_FILE_CHARS,
+    ModelReviewContext,
+    build_model_review_context,
+)
 from punto.planning.capabilities import canonical_capability, capability_status
 from punto.providers.deepseek import (
     DeepSeekClient,
@@ -76,9 +91,6 @@ BLOCKED_SECURITY_ATTEMPTS: str = "MAX_SECURITY_ATTEMPTS_EXCEEDED"
 BLOCKED_SECURITY_CALLS: str = "MAX_SECURITY_MODEL_CALLS_EXCEEDED"
 BLOCKED_SECURITY_TOKENS: str = "MAX_SECURITY_TOKENS_EXCEEDED"
 BLOCKED_SECURITY_CAPABILITY: str = "CAPABILITY_REQUIRED"
-
-#: Máximo de caracteres de un archivo incluido en el contexto de revisión.
-MAX_CONTEXT_FILE_CHARS: int = 40_000
 
 
 def _bullets(items: tuple[str, ...]) -> str:
@@ -151,6 +163,8 @@ class DeepSeekSecurityRunner(SecurityRunner):
         findings: tuple[SecurityFinding, ...] = ()
         checks: tuple[SecurityCheckOutcome, ...] = ()
         reviewed: tuple[str, ...] = ()
+        visible_to_model: tuple[str, ...] = ()
+        omitted_from_model: tuple[str, ...] = ()
         gaps: tuple[CapabilityGap, ...] = ()
         evidence: list[str] = []
         error = ""
@@ -184,30 +198,54 @@ class DeepSeekSecurityRunner(SecurityRunner):
                 deterministic_findings = tuple(
                     finding for result in deterministic for finding in result.findings
                 )
-                (
-                    model_findings,
-                    findings_blocked,
-                    findings_error,
-                    model_calls,
-                    usage,
-                ) = self._obtain_findings(
-                    task=task,
-                    plan=plan,
-                    check_results=deterministic,
-                    usage=usage,
-                    model_calls=model_calls,
-                )
-                if findings_blocked:
+                # El contexto del modelo se construye desde los objetivos **del plan**, no
+                # desde la lista autorizada recortada: lo que el modelo audita es lo que
+                # recibe, y lo que recibe es exactamente lo que puede mencionar.
+                model_context = build_model_review_context(workspace, plan.target_paths)
+                visible_to_model = model_context.visible_paths
+                omitted_from_model = model_context.omitted_paths
+                model_findings: tuple[SecurityFinding, ...] = ()
+                if not model_context.complete:
                     planning_blocked = True
-                    error = findings_error
+                    error = (
+                        f"{BLOCKED_CONTEXT_LIMIT}: el plan declara {len(plan.target_paths)} "
+                        f"objetivo(s) y el contexto del modelo admite "
+                        f"{len(model_context.visible_paths)}: no se puede auditar con el "
+                        "modelo lo que el modelo no recibió"
+                    )
                     evidence.append(error)
+                else:
+                    (
+                        model_findings,
+                        findings_blocked,
+                        findings_error,
+                        model_calls,
+                        usage,
+                    ) = self._obtain_findings(
+                        task=task,
+                        plan=plan,
+                        model_context=model_context,
+                        check_results=deterministic,
+                        usage=usage,
+                        model_calls=model_calls,
+                    )
+                    if findings_blocked:
+                        planning_blocked = True
+                        error = findings_error
+                        evidence.append(error)
                 # Los deterministas van primero: son hechos reproducibles. La deduplicación
                 # funde las coincidencias conservando **ambas** fuentes.
                 findings = deduplicate_findings((*deterministic_findings, *model_findings))
                 evidence.append(
                     f"{len(checks)} check(s) ejecutado(s), {len(reviewed)} archivo(s) "
-                    f"revisado(s), {len(deterministic_findings)} hallazgo(s) determinista(s)"
+                    f"revisado(s), {len(model_context.visible_paths)} archivo(s) visibles al "
+                    f"modelo, {len(deterministic_findings)} hallazgo(s) determinista(s)"
                 )
+                if model_context.truncated_paths:
+                    evidence.append(
+                        f"contexto recortado en {len(model_context.truncated_paths)} archivo(s): "
+                        f"{', '.join(model_context.truncated_paths[:5])}"
+                    )
         except PlanningLimitExceededError as exc:
             planning_blocked = True
             error = str(exc)
@@ -235,6 +273,8 @@ class DeepSeekSecurityRunner(SecurityRunner):
             findings=findings,
             executed_checks=checks,
             reviewed_files=reviewed,
+            model_visible_files=visible_to_model,
+            omitted_paths=omitted_from_model,
             capability_gaps=gaps,
             provider=self.provider,
             model=self.model,
@@ -325,15 +365,15 @@ class DeepSeekSecurityRunner(SecurityRunner):
         *,
         task: SecurityTask,
         plan: SecurityPlan,
+        model_context: ModelReviewContext,
         check_results: tuple[SecurityCheckResult, ...],
         usage: ModelUsage,
         model_calls: int,
     ) -> tuple[tuple[SecurityFinding, ...], bool, str, int, ModelUsage]:
         """Pide hallazgos al modelo y los valida, con reparación acotada."""
         violations: tuple[str, ...] = ()
-        prompt = self._findings_prompt(task, plan, check_results)
+        prompt = self._findings_prompt(task, plan, check_results, model_context)
         existing = self._existing_paths(task)
-        file_lines = self._file_lines(task)
 
         for attempt in range(1, self._limits.max_attempts + 1):
             if model_calls >= self._limits.max_model_calls:
@@ -363,9 +403,9 @@ class DeepSeekSecurityRunner(SecurityRunner):
             validation = validate_findings(
                 proposal,
                 task,
-                plan_paths=plan.target_paths,
+                model_visible_paths=model_context.visible_set,
                 workspace_files=existing,
-                file_lines=file_lines,
+                file_lines=model_context.line_map(),
             )
             if validation.violations:
                 violations = validation.violations
@@ -480,14 +520,18 @@ class DeepSeekSecurityRunner(SecurityRunner):
         results: tuple[SecurityCheckResult, ...],
         existing: frozenset[str],
     ) -> tuple[str, ...]:
-        """Archivos efectivamente revisados: objetivos válidos más los inspeccionados."""
+        """Archivos efectivamente revisados: objetivos válidos más los inspeccionados.
+
+        Solo cuenta lo que existe: un workspace sin archivos no convierte una ruta declarada
+        en un archivo revisado.
+        """
         reviewed: list[str] = []
         for path in (*plan.target_paths, *(f for result in results for f in result.scanned)):
             try:
                 relative = normalize_relative_path(path)
             except ValueError:
                 continue
-            if existing and relative not in existing:
+            if relative not in existing:
                 continue
             if relative not in reviewed:
                 reviewed.append(relative)
@@ -532,9 +576,16 @@ class DeepSeekSecurityRunner(SecurityRunner):
         return SECURITY_SYSTEM_PROMPT
 
     def _plan_prompt(self, task: SecurityTask) -> str:
-        """Petición del plan de auditoría."""
+        """Petición del plan de auditoría.
+
+        El plan ve el contexto **autorizado** (bounded por el mismo presupuesto) para poder
+        elegir objetivos. La elección no amplía nada: los objetivos siguen validándose uno a
+        uno contra la allowlist de la tarea, que nunca es un comodín.
+        """
+        context = build_model_review_context(task.workspace_path, task.reviewable_paths)
         return SECURITY_PLAN_TEMPLATE.format(
             format_reminder=SECURITY_PLAN_FORMAT_REMINDER,
+            review_content=context.annotated_content(),
             **self._task_fields(task),
         )
 
@@ -543,8 +594,13 @@ class DeepSeekSecurityRunner(SecurityRunner):
         task: SecurityTask,
         plan: SecurityPlan,
         results: tuple[SecurityCheckResult, ...],
+        model_context: ModelReviewContext,
     ) -> str:
-        """Petición de hallazgos, con la evidencia determinista ya recogida."""
+        """Petición de hallazgos, con la evidencia determinista ya recogida.
+
+        El contenido que se envía es **exactamente** el contexto visible registrado: los
+        mismos bytes que después se usan para validar los hallazgos.
+        """
         check_lines: list[str] = []
         for result in results:
             if not result.findings:
@@ -556,7 +612,6 @@ class DeepSeekSecurityRunner(SecurityRunner):
                 check_lines.append(
                     f"- {result.name}: {finding.severity.value} {location}{line} — {finding.title}"
                 )
-        fields = self._task_fields(task)
         return SECURITY_FINDINGS_TEMPLATE.format(
             format_reminder=SECURITY_FINDINGS_FORMAT_REMINDER,
             plan_summary=plan.summary,
@@ -564,7 +619,7 @@ class DeepSeekSecurityRunner(SecurityRunner):
             plan_areas=_bullets(tuple(area.value for area in plan.analysis_areas)),
             plan_threats=_bullets(plan.threats_considered),
             check_results="\n".join(check_lines) or "(ningún check produjo evidencia)",
-            review_content=fields["review_content"],
+            review_content=model_context.annotated_content(),
         )
 
     def _repair_prompt(
@@ -608,34 +663,7 @@ class DeepSeekSecurityRunner(SecurityRunner):
             "architecture_context": task.architecture_context or "(no disponible)",
             "capability_profile": _bullets(task.capability_profile),
             "available_checks": _bullets(self._registry.available_names()),
-            "review_content": self._review_content(task),
         }
-
-    def _review_content(self, task: SecurityTask) -> str:
-        """Contenido de los archivos autorizados, acotado y sin silencios."""
-        workspace = Path(task.workspace_path)
-        chunks: list[str] = []
-        for relative in task.reviewable_paths[:30]:
-            try:
-                normalized = normalize_relative_path(relative)
-            except ValueError:
-                continue
-            path = workspace / normalized
-            if not path.is_file():
-                chunks.append(f"=== {normalized} ===\n(no existe)")
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:  # pragma: no cover - depende del sistema de archivos
-                chunks.append(f"=== {normalized} ===\n(no legible)")
-                continue
-            if len(content) > MAX_CONTEXT_FILE_CHARS:
-                content = (
-                    f"{content[:MAX_CONTEXT_FILE_CHARS]}\n"
-                    f"…[recortado de {len(content)} caracteres]"
-                )
-            chunks.append(f"=== {normalized} ===\n{content}")
-        return "\n\n".join(chunks) or "(no se declararon archivos)"
 
     def _existing_paths(self, task: SecurityTask) -> frozenset[str]:
         """Rutas que existen en el workspace."""
@@ -651,24 +679,6 @@ class DeepSeekSecurityRunner(SecurityRunner):
                     continue
         return frozenset(found)
 
-    def _file_lines(self, task: SecurityTask) -> dict[str, int]:
-        """Número de líneas de cada archivo revisable."""
-        root = Path(task.workspace_path)
-        lines: dict[str, int] = {}
-        for relative in task.reviewable_paths:
-            try:
-                normalized = normalize_relative_path(relative)
-            except ValueError:
-                continue
-            path = root / normalized
-            if not path.is_file():
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:  # pragma: no cover - depende del sistema de archivos
-                continue
-            lines[normalized] = content.count("\n") + 1
-        return lines
 
     # --------------------------------------------------------------- auditoría
     def _audit_request_started(self, task: SecurityTask) -> None:

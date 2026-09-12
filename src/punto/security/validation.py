@@ -1,12 +1,16 @@
-"""Invariantes de seguridad y validación de hallazgos (ENGINE-5 §11 a §13).
+"""Invariantes de seguridad y validación de hallazgos (ENGINE-5 §11 a §13, ENGINE-5.1).
 
 Dos cosas se comprueban aquí, y ninguna consulta al modelo:
 
-1. **El plan**: objetivos de revisión dentro del contexto autorizado, checks registrados,
-   áreas y amenazas declaradas.
-2. **Los hallazgos**: evidencia real, archivo existente y dentro del contexto que el
-   agente efectivamente vio, descripción e impacto. Un hallazgo sobre un archivo que
-   nadie revisó no es un hallazgo: es una invención.
+1. **El plan**: objetivos dentro del contexto autorizado, checks registrados, áreas y
+   amenazas declaradas.
+2. **Los hallazgos**: evidencia real, archivo existente, autorizado **y visible al modelo**,
+   descripción e impacto. Un hallazgo sobre un archivo que el agente no vio no es un
+   hallazgo: es una invención.
+
+Frontera (ENGINE-5.1): la autorización y la visibilidad son conjuntos **exactos**. Una
+allowlist vacía no autoriza nada, y el contexto visible no es un superconjunto aproximado:
+es lo que el prompt realmente llevó.
 """
 
 from __future__ import annotations
@@ -74,11 +78,20 @@ def validate_security_plan(
     task: SecurityTask,
     *,
     registry: SecurityCheckRegistry,
-    existing_paths: frozenset[str] = frozenset(),
+    existing_paths: frozenset[str] | None = None,
 ) -> SecurityValidation:
-    """Comprueba los invariantes del plan antes de ejecutar nada."""
+    """Comprueba los invariantes del plan antes de ejecutar nada.
+
+    El contexto autorizado se normaliza primero y **nunca** se interpreta como comodín: si la
+    tarea no declara ningún archivo revisable, ningún objetivo es admisible. Una allowlist
+    vacía autoriza nada, no todo.
+
+    ``existing_paths`` distingue dos situaciones que no son iguales: ``None`` significa que
+    no se conoce el contenido del workspace; un conjunto **vacío** significa que el workspace
+    no tiene archivos, así que cualquier objetivo existente es inexistente.
+    """
     violations: list[str] = []
-    allowed = set(task.reviewable_paths)
+    authorized = _normalized(task.reviewable_paths)
 
     if not proposal.review_targets:
         violations.append("security_plan: el plan no declara ningún objetivo de revisión")
@@ -115,13 +128,13 @@ def validate_security_plan(
                 f"security_plan: el objetivo {relative!r} es configuración constitucional"
             )
             continue
-        if allowed and relative not in allowed:
+        if relative not in authorized:
             violations.append(
                 f"security_plan: el objetivo {relative!r} está fuera del contexto autorizado "
                 "(ni changed_files ni context_files)"
             )
             continue
-        if existing_paths and relative not in existing_paths:
+        if existing_paths is not None and relative not in existing_paths:
             violations.append(f"security_plan: el objetivo {relative!r} no existe")
 
     for name in proposal.security_checks:
@@ -140,8 +153,8 @@ def validate_findings(
     proposal: SecurityFindingsProposal,
     task: SecurityTask,
     *,
-    plan_paths: tuple[str, ...] = (),
-    workspace_files: frozenset[str] = frozenset(),
+    model_visible_paths: frozenset[str],
+    workspace_files: frozenset[str] | None = None,
     file_lines: dict[str, int] | None = None,
 ) -> FindingValidation:
     """Valida y normaliza los hallazgos propuestos por el modelo.
@@ -150,13 +163,20 @@ def validate_findings(
     modelo tiene que corregirlo. Los casos comprobados:
 
     - sin evidencia, sin descripción o sin impacto → inválido;
-    - archivo inexistente o fuera del contexto revisado → inválido (el agente no lo vio);
-    - línea fuera del archivo → se descarta la línea, pero el hallazgo se conserva;
+    - archivo que el modelo **no recibió** → inválido: no se revisa lo que no se vio. El
+      conjunto visible es el exacto, nunca un superconjunto aproximado, y un conjunto vacío
+      no autoriza nada;
+    - archivo inexistente o fuera del workspace → inválido;
+    - línea fuera de lo visible → se descarta la línea, pero el hallazgo se conserva;
     - duplicados exactos → se funden conservando las fuentes.
+
+    Los hallazgos deterministas **no** pasan por aquí: su evidencia la produce PUNTO y no
+    depende de lo que el modelo haya visto.
     """
     violations: list[str] = []
     accepted: list[SecurityFinding] = []
-    reviewed = set(plan_paths) | set(task.reviewable_paths)
+    authorized = _normalized(task.reviewable_paths)
+    visible = set(model_visible_paths)
     lines = file_lines or {}
 
     if len(proposal.findings) > MAX_FINDINGS:
@@ -190,13 +210,19 @@ def validate_findings(
                     f"security_findings: el hallazgo {finding.id!r} usa una ruta inválida: {exc}"
                 )
                 continue
-            if reviewed and relative not in reviewed:
+            if relative not in authorized:
                 violations.append(
                     f"security_findings: el hallazgo {finding.id!r} señala {relative!r}, que "
-                    "está fuera del contexto revisado"
+                    "está fuera del contexto autorizado por la tarea"
                 )
                 continue
-            if workspace_files and relative not in workspace_files:
+            if relative not in visible:
+                violations.append(
+                    f"security_findings: el hallazgo {finding.id!r} señala {relative!r}, que "
+                    "está fuera del contexto visible al modelo: su contenido no se envió"
+                )
+                continue
+            if workspace_files is not None and relative not in workspace_files:
                 violations.append(
                     f"security_findings: el hallazgo {finding.id!r} señala {relative!r}, que "
                     "no existe en el workspace"
@@ -224,6 +250,17 @@ def validate_findings(
         accepted.append(normalized)
 
     return FindingValidation(findings=tuple(accepted), violations=tuple(violations))
+
+
+def _normalized(paths: tuple[str, ...]) -> set[str]:
+    """Conjunto normalizado de rutas; las inválidas se descartan y no autorizan nada."""
+    result: set[str] = set()
+    for raw in paths:
+        try:
+            result.add(normalize_relative_path(raw))
+        except ValueError:
+            continue
+    return result
 
 
 def _duplicates(values: list[str]) -> tuple[str, ...]:

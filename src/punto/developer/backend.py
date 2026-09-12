@@ -282,20 +282,32 @@ def assert_sandbox_capabilities(capabilities: SandboxCapabilities) -> None:
 class SandboxedBackend(ExecutionBackend):
     """Contrato de ejecución aislada. **Obligatorio** para ``UNTRUSTED_MODEL``.
 
-    No hay implementación real en esta fase. Esta clase fija el contrato y valida
-    que quien pretenda declararse sandbox garantice los **cuatro** aislamientos.
+    Un backend puede construirse en dos estados:
+
+    - **verificado**: se pasa ``capabilities`` y debe acreditar los cuatro
+      aislamientos al construirse;
+    - **no verificado** (``capabilities=None``): nace declarando que **no** aísla
+      nada y solo pasa a acreditarlo cuando su verificación real lo demuestra.
+      Es el estado honesto de un backend basado en contenedores antes de
+      comprobar su runtime.
+
+    ``require_sandbox_backend`` es el punto de consumo y rechaza cualquier backend
+    que no acredite aislamiento completo.
 
     Raises:
         SandboxUnavailableError: si las capacidades declaradas no son completas.
     """
 
-    def __init__(self, *, capabilities: SandboxCapabilities) -> None:
-        assert_sandbox_capabilities(capabilities)
+    def __init__(self, *, capabilities: SandboxCapabilities | None = None) -> None:
+        if capabilities is not None:
+            assert_sandbox_capabilities(capabilities)
         self._capabilities = capabilities
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        """Aislamientos garantizados por el sandbox."""
+        """Aislamientos acreditados; ninguno mientras no se verifiquen."""
+        if self._capabilities is None:
+            return NO_SANDBOX_CAPABILITIES
         return self._capabilities
 
     @property

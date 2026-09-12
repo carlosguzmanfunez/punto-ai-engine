@@ -12,3 +12,19 @@ requires-python = ">=3.12"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+# Conjunto de reglas explícito, igual que el del repositorio PUNTO, para que la
+# validación sea determinista y no dependa de los valores por defecto de la
+# versión de ruff instalada.
+#
+# Nota: los bind mounts de Windows sobre WSL2 exponen todos los archivos como
+# 0777. Sin esta selección explícita, ruff aplica su conjunto por defecto —que
+# incluye EXE002 "ejecutable sin shebang"— y reporta un artefacto del montaje
+# que no describe al código.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF"]
+

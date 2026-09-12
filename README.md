@@ -20,6 +20,7 @@
 | **ENGINE-0** | Núcleo constitucional determinista: autoridad, política, riesgo, presupuesto, Human Gate, máquina de estados, auditoría, CAMUS y API mínima. | ✅ **CERRADA** |
 | **ENGINE-1** | Capa de ejecución controlada: `DeveloperRunner`, `ExecutionContext`, Filesystem, Shell, Git, Validator, `LocalDeveloperRunner`, auditoría de ejecución, fixture y demo real. | ✅ Implementada |
 | **ENGINE-1.R1** | Frontera de ejecución confiable: separación `TRUSTED_LOCAL` / `UNTRUSTED_MODEL`, `ExecutionBackend`, `TrustedLocalBackend`, contrato `SandboxedBackend`, entorno saneado y fallo cerrado. | ✅ Implementada |
+| **ENGINE-1.R3** | Sandbox **real**: WSL2 + Podman, `ContainerSandboxBackend`, verificación de capacidades por sondas, imagen reproducible y los **cuatro aislamientos demostrados**. | ✅ Implementada |
 | **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz y **exigiendo sandbox**. | ⏳ Futura |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
@@ -1049,7 +1050,118 @@ lo hay. Sin excepciones y sin fallback.
 
 ---
 
-## 19. Licencia
+## 19. ENGINE-1.R3 — Sandbox real (WSL2 + Podman)
+
+ENGINE-1.R1 dejó la frontera, pero **sin sandbox**: `SandboxedBackend` era solo un
+contrato y el trabajo no confiable quedaba bloqueado. ENGINE-1.R3 entrega la
+implementación real y **demuestra** los cuatro aislamientos.
+
+### Sustrato
+
+| Componente | Valor |
+| --- | --- |
+| Runtime | **Podman** 5.8.3 (Apache-2.0, rootless, daemonless) |
+| Backend | **WSL2** — kernel 6.18.33.2, versión predeterminada 2 |
+| Almacenamiento | VHDX en **`D:\wsl\podman-machine-default`** (movido con `wsl --manage --move`) |
+| Imagen | **`localhost/punto-sandbox-python:0.1`** (345 MB) |
+| Recursos | 2 CPU, 4 GB RAM, 30 GB disco |
+
+**Podman y WSL son dependencias locales de desarrollo.** No forman parte del
+código; el motor las detecta y **falla cerrado** si no están.
+
+### Verificación de capacidades (no se declara, se demuestra)
+
+`ContainerSandboxBackend` nace **NO VERIFICADO**: `capabilities` no acredita nada
+hasta que `verify_capabilities()` ejecuta **sondas reales** dentro de contenedores:
+
+| Sonda | Qué demuestra |
+| --- | --- |
+| `probe_filesystem` | El workspace montado es accesible; `/mnt/c`, `/mnt/d`, `/Users`… **no existen**; la raíz es de solo lectura |
+| `probe_network` | TCP, UDP y DNS **fallan** realmente (no basta con que falte `curl`) |
+| `probe_environment` | La variable canario del host **no** llega al contenedor |
+| `probe_process` | Solo se ven los procesos del contenedor; ningún proceso de Windows |
+| `probe_hardening` | Capacidades vacías, `NoNewPrivs=1`, límites de cgroups aplicados |
+
+Si una sonda falla: `SandboxUnavailableError` y el backend queda **NOT READY**.
+La verificación se guarda con la **huella** del runtime (versión e imagen): si la
+huella cambia, se vuelve a verificar en lugar de arrastrar un PASS caducado.
+
+Las sondas viven **dentro de la imagen** (`/opt/punto/probes/`), así que la
+verificación versiona con ella y no necesita un segundo montaje.
+
+### Modelo de aislamiento
+
+Cada ejecución usa exactamente estos parámetros:
+
+```
+--network none
+--read-only
+--cap-drop ALL
+--security-opt no-new-privileges
+--pids-limit 128 --memory 512m --cpus 1
+--tmpfs /tmp:rw,size=64m
+--user 10001:10001
+--rm --name punto-sbx-<id> --label punto.sandbox=1
+--mount type=bind,source=<workspace de la tarea>,target=/workspace,rw
+```
+
+**Nunca** se usa `--privileged`, `--pid host`, `--network host`, `--ipc host`,
+`--uts host`, `--device` ni el socket del runtime. El **único** montaje es el
+workspace de la tarea.
+
+### Red
+
+`--network none` en toda ejecución de código. Ninguna sonda de red puede
+establecer una conexión, resolver un nombre ni enviar un datagrama.
+
+### Modelo de secretos
+
+`DEEPSEEK_API_KEY` (cuando llegue ENGINE-2) vivirá **solo** en el proceso que
+llama al modelo. **No** entra al sandbox: `ContainerSandboxBackend` nunca pasa
+secretos con `-e`, y el contenedor solo recibe un entorno explícito y mínimo.
+**No** se escribe en el repositorio, **no** aparece en los logs de auditoría y
+**no** se envía al código generado. Hay pruebas que lo verifican con canarios.
+
+### Recuperar el runtime y diagnosticar
+
+```powershell
+# ¿Está Podman instalado?
+where.exe podman
+podman --version
+
+# ¿Está la máquina en ejecución?
+podman machine inspect --format "{{.State}}"
+
+# Si está detenida, el motor BLOQUEA. Recupérala con:
+podman machine start
+
+# Si la imagen no existe:
+podman build -t punto-sandbox-python:0.1 sandbox/
+
+# Ver la configuración efectiva
+podman machine inspect
+podman info --format "{{.Host.CPUs}} {{.Host.MemTotal}}"
+```
+
+Los límites de la VM viven en `%USERPROFILE%\.wslconfig` (`processors=2`,
+`memory=4GB`): sin ese archivo, WSL2 ignora lo que declara `podman machine init`.
+
+**Comprobación de extremo a extremo:**
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_sandbox_backend.py -q
+```
+
+### Limitación declarada
+
+La **máquina** WSL2 ve el sistema de archivos del host (`/mnt/c`, `/mnt/d`) porque
+el automount de WSL2 es lo que permite traducir las rutas del host al montar el
+workspace. El **contenedor no** los ve: esa es la frontera que importa, y está
+probada. En consecuencia, el runtime de Podman es parte de la base de confianza.
+
+---
+
+## 20. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

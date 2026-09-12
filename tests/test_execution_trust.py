@@ -476,17 +476,31 @@ def test_child_temp_is_redirected_to_a_controlled_zone(
             assert Path(line) != Path(inherited)
 
 
+#: Módulos que sí pueden leer el entorno del host, con motivo explícito.
+#:
+#: ``sandbox.py`` copia el entorno para lanzar el **cliente de Podman** y colocar
+#: en él el canario de verificación. Ese entorno no llega al contenedor: dentro
+#: solo entran las variables pasadas con ``-e``, y la sonda ``probe_environment``
+#: lo demuestra contenedor a contenedor.
+ENV_INHERITANCE_EXEMPTIONS = frozenset({"sandbox.py"})
+
+
 def test_no_module_inherits_the_full_environment() -> None:
-    """§5: ningún módulo construye el entorno del hijo con ``dict(os.environ)``."""
+    """§5: ningún módulo construye el entorno del **comando hijo** heredando el host."""
     source_root = Path(shell_policy.__file__).resolve().parents[1]
 
     offenders = [
         path.name
         for path in sorted(source_root.rglob("*.py"))
         if "dict(os.environ)" in path.read_text(encoding="utf-8")
+        and path.name not in ENV_INHERITANCE_EXEMPTIONS
     ]
 
     assert offenders == []
+    # El módulo que construye el entorno de los comandos controlados nunca hereda.
+    assert "dict(os.environ)" not in (source_root / "tools" / "shell_policy.py").read_text(
+        encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------

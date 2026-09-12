@@ -1,0 +1,7 @@
+# Dependencias de validación de la imagen del sandbox (ENGINE-1.R3).
+# Rangos deliberadamente acotados: la imagen se etiqueta por versión
+# (punto-sandbox-python:0.1) para que la ejecución sea reproducible.
+pytest>=8.2,<10
+ruff>=0.6,<1
+mypy>=1.11
+types-PyYAML>=6.0.12

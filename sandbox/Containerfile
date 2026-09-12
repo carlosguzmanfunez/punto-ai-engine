@@ -1,0 +1,47 @@
+# ============================================================================
+# PUNTO AI ENGINE - Imagen de ejecución del sandbox (ENGINE-1.R3)
+# ============================================================================
+# Imagen reproducible para ejecutar el código y los tests de una tarea
+# UNTRUSTED_MODEL dentro del ContainerSandboxBackend.
+#
+# Principios:
+#   - no contiene secretos;
+#   - no contiene código privado: el workspace se monta en runtime;
+#   - usuario NO-root por defecto;
+#   - sistema de archivos raíz pensado para montarse con --read-only.
+#
+# Construir:
+#   podman build -t punto-sandbox-python:0.1 sandbox/
+# ============================================================================
+FROM docker.io/library/python:3.12-slim
+
+# Herramientas del sistema estrictamente necesarias.
+# git: lo exige el contrato de la imagen; se instala sin recomendados.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Dependencias de validación, versionadas en requirements.txt.
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+      -r /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
+
+# Usuario sin privilegios para la ejecución.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin sandbox
+
+# Sondas de auto-verificación de aislamiento (ENGINE-1.R3).
+# Viven DENTRO de la imagen y versionan con ella: la verificación de capacidades
+# es reproducible y no necesita un segundo montaje en el contenedor.
+COPY probes/ /opt/punto/probes/
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONIOENCODING=utf-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+USER 10001:10001
+WORKDIR /workspace
+
+# El workspace se monta en runtime; por defecto solo se informa la versión.
+CMD ["python", "--version"]

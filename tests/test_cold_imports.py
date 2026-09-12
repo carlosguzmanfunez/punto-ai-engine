@@ -58,6 +58,7 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.developer.base",
     "punto.developer.context",
     "punto.developer.local",
+    "punto.developer.sandbox",
 )
 
 

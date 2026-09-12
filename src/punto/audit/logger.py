@@ -572,6 +572,143 @@ class AuditLogger:
             },
         )
 
+    # ------------------------------------------------- Sandbox real (R3)
+    def log_sandbox_prepared(
+        self,
+        *,
+        runtime: str,
+        image: str,
+        version: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el runtime y la imagen del sandbox están disponibles."""
+        return self.record(
+            AuditEventType.SANDBOX_PREPARED,
+            action="sandbox_prepared",
+            resource_id=runtime,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={"runtime": runtime, "image": image, "runtime_version": version},
+        )
+
+    def log_sandbox_capability_verified(
+        self,
+        *,
+        runtime: str,
+        image: str,
+        checks: Sequence[str],
+        capabilities: object,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la verificación real de los aislamientos del sandbox.
+
+        Se registran las capacidades acreditadas y los nombres de las sondas.
+        Nunca secretos ni valores de entorno.
+        """
+        return self.record(
+            AuditEventType.SANDBOX_CAPABILITY_VERIFIED,
+            action="sandbox_capability_verified",
+            resource_id=runtime,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "runtime": runtime,
+                "image": image,
+                "checks": list(checks),
+                "capabilities": {
+                    "filesystem_isolated": bool(
+                        getattr(capabilities, "filesystem_isolated", False)
+                    ),
+                    "environment_isolated": bool(
+                        getattr(capabilities, "environment_isolated", False)
+                    ),
+                    "network_isolated": bool(
+                        getattr(capabilities, "network_isolated", False)
+                    ),
+                    "process_isolated": bool(getattr(capabilities, "process_isolated", False)),
+                },
+            },
+        )
+
+    def log_sandbox_run_started(
+        self,
+        *,
+        task_id: UUID,
+        runtime: str,
+        image: str,
+        workspace: str,
+        limits: Mapping[str, object],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una ejecución dentro del sandbox."""
+        return self.record(
+            AuditEventType.SANDBOX_RUN_STARTED,
+            action="sandbox_run_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "runtime": runtime,
+                "image": image,
+                "workspace": workspace,
+                "limits": dict(limits),
+            },
+        )
+
+    def log_sandbox_run_completed(
+        self,
+        *,
+        task_id: UUID,
+        runtime: str,
+        exit_code: int,
+        duration_ms: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la finalización de una ejecución dentro del sandbox."""
+        return self.record(
+            AuditEventType.SANDBOX_RUN_COMPLETED,
+            action="sandbox_run_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if exit_code == 0 else AuditResult.FAILURE,
+            actor=actor,
+            metadata={"runtime": runtime, "exit_code": exit_code, "duration_ms": duration_ms},
+        )
+
+    def log_sandbox_run_failed(
+        self,
+        *,
+        task_id: UUID,
+        runtime: str,
+        detail: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el sandbox no pudo ejecutar."""
+        return self.record(
+            AuditEventType.SANDBOX_RUN_FAILED,
+            action="sandbox_run_failed",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={"runtime": runtime, "detail": detail},
+        )
+
+    def log_sandbox_destroyed(
+        self,
+        *,
+        runtime: str,
+        image: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la destrucción de los contenedores del sandbox."""
+        return self.record(
+            AuditEventType.SANDBOX_DESTROYED,
+            action="sandbox_destroyed",
+            resource_id=runtime,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={"runtime": runtime, "image": image},
+        )
+
     # -------------------------------------------------------------------- read
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""

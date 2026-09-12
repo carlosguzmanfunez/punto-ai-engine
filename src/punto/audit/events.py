@@ -45,6 +45,13 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.UNTRUSTED_EXECUTION_BLOCKED: "execution_backend",
     AuditEventType.SANDBOX_REQUIRED: "execution_backend",
     AuditEventType.ENVIRONMENT_SANITIZED: "execution_environment",
+    # --- Sandbox real (ENGINE-1.R3) -------------------------------------------
+    AuditEventType.SANDBOX_PREPARED: "sandbox",
+    AuditEventType.SANDBOX_CAPABILITY_VERIFIED: "sandbox",
+    AuditEventType.SANDBOX_RUN_STARTED: "sandbox",
+    AuditEventType.SANDBOX_RUN_COMPLETED: "sandbox",
+    AuditEventType.SANDBOX_RUN_FAILED: "sandbox",
+    AuditEventType.SANDBOX_DESTROYED: "sandbox",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

@@ -214,7 +214,7 @@ def test_model_completion_can_be_built_with_the_minimal_fields() -> None:
 def test_model_completion_stop_reason_mirrors_finish_reason() -> None:
     completion = ModelCompletion(
         content=MODEL_OUTPUT,
-        model="claude-sonnet-4-5",
+        model="claude-opus-5",
         usage=ModelUsage(),
         latency_ms=0,
         finish_reason="max_tokens",

@@ -25,11 +25,18 @@ aquí para no romper a ningún agente existente.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 from punto.schemas.execution import ModelUsage
+
+#: Esquema JSON que el proveedor debe respetar, si su API lo permite.
+#:
+#: Es una capacidad del **contrato de PUNTO**, no una suposición de que todos los proveedores
+#: tengan la misma primitiva: unos la cumplen de forma nativa (Structured Outputs), otros de
+#: forma textual. Lo que ninguno puede hacer es ignorarla en silencio.
+JsonSchema = Mapping[str, Any]
 
 #: Media types de imagen soportados inicialmente. La lista es corta a propósito: cada
 #: formato que se acepta es un formato que hay que saber transportar.
@@ -231,8 +238,16 @@ class StructuredModelClient(ABC):
         *,
         system_prompt: str,
         user_prompt: str,
+        json_schema: JsonSchema | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada.
+
+        Args:
+            system_prompt: Prompt de sistema versionado.
+            user_prompt: Petición concreta.
+            json_schema: Esquema que la respuesta debe cumplir, si el proveedor puede
+                aplicarlo. Un proveedor sin la primitiva nativa puede cumplirlo de forma
+                textual; lo que no puede es ignorarlo en silencio.
 
         Raises:
             ProviderError: cualquier fallo clasificado del proveedor.
@@ -287,6 +302,7 @@ class MultimodalModelClient(StructuredModelClient):
         user_prompt: str,
         images: Sequence[ImagePayload],
         limits: ImageLimits | None = None,
+        json_schema: JsonSchema | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada a partir de texto e imágenes.
 
@@ -295,6 +311,8 @@ class MultimodalModelClient(StructuredModelClient):
             user_prompt: Petición concreta en texto.
             images: Imágenes cuyos bytes controla PUNTO.
             limits: Límites a aplicar. Si es ``None`` se usan los seguros por defecto.
+            json_schema: Esquema que la respuesta debe cumplir, si el proveedor puede
+                aplicarlo.
 
         Raises:
             ImageValidationError: si una imagen incumple los límites.
@@ -312,6 +330,7 @@ __all__ = [
     "ImageLimits",
     "ImagePayload",
     "ImageValidationError",
+    "JsonSchema",
     "ModelCompletion",
     "MultimodalModelClient",
     "ProviderAuthenticationError",

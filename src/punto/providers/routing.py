@@ -10,9 +10,10 @@ Lo que este módulo **no** hace, y es lo importante:
   discusión: si Anthropic no está, el resultado es ``PROVIDER_UNAVAILABLE``, nunca «entonces
   DeepSeek». Un fallback silencioso convertiría la auditoría cruzada en una auditoría del mismo
   modelo, que es exactamente lo que deja de tener valor;
-- **no** adivina el modelo. Cada rol tiene su variable de entorno; lo que no está configurado
-  usa un valor por defecto declarado, y un nombre desconocido se acepta porque no se puede
-  verificar sin credencial (``MODEL_AVAILABILITY_UNVERIFIED``).
+- **no** adivina el modelo. Cada rol tiene su variable de entorno; los valores por defecto son
+  los identificadores **documentados** por el proveedor, y un nombre distinto se acepta sin
+  lista blanca porque lo que no se puede verificar sin credencial es el acceso de la cuenta
+  (``LIVE_ACCOUNT_ACCESS_UNVERIFIED``), no la existencia del identificador.
 
 DeepSeek sigue siendo el proveedor de los seis roles que ya existían. Anthropic entra con los
 cuatro roles nuevos, y en esta fase solo ``CROSS_AUDITOR`` tiene runner real.
@@ -201,7 +202,7 @@ def require_provider(
     **No** se devuelve «el que haya».
 
     Comprobar el modelo importa tanto como comprobar el proveedor: una ruta que dice
-    ``claude-sonnet-4-5`` y un cliente configurado con otro modelo producirían un informe que
+    ``claude-opus-5`` y un cliente configurado con otro modelo producirían un informe que
     declara algo distinto de lo que se ejecutó.
 
     Raises:

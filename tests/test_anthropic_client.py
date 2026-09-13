@@ -33,9 +33,10 @@ from punto.providers.anthropic import (
     DEFAULT_API_VERSION,
     DEFAULT_AUDIT_MODEL,
     DEFAULT_BASE_URL,
+    LIVE_ACCOUNT_ACCESS_UNVERIFIED,
     MAX_TOKENS_ENV,
     MESSAGES_PATH,
-    MODEL_AVAILABILITY_UNVERIFIED,
+    MODEL_ID_DOCUMENTED,
     RETRY_BACKOFF_SECONDS,
     AnthropicAuthenticationError,
     AnthropicClient,
@@ -813,7 +814,8 @@ def test_model_identifier_is_fully_configurable() -> None:
     assert api.last_body["model"] == exotic
     assert completion.model == exotic
     assert AnthropicConfig(api_key=FAKE_KEY, model=exotic).model == exotic
-    assert MODEL_AVAILABILITY_UNVERIFIED is True
+    assert MODEL_ID_DOCUMENTED is True
+    assert LIVE_ACCOUNT_ACCESS_UNVERIFIED is True
 
 
 def test_config_rejects_incoherent_values() -> None:

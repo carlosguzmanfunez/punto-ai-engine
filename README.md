@@ -2208,6 +2208,8 @@ contrato común, y cada rol se enruta de forma explícita.
 | `MultimodalModelClient` | `src/punto/providers/base.py` | Añade `complete_multimodal_json` y `supports_images` |
 | `ModelCompletion` | `src/punto/providers/base.py` | Resultado común: contenido, proveedor, modelo, usage, latencia, reintentos, `stop_reason`, `request_id` |
 | `ImagePayload` / `ImageLimits` | `src/punto/providers/base.py` | Bytes que controla PUNTO y validación determinista previa |
+| `JsonSchema` | `src/punto/providers/base.py` | Esquema opcional que la respuesta debe cumplir, si el proveedor puede aplicarlo |
+| `prepare_json_schema` | `src/punto/providers/json_schema.py` | Inlinea `$ref`, quita `$defs` y exige el contrato de PUNTO |
 
 `ModelCompletion` se **extrajo** del cliente de DeepSeek sin romper nada: `punto.providers
 .deepseek` la reexporta, así que `from punto.providers.deepseek import ModelCompletion` sigue
@@ -2217,6 +2219,33 @@ funcionando y los seis agentes existentes no cambiaron. Lo que sí se añadió e
 Nota documentada: `stop_reason` devuelve el valor **nativo** del proveedor. DeepSeek informa
 `length` y Anthropic `max_tokens` para el mismo fenómeno; traducirlo exigiría verificar en vivo
 la semántica de cada uno, y una tabla inventada sería peor que la asimetría declarada.
+
+### Structured Outputs (ENGINE-5.2.1)
+
+El formato no depende de que el prompt pida JSON por favor. `complete_json` y
+`complete_multimodal_json` aceptan `json_schema`, y cada proveedor lo cumple según su
+primitiva real:
+
+| Proveedor | Cómo lo aplica |
+| --- | --- |
+| Anthropic | `output_config.format = {"type": "json_schema", "schema": <schema>}` en la petición; sin `output_format` antiguo y sin *assistant prefill* |
+| DeepSeek | Conserva `response_format: json_object` y recibe el esquema como contrato **textual** en el prompt de sistema: no se finge una garantía que su API no da |
+
+Antes de enviar nada, `prepare_json_schema` hace una transformación controlada del esquema que
+produce Pydantic:
+
+1. **inlinea** las referencias locales (`$ref` a `$defs`) y elimina `$defs`, para enviar un
+   esquema autocontenido en vez de uno que el proveedor tenga que resolver;
+2. **rechaza** los ciclos de referencias en lugar de adivinar una estructura;
+3. exige que la raíz cumpla el contrato de PUNTO: `type: object`, `properties` no vacío,
+   `required` con campos reales y `additionalProperties: false`.
+
+Un esquema que no cumple falla en PUNTO con `SchemaValidationError` y **cero** peticiones HTTP.
+
+Structured Outputs **reduce** errores de formato; no sustituye a la frontera final: el
+resultado sigue pasando por `Pydantic.model_validate(...)`, y el bucle de reparación semántica
+se conserva para lo que un esquema no puede cubrir (evidencia, visibilidad de archivos,
+referencias a hallazgos y los invariantes propios de PUNTO).
 
 ### Cliente de Anthropic
 
@@ -2254,11 +2283,11 @@ productor de imágenes, no rediseñar el transporte.
 
 ### Routing por rol
 
-| Rol | Proveedor por defecto |
-| --- | --- |
-| ARCHITECT, PLANNER, DEVELOPER, QA, SECURITY, REVIEWER | `deepseek` |
-| CROSS_AUDITOR | `anthropic` |
-| VISUAL_ARCHITECT, FRONTEND_SPECIALIST, VISUAL_QA | `anthropic` (preparados; runner real en ENGINE-5.3) |
+| Rol | Proveedor por defecto | Modelo por defecto |
+| --- | --- | --- |
+| ARCHITECT, PLANNER, DEVELOPER, QA, SECURITY, REVIEWER | `deepseek` | `deepseek-v4-pro` |
+| CROSS_AUDITOR | `anthropic` | `claude-opus-5` |
+| VISUAL_ARCHITECT, FRONTEND_SPECIALIST, VISUAL_QA | `anthropic` | `claude-sonnet-5` (preparados; runner real en ENGINE-5.3) |
 
 `ModelRouter` resuelve la ruta de cada rol desde el entorno (`PUNTO_<ROL>_MODEL` y
 `PUNTO_<ROL>_PROVIDER`), valida que haya exactamente una ruta por rol y expone
@@ -2335,13 +2364,29 @@ resultados, no se simula que Claude respondió y no se pide la credencial por el
 estándar no depende de ella (vive en `tests/integration`, que el `addopts` ignora) y mantiene
 **0 failed / 0 skipped**.
 
+Los gates vivos están endurecidos para no poder confundir un bloqueo con un éxito:
+
+| Gate | Exigencia |
+| --- | --- |
+| A. Autenticación | respuesta real con `provider=anthropic`, tokens > 0 |
+| B. JSON estructurado | **esquema real** en `output_config.format` y `json.loads` del contenido **sin** quitar vallas |
+| C. Credencial inválida | `AnthropicAuthenticationError` con **cero** reintentos |
+| D. Multimodal | esquema `{"image_received": boolean}` y `image_received is True`: nada de juicios visuales subjetivos |
+| E. Auditoría cruzada | el fixture limpio debe dar **PASS**; `BLOCKED` y `CHANGES_REQUESTED` **no** se aceptan como éxito, y se exige `provider == "anthropic"`, `model == cliente.model`, `cross_model is True` y tokens > 0 |
+
 ### Limitación declarada
 
 - ENGINE-5.2 **no** implementa runtime Node, Next.js, TypeScript, Tailwind, Playwright ni
   Chromium, ni el especialista frontend, ni Visual QA completo: es ENGINE-5.3.
-- El identificador de modelo por defecto (`claude-sonnet-4-5`) **no** está verificado en vivo:
-  `MODEL_AVAILABILITY_UNVERIFIED` es `True` y no existe lista blanca, así que un identificador
-  equivocado se verá como 404 del proveedor y solo los live gates lo confirman.
+- Los identificadores por defecto (`claude-opus-5` para la auditoría, `claude-sonnet-5` para
+  los roles visuales) son los **documentados** por el proveedor: `MODEL_ID_DOCUMENTED` es
+  `True`. Lo que sigue sin poder afirmarse es el **acceso de esta cuenta** a ellos
+  (`LIVE_ACCOUNT_ACCESS_UNVERIFIED`), porque la fase se construyó sin credencial. No hay lista
+  blanca: un identificador equivocado se verá como un 404 explícito del proveedor.
+- El esquema preparado usa `anyOf` para los campos opcionales (`line`, `confidence`), que es lo
+  que produce Pydantic para `int | None`. Ese detalle del dialecto solo lo puede confirmar la
+  API real: lo verificará el gate vivo E, que envía el esquema completo de
+  `CrossAuditProposal`.
 - Los tres roles visuales están **preparados** (ruta declarada) pero **sin runner**: sus
   interfaces llegarán en ENGINE-5.3.
 - No hay routing autónomo ni bucle de reparación: eso es ENGINE-6.

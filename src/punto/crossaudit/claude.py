@@ -295,11 +295,19 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
     def _call_model(
         self, task: CrossAuditTask, attempt: int, prompt: str
     ) -> ModelCompletion:
-        """Llama al modelo y audita inicio, fin y fallo."""
+        """Llama al modelo y audita inicio, fin y fallo.
+
+        La petición lleva el **esquema real** de :class:`CrossAuditProposal`: el formato no
+        depende de que el prompt lo pida. El bucle de reparación semántica se conserva para lo
+        que un esquema no puede cubrir —evidencia, visibilidad de archivos, referencias a
+        hallazgos y los invariantes propios de PUNTO—, no para arreglar JSON roto.
+        """
         self._audit_model_started(task, attempt, prompt)
         try:
             completion = self._client.complete_json(
-                system_prompt=CROSS_AUDIT_SYSTEM_PROMPT, user_prompt=prompt
+                system_prompt=CROSS_AUDIT_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                json_schema=CrossAuditProposal.model_json_schema(),
             )
         except ProviderError as exc:
             self._audit_model_failed(task, attempt, self._client.redact(str(exc)))

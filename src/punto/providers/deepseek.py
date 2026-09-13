@@ -28,6 +28,7 @@ import httpx
 
 from punto.providers.base import (
     PROVIDER_DEEPSEEK,
+    JsonSchema,
     ModelCompletion,
     StructuredModelClient,
 )
@@ -323,12 +324,19 @@ class DeepSeekClient(StructuredModelClient):
         *,
         system_prompt: str,
         user_prompt: str,
+        json_schema: JsonSchema | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada al modelo.
+
+        DeepSeek conserva su mecanismo actual (``response_format: json_object``), que es su
+        primitiva real. Si se entrega un esquema, se añade al prompt de sistema como contrato
+        **textual**: no se finge que la API lo impone, y PUNTO sigue validando con Pydantic.
+        Ignorarlo en silencio sería peor que declararlo como lo que es.
 
         Args:
             system_prompt: Prompt de sistema versionado del Developer.
             user_prompt: Contexto y petición concretos.
+            json_schema: Esquema que la respuesta debería cumplir, si se declara.
 
         Returns:
             El contenido, el modelo, el consumo y la latencia.
@@ -344,7 +352,7 @@ class DeepSeekClient(StructuredModelClient):
         payload: dict[str, Any] = {
             "model": self._config.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": _system_with_schema(system_prompt, json_schema)},
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {"type": "json_object"},
@@ -515,6 +523,23 @@ def _parse_usage(raw: object) -> ModelUsage:
         total_tokens=total if total is not None else prompt + completion,
         prompt_cache_hit_tokens=number("prompt_cache_hit_tokens"),
         prompt_cache_miss_tokens=number("prompt_cache_miss_tokens"),
+    )
+
+
+def _system_with_schema(system_prompt: str, json_schema: JsonSchema | None) -> str:
+    """Añade el esquema al prompt de sistema como contrato textual.
+
+    DeepSeek no aplica JSON Schema de forma nativa, así que el esquema se declara **en el
+    prompt** en lugar de fingir una garantía que la API no da. La frontera final sigue siendo
+    ``Pydantic.model_validate(...)``.
+    """
+    if json_schema is None:
+        return system_prompt
+    return (
+        f"{system_prompt}\n\n"
+        "FORMATO: responde con un único objeto JSON que cumpla exactamente este esquema "
+        "(las claves no listadas no son válidas):\n"
+        f"{json.dumps(json_schema, ensure_ascii=False, sort_keys=True)}"
     )
 
 

@@ -37,11 +37,13 @@ from punto.providers.base import (
     PROVIDER_ANTHROPIC,
     ImageLimits,
     ImagePayload,
+    JsonSchema,
     ModelCompletion,
     MultimodalModelClient,
     ProviderAuthenticationError,
     ProviderError,
 )
+from punto.providers.json_schema import prepare_json_schema
 from punto.schemas.execution import ModelUsage
 
 #: URL base oficial de la API de Anthropic.
@@ -94,21 +96,26 @@ VISUAL_MODEL_ENV: Final[str] = "PUNTO_CLAUDE_VISUAL_MODEL"
 #: Variable de entorno del presupuesto de salida.
 MAX_TOKENS_ENV: Final[str] = "PUNTO_CLAUDE_MAX_TOKENS"
 
-#: Modelo por defecto de la auditoria estructurada.
-DEFAULT_AUDIT_MODEL: Final[str] = "claude-sonnet-4-5"
+#: Modelo por defecto de la auditoría cruzada.
+DEFAULT_AUDIT_MODEL: Final[str] = "claude-opus-5"
 
-#: Modelo por defecto del rol visual. Coincide con el de auditoria porque el
-#: mismo modelo multimodal sirve a ambos papeles; el rol se distingue por prompt.
-DEFAULT_VISUAL_MODEL: Final[str] = "claude-sonnet-4-5"
+#: Modelo por defecto de los roles visuales.
+DEFAULT_VISUAL_MODEL: Final[str] = "claude-sonnet-5"
 
-#: Marca de honestidad sobre el identificador de modelo.
+#: El identificador por defecto está **documentado** por el proveedor.
 #:
-#: El identificador por defecto (``claude-sonnet-4-5``) **no** se pudo verificar en vivo:
-#: la fase se desarrollo sin credencial de Anthropic disponible. Por eso no hay lista
-#: blanca de modelos (una lista inventada seria peor que no tenerla), el modelo es
-#: totalmente configurable por variable de entorno y la confirmacion queda en manos de
-#: los live gates, que son los únicos que pueden hablar con la API real.
-MODEL_AVAILABILITY_UNVERIFIED: Final[bool] = True
+#: Es un hecho distinto de tener acceso: los identificadores son los publicados oficialmente,
+#: y lo que todavía no se puede afirmar es que esta cuenta pueda invocarlos, porque la fase se
+#: construyó sin ``ANTHROPIC_API_KEY``. Confundir ambas cosas llevaba a tratar un identificador
+#: documentado como si fuera inventado.
+MODEL_ID_DOCUMENTED: Final[bool] = True
+
+#: Todavía no se pudo verificar el acceso de la cuenta a esos modelos.
+#:
+#: Solo los live gates pueden convertirlo en ``False``. Es la razón por la que el modelo es
+#: configurable y no existe lista blanca: una lista cerrada inventada sería peor que confiar
+#: en el proveedor y fallar con un 404 explícito.
+LIVE_ACCOUNT_ACCESS_UNVERIFIED: Final[bool] = True
 
 #: Texto con el que se sustituye cualquier credencial detectada.
 _REDACTED: Final[str] = "***REDACTED***"
@@ -406,6 +413,7 @@ class AnthropicClient(MultimodalModelClient):
         *,
         system_prompt: str,
         user_prompt: str,
+        json_schema: JsonSchema | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta estructurada solo con texto.
 
@@ -413,12 +421,14 @@ class AnthropicClient(MultimodalModelClient):
         petición significa un único lugar donde equivocarse.
 
         Raises:
+            SchemaValidationError: si el esquema no cumple el contrato de PUNTO.
             AnthropicError: cualquier fallo clasificado del proveedor.
         """
         return self.complete_multimodal_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             images=(),
+            json_schema=json_schema,
         )
 
     def complete_multimodal_json(
@@ -428,19 +438,24 @@ class AnthropicClient(MultimodalModelClient):
         user_prompt: str,
         images: Sequence[ImagePayload],
         limits: ImageLimits | None = None,
+        json_schema: JsonSchema | None = None,
     ) -> ModelCompletion:
-        """Solicita una respuesta estructurada a partir de texto e imagenes.
+        """Solicita una respuesta estructurada a partir de texto e imágenes.
 
-        La validación de límites ocurre **antes** de construir la petición: si una
-        imagen no cumple, no se llega a hablar con la API.
+        La validación de límites y la del esquema ocurren **antes** de construir la petición:
+        si algo no cumple, no se llega a hablar con la API. Con esquema, la petición lleva
+        ``output_config.format`` con el JSON Schema preparado, de modo que el formato no
+        depende de que el prompt lo pida por favor.
 
         Raises:
             ImageValidationError: si una imagen incumple los límites.
+            SchemaValidationError: si el esquema no cumple el contrato de PUNTO.
             AnthropicError: cualquier fallo clasificado del proveedor.
         """
         effective_limits = limits if limits is not None else ImageLimits()
         validated = effective_limits.validate(images)
-        payload = self._build_payload(system_prompt, user_prompt, validated)
+        prepared = None if json_schema is None else prepare_json_schema(json_schema)
+        payload = self._build_payload(system_prompt, user_prompt, validated, prepared)
 
         started = time.perf_counter()
         response, retries = self._post_with_retries(payload)
@@ -453,9 +468,15 @@ class AnthropicClient(MultimodalModelClient):
         system_prompt: str,
         user_prompt: str,
         images: Sequence[ImagePayload],
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Construye el cuerpo de ``POST /v1/messages``."""
-        return {
+        """Construye el cuerpo de ``POST /v1/messages``.
+
+        El esquema viaja en ``output_config.format`` (la forma actual de la Messages API). No
+        se usa ``output_format`` ni *assistant prefill*: el primero es una forma antigua y el
+        segundo condiciona la generación en vez de restringir el formato.
+        """
+        payload: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": self._config.max_tokens,
             "system": system_prompt,
@@ -463,6 +484,11 @@ class AnthropicClient(MultimodalModelClient):
                 {"role": "user", "content": build_content_blocks(user_prompt, images)}
             ],
         }
+        if schema is not None:
+            payload["output_config"] = {
+                "format": {"type": "json_schema", "schema": schema}
+            }
+        return payload
 
     def _post_with_retries(
         self, payload: dict[str, Any]
@@ -672,9 +698,10 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TRANSPORT_RETRIES",
     "DEFAULT_VISUAL_MODEL",
+    "LIVE_ACCOUNT_ACCESS_UNVERIFIED",
     "MAX_TOKENS_ENV",
     "MESSAGES_PATH",
-    "MODEL_AVAILABILITY_UNVERIFIED",
+    "MODEL_ID_DOCUMENTED",
     "RETRYABLE_STATUS_CODES",
     "RETRY_BACKOFF_SECONDS",
     "STOP_REASON_MAX_TOKENS",

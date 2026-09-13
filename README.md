@@ -2241,19 +2241,23 @@ contrato de PUNTO y no se toca: `Model.model_validate(...)` lo sigue aplicando e
 2. los **siblings** de un `$ref` solo pueden anotar (`title`, `description`, `default`). Un
    sibling estructural que contradiga o amplíe el destino es un **conflicto** y se rechaza: no
    se elige uno de los dos en silencio;
-3. **retira** las restricciones que el dialecto del proveedor no admite y las cuenta en la
-   `description` del campo. La lista es explícita y solo toca lo no admitido:
-   `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
-   `multipleOf`, `maxItems`, `uniqueItems`, `minProperties`, `maxProperties`. Lo que **sí** se
-   admite (`anyOf`, `allOf`, `enum`, `const`, `default`, `required`, `additionalProperties`,
-   `format`, `pattern`, `minItems`) se conserva intacto: una lista negra improvisada destruiría
-   features válidas;
+3. **retira** lo que el dialecto del proveedor no admite y lo cuenta en la `description` del
+   campo. La lista es explícita: `minLength`, `maxLength`, `minimum`, `maximum`,
+   `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `maxItems`, `uniqueItems`,
+   `minProperties`, `maxProperties`, `pattern` (PUNTO no puede demostrar que domina el
+   subconjunto regex del proveedor, así que no lo envía) y `minItems > 1`. Sí viajan `anyOf`,
+   `allOf`, `enum`, `const`, `default`, `required`, `minItems` con 0 o 1, `format` de la
+   allowlist documentada (`date`, `date-time`, `duration`, `email`, `hostname`, `ipv4`, `ipv6`,
+   `time`, `uri`, `uuid`) y `additionalProperties: false`. Una lista negra improvisada
+   destruiría features válidas;
 4. **rechaza** ciclos de referencias, referencias irresolubles y profundidades absurdas;
 5. valida **todos** los nodos, no solo la raíz: un `minLength` escondido en el `items` de un
-   array anidado rompería la petición igual que uno en la raíz. Cada objeto con `properties`
-   debe estar cerrado (`additionalProperties: false`), cada array debe declarar `items`, cada
-   unión debe ser una lista no vacía de esquemas y ningún keyword desconocido llega al
-   proveedor.
+   array anidado rompería la petición igual que uno en la raíz. Cada objeto debe estar cerrado
+   (`additionalProperties: false`, y **solo** `false`: el dialecto no admite mapas), cada array
+   debe declarar `items` **con esquema**, cada unión debe ser una lista no vacía de esquemas,
+   `enum`/`const` solo admiten escalares, `type` debe ser uno de los siete tipos básicos y
+   ningún keyword desconocido llega al proveedor. Un campo `dict[str, X]` de Pydantic, por
+   ejemplo, falla aquí antes de llamar a la API.
 
 Un esquema que no cumple falla en PUNTO con `SchemaValidationError` y **cero** peticiones HTTP.
 
@@ -2363,6 +2367,11 @@ La auditoría cruzada **reutiliza** `build_model_review_context()` y
 solo puede señalar archivos de `model_visible_files`, los enlaces que escapan del workspace no
 se leen nunca, y si un archivo modificado no cabe en el contexto la auditoría queda `BLOCKED` /
 `CONTEXT_LIMIT_EXCEEDED`. No hay auditoría parcial disfrazada.
+
+Una ruta declarada **inválida** (carácter de control, `..`, absoluta) tampoco desaparece: se
+registra en `invalid_paths` y en las omisiones con una representación saneada —nunca con los
+caracteres de control crudos— y, si era un archivo obligatorio, cuenta como no cubierto. La
+auditoría queda `BLOCKED` **antes** de llamar al modelo.
 
 ### Estado live
 

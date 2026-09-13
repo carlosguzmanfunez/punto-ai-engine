@@ -34,9 +34,9 @@ from pydantic import BaseModel
 
 #: Keywords que el dialecto del proveedor admite y PUNTO transporta tal cual.
 #:
-#: ``minItems`` está aquí a propósito y ``maxItems`` no: el dialecto admite el primero con
-#: restricciones documentadas. Una lista negra improvisada destruiría features válidas, así que
-#: la lista es de lo **permitido**, no de lo prohibido.
+#: ``minItems`` está aquí a propósito: el dialecto lo admite, pero **solo** con 0 o 1, y eso se
+#: comprueba aparte. ``format`` también, con allowlist. Una lista negra improvisada destruiría
+#: features válidas, así que la lista es de lo **permitido**.
 SUPPORTED_KEYWORDS: Final[frozenset[str]] = frozenset(
     {
         "additionalProperties",
@@ -49,12 +49,35 @@ SUPPORTED_KEYWORDS: Final[frozenset[str]] = frozenset(
         "format",
         "items",
         "minItems",
-        "pattern",
         "properties",
         "required",
         "title",
         "type",
     }
+)
+
+#: Valores de ``minItems`` que el dialecto admite.
+SUPPORTED_MIN_ITEMS: Final[frozenset[int]] = frozenset({0, 1})
+
+#: Formatos documentados por el proveedor. Cualquier otro es un 400 esperando a ocurrir.
+ALLOWED_FORMATS: Final[frozenset[str]] = frozenset(
+    {
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "ipv4",
+        "ipv6",
+        "time",
+        "uri",
+        "uuid",
+    }
+)
+
+#: Tipos admitidos. Un ``type`` fuera de esta lista no se puede transportar.
+ALLOWED_TYPES: Final[frozenset[str]] = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
 )
 
 #: Keywords que se resuelven o se descartan antes de validar: no deben llegar al proveedor.
@@ -77,7 +100,15 @@ UNSUPPORTED_CONSTRAINTS: Final[Mapping[str, str]] = {
     "minProperties": "debe declarar al menos {value} propiedad(es)",
     "minimum": "debe ser mayor o igual que {value}",
     "multipleOf": "debe ser múltiplo de {value}",
+    "pattern": "debe cumplir el patrón {value}",
     "uniqueItems": "no debe contener elementos duplicados",
+}
+
+#: Notas legibles, incluidas las de los valores que se retiran **condicionalmente**
+#: (``minItems > 1``), que no están en :data:`UNSUPPORTED_CONSTRAINTS` porque 0 y 1 sí viajan.
+CONSTRAINT_NOTES: Final[Mapping[str, str]] = {
+    **UNSUPPORTED_CONSTRAINTS,
+    "minItems": "debe contener al menos {value} elemento(s)",
 }
 
 #: Claves estructurales: no se pueden fusionar con conflicto desde un ``$ref`` con siblings.
@@ -189,17 +220,28 @@ def _validate_node(node: Any, *, path: str, root: bool = False) -> None:
             f"{location}: keyword {keyword!r} que PUNTO no sabe transportar"
         )
 
+    node_type = node.get("type")
+    if node_type is not None and (not isinstance(node_type, str) or node_type not in ALLOWED_TYPES):
+        raise SchemaValidationError(
+            f"{location}: 'type' debe ser uno de {', '.join(sorted(ALLOWED_TYPES))}, "
+            f"no {node_type!r}"
+        )
+
+    # El proveedor solo admite el objeto **cerrado**. Un esquema de mapa
+    # (``additionalProperties: {...}``) cambiaría la semántica del modelo si se transformara,
+    # así que se rechaza antes de llamar a la API.
+    if "additionalProperties" in node and node["additionalProperties"] is not False:
+        raise SchemaValidationError(
+            f"{location}: 'additionalProperties' debe ser exactamente false; "
+            f"{node['additionalProperties']!r} no está admitido por el dialecto"
+        )
+
     properties = node.get("properties")
     if properties is not None:
-        if node.get("type") != "object":
+        if node_type != "object":
             raise SchemaValidationError(f"{location}: 'properties' exige type='object'")
         if not isinstance(properties, dict) or not properties:
             raise SchemaValidationError(f"{location}: 'properties' debe ser un objeto no vacío")
-        if node.get("additionalProperties") is not False:
-            raise SchemaValidationError(
-                f"{location}: un objeto con 'properties' debe declarar "
-                "'additionalProperties: false'"
-            )
         required = node.get("required")
         if not isinstance(required, list) or not required:
             raise SchemaValidationError(
@@ -217,12 +259,55 @@ def _validate_node(node: Any, *, path: str, root: bool = False) -> None:
         for name, child in properties.items():
             _validate_node(child, path=f"{path}.properties.{name}" if path else name)
 
-    if node.get("type") == "array" and "items" not in node:
-        raise SchemaValidationError(f"{location}: un array debe declarar 'items'")
+    if node_type == "object" and node.get("additionalProperties") is not False:
+        raise SchemaValidationError(
+            f"{location}: un objeto debe declarar 'additionalProperties: false'"
+        )
 
-    items = node.get("items")
-    if isinstance(items, dict):
+    if node_type == "array":
+        items = node.get("items")
+        if not isinstance(items, dict):
+            # No basta con que exista la clave: el dialecto exige un **esquema** de items.
+            raise SchemaValidationError(
+                f"{location}: 'items' debe ser un esquema de objeto, no {type(items).__name__}"
+            )
         _validate_node(items, path=f"{path}.items".lstrip("."))
+
+    if "minItems" in node:
+        value = node["minItems"]
+        unsupported = (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in SUPPORTED_MIN_ITEMS
+        )
+        if unsupported:
+            raise SchemaValidationError(
+                f"{location}: 'minItems' solo admite {sorted(SUPPORTED_MIN_ITEMS)}, no {value!r}"
+            )
+
+    if "format" in node:
+        value = node["format"]
+        if not isinstance(value, str) or value not in ALLOWED_FORMATS:
+            raise SchemaValidationError(
+                f"{location}: 'format' debe ser uno de {', '.join(sorted(ALLOWED_FORMATS))}, "
+                f"no {value!r}"
+            )
+
+    if "enum" in node:
+        values = node["enum"]
+        if not isinstance(values, list) or not values:
+            raise SchemaValidationError(f"{location}: 'enum' debe ser una lista no vacía")
+        for item in values:
+            if not _is_scalar(item):
+                raise SchemaValidationError(
+                    f"{location}: 'enum' solo admite valores escalares; {type(item).__name__} "
+                    "no lo es"
+                )
+
+    if "const" in node and not _is_scalar(node["const"]):
+        raise SchemaValidationError(
+            f"{location}: 'const' solo admite valores escalares"
+        )
 
     for keyword in ("anyOf", "allOf"):
         branches = node.get(keyword)
@@ -237,12 +322,13 @@ def _validate_node(node: Any, *, path: str, root: bool = False) -> None:
                 )
             _validate_node(branch, path=f"{path}.{keyword}[{index}]".lstrip("."))
 
-    additional = node.get("additionalProperties")
-    if isinstance(additional, dict):
-        _validate_node(additional, path=f"{path}.additionalProperties".lstrip("."))
-
-    if root and node.get("type") != "object":
+    if root and node_type != "object":
         raise SchemaValidationError("(raíz): 'type' debe ser 'object'")
+
+
+def _is_scalar(value: Any) -> bool:
+    """True si el valor es un escalar JSON: cadena, número, booleano o nulo."""
+    return value is None or isinstance(value, str | int | float | bool)
 
 
 def _transform(node: Any, *, path: str) -> Any:
@@ -259,22 +345,28 @@ def _transform(node: Any, *, path: str) -> Any:
             continue
         if keyword in DROPPED_KEYWORDS:
             continue
-        if keyword in UNSUPPORTED_CONSTRAINTS:
+        if keyword == "minItems":
+            result[keyword], note = _transform_min_items(value)
+            if note:
+                notes.append(note)
+        elif keyword in UNSUPPORTED_CONSTRAINTS:
             notes.append(_describe(keyword, value))
-            continue
-        if keyword in ("properties",) and isinstance(value, dict):
+        elif keyword == "properties" and isinstance(value, dict):
             result[keyword] = {
                 name: _transform(child, path=f"{path}.properties.{name}".lstrip("."))
                 for name, child in value.items()
             }
-        elif keyword in ("items", "additionalProperties") and isinstance(value, dict):
-            result[keyword] = _transform(value, path=f"{path}.{keyword}".lstrip("."))
+        elif keyword == "items" and isinstance(value, dict):
+            result[keyword] = _transform(value, path=f"{path}.items".lstrip("."))
         elif keyword in ("anyOf", "allOf") and isinstance(value, list):
             result[keyword] = [
                 _transform(branch, path=f"{path}.{keyword}[{index}]".lstrip("."))
                 for index, branch in enumerate(value)
             ]
         else:
+            # ``additionalProperties`` cae aquí a propósito cuando no es ``False``: se conserva
+            # tal cual para que la validación lo **rechace**, en vez de transformarlo y cambiar
+            # en silencio la semántica del modelo.
             result[keyword] = value
 
     if notes:
@@ -286,9 +378,24 @@ def _transform(node: Any, *, path: str) -> Any:
     return result
 
 
+def _transform_min_items(value: Any) -> tuple[int, str]:
+    """Aplica la regla de ``minItems``: 0 y 1 viajan, más de 1 se retira, lo ilegible falla.
+
+    Raises:
+        SchemaValidationError: si el valor no es un entero no negativo.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SchemaValidationError(
+            f"'minItems' debe ser un entero no negativo, no {value!r}"
+        )
+    if value in SUPPORTED_MIN_ITEMS:
+        return value, ""
+    return 0, _describe("minItems", value)
+
+
 def _describe(keyword: str, value: Any) -> str:
     """Traducción legible de una restricción retirada."""
-    template = UNSUPPORTED_CONSTRAINTS[keyword]
+    template = CONSTRAINT_NOTES[keyword]
     if keyword == "uniqueItems":
         return template
     rendered = value if isinstance(value, int | float) else str(value)
@@ -402,13 +509,17 @@ def _collect_refs(node: Any, found: list[str]) -> None:
 
 
 __all__ = [
+    "ALLOWED_FORMATS",
+    "ALLOWED_TYPES",
     "ANNOTATION_KEYWORDS",
+    "CONSTRAINT_NOTES",
     "DROPPED_KEYWORDS",
     "LOCAL_REF_PREFIX",
     "MAX_REF_DEPTH",
     "RESOLVED_KEYWORDS",
     "STRUCTURAL_KEYWORDS",
     "SUPPORTED_KEYWORDS",
+    "SUPPORTED_MIN_ITEMS",
     "UNSUPPORTED_CONSTRAINTS",
     "SchemaValidationError",
     "prepare_json_schema",

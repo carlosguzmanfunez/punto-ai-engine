@@ -60,6 +60,7 @@ class ModelReviewContext:
     visible_paths: tuple[str, ...] = ()
     omitted_paths: tuple[str, ...] = ()
     unsafe_paths: tuple[str, ...] = ()
+    invalid_paths: tuple[str, ...] = ()
     truncated_paths: tuple[str, ...] = ()
     content: str = ""
     line_counts: tuple[tuple[str, int], ...] = ()
@@ -104,6 +105,13 @@ class ModelReviewContext:
                 f"{detail}; {len(self.unsafe_paths)} de ellos resuelven fuera del "
                 f"workspace y fueron rechazados sin leerlos ({unsafe}{unsafe_suffix})"
             )
+        if self.invalid_paths:
+            invalid = ", ".join(self.invalid_paths[:5])
+            invalid_suffix = "…" if len(self.invalid_paths) > 5 else ""
+            detail = (
+                f"{detail}; {len(self.invalid_paths)} no son rutas válidas y quedan "
+                f"declaradas como inválidas ({invalid}{invalid_suffix})"
+            )
         return detail
 
     def annotated_content(self) -> str:
@@ -125,6 +133,12 @@ class ModelReviewContext:
                 f"{', '.join(self.unsafe_paths[:5])}"
                 f"{'…' if len(self.unsafe_paths) > 5 else ''}"
             )
+        if self.invalid_paths:
+            notes.append(
+                f"declarado(s) como inválido(s): "
+                f"{', '.join(self.invalid_paths[:5])}"
+                f"{'…' if len(self.invalid_paths) > 5 else ''}"
+            )
         body = self.content or "(no se declararon archivos)"
         return f"{body}\n\n[{'; '.join(notes)}]"
 
@@ -139,9 +153,14 @@ def build_model_review_context(
 ) -> ModelReviewContext:
     """Construye el contexto visible al modelo, de forma pura y determinista.
 
-    Las rutas inválidas se descartan; las repetidas se deduplican conservando el orden. Todo
-    lo que no entre en el presupuesto queda en ``omitted_paths``: **nunca** se omite en
-    silencio, y quien llama decide si eso basta para bloquear la revisión.
+    Las rutas repetidas se deduplican conservando el orden. Todo lo que no entre en el
+    presupuesto queda en ``omitted_paths``: **nunca** se omite en silencio, y quien llama decide
+    si eso basta para bloquear la revisión.
+
+    Una ruta **inválida** (carácter de control, traversal, absoluta) no se descarta sin dejar
+    rastro: queda declarada en ``invalid_paths`` y en ``omitted_paths``, con una representación
+    saneada —nunca con los caracteres de control crudos—. Así una ruta obligatoria inválida
+    sigue contando como no cubierta y quien decide puede bloquear.
 
     Antes de leer cada archivo se comprueba que su destino **real** siga dentro del
     workspace (ENGINE-5.1.1). Un enlace que escape no se lee: queda en ``omitted_paths`` y en
@@ -160,16 +179,20 @@ def build_model_review_context(
     root = Path(workspace)
     resolved_root = _resolved_root(root)
     ordered: list[str] = []
+    invalid: list[str] = []
     for raw in _iter_paths(paths):
         try:
             relative = normalize_relative_path(raw)
         except ValueError:
+            label = safe_path_label(raw)
+            if label not in invalid:
+                invalid.append(label)
             continue
         if relative not in ordered:
             ordered.append(relative)
 
     visible = ordered[:max_paths]
-    omitted: list[str] = list(ordered[max_paths:])
+    omitted: list[str] = [*ordered[max_paths:], *invalid]
     unsafe: list[str] = []
 
     chunks: list[str] = []
@@ -200,6 +223,7 @@ def build_model_review_context(
         visible_paths=tuple(path for path, _ in line_counts),
         omitted_paths=tuple(omitted),
         unsafe_paths=tuple(unsafe),
+        invalid_paths=tuple(invalid),
         truncated_paths=tuple(truncated),
         content="\n\n".join(chunks),
         line_counts=tuple(line_counts),
@@ -235,6 +259,10 @@ def missing_paths(context: ModelReviewContext, required: Iterable[str]) -> tuple
     """Rutas declaradas como obligatorias que **no** llegaron al modelo.
 
     Es la comprobación que impide aprobar una revisión parcial como si fuera completa.
+
+    Una ruta obligatoria **inválida** también falta: no puede estar en el contexto visible, así
+    que cuenta como no cubierta y se devuelve con una representación saneada. Desaparecer de
+    las dos capas (ni visible ni faltante) sería justamente el agujero que esto cierra.
     """
     visible = context.visible_set
     missing: list[str] = []
@@ -242,10 +270,29 @@ def missing_paths(context: ModelReviewContext, required: Iterable[str]) -> tuple
         try:
             relative = normalize_relative_path(raw)
         except ValueError:
+            label = safe_path_label(raw)
+            if label not in missing:
+                missing.append(label)
             continue
         if relative not in visible and relative not in missing:
             missing.append(relative)
     return tuple(missing)
+
+
+def safe_path_label(path: str) -> str:
+    """Representación segura de una ruta para informes, evidencia y registros.
+
+    Los caracteres de control se escapan (``\\x00``) en lugar de escribirse crudos: un informe
+    no debe poder inyectar un salto de línea, un NUL ni una secuencia de terminal en un log. La
+    ruta se recorta además a un tamaño razonable.
+    """
+    escaped = "".join(
+        character
+        if character >= " " and character != "\x7f"
+        else f"\\x{ord(character):02x}"
+        for character in path
+    )
+    return escaped[:200]
 
 
 def _iter_paths(paths: Iterable[str]) -> tuple[str, ...]:
@@ -324,4 +371,5 @@ __all__ = [
     "build_model_review_context",
     "missing_paths",
     "resolve_within_workspace",
+    "safe_path_label",
 ]

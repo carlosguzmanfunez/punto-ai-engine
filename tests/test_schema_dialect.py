@@ -21,6 +21,8 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from punto.providers.json_schema import (
+    ALLOWED_FORMATS,
+    ALLOWED_TYPES,
     SUPPORTED_KEYWORDS,
     UNSUPPORTED_CONSTRAINTS,
     SchemaValidationError,
@@ -39,8 +41,12 @@ def assert_clean_everywhere(node: Any, path: str = "(raíz)") -> None:
     """Recorre el provider schema y exige que no quede nada fuera del dialecto.
 
     Solo desciende por posiciones que contienen **esquemas** (``properties.*``, ``items``,
-    ``anyOf``, ``allOf``, ``additionalProperties``); el resto de valores son datos, no
-    keywords, y tratarlos como tales daría falsos positivos.
+    ``anyOf``, ``allOf``); el resto de valores son datos, no keywords, y tratarlos como tales
+    daría falsos positivos.
+
+    Este walker es deliberadamente independiente del validador de producción: comprueba por su
+    cuenta las reglas del dialecto (objetos cerrados, ``minItems`` 0/1, ``format`` de la
+    allowlist, sin ``pattern``, ``enum`` escalar, ``type`` admitido y ``items`` con esquema).
     """
     if isinstance(node, list):
         for index, item in enumerate(node):
@@ -55,13 +61,30 @@ def assert_clean_everywhere(node: Any, path: str = "(raíz)") -> None:
         if keyword == "properties" and isinstance(value, dict):
             for name, child in value.items():
                 assert_clean_everywhere(child, f"{path}.properties.{name}")
-        elif keyword in {"items", "additionalProperties"} and isinstance(value, dict):
-            assert_clean_everywhere(value, f"{path}.{keyword}")
+        elif keyword == "items" and isinstance(value, dict):
+            assert_clean_everywhere(value, f"{path}.items")
         elif keyword in {"anyOf", "allOf"} and isinstance(value, list):
             for index, branch in enumerate(value):
                 assert_clean_everywhere(branch, f"{path}.{keyword}[{index}]")
-    if node.get("type") == "object" and "properties" in node:
-        assert node.get("additionalProperties") is False, f"{path}: objeto abierto"
+
+    node_type = node.get("type")
+    if node_type is not None:
+        assert node_type in ALLOWED_TYPES, f"{path}: type no admitido {node_type!r}"
+    if "additionalProperties" in node:
+        assert node["additionalProperties"] is False, f"{path}: additionalProperties no es false"
+    if node_type == "object":
+        assert node.get("additionalProperties") is False, f"{path}: objeto sin cerrar"
+    if node_type == "array":
+        assert isinstance(node.get("items"), dict), f"{path}: array sin esquema de items"
+    if "minItems" in node:
+        assert node["minItems"] in {0, 1}, f"{path}: minItems no admitido {node['minItems']!r}"
+    if "format" in node:
+        assert node["format"] in ALLOWED_FORMATS, f"{path}: format no admitido"
+    if "enum" in node:
+        for item in node["enum"]:
+            assert item is None or isinstance(item, str | int | float | bool), (
+                f"{path}: enum no escalar"
+            )
 
 
 class Annotated(BaseModel):
@@ -143,12 +166,15 @@ def test_supported_features_are_preserved() -> None:
 
     prepared = prepare_json_schema(Mixed.model_json_schema())
 
-    assert prepared["properties"]["kind"]["pattern"] == "^[a-z]+$"
+    # ``pattern`` y ``minimum`` se retiran; ``minItems=1`` sí viaja; la estructura se conserva.
+    assert "pattern" not in prepared["properties"]["kind"]
+    assert "minimum" not in prepared["properties"]["level"]
     assert prepared["properties"]["items"]["minItems"] == 1
     assert prepared["properties"]["items"]["type"] == "array"
     assert prepared["additionalProperties"] is False
     assert prepared["required"] == ["kind", "level", "items"]
     assert prepared["type"] == "object"
+    assert_clean_everywhere(prepared)
 
 
 def test_enum_and_const_survive_the_transformation() -> None:
@@ -165,6 +191,350 @@ def test_default_is_preserved() -> None:
     prepared = prepare_json_schema(Annotated.model_json_schema())
 
     assert prepared["properties"]["optional_line"]["default"] is None
+
+
+def test_additional_properties_must_be_exactly_false() -> None:
+    """El dialecto solo admite el objeto cerrado: cualquier otra forma se rechaza.
+
+    ``additionalProperties`` con esquema (un mapa) **no** se transforma: cambiarlo alteraría la
+    semántica del modelo. Se falla antes de llamar a la API.
+    """
+    valid = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+    validate_provider_schema(valid)
+
+    for rejected in (True, {}, {"type": "string"}, {"type": "integer"}):
+        broken = {**valid, "additionalProperties": rejected}
+        with pytest.raises(SchemaValidationError, match="additionalProperties"):
+            validate_provider_schema(broken)
+
+
+def test_object_without_closing_is_rejected_even_without_properties() -> None:
+    """Un objeto sin ``properties`` también debe estar cerrado."""
+    with pytest.raises(SchemaValidationError, match="additionalProperties"):
+        validate_provider_schema({"type": "object"})
+
+
+def test_pydantic_map_is_rejected_before_calling_the_provider() -> None:
+    """Un campo ``dict[str, X]`` de Pydantic no se transporta: falla en PUNTO."""
+
+    class WithMap(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        values: dict[str, int]
+
+    with pytest.raises(SchemaValidationError, match="additionalProperties"):
+        provider_schema_for(WithMap)
+
+
+# ---------------------------------------------------------------------------
+# minItems
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("value", [0, 1])
+def test_supported_min_items_values_travel(value: int) -> None:
+    """0 y 1 son los únicos valores admitidos y viajan tal cual."""
+    schema = {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {"type": "string"}, "minItems": value}},
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+    prepared = prepare_json_schema(schema) if value else validate_provider_schema(schema)
+
+    if value:
+        assert prepared["properties"]["items"]["minItems"] == 1
+    else:
+        validate_provider_schema(schema)
+
+
+@pytest.mark.parametrize("value", [2, 10])
+def test_min_items_over_one_is_removed_and_annotated(value: int) -> None:
+    """Por encima de 1 se retira del provider schema y se cuenta en la descripción."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": value,
+                "description": "Elementos.",
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+    prepared = prepare_json_schema(schema)
+    items = prepared["properties"]["items"]
+
+    assert items["minItems"] == 0
+    assert f"al menos {value} elemento" in items["description"]
+
+
+@pytest.mark.parametrize("value", [-1, "dos", 1.5, True])
+def test_invalid_min_items_is_rejected(value: Any) -> None:
+    """Un ``minItems`` ilegible no se adivina: falla en PUNTO."""
+    schema = {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {"type": "string"}, "minItems": value}},
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(SchemaValidationError, match="minItems"):
+        prepare_json_schema(schema)
+
+
+def test_min_length_two_on_a_tuple_never_reaches_the_provider() -> None:
+    """``Field(min_length=2)`` sobre una tupla: el provider schema no lleva ``minItems``.
+
+    Pydantic sigue aplicándolo localmente: retirarlo del provider schema no relaja nada.
+    """
+
+    class TwoOrMore(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        tags: tuple[str, ...] = Field(..., min_length=2, description="Etiquetas.")
+
+    provider = prepare_json_schema(TwoOrMore.model_json_schema())
+    tags = provider["properties"]["tags"]
+
+    assert tags["minItems"] == 0
+    assert "al menos 2 elemento" in tags["description"]
+
+    with pytest.raises(ValidationError):
+        TwoOrMore(tags=("uno",))
+    assert TwoOrMore(tags=("uno", "dos")).tags == ("uno", "dos")
+
+
+# ---------------------------------------------------------------------------
+# format
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("value", ["uuid", "email", "date-time", "uri"])
+def test_allowed_formats_travel(value: str) -> None:
+    """Los formatos documentados se transportan."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"type": "string", "format": value}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    prepared = prepare_json_schema(schema)
+
+    assert prepared["properties"]["campo"]["format"] == value
+
+
+@pytest.mark.parametrize("value", ["formato-inventado", "regex", "binary", ""])
+def test_invented_format_is_rejected(value: str) -> None:
+    """Un formato fuera de la allowlist sería un 400 esperando a ocurrir."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"type": "string", "format": value}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(SchemaValidationError, match="format"):
+        prepare_json_schema(schema)
+
+
+def test_allowed_formats_are_the_documented_ones() -> None:
+    """La allowlist es exactamente la documentada."""
+    documented = {
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "ipv4",
+        "ipv6",
+        "time",
+        "uri",
+        "uuid",
+    }
+
+    assert set(ALLOWED_FORMATS) == documented
+
+
+def test_pydantic_uuid_format_is_transportable() -> None:
+    """Un campo ``UUID`` de Pydantic produce ``format: uuid``, que sí viaja."""
+    from uuid import UUID
+
+    class WithUuid(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        identifier: UUID
+
+    prepared = prepare_json_schema(WithUuid.model_json_schema())
+
+    assert prepared["properties"]["identifier"]["format"] == "uuid"
+
+
+# ---------------------------------------------------------------------------
+# pattern
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "^[a-z]+$",
+        "^(?!.*--).*$",
+        "(?<=a)b",
+        r"(\w+)\s+\1",
+        r"\bword\b",
+        "^.*$",
+    ],
+)
+def test_no_pattern_reaches_the_provider_schema(pattern: str) -> None:
+    """Ningún pattern viaja: PUNTO no puede probar el subconjunto regex del proveedor.
+
+    En lugar de afirmar que sabe validarlo, se retira y se anota. Pydantic conserva la
+    garantía local.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"type": "string", "pattern": pattern}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    prepared = prepare_json_schema(schema)
+    campo = prepared["properties"]["campo"]
+
+    assert "pattern" not in campo
+    assert pattern in campo["description"]
+    assert_clean_everywhere(prepared)
+
+
+def test_pattern_still_enforced_by_pydantic() -> None:
+    """La restricción no se pierde: sigue en el modelo."""
+    import re
+
+    class Patched(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        kind: str = Field(..., pattern=r"^[a-z]+$")
+
+    provider = prepare_json_schema(Patched.model_json_schema())
+    assert "pattern" not in json.dumps(provider)
+
+    with pytest.raises(ValidationError):
+        Patched(kind="MAYUSCULAS")
+    assert re.match(r"^[a-z]+$", Patched(kind="minusculas").kind)
+
+
+# ---------------------------------------------------------------------------
+# enum, type y items
+# ---------------------------------------------------------------------------
+def test_enum_must_contain_only_scalars() -> None:
+    """Un ``enum`` con objetos o listas no se transporta."""
+    base = {
+        "type": "object",
+        "properties": {"campo": {"type": "string", "enum": ["a", "b"]}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+    validate_provider_schema(base)
+
+    for bad in ([[1, 2]], [{"a": 1}], ["ok", {"a": 1}]):
+        broken = {
+            "type": "object",
+            "properties": {"campo": {"enum": bad}},
+            "required": ["campo"],
+            "additionalProperties": False,
+        }
+        with pytest.raises(SchemaValidationError, match="escalar"):
+            validate_provider_schema(broken)
+
+
+def test_enum_accepts_every_scalar_kind() -> None:
+    """Cadenas, números, booleanos y nulo son escalares válidos."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"enum": ["a", 1, 2.5, True, None]}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    validate_provider_schema(schema)
+
+
+@pytest.mark.parametrize(
+    "value", ["object", "array", "string", "integer", "number", "boolean", "null"]
+)
+def test_allowed_types_are_accepted(value: str) -> None:
+    """Los siete tipos básicos son válidos como propiedad."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"type": value}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+    if value == "object":
+        schema["properties"]["campo"]["properties"] = {"x": {"type": "string"}}
+        schema["properties"]["campo"]["required"] = ["x"]
+        schema["properties"]["campo"]["additionalProperties"] = False
+    if value == "array":
+        schema["properties"]["campo"]["items"] = {"type": "string"}
+
+    validate_provider_schema(schema)
+
+
+@pytest.mark.parametrize("value", ["any", "map", "datetime", ["string"], 42])
+def test_unsupported_type_is_rejected(value: Any) -> None:
+    """Un ``type`` fuera de la lista no se puede transportar."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {"type": value}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(SchemaValidationError, match="type"):
+        validate_provider_schema(schema)
+
+
+def test_a_node_without_type_is_tolerated() -> None:
+    """Un nodo sin ``type`` no afirma un tipo inadmisible: se acepta."""
+    schema = {
+        "type": "object",
+        "properties": {"campo": {}},
+        "required": ["campo"],
+        "additionalProperties": False,
+    }
+
+    validate_provider_schema(schema)
+
+
+def test_array_items_must_be_a_schema_object() -> None:
+    """No basta con que exista la clave ``items``: tiene que ser un esquema."""
+    for bad in ("string", ["string"], 3, None, True):
+        schema = {
+            "type": "object",
+            "properties": {"lista": {"type": "array", "items": bad}},
+            "required": ["lista"],
+            "additionalProperties": False,
+        }
+        with pytest.raises(SchemaValidationError, match="items"):
+            validate_provider_schema(schema)
+
+
+def test_array_without_items_is_rejected() -> None:
+    """Un array sin ``items`` no dice qué contiene."""
+    schema = {
+        "type": "object",
+        "properties": {"lista": {"type": "array"}},
+        "required": ["lista"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(SchemaValidationError, match="items"):
+        validate_provider_schema(schema)
 
 
 # ---------------------------------------------------------------------------
@@ -249,16 +619,22 @@ def test_recursive_validation_rejects_empty_unions() -> None:
         validate_provider_schema(schema)
 
 
-def test_additional_properties_as_schema_is_allowed() -> None:
-    """``additionalProperties`` con esquema (diccionarios) es válido y se inspecciona."""
+def test_additional_properties_as_schema_is_not_allowed() -> None:
+    """El dialecto **no** admite ``additionalProperties`` con esquema.
+
+    Corregida en ENGINE-5.2.3: la versión anterior daba por válido un mapa, que la API rechaza.
+    """
     schema = {
         "type": "object",
-        "properties": {"mapa": {"type": "object", "additionalProperties": {"type": "integer"}}},
+        "properties": {
+            "mapa": {"type": "object", "additionalProperties": {"type": "integer"}}
+        },
         "required": ["mapa"],
         "additionalProperties": False,
     }
 
-    validate_provider_schema(schema)
+    with pytest.raises(SchemaValidationError, match="additionalProperties"):
+        prepare_json_schema(schema)
 
 
 # ---------------------------------------------------------------------------

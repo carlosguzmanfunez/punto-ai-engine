@@ -35,7 +35,9 @@ from punto.model_context import (
     _contained,
     _resolved_root,
     build_model_review_context,
+    missing_paths,
     resolve_within_workspace,
+    safe_path_label,
 )
 from punto.qa.paths import PathKind, classify_path, normalize_relative_path
 from punto.schemas.audit import AuditEventType
@@ -264,19 +266,68 @@ def test_contained_handles_value_error_from_resolve(tmp_path: Path) -> None:
     assert _contained(workspace, root, "runner.py") is not None
 
 
-def test_context_builder_survives_a_null_byte_path(tmp_path: Path) -> None:
-    """Construir contexto con una ruta con NUL no revienta: la descarta."""
+def test_context_builder_records_an_invalid_path(tmp_path: Path) -> None:
+    """§9: una ruta inválida queda declarada, nunca desaparece en silencio."""
     workspace = build_security_project(tmp_path, {"runner.py": "VALOR = 1\n"})
 
     context = build_model_review_context(workspace, ("runner.py", "a\x00b"))
 
     assert context.visible_paths == ("runner.py",)
+    assert context.invalid_paths == ("a\\x00b",)
+    assert context.omitted_paths == ("a\\x00b",)
     assert context.unsafe_paths == ()
-    assert context.omitted_paths == ()
+    assert context.complete is False
     assert "VALOR = 1" in context.content
+    # La representación saneada no arrastra el carácter de control crudo.
+    assert "\x00" not in context.omission_detail()
+    assert "\x00" not in context.annotated_content()
+    assert "inválido" in context.annotated_content()
 
 
-def test_deterministic_checks_survive_a_null_byte_path(tmp_path: Path) -> None:
+def test_invalid_required_path_counts_as_missing(tmp_path: Path) -> None:
+    """§8: una ruta obligatoria inválida no puede estar visible, así que falta."""
+    workspace = build_security_project(tmp_path, {"runner.py": "VALOR = 1\n"})
+    context = build_model_review_context(workspace, ("runner.py", "a\x00b"))
+
+    missing = missing_paths(context, ("runner.py", "a\x00b"))
+
+    assert missing == ("a\\x00b",)
+    assert "\x00" not in "".join(missing)
+
+
+def test_invalid_auxiliary_path_is_declared_but_not_required(tmp_path: Path) -> None:
+    """Una ruta auxiliar inválida se declara omitida y no bloquea por sí sola."""
+    workspace = build_security_project(tmp_path, {"runner.py": "VALOR = 1\n"})
+    context = build_model_review_context(workspace, ("runner.py", "a\x00b"))
+
+    assert missing_paths(context, ("runner.py",)) == ()
+    assert context.invalid_paths == ("a\\x00b",)
+
+
+@pytest.mark.parametrize(
+    "bad", ["a\x00b", "../fuera.py", "/etc/passwd", "C:/otro.py", "a\nb", "a\x7fb"]
+)
+def test_any_invalid_declared_path_is_accounted(tmp_path: Path, bad: str) -> None:
+    """Traversal, rutas absolutas y caracteres de control quedan declarados igual."""
+    workspace = build_security_project(tmp_path, {"runner.py": "VALOR = 1\n"})
+
+    context = build_model_review_context(workspace, (bad,))
+
+    assert context.visible_paths == ()
+    assert context.invalid_paths
+    assert context.complete is False
+    assert missing_paths(context, (bad,)) == context.invalid_paths
+
+
+def test_safe_path_label_escapes_control_characters() -> None:
+    """La etiqueta de una ruta no puede inyectar nada en un informe."""
+    label = safe_path_label("a\x00b\nc\x7fd")
+
+    assert label == "a\\x00b\\x0ac\\x7fd"
+    assert "\x00" not in label and "\n" not in label
+
+
+def test_security_context_survives_a_null_byte_path(tmp_path: Path) -> None:
     """El contexto de los checks deterministas tampoco se cae."""
     workspace = build_security_project(tmp_path, {"runner.py": "VALOR = 1\n"})
     context = SecurityCheckContext(workspace=workspace, paths=("a\x00b", "runner.py"))
@@ -285,8 +336,14 @@ def test_deterministic_checks_survive_a_null_byte_path(tmp_path: Path) -> None:
     assert context.readable("runner.py") is not None
 
 
-def test_null_byte_path_discarded_by_the_audit_task(tmp_path: Path) -> None:
-    """El runner de auditoría no se cae si la tarea declara una ruta con NUL."""
+def test_invalid_required_path_blocks_the_audit_before_any_model_call(
+    tmp_path: Path,
+) -> None:
+    """§9: ``changed_files`` con una ruta inválida ⇒ BLOCKED y **cero** llamadas al modelo.
+
+    Antes, la ruta desaparecía de las dos capas (ni visible ni faltante) y la auditoría podía
+    seguir como si el cambio estuviera completo.
+    """
     workspace = cross_audit_workspace(tmp_path)
     task = make_cross_audit_task(
         workspace, changed_files=("runner.py", "a\x00b"), context_files=("runner.py",)
@@ -296,5 +353,9 @@ def test_null_byte_path_discarded_by_the_audit_task(tmp_path: Path) -> None:
 
     report = runner.audit(task)
 
-    assert report.status in {CrossAuditStatus.PASS, CrossAuditStatus.BLOCKED}
+    assert report.status is CrossAuditStatus.BLOCKED
+    assert api.calls == 0, "no se llama al modelo con el contexto incompleto"
+    assert "a\\x00b" in report.error
+    assert "\x00" not in report.error
     assert "runner.py" in report.model_visible_files
+    assert report.findings == ()

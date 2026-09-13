@@ -1,4 +1,4 @@
-"""Cliente HTTP de Anthropic sobre la Messages API nativa (ENGINE-5.3).
+"""Cliente HTTP de Anthropic sobre la Messages API nativa (ENGINE-5.2).
 
 Anthropic no habla el dialecto de OpenAI: la ruta es ``POST /v1/messages``, la credencial
 viaja en la cabecera ``x-api-key`` (no en ``Authorization``), la version del contrato se

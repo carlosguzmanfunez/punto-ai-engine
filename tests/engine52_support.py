@@ -95,7 +95,7 @@ def cross_audit_finding_payload(
     title: str = "Falta documentar el contrato de la función",
     file: str = "runner.py",
     line: int | None = 4,
-    evidence: str = "def run_user_command(command: list[str]) -> str:",
+    evidence: str = "def normalize_label(value: str) -> str:",
     description: str = "La función no documenta qué recibe ni qué devuelve.",
     recommendation: str = "Añadir una docstring con el contrato.",
     confidence: str = "HIGH",

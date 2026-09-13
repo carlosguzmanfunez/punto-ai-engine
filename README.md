@@ -26,7 +26,8 @@
 | **ENGINE-4** | **Independent QA Agent.** QA determinista más evaluación independiente, con gates que el modelo no puede anular. | ✅ Implementada |
 | **ENGINE-5** | **Security + Reviewer.** Análisis de seguridad, revisión independiente, frontera de contexto del modelo y evaluación completa de la tarea. | ✅ Implementada |
 | **ENGINE-5.2** | **Multi-Provider + Anthropic/Claude + Cross-Model Audit.** Contrato provider-neutral, `output_config` estructurado, auditoría cruzada real y fundación multimodal. | ✅ Implementada |
-| **ENGINE-5.3** | **Web + Visual Execution Foundation.** Perfil web, sandbox con Chromium real, once checks deterministas, capturas verificadas y Visual QA con gates no anulables. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
+| **ENGINE-5.3** | **Web + Visual Execution Foundation.** Perfil web, sandbox con Chromium real, once checks deterministas, capturas verificadas y Visual QA con gates no anulables. | ✅ Implementada |
+| **ENGINE-5.3.1** | **Trusted Web Evidence + Visual Completeness Hardening.** Frontera de dos contenedores para la medición, cobertura visual exigida por la especificación, aplicabilidad explícita de los checks y gates vivos de Visual QA. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -2723,7 +2724,131 @@ la imagen del sandbox).
 
 ---
 
-## 26. Licencia
+## 26. ENGINE-5.3.1 — Trusted Web Evidence + Visual Completeness Hardening
+
+Una auditoría independiente ciega y la revisión del programador en jefe dejaron ENGINE-5.3 en
+`CHANGES_REQUIRED`. Esta fase cierra los cuatro hallazgos —uno de ellos HIGH con PoC reproducido— y
+un endurecimiento de frontera. No cambia ninguna otra capa.
+
+### V53-01 — La frontera de la medición
+
+El hallazgo, reproducido con código real: el probe vivía **dentro del workspace**, así que el
+proyecto no confiable podía encontrar `.punto-web-session-*` y reescribir `capture.cjs`
+(22 161 bytes → 45) **antes** de que se ejecutara. El digest posterior demostraba que el archivo no
+había cambiado *después*, no que la medición la hubiera producido código confiable. Un adversario
+que conoce el código de PUNTO no se detiene con un nombre aleatorio ni con un glob más difícil.
+
+| | Antes (ENGINE-5.3) | Ahora (ENGINE-5.3.1) |
+| --- | --- | --- |
+| Contenedores | uno | **dos**: no confiable (proyecto + preview) y confiable (navegador + evidencia) |
+| Red | `--network none` | red **interna** del sandbox (`--internal`), sin ruta a Internet |
+| Código de medición | copiado al workspace, escribible | montado desde el host en `/opt/punto/probe` **read-only** |
+| Control (payload) | archivo en el workspace | en el mismo montaje read-only, escrito por el host |
+| Evidencia | dentro del workspace | directorio del host **fuera** del workspace, montado **solo** en el contenedor confiable |
+| Workspace en el contenedor de medición | sí | **no**: mide por HTTP, no necesita tocarlo |
+| Integridad | digest del manifiesto | digest del manifiesto **y** digest del código de medición |
+
+El contenedor no confiable ejecuta los comandos del proyecto y sirve la preview en `0.0.0.0`; el
+confiable espera a que la URL responda por la red interna, captura con Chromium y escribe la
+evidencia. El proyecto **no puede** ver el directorio de evidencia, ni escribir el probe, ni el
+control, ni fabricar el stdout del que sale el digest: son sistemas de archivos y procesos
+distintos. El endurecimiento no se degrada: los dos contenedores llevan `rootfs` de solo lectura,
+`--cap-drop ALL`, `no-new-privileges`, usuario no-root, tmpfs acotados y límites de CPU, memoria y
+PIDs.
+
+`tests/integration/test_web_trust_boundary_live.py` lo demuestra **ejecutando** un proyecto
+malicioso real que intenta los diez ataques del encargo (glob del directorio del probe, localizar y
+sobrescribir `capture.cjs` y `run_web_session.py`, modificar el control, `observations.json`,
+`diagnostics.json`, sustituir capturas, mantener un vigilante en segundo plano y falsificar los
+marcadores de digest). El propio atacante escribe el informe de lo que consiguió: no consigue
+escribir nada, la sesión sigue midiendo bien, y el host acepta únicamente los bytes de la medición
+confiable.
+
+### V53-02 — Cobertura visual exigida, no derivada
+
+La cobertura requerida se derivaba de las capturas **producidas** (`task.screenshots`), lo que hacía
+el gate tautológico: una sesión que solo midió una ruta de tres parecía completa. Ahora la fuente de
+verdad es `VisualSpec`: el producto cartesiano exacto `spec.routes x spec.viewports`, y la identidad
+de una captura es el par **(ruta, viewport)**, no su nombre de archivo.
+
+| Situación | Resultado |
+| --- | --- |
+| Falta una ruta o un viewport exigido | **BLOCKED** con los pares ausentes enumerados |
+| Artefacto sin imagen | ese par cuenta como **ausente** |
+| Imagen sin artefacto | se ignora: no puede satisfacer cobertura |
+| Par repetido | **BLOCKED** (contrato roto) |
+| Par extra que nadie pidió | se informa; no tapa un par requerido ausente y no se envía |
+
+El runner comprueba la cobertura **antes** de llamar al modelo: si falta un par, no hay llamada. Y
+el informe declara lo que el modelo recibió de verdad: `routes_analyzed`, `viewports_analyzed` y
+`screenshots_analyzed` salen de los pares realmente enviados, nunca de la cobertura ideal.
+
+### V53-03 — Gates vivos de Visual QA
+
+`tests/integration/test_anthropic_visual_live.py` define los cuatro gates que faltaban:
+
+| Gate | Qué exige |
+| --- | --- |
+| A. Autenticación | respuesta real con `PUNTO_CLAUDE_VISUAL_MODEL` (por defecto `claude-sonnet-5`), `provider=anthropic` y tokens > 0 |
+| B. Una imagen + esquema de producción | JSON parseable **sin** quitar vallas y `VisualQAProposal.model_validate` |
+| C. Varias imágenes + esquema de producción | la ruta multimodal que Visual QA usa de verdad |
+| D. Extremo a extremo limpio | `ClaudeVisualQARunner` real → `VisualQAStatus.PASS` calculado por PUNTO, con `model_calls > 0` y tokens > 0 |
+
+Sin `ANTHROPIC_API_KEY` la suite **no se ejecuta** y falla con `CREDENTIAL_REQUIRED` en lugar de
+saltarse: `LIVE VISUAL CLAUDE GATES NOT RUN — PENDING_API_KEY`.
+
+### V53-04 — No aplicable no es lo mismo que sin señal
+
+`WebCheckOutcome` distingue ahora tres estados explícitos, y la aplicabilidad la decide el contrato,
+no el modelo:
+
+| Estado | Significado | Efecto |
+| --- | --- | --- |
+| `NOT_APPLICABLE` | la sesión no exigía esa comprobación | no penaliza |
+| `PASS` / `FAIL` | aplicable y medida | verde o fallo |
+| `NO_SIGNAL` | aplicable y **no** medida | **BLOCKED** |
+
+`determine_web_status` aplica, en este orden: sin comprobaciones o sin ninguna aplicable →
+`BLOCKED`; alguna aplicable sin señal → `BLOCKED` (antes que el fallo medido: no se culpa al
+producto de una medición que no existe); alguna medida que no pasó → `FAIL`; todo lo aplicable,
+medido y verde → `PASS`. La regla de aplicabilidad está escrita por comprobación en
+`_is_applicable` (marcadores exigidos, dos o más viewports para el responsive, nota de recorte por
+captura, y «se intentó renderizar» para las de carga).
+
+### V53-05 — Enlace artefacto/imagen en la frontera
+
+`ClaudeVisualQARunner` ya no confía en la metadata del llamante: reconstruye el payload **canónico**
+desde el artefacto (`artifact.as_image_payload(payload.data)`), lo que revalida tamaño y `sha256`, y
+rechaza cualquier contradicción en `logical_name` o `media_type` **antes** de llamar al proveedor.
+Mismo tamaño con distinto hash ⇒ bloqueo sin gastar una llamada.
+
+### Evidencia adicional
+
+- El **runtime Node** se ejercita de verdad: la integración de extremo a extremo ejecuta
+  `node -e "require('fs').writeFileSync('node-ok.txt','ok')"` y comprueba el archivo, así que la
+  evidencia no depende solo de `python3`.
+- **Honestidad del gestor de paquetes**: la imagen solo trae npm/npx (y node/python3). Un proyecto
+  que declare `pnpm`, `yarn` o `bun` **no** cae en `npm` en silencio: el lanzador comprueba
+  `shutil.which(argv[0])`, imprime `PUNTO_PROGRAM_MISSING <programa>` y la sesión falla de forma
+  explícita nombrando el programa que falta.
+
+### Limitación declarada
+
+- El contenedor no confiable **puede leer** el código de medición montado (no escribirlo). Se
+  acepta: leerlo no permite falsificar la evidencia, y el digest del código se contrasta con el que
+  calcula el host.
+- La medición sigue corriendo **dentro de la página** (`page.evaluate`): una página que sobrescriba
+  `getComputedStyle` o `scrollWidth` puede falsear sus propias medidas. Es inherente a observar con
+  JavaScript en la página y por eso un `PASS` técnico no sustituye a la revisión humana.
+- Sin red en la sesión, un proyecto con dependencias no disponibles no se puede construir: sigue
+  siendo un bloqueo declarado.
+- Chromium corre con `--no-sandbox` **dentro** de su contenedor: el contenedor es la frontera real.
+- Los gates vivos de Visual QA están **definidos** y sin ejecutar: `CLAUDE VISUAL LIVE =
+  PENDING_API_KEY`.
+
+---
+
+## 27. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

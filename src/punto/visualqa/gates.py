@@ -15,6 +15,7 @@ from punto.schemas.visual import (
     VisualQAStatus,
 )
 from punto.schemas.web import WebSessionReport, WebTechnicalStatus
+from punto.visualqa.coverage import VisualCoverage
 
 
 def evaluate_provider_gate(*, responded: bool, detail: str = "") -> VisualQAGate:
@@ -32,28 +33,24 @@ def evaluate_provider_gate(*, responded: bool, detail: str = "") -> VisualQAGate
     )
 
 
-def evaluate_screenshots_gate(
-    *, required: tuple[str, ...], present: tuple[str, ...]
-) -> VisualQAGate:
-    """Gate de capturas: evaluar sin todas las capturas exigidas no es evaluar."""
-    missing = tuple(name for name in required if name not in present)
-    if missing:
-        listed = ", ".join(missing[:5])
-        suffix = "…" if len(missing) > 5 else ""
+def evaluate_screenshots_gate(coverage: VisualCoverage) -> VisualQAGate:
+    """Gate de capturas: la cobertura exigida por la especificación tiene que estar entera.
+
+    La exigencia sale de ``VisualSpec`` (producto cartesiano rutas x viewports), nunca de lo que la
+    sesión produjo: derivar lo requerido del resultado convertiría el gate en una tautología.
+    """
+    if coverage.complete:
         return VisualQAGate(
             name=VisualQAGateName.SCREENSHOTS,
-            passed=False,
-            blocking=True,
-            detail=(
-                f"faltan {len(missing)} captura(s) exigida(s) por la especificación: "
-                f"{listed}{suffix}"
-            ),
+            passed=True,
+            blocking=False,
+            detail=coverage.detail(),
         )
     return VisualQAGate(
         name=VisualQAGateName.SCREENSHOTS,
-        passed=True,
-        blocking=False,
-        detail=f"{len(required)} captura(s) disponibles para el modelo visual",
+        passed=False,
+        blocking=True,
+        detail=coverage.detail(),
     )
 
 
@@ -134,9 +131,8 @@ def evaluate_visual_gates(
     session: WebSessionReport,
     *,
     provider_responded: bool,
+    coverage: VisualCoverage,
     provider_detail: str = "",
-    required_screenshots: tuple[str, ...],
-    present_screenshots: tuple[str, ...],
     proposal_present: bool,
     blocking_findings: int,
     total_findings: int,
@@ -144,9 +140,7 @@ def evaluate_visual_gates(
     """Evalúa los cuatro gates, en orden fijo."""
     return (
         evaluate_provider_gate(responded=provider_responded, detail=provider_detail),
-        evaluate_screenshots_gate(
-            required=required_screenshots, present=present_screenshots
-        ),
+        evaluate_screenshots_gate(coverage),
         evaluate_technical_gate(session),
         evaluate_findings_gate(
             proposal_present=proposal_present,

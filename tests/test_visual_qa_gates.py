@@ -22,10 +22,12 @@ from punto.schemas.visual import (
 )
 from punto.schemas.web import (
     DEFAULT_VIEWPORTS,
+    Viewport,
     WebCheckKind,
     WebCheckOutcome,
     WebTechnicalStatus,
 )
+from punto.visualqa.coverage import VisualCoverage, evaluate_visual_coverage
 from punto.visualqa.gates import (
     determine_visual_status,
     evaluate_findings_gate,
@@ -40,6 +42,7 @@ from visual_support import (
     make_spec,
     make_visual_task,
     png_bytes,
+    screenshots_for,
     visual_finding_payload,
     visual_payload,
 )
@@ -49,6 +52,26 @@ def session_with_checks(*checks: WebCheckOutcome, **kwargs: object) -> object:
     """Sesión con los checks indicados."""
     session, _ = make_session(checks=checks, **kwargs)  # type: ignore[arg-type]
     return session
+
+
+def coverage_for(
+    routes: tuple[str, ...] = ("/",),
+    viewports: tuple[Viewport, ...] = DEFAULT_VIEWPORTS,
+    *,
+    drop: tuple[str, ...] = (),
+) -> VisualCoverage:
+    """Cobertura real: artefactos y payloads de verdad, con pares descartados si se pide.
+
+    Se construye con la especificación como fuente de verdad, igual que en producción: los pares
+    exigidos salen de ``spec.routes x spec.viewports`` y nunca de lo producido.
+    """
+    artifacts, raw = screenshots_for(routes, viewports)
+    payloads = {
+        artifact.logical_name: artifact.as_image_payload(raw[artifact.logical_name])
+        for artifact in artifacts
+        if artifact.logical_name not in drop
+    }
+    return evaluate_visual_coverage(make_spec(routes, viewports), artifacts, payloads)
 
 
 # ---------------------------------------------------------------------------
@@ -72,22 +95,30 @@ def test_provider_gate_passes_when_the_model_answers() -> None:
 
 
 def test_screenshots_gate_blocks_when_a_capture_is_missing() -> None:
-    """Evaluar sin todas las capturas exigidas no es evaluar."""
-    gate = evaluate_screenshots_gate(
-        required=("home-mobile.png", "home-desktop.png"),
-        present=("home-mobile.png",),
+    """Sin todos los pares que exige la especificación, el gate bloquea."""
+    coverage = coverage_for(
+        ("/", "/precios"),
+        DEFAULT_VIEWPORTS,
+        drop=("precios-mobile.png", "precios-tablet.png", "precios-desktop.png"),
     )
+
+    gate = evaluate_screenshots_gate(coverage)
 
     assert gate.passed is False
     assert gate.blocking is True
-    assert "home-desktop.png" in gate.detail
+    assert "/precios @ MOBILE" in gate.detail
+    assert len(coverage.missing) == 3
 
 
 def test_screenshots_gate_passes_with_every_capture() -> None:
-    """Con todas las capturas, el gate está en verde."""
-    gate = evaluate_screenshots_gate(required=("a.png",), present=("a.png",))
+    """Con todos los pares presentes, el gate está en verde."""
+    coverage = coverage_for()
+
+    gate = evaluate_screenshots_gate(coverage)
 
     assert gate.passed is True
+    assert gate.blocking is False
+    assert "3 par(es) ruta x viewport disponibles de 3 exigidos" in gate.detail
 
 
 def test_technical_gate_blocks_a_blocked_session() -> None:
@@ -119,6 +150,40 @@ def test_technical_gate_fails_a_broken_page_without_blocking() -> None:
     assert gate.passed is False
     assert gate.blocking is False
     assert "CONSOLE_ERROR" in gate.detail
+
+
+def test_a_missing_signal_blocks_the_visual_verdict() -> None:
+    """Agregación: una comprobación aplicable sin señal ⇒ sesión BLOCKED ⇒ Visual QA BLOCKED.
+
+    Es la regla que impide que Visual QA reciba un ``session.status = PASS`` habiendo una
+    comprobación obligatoria sin medir. Un Claude que responda perfectamente no cambia el hecho.
+    """
+    session, _ = make_session(
+        checks=(
+            WebCheckOutcome(
+                kind=WebCheckKind.PAGE_LOAD_ERROR,
+                applicable=True,
+                ran=True,
+                passed=True,
+                detail="la página cargó",
+            ),
+            WebCheckOutcome(
+                kind=WebCheckKind.CONSOLE_ERROR,
+                applicable=True,
+                ran=False,
+                passed=True,
+                detail="sin señal de consola",
+            ),
+        ),
+        status=WebTechnicalStatus.BLOCKED,
+        error="CONSOLE_ERROR aplicable sin señal",
+    )
+
+    gate = evaluate_technical_gate(session)  # type: ignore[arg-type]
+
+    assert gate.passed is False
+    assert gate.blocking is True, "sin medición no se puede certificar: bloquea, no pide cambios"
+    assert "BLOCKED" in gate.detail
 
 
 def test_technical_gate_passes_a_clean_session() -> None:
@@ -167,8 +232,7 @@ def visual_status(
     session: object,
     *,
     provider: bool = True,
-    required: tuple[str, ...] = ("home-mobile.png",),
-    present: tuple[str, ...] = ("home-mobile.png",),
+    coverage: VisualCoverage | None = None,
     proposal: bool = True,
     blocking: int = 0,
     total: int = 0,
@@ -177,8 +241,7 @@ def visual_status(
     gates = evaluate_visual_gates(
         session,  # type: ignore[arg-type]
         provider_responded=provider,
-        required_screenshots=required,
-        present_screenshots=present,
+        coverage=coverage if coverage is not None else coverage_for(),
         proposal_present=proposal,
         blocking_findings=blocking,
         total_findings=total,
@@ -202,17 +265,15 @@ def test_provider_unavailable_blocks() -> None:
 
 
 def test_missing_required_screenshot_blocks() -> None:
-    """Falta una captura exigida ⇒ BLOCKED."""
-    session, _ = make_session()
+    """Falta un par exigido por la especificación ⇒ BLOCKED, aunque el resto esté."""
+    session, _ = make_session(routes=("/", "/precios"))
 
-    assert (
-        visual_status(
-            session,
-            required=("a.png", "b.png"),
-            present=("a.png",),
-        )
-        is VisualQAStatus.BLOCKED
+    result = visual_status(
+        session,
+        coverage=coverage_for(("/", "/precios"), drop=("home-desktop.png",)),
     )
+
+    assert result is VisualQAStatus.BLOCKED
 
 
 @pytest.mark.parametrize(
@@ -271,8 +332,7 @@ def test_gates_have_a_fixed_order() -> None:
     gates = evaluate_visual_gates(
         session,
         provider_responded=True,
-        required_screenshots=("home-mobile.png",),
-        present_screenshots=("home-mobile.png",),
+        coverage=coverage_for(),
         proposal_present=True,
         blocking_findings=0,
         total_findings=0,

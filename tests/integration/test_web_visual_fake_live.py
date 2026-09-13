@@ -1,9 +1,10 @@
-"""Flujo de extremo a extremo web + Visual QA con navegador real y Claude falso (ENGINE-5.3 §31).
+"""Flujo de extremo a extremo web + Visual QA con navegador real y Claude falso (ENGINE-5.3).
 
-Todo es real **excepto la llamada HTTP a Anthropic**: proyecto real en el workspace, contenedor
-real, Chromium real, tres viewports reales, capturas reales verificadas, once comprobaciones
-reales, informe real, tarea real y gates reales. Lo único simulado es la respuesta del modelo
-visual, porque la fase se construyó sin `ANTHROPIC_API_KEY`.
+Todo es real **excepto la llamada HTTP a Anthropic**: proyecto real en el workspace, **dos
+contenedores reales** (el no confiable con el proyecto y su preview, el confiable con el navegador
+y la evidencia), red interna sin Internet, Chromium real, tres viewports reales, capturas reales
+verificadas, once comprobaciones reales, informe real, tarea real y gates reales. Lo único simulado
+es la respuesta del modelo visual, porque la fase se construyó sin `ANTHROPIC_API_KEY`.
 
     .\\.venv\\Scripts\\python.exe -m pytest tests/integration/test_web_visual_fake_live.py -q -s
 
@@ -72,17 +73,26 @@ EXPECTED_DIMENSIONS: dict[ViewportName, tuple[int, int]] = {
     ViewportName.DESKTOP: (1440, 900),
 }
 
-#: Preview servida en loopback dentro del contenedor (sin red externa).
+#: Preview servida por el contenedor no confiable, alcanzable desde el de medición por la red
+#: interna: escucha en ``0.0.0.0``, no en loopback.
 PREVIEW_ARGV: tuple[tuple[str, ...], ...] = (
-    ("python3", "-m", "http.server", "4173", "--bind", "127.0.0.1"),
+    ("python3", "-m", "http.server", "4173", "--bind", "0.0.0.0"),
 )
 
-#: Comando de proyecto previo a la captura: escribe dentro del workspace montado.
+#: Comandos de proyecto previos a la captura: escriben dentro del workspace montado.
+#:
+#: El segundo usa **Node** de verdad, no `python3`: así la evidencia de la integración demuestra que
+#: el runtime Node de la imagen del sandbox se ejecuta, y no solo que está declarado en el plan.
 PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
     (
         "python3",
         "-c",
         "from pathlib import Path; Path('build-ok.txt').write_text('ok', encoding='utf-8')",
+    ),
+    (
+        "node",
+        "-e",
+        "require('fs').writeFileSync('node-ok.txt', 'ok')",
     ),
 )
 
@@ -280,7 +290,9 @@ def failing_checks(report: WebSessionReport) -> str:
 @pytest.fixture(scope="module")
 def backend() -> Iterator[WebSandboxBackend]:
     """Backend real, fallando si la imagen del sandbox web no está."""
-    instance = WebSandboxBackend(limits=WebSandboxLimits(timeout_seconds=300.0))
+    instance = WebSandboxBackend(
+        limits=WebSandboxLimits(timeout_seconds=300.0, preview_timeout_seconds=30.0)
+    )
     if not instance.image_available():
         pytest.fail(
             f"{WEB_SANDBOX_REQUIRED}: la imagen del sandbox web no está disponible. "
@@ -299,6 +311,9 @@ def clean_flow(
     site = build_site(workspace, defective=False)
     run = run_session(backend, workspace, site)
     assert (site / "build-ok.txt").read_text(encoding="utf-8") == "ok"
+    assert (site / "node-ok.txt").read_text(encoding="utf-8") == "ok", (
+        "el runtime Node del sandbox tiene que ejecutarse de verdad, no solo declararse"
+    )
     assert list(workspace.glob(f"{PROBE_DIR_PREFIX}*")) == [], "quedó la carpeta del probe"
     assert_screenshot_evidence(run)
     return report_for(run), run

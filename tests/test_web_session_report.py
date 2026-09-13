@@ -35,6 +35,7 @@ from punto.schemas.web import (
     WebTechnicalStatus,
 )
 from punto.visualqa.claude import ClaudeVisualQARunner
+from punto.web.checks import build_clipping_note
 from punto.web.report import (
     build_blocked_web_session_report,
     build_web_session_report,
@@ -88,16 +89,27 @@ def observations_for(
     viewports: tuple[Viewport, ...] = DEFAULT_VIEWPORTS,
     **overrides: Any,
 ) -> WebObservations:
-    """Rectángulo completo ruta x viewport."""
+    """Rectángulo completo ruta x viewport, con la nota de recorte que emite el probe real.
+
+    La nota importa: el check de recorte es aplicable siempre, así que una sesión sin notas sería
+    «aplicable sin señal» y quedaría BLOCKED. El probe emite una por captura, incluso cuando no
+    encuentra recorte; el fixture tiene que reproducir eso para ser realista.
+    """
     items = [
         observation(route, viewport, **overrides) for route in routes for viewport in viewports
     ]
+    notes = tuple(
+        build_clipping_note(route=route, viewport=viewport.name)
+        for route in routes
+        for viewport in viewports
+    )
     return WebObservations(
         observations=tuple(items),
         runtime=(("node", "v24.21.0"), ("npm", "11.19.0"), ("playwright", "1.63.0")),
         browser="chromium 153.0.8010.12",
         playwright_version="1.63.0",
         node_version="v24.21.0",
+        notes=notes,
     )
 
 
@@ -193,7 +205,7 @@ def test_without_checks_the_session_is_blocked() -> None:
 def test_all_checks_passing_is_pass() -> None:
     """Todo lo ejecutado en verde: PASS."""
     checks = tuple(
-        WebCheckOutcome(kind=kind, ran=True, passed=True, detail="sin problemas")
+        WebCheckOutcome(kind=kind, applicable=True, ran=True, passed=True, detail="sin problemas")
         for kind in WebCheckKind
     )
 
@@ -222,19 +234,64 @@ def test_a_failed_check_is_fail_not_blocked() -> None:
     assert any("HORIZONTAL_OVERFLOW" in reason for reason in reasons)
 
 
-def test_a_check_without_signal_does_not_suspend_the_session() -> None:
-    """Sin señal no hay veredicto: la comprobación no ejecutada se informa, no se inventa."""
+def test_a_check_without_signal_that_applies_blocks_the_session() -> None:
+    """Aplicable sin señal ⇒ BLOCKED: PUNTO exigía medirlo y no lo midió.
+
+    Es la regla que distingue «no aplica» de «debía medirse y no hay señal». La primera no
+    penaliza; la segunda no puede acabar en PASS, y además bloquea en lugar de suspender, porque
+    culpar al producto de una medición inexistente sería tan incorrecto como aprobarlo.
+    """
     checks = (
         WebCheckOutcome(
-            kind=WebCheckKind.VIEWPORT_CLIPPING, ran=False, passed=True, detail="sin señal"
+            kind=WebCheckKind.VIEWPORT_CLIPPING,
+            applicable=True,
+            ran=False,
+            passed=True,
+            detail="sin señal",
         ),
-        WebCheckOutcome(kind=WebCheckKind.CONSOLE_ERROR, ran=True, passed=True),
+        WebCheckOutcome(
+            kind=WebCheckKind.CONSOLE_ERROR, applicable=True, ran=True, passed=True
+        ),
+    )
+
+    status, reasons = determine_web_status(checks)
+
+    assert status is WebTechnicalStatus.BLOCKED
+    assert any("VIEWPORT_CLIPPING" in reason for reason in reasons)
+
+
+def test_a_check_that_does_not_apply_does_not_penalize() -> None:
+    """No aplicable no penaliza: no se exige lo que la sesión no pedía."""
+    checks = (
+        WebCheckOutcome(
+            kind=WebCheckKind.MISSING_REQUIRED_ELEMENT,
+            applicable=False,
+            ran=False,
+            passed=True,
+            detail="la especificación no exige marcadores",
+        ),
+        WebCheckOutcome(
+            kind=WebCheckKind.CONSOLE_ERROR, applicable=True, ran=True, passed=True
+        ),
     )
 
     status, reasons = determine_web_status(checks)
 
     assert status is WebTechnicalStatus.PASS
-    assert any("VIEWPORT_CLIPPING" in reason for reason in reasons)
+    assert any("no aplicable" in reason for reason in reasons)
+
+
+def test_no_applicable_check_is_not_a_pass() -> None:
+    """Si nada aplica, tampoco hay veredicto: BLOCKED."""
+    checks = tuple(
+        WebCheckOutcome(kind=kind, applicable=False, ran=False, passed=True)
+        for kind in WebCheckKind
+    )
+
+    status, reasons = determine_web_status(checks)
+
+    assert status is WebTechnicalStatus.BLOCKED
+    assert "ninguna" in reasons[0]
 
 
 # ---------------------------------------------------------------------------

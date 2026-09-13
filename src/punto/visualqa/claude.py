@@ -28,7 +28,6 @@ from punto.providers.base import (
     PROVIDER_ANTHROPIC,
     ImageLimits,
     ImagePayload,
-    ImageValidationError,
     ModelCompletion,
     ProviderAuthenticationError,
     ProviderError,
@@ -43,8 +42,10 @@ from punto.schemas.visual import (
     VisualQAStatus,
     VisualQATask,
 )
+from punto.schemas.web import ViewportName
 from punto.tools.errors import PlanningLimitExceededError, VisualQAError
 from punto.visualqa.base import VisualQALimits, VisualQARunner
+from punto.visualqa.coverage import VisualCoverage, evaluate_visual_coverage
 from punto.visualqa.gates import determine_visual_status, evaluate_visual_gates
 from punto.visualqa.prompts import (
     VISUAL_FORMAT_REMINDER,
@@ -69,6 +70,7 @@ BLOCKED_VISUAL_PROVIDER_REFUSAL: str = "PROVIDER_REFUSAL"
 BLOCKED_VISUAL_PROVIDER_ERROR: str = "PROVIDER_ERROR"
 BLOCKED_VISUAL_IMAGES: str = "VISUAL_IMAGE_BUDGET_EXCEEDED"
 BLOCKED_VISUAL_SCHEMA: str = "VISUAL_SCHEMA_INVALID"
+BLOCKED_VISUAL_COVERAGE: str = "VISUAL_COVERAGE_INCOMPLETE"
 
 
 def _bullets(items: Sequence[str]) -> str:
@@ -145,9 +147,18 @@ class ClaudeVisualQARunner(VisualQARunner):
     ) -> VisualQAReport:
         """Evalúa la interfaz y calcula el veredicto.
 
-        Nunca lanza por un fallo de la evaluación: lo traduce a un ``VisualQAReport``. Los gates
-        se evalúan **siempre**, incluso si el proveedor falla: un Claude caído no convierte una
-        página rota en un PASS.
+        El orden importa y no es negociable:
+
+        1. la cobertura se calcula contra la **especificación**, no contra lo producido;
+        2. si falta un par exigido, no se llama al modelo: evaluar una parte y presentarla como el
+           todo sería exactamente el fallo que esta fase cierra;
+        3. los payloads que viajan son los **canónicos**, reconstruidos desde el artefacto;
+        4. el veredicto lo calculan los gates de PUNTO, y el modelo no puede anular un hecho
+           determinista.
+
+        Nunca lanza por un fallo de la evaluación: lo traduce a un ``VisualQAReport``. Los gates se
+        evalúan **siempre**, incluso si el proveedor falla: un Claude caído no convierte una página
+        rota en un PASS.
         """
         started_at = utc_now()
         usage = ModelUsage()
@@ -159,52 +170,49 @@ class ClaudeVisualQARunner(VisualQARunner):
         proposal_missing = False
         provider_responded = False
 
-        required = tuple(
-            artifact.logical_name for artifact in task.screenshots
-        )
-        sent = tuple(
-            name for name in required if name in screenshots
+        coverage = evaluate_visual_coverage(
+            task.spec, task.session.screenshots, screenshots
         )
 
-        self._audit_request_started(task, required)
+        self._audit_request_started(task, coverage)
 
-        #: Capturas que de verdad se analizaron. Si el presupuesto de imágenes aborta antes de
-        #: construir la petición, no se analizó ninguna: informar de nueve sería mentir.
-        analyzed = sent
         try:
-            self._assert_image_budget(required)
+            self._assert_image_budget(coverage)
         except VisualQAError as exc:
             proposal_missing = True
             error = str(exc)
-            analyzed = ()
         else:
-            try:
-                (
-                    proposal,
-                    attempts,
-                    model_calls,
-                    usage,
-                    provider_responded,
-                ) = self._obtain_proposal(task, screenshots, usage, model_calls)
-            except PlanningLimitExceededError as exc:
+            if not coverage.complete:
                 proposal_missing = True
-                error = self._safe(str(exc))
-            except ProviderAuthenticationError as exc:
-                proposal_missing = True
-                error = f"{BLOCKED_VISUAL_PROVIDER_UNAVAILABLE}: {self._safe(str(exc))}"
-            except ProviderRefusalError as exc:
-                proposal_missing = True
-                error = f"{BLOCKED_VISUAL_PROVIDER_REFUSAL}: {self._safe(str(exc))}"
-            except ProviderError as exc:
-                proposal_missing = True
-                error = f"{BLOCKED_VISUAL_PROVIDER_ERROR}: {self._safe(str(exc))}"
-            except SchemaValidationError as exc:
-                proposal_missing = True
-                error = f"{BLOCKED_VISUAL_SCHEMA}: {self._safe(str(exc))}"
-            except VisualQAProposalError as exc:
-                proposal_missing = True
-                violations = self._safe_violations(exc.violations)
-                error = self._safe(str(exc))
+                error = f"{BLOCKED_VISUAL_COVERAGE}: {coverage.detail()}"
+            else:
+                try:
+                    (
+                        proposal,
+                        attempts,
+                        model_calls,
+                        usage,
+                        provider_responded,
+                    ) = self._obtain_proposal(task, coverage, usage, model_calls)
+                except PlanningLimitExceededError as exc:
+                    proposal_missing = True
+                    error = self._safe(str(exc))
+                except ProviderAuthenticationError as exc:
+                    proposal_missing = True
+                    error = f"{BLOCKED_VISUAL_PROVIDER_UNAVAILABLE}: {self._safe(str(exc))}"
+                except ProviderRefusalError as exc:
+                    proposal_missing = True
+                    error = f"{BLOCKED_VISUAL_PROVIDER_REFUSAL}: {self._safe(str(exc))}"
+                except ProviderError as exc:
+                    proposal_missing = True
+                    error = f"{BLOCKED_VISUAL_PROVIDER_ERROR}: {self._safe(str(exc))}"
+                except SchemaValidationError as exc:
+                    proposal_missing = True
+                    error = f"{BLOCKED_VISUAL_SCHEMA}: {self._safe(str(exc))}"
+                except VisualQAProposalError as exc:
+                    proposal_missing = True
+                    violations = self._safe_violations(exc.violations)
+                    error = self._safe(str(exc))
 
         findings = () if proposal is None else proposal.findings
         blocking = sum(1 for finding in findings if finding.blocks)
@@ -213,8 +221,7 @@ class ClaudeVisualQARunner(VisualQARunner):
             task.session,
             provider_responded=provider_responded,
             provider_detail=error if not provider_responded else "",
-            required_screenshots=required,
-            present_screenshots=sent,
+            coverage=coverage,
             proposal_present=proposal is not None,
             blocking_findings=blocking,
             total_findings=len(findings),
@@ -225,7 +232,12 @@ class ClaudeVisualQARunner(VisualQARunner):
             status=status,
             gates=gates,
             proposal=proposal,
-            screenshots=analyzed,
+            coverage=coverage,
+            sent=(
+                tuple(key for key, _ in coverage.expected_payloads)
+                if provider_responded
+                else ()
+            ),
             reasons=reasons,
             error=error if proposal_missing else "",
             violations=violations,
@@ -238,37 +250,40 @@ class ClaudeVisualQARunner(VisualQARunner):
         return report
 
     # ------------------------------------------------------------- presupuesto
-    def _assert_image_budget(self, names: tuple[str, ...]) -> None:
+    def _assert_image_budget(self, coverage: VisualCoverage) -> None:
         """Comprueba el presupuesto de imágenes **antes** de construir la petición.
 
-        Raises:
-            VisualQAError: si se piden más capturas de las que el contrato multimodal admite o
-                si alguna supera el tamaño permitido.
-        """
-        if not names:
-            raise VisualQAError(
-                f"{BLOCKED_VISUAL_IMAGES}: la sesión no produjo ninguna captura que enviar"
-            )
-        if len(names) > self._image_limits.max_images:
-            raise VisualQAError(
-                f"{BLOCKED_VISUAL_IMAGES}: se exigen {len(names)} capturas y el contrato "
-                f"multimodal admite {self._image_limits.max_images}: no se evalúa una parte "
-                "haciéndola pasar por el todo"
-            )
+        El presupuesto se mide sobre lo que la especificación **exige**, no sobre lo que hay: una
+        cobertura que no cabe en el contrato multimodal es un bloqueo declarado, no una excusa para
+        enviar la mitad.
 
+        Raises:
+            VisualQAError: si se exigen más capturas de las que el contrato multimodal admite o si
+                la sesión no produjo ninguna.
+        """
+        if not coverage.expected:
+            raise VisualQAError(
+                f"{BLOCKED_VISUAL_IMAGES}: la especificación visual no declara rutas ni viewports"
+            )
+        if len(coverage.expected) > self._image_limits.max_images:
+            raise VisualQAError(
+                f"{BLOCKED_VISUAL_IMAGES}: la especificación exige {len(coverage.expected)} "
+                f"capturas y el contrato multimodal admite {self._image_limits.max_images}: no se "
+                "evalúa una parte haciéndola pasar por el todo"
+            )
     # ------------------------------------------------------------------ propuesta
     def _obtain_proposal(
         self,
         task: VisualQATask,
-        screenshots: Mapping[str, ImagePayload],
+        coverage: VisualCoverage,
         usage: ModelUsage,
         model_calls: int,
     ) -> tuple[VisualQAProposal, int, int, ModelUsage, bool]:
         """Pide la propuesta visual y la valida, con reparación acotada."""
-        images = self._collect_images(task, screenshots)
+        images = coverage.images
         names = frozenset(image.logical_name for image in images)
         check_kinds = frozenset(check.kind.value for check in task.session.checks)
-        prompt = self._user_prompt(task, images)
+        prompt = self._user_prompt(task, coverage)
         violations: tuple[str, ...] = ()
 
         for attempt in range(1, self._limits.max_attempts + 1):
@@ -314,28 +329,6 @@ class ClaudeVisualQARunner(VisualQARunner):
 
         raise VisualQAProposalError(violations)
 
-    def _collect_images(
-        self, task: VisualQATask, screenshots: Mapping[str, ImagePayload]
-    ) -> tuple[ImagePayload, ...]:
-        """Reúne las imágenes en el orden de la sesión, sin aceptar rutas ni nombres libres."""
-        images: list[ImagePayload] = []
-        for artifact in task.screenshots:
-            payload = screenshots.get(artifact.logical_name)
-            if payload is None:
-                continue
-            if payload.logical_name != artifact.logical_name:
-                raise ImageValidationError(
-                    f"la imagen {payload.logical_name!r} no corresponde al artefacto "
-                    f"{artifact.logical_name!r}"
-                )
-            if payload.size_bytes != artifact.bytes:
-                raise ImageValidationError(
-                    f"la imagen {artifact.logical_name!r} ocupa {payload.size_bytes} y el "
-                    f"artefacto declara {artifact.bytes}"
-                )
-            images.append(payload)
-        return tuple(images)
-
     # ------------------------------------------------------------------ modelo
     def _call_model(
         self,
@@ -373,15 +366,19 @@ class ClaudeVisualQARunner(VisualQARunner):
                 self._limits.max_output_tokens,
             )
 
-    def _user_prompt(
-        self, task: VisualQATask, images: tuple[ImagePayload, ...]
-    ) -> str:
-        """Petición visual: especificación, hechos medidos y el orden exacto de las capturas."""
+    def _user_prompt(self, task: VisualQATask, coverage: VisualCoverage) -> str:
+        """Petición visual: especificación, hechos medidos y el orden exacto de las capturas.
+
+        Cada captura viaja identificada por su par **(ruta, viewport)**, no solo por su nombre de
+        archivo: el nombre es cosmético y el par es lo que el modelo necesita para no confundir dos
+        capturas distintas de la misma ruta.
+        """
         spec = task.spec
         session = task.session
         screenshot_lines = [
-            f"- {image.logical_name} ({image.media_type}, {image.size_bytes} bytes)"
-            for image in images
+            f"- {payload.logical_name} ({route} @ {viewport.value}, {payload.media_type}, "
+            f"{payload.size_bytes} bytes)"
+            for (route, viewport), payload in coverage.expected_payloads
         ]
         return VISUAL_USER_TEMPLATE.format(
             format_reminder=VISUAL_FORMAT_REMINDER,
@@ -405,8 +402,7 @@ class ClaudeVisualQARunner(VisualQARunner):
             screenshots=_bullets(tuple(screenshot_lines)),
             checks=_bullets(
                 tuple(
-                    f"{check.kind.value}: {'PASS' if check.passed else 'FAIL'}"
-                    f"{'' if check.ran else ' (no ejecutada)'} — {check.detail}"
+                    f"{check.kind.value}: {check.state} — {check.detail}"
                     for check in session.checks
                 )
             ),
@@ -466,7 +462,8 @@ class ClaudeVisualQARunner(VisualQARunner):
         status: VisualQAStatus,
         gates: tuple[VisualQAGate, ...],
         proposal: VisualQAProposal | None,
-        screenshots: tuple[str, ...],
+        coverage: VisualCoverage,
+        sent: tuple[tuple[str, ViewportName], ...],
         reasons: tuple[str, ...],
         error: str,
         violations: tuple[str, ...],
@@ -475,12 +472,26 @@ class ClaudeVisualQARunner(VisualQARunner):
         usage: ModelUsage,
         started_at: datetime,
     ) -> VisualQAReport:
-        """Compone el informe de Visual QA."""
+        """Compone el informe de Visual QA.
+
+        ``routes_analyzed``, ``viewports_analyzed`` y ``screenshots_analyzed`` describen **lo que el
+        modelo recibió de verdad**, nunca la cobertura ideal de la especificación: informar de una
+        ruta que Claude no vio sería convertir un informe en un deseo.
+        """
         findings = () if proposal is None else proposal.findings
+        sent_set = set(sent)
+        analyzed_routes = tuple(dict.fromkeys(route for route, _ in sent))
+        analyzed_viewports = tuple(dict.fromkeys(viewport.value for _, viewport in sent))
+        analyzed_names = tuple(
+            payload.logical_name
+            for key, payload in coverage.expected_payloads
+            if key in sent_set
+        )
         summary_parts = [
             f"Visual QA {status.value}: {len(gates)} gate(s)",
             f"{len(findings)} hallazgo(s) visual(es)",
-            f"{len(screenshots)} captura(s) analizada(s)",
+            f"cobertura {len(coverage.present)}/{len(coverage.expected)} par(es) ruta x viewport",
+            f"{len(analyzed_names)} captura(s) enviada(s) al modelo",
             f"provider={self.provider} model={self.model}",
         ]
         if reasons:
@@ -504,11 +515,9 @@ class ClaudeVisualQARunner(VisualQARunner):
                 "" if proposal is None else proposal.accessibility_assessment
             ),
             recommendation_notes="" if proposal is None else proposal.recommendation_notes,
-            screenshots_analyzed=screenshots,
-            routes_analyzed=task.spec.routes,
-            viewports_analyzed=tuple(
-                viewport.name.value for viewport in task.spec.viewports
-            ),
+            screenshots_analyzed=analyzed_names,
+            routes_analyzed=analyzed_routes,
+            viewports_analyzed=analyzed_viewports,
             provider=self.provider,
             model=self.model,
             prompt_version=self.prompt_version,
@@ -522,7 +531,7 @@ class ClaudeVisualQARunner(VisualQARunner):
 
     # --------------------------------------------------------------- auditoría
     def _audit_request_started(
-        self, task: VisualQATask, required: tuple[str, ...]
+        self, task: VisualQATask, coverage: VisualCoverage
     ) -> None:
         if self._audit is None:
             return
@@ -534,7 +543,7 @@ class ClaudeVisualQARunner(VisualQARunner):
             prompt_version=self.prompt_version,
             routes=list(task.spec.routes),
             viewports=[viewport.name.value for viewport in task.spec.viewports],
-            screenshots=len(required),
+            screenshots=len(coverage.present),
         )
 
     def _audit_proposal_received(

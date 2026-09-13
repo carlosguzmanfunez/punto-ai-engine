@@ -269,6 +269,13 @@ class WebCheckOutcome(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: WebCheckKind = Field(..., description="Comprobación evaluada.")
+    applicable: bool = Field(
+        default=True,
+        description=(
+            "True si la especificación de esta sesión exigía la comprobación. Una comprobación "
+            "no aplicable no penaliza el veredicto; una aplicable sin señal lo bloquea."
+        ),
+    )
     ran: bool = Field(default=True, description="True si la comprobación llegó a ejecutarse.")
     passed: bool = Field(default=True, description="True si no encontró problemas bloqueantes.")
     blocking: bool = Field(
@@ -276,6 +283,35 @@ class WebCheckOutcome(BaseModel):
     )
     detail: str = Field(default="", description="Motivo determinista del resultado.")
     findings: int = Field(default=0, ge=0, description="Problemas encontrados.")
+
+    @property
+    def measured(self) -> bool:
+        """True si la comprobación aplicaba y además se midió."""
+        return self.applicable and self.ran
+
+    @property
+    def no_signal(self) -> bool:
+        """True si la comprobación aplicaba pero no hubo señal: no se puede dar PASS.
+
+        Es la distinción que exige esta fase: **no aplicable** y **aplicable sin señal** no son lo
+        mismo. Lo primero no penaliza; lo segundo significa que PUNTO no pudo medir algo que sí
+        exigía, así que no puede certificar nada.
+        """
+        return self.applicable and not self.ran
+
+    @property
+    def not_applicable(self) -> bool:
+        """True si la comprobación no aplicaba a esta sesión."""
+        return not self.applicable
+
+    @property
+    def state(self) -> str:
+        """Estado legible de la comprobación, sin ambigüedad."""
+        if self.not_applicable:
+            return "NOT_APPLICABLE"
+        if self.no_signal:
+            return "NO_SIGNAL"
+        return "PASS" if self.passed else "FAIL"
 
 
 class WebFinding(BaseModel):
@@ -494,15 +530,27 @@ class WebSessionReport(BaseModel):
 
     @property
     def blocking_checks(self) -> tuple[WebCheckOutcome, ...]:
-        """Comprobaciones que impiden el PASS técnico."""
+        """Comprobaciones aplicables que impiden el PASS técnico."""
         return tuple(
-            check for check in self.checks if check.ran and not check.passed and check.blocking
+            check
+            for check in self.checks
+            if check.measured and not check.passed and check.blocking
         )
 
     @property
     def failed_checks(self) -> tuple[WebCheckOutcome, ...]:
-        """Comprobaciones que no pasaron, bloqueen o no."""
-        return tuple(check for check in self.checks if check.ran and not check.passed)
+        """Comprobaciones aplicables que no pasaron, bloqueen o no."""
+        return tuple(check for check in self.checks if check.measured and not check.passed)
+
+    @property
+    def no_signal_checks(self) -> tuple[WebCheckOutcome, ...]:
+        """Comprobaciones que la sesión exigía y que no llegaron a medirse."""
+        return tuple(check for check in self.checks if check.no_signal)
+
+    @property
+    def not_applicable_checks(self) -> tuple[WebCheckOutcome, ...]:
+        """Comprobaciones que no aplicaban a esta sesión."""
+        return tuple(check for check in self.checks if check.not_applicable)
 
     def command(self, kind: WebCommandKind) -> WebCommandResult | None:
         """Resultado de una acción, o ``None`` si no se ejecutó."""

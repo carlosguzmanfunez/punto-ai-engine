@@ -1,39 +1,60 @@
 #!/usr/bin/env python3
-"""Probe de sesión web: orquesta un navegador real DENTRO del sandbox (ENGINE-5.3).
+"""Probe de medición confiable: navegador real sobre la preview (ENGINE-5.3).
 
-Este archivo corre **dentro** del contenedor ``localhost/punto-sandbox-web:0.1``, invocado por
-``punto.web.sandbox.WebSandboxBackend``. Solo usa la biblioteca estándar: la imagen del sandbox no
-instala el paquete ``punto``, y el probe **no debe** confiar en código que viene del host.
+Este archivo corre **dentro** del contenedor confiable de medición, invocado por
+``punto.web.sandbox.WebSandboxBackend`` como
+``python3 /opt/punto/probe/run_web_session.py --payload /opt/punto/probe/measure-payload.json``.
+Solo usa la biblioteca estándar: la imagen no instala el paquete ``punto``, y el probe **no debe**
+confiar en código que venga del proyecto auditado.
+
+Por qué este contenedor está separado del que ejecuta el proyecto
+---------------------------------------------------------------
+La auditoría de ENGINE-5.3 demostró que un solo contenedor era un fallo HIGH: el probe de medición
+(``run_web_session.py`` + ``capture.cjs``) vivía **copiado dentro del workspace montado rw**, así
+que el proyecto no confiable podía localizar ``.punto-web-session-*`` y reescribir ``capture.cjs``
+antes de que se ejecutara; la medición habría sido la que el proyecto quisiera. Aquí el código de
+medición llega por un montaje de **solo lectura** (``/opt/punto/probe``), el directorio de evidencia
+está **fuera del workspace** y la preview se alcanza por la red interna. Nada de este contenedor
+ejecuta comandos del proyecto: eso es de ``run_preview.py``, en la zona no confiable.
 
 Responsabilidades, en orden:
 
-1. leer el *payload* (``--payload <ruta>`` o ``stdin``) con la petición de sesión;
+1. leer el *payload* (``--payload <ruta>`` o ``stdin``) con la petición de medición;
 2. imprimir las versiones **reales** del entorno (``node --version``, ``npm --version``,
    ``python3 --version`` y la de Playwright), leídas de un subproceso;
-3. ejecutar los comandos de proyecto recibidos (siempre listas de argv, ``shell=False``, con
-   timeout por comando y salida acotada);
-4. arrancar el servidor de preview en segundo plano, esperar a que **escuche** en 127.0.0.1
-   (sondeo con ``socket`` y timeout explícito) y, si no arranca, reportarlo como bloqueo;
-5. invocar ``capture.cjs`` con ``node`` para cada viewport y guardar los PNG en la carpeta de
-   salida del workspace;
-6. validar cada PNG en Python (firma + dimensiones de la cabecera IHDR) y anotar **tamaño y
-   sha256 calculados aquí**, de modo que el host pueda verificar los bytes sin confiar en el
-   probe;
-7. escribir ``observations.json`` con la forma exacta de ``WebObservations``
-   (``punto/schemas/web.py``, campos en snake_case) y terminar la preview limpiamente.
+3. esperar con reintentos a que ``base_url + route`` responda (cualquier código HTTP cuenta, también
+   404: la ruta la juzga el host, no este probe) dentro de ``preview_timeout_seconds``;
+4. invocar ``/opt/punto/probe/capture.cjs`` con ``node`` para cada viewport y guardar los PNG en el
+   directorio de evidencia;
+5. validar cada PNG en Python (firma + dimensiones de la cabecera IHDR) y anotar **tamaño y sha256
+   calculados aquí**, de modo que el host pueda verificar los bytes sin confiar en el probe;
+6. escribir ``observations.json`` con la forma exacta de ``WebObservations``
+   (``punto/schemas/web.py``, campos en snake_case) y ``diagnostics.json`` con el manifiesto;
+7. publicar por stdout el sha256 de ``diagnostics.json`` y el sha256 del **código de medición**
+   (``run_web_session.py`` seguido de ``capture.cjs``), para que el host pueda demostrar que el
+   código que midió es el que él montó.
 
-Contrato de salida, dentro de la carpeta de salida:
+Contrato de salida, dentro de ``output_dir`` (montaje del host, fuera del workspace):
 
-- ``observations.json``: forma exacta de ``WebObservations``. Solo se escribe si la sesión
-  terminó bien (exit 0): el host no acepta observaciones parciales como si fueran completas.
-- ``diagnostics.json``: se escribe **siempre**, incluso al fallar. Lleva versiones, comandos,
-  salida acotada de la preview, resultado de cada captura y el manifiesto de screenshots
-  (nombre, ruta lógica, viewport, dimensiones, bytes y sha256).
+- ``observations.json``: forma exacta de ``WebObservations``. Solo se escribe si la sesión terminó
+  bien (exit 0): el host no acepta observaciones parciales como si fueran completas.
+- ``diagnostics.json``: se escribe **siempre**, incluso al fallar. Lleva versiones, el resultado de
+  cada captura, notas y el manifiesto de screenshots (nombre, ruta lógica, viewport, dimensiones,
+  bytes y sha256).
 - ``screenshots/<nombre>.png``: los PNG capturados.
 
-Códigos de salida: 0 correcto, 2 el proyecto no arrancó, 3 el navegador falló, 4 payload
-inválido. Nunca se deja un proceso hijo vivo: la preview se termina (SIGTERM y, si hace falta,
-SIGKILL a su grupo de procesos) en un bloque ``finally``.
+Marcadores de stdout: ``PUNTO_EVIDENCE_SHA256 <sha256 de diagnostics.json>`` (no se imprime si no
+hay diagnóstico escrito) y ``PUNTO_PROBE_SHA256 <sha256 del código de medición>`` (se imprime
+siempre que se pueda leer el código). El stdout del proceso no lo puede reescribir el proyecto, así
+que el host puede comparar lo publicado con lo que relee.
+
+Códigos de salida: 0 correcto, 2 la preview no respondió, 3 el navegador o la evidencia fallaron, 4
+payload inválido. No se usa el 5 del contenedor no confiable: aquí no se ejecuta ningún programa del
+proyecto, así que un ``node`` ausente es un fallo de este entorno de medición (3), no un programa
+pedido por el payload.
+
+Nunca se escribe nada en ``/workspace``: la evidencia va a ``output_dir`` y los temporales al
+``/tmp`` del contenedor.
 
 Límites: se repiten aquí los máximos del contrato porque este archivo no puede importarlos
 (``punto`` no existe en la imagen). Si el contrato cambia, estos números cambian con él:
@@ -46,22 +67,30 @@ import argparse
 import contextlib
 import hashlib
 import json
-import os
-import signal
-import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-#: Raíz del workspace montado por el backend del host (bind mount).
+#: Workspace del proyecto. En este contenedor **no se monta** y no se escribe nunca en él: se
+#: declara solo para poder *prohibir* un ``output_dir`` que cayera dentro (sería devolver la
+#: evidencia —y con ella la medición— al filesystem que controla el proyecto no confiable).
 WORKSPACE = Path("/workspace")
 
-#: Directorio de este probe (donde vive también ``capture.cjs``).
-PROBE_DIR = Path(__file__).resolve().parent
+#: Montaje de solo lectura con el código de medición dentro del contenedor confiable. El contrato lo
+#: fija en ``/opt/punto/probe``; si esa ruta no existe (pruebas fuera del contenedor) se usa el
+#: directorio real del script, que es de donde el intérprete cargó estos mismos bytes.
+CONTRACT_PROBE_DIR = Path("/opt/punto/probe")
+PROBE_DIR = (
+    CONTRACT_PROBE_DIR
+    if (CONTRACT_PROBE_DIR / "capture.cjs").is_file()
+    else Path(__file__).resolve().parent
+)
+SELF_PATH = PROBE_DIR / "run_web_session.py"
 CAPTURE_SCRIPT = PROBE_DIR / "capture.cjs"
 
 #: Códigos de salida.
@@ -83,9 +112,14 @@ MAX_VIEWPORTS = 8
 #: publicado con el archivo que lee: si alguien manipuló el manifiesto después, no coinciden.
 EVIDENCE_DIGEST_MARKER = "PUNTO_EVIDENCE_SHA256"
 
-#: Acotado de la salida de los comandos y de la bitácora de la preview.
+#: Marca con la que publica el sha256 del **código de medición** (este archivo + ``capture.cjs``).
+#: El host recalcula el mismo hash sobre los ficheros que monta: sirve para demostrar que el código
+#: que midió no cambió dentro del contenedor. La concatenación es ``run_web_session.py`` y después
+#: ``capture.cjs``, sin separador; cualquier otro orden daría un hash distinto.
+PROBE_DIGEST_MARKER = "PUNTO_PROBE_SHA256"
+
+#: Acotado de la salida de los comandos de captura que se anota en el diagnóstico.
 MAX_COMMAND_OUTPUT_CHARS = 4000
-MAX_PREVIEW_LOG_CHARS = 4000
 
 #: Firma de un PNG (los ocho primeros bytes de todo PNG válido).
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -149,6 +183,22 @@ def _as_positive_int(value: object) -> int:
     return number if number is not None and number > 0 else 0
 
 
+def _seconds(value: object, field: str, default: float) -> float:
+    """Segundos positivos del payload; ausente usa el valor por defecto.
+
+    Un valor presente pero inválido es un payload inválido (exit 4), no un fallo del proyecto:
+    mezclarlos haría que el informe culpara a quien no es.
+
+    Raises:
+        ValueError: si el valor está presente y no es un número positivo.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{field} debe ser un número positivo")
+    return float(value)
+
+
 # ---------------------------------------------------------------------------
 # Versiones reales del entorno
 # ---------------------------------------------------------------------------
@@ -204,43 +254,57 @@ def _read_payload(path: str) -> dict[str, Any]:
     return data
 
 
-def _workspace_path(value: object, field: str) -> Path:
-    """Resuelve una ruta relativa al workspace y comprueba que no escape.
+def _output_dir(value: object) -> Path:
+    """Valida el directorio de evidencia: absoluto, y **fuera** del workspace del proyecto.
+
+    Por qué se rechaza el workspace: la evidencia la escribe este contenedor, que no comparte
+    filesystem con el proyecto. Aceptar una ruta dentro de ``/workspace`` devolvería los PNG, el
+    manifiesto y el propio ``capture.cjs`` al filesystem que controla el proyecto no confiable, que
+    es exactamente el fallo HIGH que esta separación viene a cerrar.
 
     Raises:
-        ValueError: si la ruta está vacía, es absoluta o sale del workspace.
+        ValueError: si la ruta falta, es relativa, es la raíz o cae dentro del workspace.
     """
-    text = str(value or "").strip().replace("\\", "/")
+    text = str(value or "").strip()
     if not text:
-        raise ValueError(f"{field} vacío")
+        raise ValueError("output_dir vacío")
     candidate = Path(text)
-    if candidate.is_absolute():
-        raise ValueError(f"{field} debe ser relativo al workspace")
-    resolved = (WORKSPACE / candidate).resolve()
-    if not resolved.is_relative_to(WORKSPACE):
-        raise ValueError(f"{field} escapa del workspace")
+    if not candidate.is_absolute():
+        raise ValueError("output_dir debe ser una ruta absoluta")
+    resolved = candidate.resolve()
+    if resolved == WORKSPACE or resolved.is_relative_to(WORKSPACE):
+        raise ValueError("output_dir no puede estar dentro del workspace del proyecto")
+    if resolved.parent == resolved:
+        raise ValueError("output_dir no puede ser la raíz del sistema de archivos")
     return resolved
 
 
-def _normalize_argv(value: object, field: str) -> list[str]:
-    """Valida que un comando sea una lista no vacía de cadenas no vacías."""
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{field} debe ser una lista no vacía de argumentos")
-    argv: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError(f"{field} debe contener cadenas no vacías")
-        argv.append(item)
-    return argv
+def _normalize_route(value: object) -> str:
+    """Ruta lógica a medir, siempre empezando por ``/``.
+
+    La URL de la preview se compone como ``base_url + route``; una ruta vacía dejaría la URL sin
+    camino, y el host fija la base (aquí no se aceptan URLs completas en ``route``).
+    """
+    text = str(value or "").strip() or "/"
+    return text if text.startswith("/") else f"/{text}"
 
 
-def _normalize_argv_list(value: object, field: str) -> list[list[str]]:
-    """Valida una lista de comandos."""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"{field} debe ser una lista de comandos")
-    return [_normalize_argv(item, f"{field}[{index}]") for index, item in enumerate(value)]
+def _base_url(value: object) -> str:
+    """URL base de la preview, servida por el OTRO contenedor por la red interna.
+
+    Se exige esquema http(s) y host: la medición tiene que apuntar a un servicio concreto, y este
+    contenedor no tiene salida a Internet, así que no hay destino externo legítimo posible.
+
+    Raises:
+        ValueError: si falta, no es una URL con host o usa otro esquema.
+    """
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        raise ValueError("base_url vacío")
+    parts = urllib.parse.urlsplit(text)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("base_url debe ser una URL http(s) con host")
+    return text
 
 
 def _normalize_viewports(value: object) -> list[dict[str, Any]]:
@@ -287,7 +351,44 @@ def _screenshot_name(route: str, viewport_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Comandos de proyecto y preview
+# Preview remota: espera de disponibilidad
+# ---------------------------------------------------------------------------
+def _http_status(url: str, timeout: float = 10.0) -> int | None:
+    """Código HTTP de la preview, o ``None`` si no hubo respuesta.
+
+    La URL es ``base_url + route`` del payload y apunta al contenedor de preview por la red interna;
+    este contenedor no tiene salida a Internet, así que no hay destino externo posible.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _wait_for_preview(url: str, timeout: float) -> int | None:
+    """Espera con reintentos a que la preview responda, hasta agotar el timeout.
+
+    Cualquier código HTTP cuenta como respuesta, incluso 404: este contenedor mide la aplicación,
+    no valida rutas, y un 404 es un hecho que ``capture.cjs`` registrará y el host juzgará. Se
+    reintenta porque el contenedor de preview puede tardar en aceptar conexiones aunque ya haya
+    publicado ``PUNTO_PREVIEW_READY``.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        status = _http_status(url, timeout=max(0.5, min(5.0, remaining)))
+        if status is not None:
+            return status
+        time.sleep(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Comandos de captura y screenshots
 # ---------------------------------------------------------------------------
 def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any]:
     """Ejecuta un comando de proyecto con timeout y salida acotada."""
@@ -327,82 +428,6 @@ def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any
     return record
 
 
-def _start_preview(
-    argv: list[str], *, cwd: Path, log_path: Path
-) -> tuple[subprocess.Popen[str], Any]:
-    """Arranca un servidor de preview en segundo plano, con su salida en un archivo."""
-    handle = log_path.open("w", encoding="utf-8")
-    try:
-        process = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            shell=False,
-            # Grupo propio: terminar el grupo mata también a los nietos (``npm run start``).
-            start_new_session=True,
-        )
-    except OSError:
-        handle.close()
-        raise
-    return process, handle
-
-
-def _terminate(process: subprocess.Popen[str]) -> None:
-    """Termina un proceso y todo su grupo, sin dejar hijos vivos."""
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except OSError:
-        process.terminate()
-    try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except OSError:
-        process.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        # pragma: no cover - si no muere aquí, el contenedor lo matará al salir
-        process.wait(timeout=5)
-
-
-def _wait_for_port(port: int, timeout: float, processes: list[subprocess.Popen[str]]) -> bool:
-    """Espera a que algo escuche en 127.0.0.1:port, o a que la preview muera."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if processes and all(process.poll() is not None for process in processes):
-            return False
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
-                return True
-        except OSError:
-            time.sleep(0.25)
-    return False
-
-
-def _http_status(url: str, timeout: float = 10.0) -> int | None:
-    """Código HTTP de una petición local, o ``None`` si no hubo respuesta.
-
-    La URL es siempre ``http://127.0.0.1:<puerto>`` recibida en el payload: el contenedor no
-    tiene red, así que no hay destino externo posible.
-    """
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return int(response.status)
-    except urllib.error.HTTPError as exc:
-        return int(exc.code)
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Screenshots
-# ---------------------------------------------------------------------------
 def _png_dimensions(data: bytes) -> tuple[int, int]:
     """Dimensiones leídas de la cabecera IHDR de un PNG.
 
@@ -432,6 +457,10 @@ def _capture_viewport(
     El registro describe la invocación (argv, exit, salida acotada); las observaciones son el
     JSON que escribió el script. Se devuelven por separado para que un fallo del navegador no se
     confunda con una observación válida.
+
+    El script se invoca desde ``PROBE_DIR`` (montaje de solo lectura del host) y con ``cwd`` en el
+    directorio de evidencia: nunca desde una copia en el workspace, que es lo que hacía
+    manipulable el código de medición.
     """
     name = str(viewport["name"])
     logical_name = _screenshot_name(route, name)
@@ -460,7 +489,7 @@ def _capture_viewport(
     for marker in markers:
         argv.extend(["--marker", marker])
 
-    record = _run_command(argv, cwd=WORKSPACE, timeout=timeout_seconds + 30.0)
+    record = _run_command(argv, cwd=output_dir, timeout=timeout_seconds + 30.0)
     record["viewport"] = name
     record["screenshot"] = logical_name
 
@@ -550,6 +579,26 @@ def _clipping_note(payload: dict[str, Any], viewport: dict[str, Any], route: str
 
 
 # ---------------------------------------------------------------------------
+# Integridad del código de medición
+# ---------------------------------------------------------------------------
+def _probe_digest() -> str:
+    """sha256 del código de medición: ``run_web_session.py`` y después ``capture.cjs``.
+
+    Se leen los ficheros del montaje de solo lectura (en el contenedor, exactamente
+    ``/opt/punto/probe``) y no una copia: así el hash cubre tanto los bytes que el intérprete acaba
+    de cargar como el script de captura que se va a ejecutar. El host recalcula el mismo hash sobre
+    sus ficheros; si no coinciden, lo que midió este contenedor no era su código.
+
+    Raises:
+        OSError: si el código de medición no se puede leer (montaje ausente o incompleto).
+    """
+    digest = hashlib.sha256()
+    digest.update(SELF_PATH.read_bytes())
+    digest.update(CAPTURE_SCRIPT.read_bytes())
+    return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Escritura del resultado
 # ---------------------------------------------------------------------------
 def _write_json(path: Path, content: Any) -> None:
@@ -566,8 +615,9 @@ def _write_diagnostics(
     """Escribe el JSON de diagnóstico y publica su sha256 por stdout.
 
     El digest se calcula sobre los bytes **ya escritos**, y se imprime: el host lo compara con el
-    manifiesto que relee. Es la única defensa posible dentro de este diseño contra que el proyecto
-    auditado reescriba la evidencia después de que el probe la cierre.
+    manifiesto que relee. Ahora que el directorio de evidencia está fuera del workspace, el proyecto
+    no puede reescribir el archivo, pero el digest sigue siendo la prueba de que lo que el host lee
+    es lo que el probe cerró.
     """
     diagnostics["exit_code"] = exit_code
     if output_dir is None:
@@ -579,9 +629,45 @@ def _write_diagnostics(
     print(f"{EVIDENCE_DIGEST_MARKER} {digest}")
 
 
+def _force_utf8_stdout() -> None:
+    """Fija UTF-8 con reemplazo en stdout para que ningún marcador se pierda al imprimirlo.
+
+    El contenedor ya corre con ``PYTHONIOENCODING=utf-8`` (está en el ``ENV`` de la imagen), pero el
+    texto que se imprime puede venir de una salida decodificada con ``errors="replace"`` (errores de
+    ``capture.cjs``, versiones del entorno): si la consola no sabe representar ese carácter, el
+    ``print`` lanzaría ``UnicodeEncodeError`` y el probe moriría **antes** de publicar los digests
+    que el host espera. Los marcadores son ASCII: perder un carácter es mucho menos grave que
+    perder el hecho.
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is None:  # pragma: no cover - stdout siempre es un TextIOWrapper
+        return
+    with contextlib.suppress(OSError, ValueError):
+        reconfigure(encoding="utf-8", errors="replace")
+
+
+def _finish(
+    diagnostics: dict[str, Any],
+    output_dir: Path | None,
+    exit_code: int,
+    probe_digest: str,
+) -> int:
+    """Cierra la sesión: escribe el diagnóstico y publica los dos digests por stdout.
+
+    El orden importa: el sha256 de la evidencia solo puede calcularse después de escribir el
+    archivo, y el del código de medición se publica **siempre**, también cuando no hay evidencia,
+    para que el host pueda distinguir «el código cambió» de «la sesión falló».
+    """
+    _write_diagnostics(output_dir, diagnostics, exit_code)
+    if probe_digest:
+        print(f"{PROBE_DIGEST_MARKER} {probe_digest}")
+    return exit_code
+
+
 def main() -> int:
     """Ejecuta la sesión completa. Devuelve el código de salida."""
-    parser = argparse.ArgumentParser(description="Probe de sesión web de PUNTO (ENGINE-5.3)")
+    _force_utf8_stdout()
+    parser = argparse.ArgumentParser(description="Probe de medición web de PUNTO (ENGINE-5.3)")
     parser.add_argument(
         "--payload",
         default="",
@@ -597,15 +683,22 @@ def main() -> int:
         "route": "",
         "project": "",
         "runtime": [],
-        "commands": [],
-        "preview": {},
         "captures": [],
         "screenshots": [],
         "notes": [],
+        "preview": {},
     }
     output_dir: Path | None = None
-    previews: list[tuple[subprocess.Popen[str], Any]] = []
-    preview_logs: list[Path] = []
+    probe_digest = ""
+
+    # El digest del código se calcula antes que nada: si el montaje de medición no se puede leer, el
+    # host no tiene forma de verificar la sesión y hay que decirlo en lugar de medir a ciegas.
+    try:
+        probe_digest = _probe_digest()
+    except OSError as exc:
+        diagnostics["error"] = f"no se pudo leer el código de medición en {PROBE_DIR}: {exc}"
+        print(f"probe: {diagnostics['error']}")
+        return _finish(diagnostics, output_dir, EXIT_BROWSER_FAILED, probe_digest)
 
     try:
         # --- 1. payload -----------------------------------------------------
@@ -613,30 +706,29 @@ def main() -> int:
             payload = _read_payload(arguments.payload)
         except (OSError, ValueError) as exc:
             diagnostics["error"] = f"payload inválido: {exc}"
-            _write_diagnostics(output_dir, diagnostics, EXIT_PAYLOAD_INVALID)
-            return EXIT_PAYLOAD_INVALID
+            return _finish(diagnostics, output_dir, EXIT_PAYLOAD_INVALID, probe_digest)
 
         try:
-            project = _workspace_path(payload.get("project", ""), "project")
-            output_dir = _workspace_path(payload.get("output_dir", ""), "output_dir")
-            commands = _normalize_argv_list(payload.get("commands"), "commands")
-            preview_argv = _normalize_argv_list(payload.get("preview_argv"), "preview_argv")
-            if not preview_argv:
-                raise ValueError("preview_argv no puede estar vacío")
+            output_dir = _output_dir(payload.get("output_dir"))
             viewports = _normalize_viewports(payload.get("viewports"))
             markers = _normalize_markers(payload.get("required_markers"))
+            base_url = _base_url(payload.get("base_url"))
+            capture_timeout = _seconds(
+                payload.get("capture_timeout_seconds"), "capture_timeout_seconds", 90.0
+            )
+            preview_timeout = _seconds(
+                payload.get("preview_timeout_seconds"), "preview_timeout_seconds", 60.0
+            )
         except ValueError as exc:
             diagnostics["error"] = f"payload inválido: {exc}"
-            _write_diagnostics(output_dir, diagnostics, EXIT_PAYLOAD_INVALID)
-            return EXIT_PAYLOAD_INVALID
+            return _finish(diagnostics, output_dir, EXIT_PAYLOAD_INVALID, probe_digest)
 
-        route = str(payload.get("route") or "/").strip() or "/"
-        preview_port = _as_positive_int(payload.get("preview_port")) or 4173
-        command_timeout = float(payload.get("command_timeout_seconds") or 120)
-        capture_timeout = float(payload.get("capture_timeout_seconds") or 90)
-        preview_timeout = float(payload.get("preview_timeout_seconds") or 60)
+        route = _normalize_route(payload.get("route"))
+        preview_url = f"{base_url}{route}"
         diagnostics["route"] = route
-        diagnostics["project"] = project.name
+        # Etiqueta informativa, si el host la envía: sirve para los mensajes de error, no se usa
+        # como ruta ni se resuelve contra ningún filesystem.
+        diagnostics["project"] = _truncate(payload.get("project", ""), 200)
 
         (output_dir / "screenshots").mkdir(parents=True, exist_ok=True)
 
@@ -645,79 +737,32 @@ def main() -> int:
         diagnostics["runtime"] = runtime_entries
         for name, value in runtime_entries:
             print(f"runtime {name}={value}")
-        print(f"probe workspace={WORKSPACE} proyecto={project}")
+        print(f"probe medición url={preview_url} salida={output_dir}")
 
-        # --- 3. comandos de proyecto ---------------------------------------
-        if not project.is_dir():
-            diagnostics["error"] = f"el proyecto {project} no existe dentro del contenedor"
-            print(f"probe: {diagnostics['error']}")
-            _write_diagnostics(output_dir, diagnostics, EXIT_PROJECT_FAILED)
-            return EXIT_PROJECT_FAILED
-
-        for argv in commands:
-            record = _run_command(argv, cwd=project, timeout=command_timeout)
-            diagnostics["commands"].append(record)
-            print(
-                f"comando {' '.join(argv)} exit={record['exit_code']} "
-                f"({record['duration_ms']}ms)"
-            )
-            if record["timed_out"] or record["exit_code"] != 0:
-                diagnostics["error"] = (
-                    f"el comando {' '.join(argv)} falló "
-                    f"(exit={record['exit_code']}, timeout={record['timed_out']}): "
-                    f"{record['stderr'] or record['stdout']}"
-                )
-                _write_diagnostics(output_dir, diagnostics, EXIT_PROJECT_FAILED)
-                return EXIT_PROJECT_FAILED
-
-        # --- 4. preview en segundo plano -----------------------------------
+        # --- 3. espera a la preview (otro contenedor) ----------------------
         preview_record: dict[str, Any] = {
-            "argv": preview_argv,
-            "port": preview_port,
+            "base_url": base_url,
+            "url": preview_url,
             "listening": False,
             "http_status": None,
+            "timeout_seconds": preview_timeout,
+            # La bitácora de la preview la guarda el contenedor no confiable: desde aquí no se ve,
+            # y decirlo es más honesto que rellenarlo con algo inventado.
             "log_excerpt": "",
         }
         diagnostics["preview"] = preview_record
-        for index, argv in enumerate(preview_argv):
-            log_path = output_dir / f"preview-{index}.log"
-            preview_logs.append(log_path)
-            try:
-                process, handle = _start_preview(argv, cwd=project, log_path=log_path)
-            except OSError as exc:
-                diagnostics["error"] = f"no se pudo arrancar la preview {' '.join(argv)}: {exc}"
-                _write_diagnostics(output_dir, diagnostics, EXIT_PROJECT_FAILED)
-                return EXIT_PROJECT_FAILED
-            previews.append((process, handle))
-
-        listening = _wait_for_port(
-            preview_port, preview_timeout, [process for process, _ in previews]
-        )
-        preview_record["listening"] = listening
-        if not listening:
-            log_text = ""
-            if preview_logs:
-                try:
-                    log_text = preview_logs[0].read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    log_text = ""
-            preview_record["log_excerpt"] = _excerpt(log_text, MAX_PREVIEW_LOG_CHARS)
+        status = _wait_for_preview(preview_url, preview_timeout)
+        preview_record["http_status"] = status
+        if status is None:
             diagnostics["error"] = (
-                f"la preview no escuchó en 127.0.0.1:{preview_port} tras {preview_timeout:.0f}s: "
-                f"{preview_record['log_excerpt']}"
+                f"la preview no respondió en {preview_url} tras {preview_timeout:.0f}s"
             )
             print(f"probe: {diagnostics['error']}")
-            _write_diagnostics(output_dir, diagnostics, EXIT_PROJECT_FAILED)
-            return EXIT_PROJECT_FAILED
+            return _finish(diagnostics, output_dir, EXIT_PROJECT_FAILED, probe_digest)
+        preview_record["listening"] = True
+        print(f"preview disponible en {preview_url} (HTTP {status})")
 
-        preview_url = f"http://127.0.0.1:{preview_port}{route}"
-        preview_record["http_status"] = _http_status(preview_url)
-        print(
-            f"preview escuchando en 127.0.0.1:{preview_port} "
-            f"(HTTP {preview_record['http_status']})"
-        )
-
-        # --- 5. captura por viewport ---------------------------------------
+        # --- 4. captura por viewport ---------------------------------------
         observations: list[dict[str, Any]] = []
         manifest: list[dict[str, Any]] = []
         notes: list[str] = [
@@ -789,23 +834,14 @@ def main() -> int:
         diagnostics["notes"] = notes
 
         if browser_failed:
-            if preview_logs:
-                try:
-                    preview_record["log_excerpt"] = _excerpt(
-                        preview_logs[0].read_text(encoding="utf-8", errors="replace"),
-                        MAX_PREVIEW_LOG_CHARS,
-                    )
-                except OSError:
-                    preview_record["log_excerpt"] = ""
-            _write_diagnostics(output_dir, diagnostics, EXIT_BROWSER_FAILED)
-            return EXIT_BROWSER_FAILED
+            return _finish(diagnostics, output_dir, EXIT_BROWSER_FAILED, probe_digest)
 
         playwright_version = next(
             (value for name, value in runtime_entries if name == "playwright"), ""
         )
         node_version = next((value for name, value in runtime_entries if name == "node"), "")
 
-        # --- 6. observations.json (forma exacta de WebObservations) --------
+        # --- 5. observations.json (forma exacta de WebObservations) --------
         _write_json(
             output_dir / "observations.json",
             {
@@ -818,19 +854,11 @@ def main() -> int:
             },
         )
         print(f"observaciones escritas: {len(observations)} de {len(viewports)} viewports")
-        _write_diagnostics(output_dir, diagnostics, EXIT_OK)
-        return EXIT_OK
+        return _finish(diagnostics, output_dir, EXIT_OK, probe_digest)
     except Exception as exc:  # el probe siempre debe dejar un diagnóstico escrito
         diagnostics["error"] = f"fallo inesperado del probe: {type(exc).__name__}: {exc}"
-        _write_diagnostics(output_dir, diagnostics, EXIT_BROWSER_FAILED)
         print(f"probe: {diagnostics['error']}")
-        return EXIT_BROWSER_FAILED
-    finally:
-        # --- 7. limpieza: nunca dejar procesos hijos vivos ------------------
-        for process, handle in previews:
-            _terminate(process)
-            with contextlib.suppress(OSError):
-                handle.close()
+        return _finish(diagnostics, output_dir, EXIT_BROWSER_FAILED, probe_digest)
 
 
 if __name__ == "__main__":

@@ -138,7 +138,7 @@ def test_a_screenshot_name_cannot_escape_the_capture_folder(tmp_path: Path) -> N
 def test_no_measured_check_is_blocked_not_pass() -> None:
     """Con las once comprobaciones sin señal, el estado es BLOCKED: no se afirma lo no medido."""
     checks = tuple(
-        WebCheckOutcome(kind=kind, ran=False, passed=True, detail="sin señal")
+        WebCheckOutcome(kind=kind, applicable=True, ran=False, passed=True, detail="sin señal")
         for kind in WebCheckKind
     )
 
@@ -149,16 +149,18 @@ def test_no_measured_check_is_blocked_not_pass() -> None:
     assert "PAGE_LOAD_ERROR" in reasons[0]
 
 
-def test_one_measured_check_is_enough_to_have_a_verdict() -> None:
-    """Basta con que una comprobación se haya medido para poder dar veredicto."""
+def test_one_measured_check_is_not_enough_when_another_applies_without_signal() -> None:
+    """Una comprobación aplicable sin señal bloquea, aunque otra se haya medido y esté verde."""
     checks = (
-        WebCheckOutcome(kind=WebCheckKind.PAGE_LOAD_ERROR, ran=True, passed=True),
-        WebCheckOutcome(kind=WebCheckKind.CONSOLE_ERROR, ran=False, passed=True),
+        WebCheckOutcome(kind=WebCheckKind.PAGE_LOAD_ERROR, applicable=True, ran=True, passed=True),
+        WebCheckOutcome(
+            kind=WebCheckKind.CONSOLE_ERROR, applicable=True, ran=False, passed=True
+        ),
     )
 
     status, reasons = determine_web_status(checks)
 
-    assert status is WebTechnicalStatus.PASS
+    assert status is WebTechnicalStatus.BLOCKED
     assert any("CONSOLE_ERROR" in reason for reason in reasons)
 
 

@@ -184,6 +184,37 @@ def parse_clipping_notes(notes: Sequence[str]) -> tuple[ViewportClippingSignal, 
 # ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
+def _is_applicable(
+    kind: WebCheckKind,
+    *,
+    observations: WebObservations,
+    markers: tuple[str, ...],
+    required_viewports: tuple[ViewportName, ...],
+) -> bool:
+    """Decide, **por contrato**, si una comprobación aplica a esta sesión.
+
+    La aplicabilidad no la decide el modelo ni el resultado: la decide lo que la sesión pidió. La
+    tabla es esta y no hay otra:
+
+    | Comprobación | Aplica cuando |
+    | --- | --- |
+    | ``MISSING_REQUIRED_ELEMENT`` | la especificación exige al menos un marcador |
+    | ``RESPONSIVE_CHECK`` | se pidieron dos o más viewports (con uno no hay nada que comparar) |
+    | ``VIEWPORT_CLIPPING`` | siempre: el probe emite una nota por captura, incluso sin recorte |
+    | las demás | se intentó renderizar: hay al menos una observación |
+
+    Las demás comprobaciones dependen de que la página se haya cargado: sin observación no hay nada
+    que comprobar, y marcarlas como no aplicables es más honesto que declararlas «sin señal».
+    """
+    if kind is WebCheckKind.MISSING_REQUIRED_ELEMENT:
+        return bool(markers)
+    if kind is WebCheckKind.RESPONSIVE_CHECK:
+        return len(required_viewports) >= 2
+    if kind is WebCheckKind.VIEWPORT_CLIPPING:
+        return True
+    return bool(observations.observations)
+
+
 def evaluate_web_checks(
     observations: WebObservations,
     *,
@@ -242,6 +273,12 @@ def evaluate_web_checks(
         outcomes.append(
             WebCheckOutcome(
                 kind=kind,
+                applicable=_is_applicable(
+                    kind,
+                    observations=observations,
+                    markers=markers,
+                    required_viewports=tuple(required_viewports),
+                ),
                 ran=result.ran,
                 passed=not result.findings,
                 blocking=result.blocking and bool(result.findings),

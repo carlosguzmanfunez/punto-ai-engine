@@ -62,9 +62,10 @@ EXPECTED_DIMENSIONS: dict[ViewportName, tuple[int, int]] = {
 #: Tamaño mínimo exigido a un PNG: un archivo de unos pocos bytes no es una captura.
 MIN_SCREENSHOT_BYTES = 1024
 
-#: Preview servida desde el proyecto, en loopback, dentro del contenedor.
+#: Preview servida por el contenedor **no confiable**, alcanzable desde el contenedor de medición
+#: por la red interna: por eso escucha en ``0.0.0.0`` y no en loopback.
 PREVIEW_ARGV: tuple[tuple[str, ...], ...] = (
-    ("python3", "-m", "http.server", "4173", "--bind", "127.0.0.1"),
+    ("python3", "-m", "http.server", "4173", "--bind", "0.0.0.0"),
 )
 
 #: Comando de proyecto previo: demuestra que la lista de argv corre con ``cwd`` en el proyecto
@@ -211,7 +212,13 @@ def report_failures(observations: WebObservations) -> str:
 def backend() -> Iterator[WebSandboxBackend]:
     """Backend del sandbox web, exigido de verdad: sin imagen, la prueba falla."""
     instance = WebSandboxBackend(
-        limits=WebSandboxLimits(timeout_seconds=300.0, capture_timeout_seconds=90.0)
+        limits=WebSandboxLimits(
+            timeout_seconds=300.0,
+            capture_timeout_seconds=90.0,
+            # La prueba del proyecto que no arranca no debe esperar un minuto a una preview que
+            # nunca va a responder: el límite es configuración, no una constante escondida.
+            preview_timeout_seconds=20.0,
+        )
     )
     try:
         instance.require_image()
@@ -399,12 +406,15 @@ def test_a_project_that_fails_to_prepare_is_reported_as_a_block(
         )
 
     message = str(failure.value)
-    # El probe sale con su propio código (2 = el proyecto no arrancó) y el host lo declara.
+    # El contenedor de medición sale con su propio código (2 = la preview no respondió) y el host
+    # lo declara, con el log del contenedor no confiable añadido para poder diagnosticar.
     assert "exit=2" in message, message
-    assert "comando exit=7" in message, message
-    assert "diagnóstico del probe" in message, message
+    assert "exit=7" in message, message
+    assert "preview" in message, message
 
-    # Nada queda a medias: ni carpeta de probe en el workspace ni contenedor vivo.
+    # Nada queda a medias: ni carpeta de probe en el workspace (la frontera no la crea nunca) ni
+    # contenedor vivo ni red interna viva.
     leftovers = [path.name for path in tmp_path.iterdir() if path.name.startswith(PROBE_DIR_PREFIX)]
     assert leftovers == [], leftovers
     assert backend.list_containers() == ()
+    assert backend.list_networks() == ()

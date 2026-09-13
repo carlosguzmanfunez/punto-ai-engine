@@ -56,27 +56,42 @@ def determine_web_status(
 ) -> tuple[WebTechnicalStatus, tuple[str, ...]]:
     """Calcula el estado técnico a partir de las comprobaciones deterministas.
 
+    Reglas, en este orden:
+
+    1. sin comprobaciones, o sin ninguna **aplicable** → ``BLOCKED``: no había nada que medir;
+    2. alguna comprobación aplicable **sin señal** → ``BLOCKED``: PUNTO exigía medirla y no la
+       midió, así que no puede certificar nada. Esta regla va **antes** que el fallo medido: culpar
+       al producto de una medición que no existe sería tan incorrecto como aprobarlo;
+    3. alguna comprobación aplicable y medida que no pasó → ``FAIL``;
+    4. todo lo aplicable, medido y en verde → ``PASS``. Lo **no aplicable** no penaliza.
+
     Args:
         checks: Resultados de las once comprobaciones, en su orden de contrato.
 
     Returns:
-        ``(status, reasons)``: el estado y los motivos, en orden determinista. ``BLOCKED`` aparece
-        cuando no hay ninguna comprobación o cuando **ninguna llegó a medirse**: sin medición no
-        hay veredicto, y devolver ``PASS`` sería afirmar lo que no se comprobó.
+        ``(status, reasons)``: el estado y los motivos, en orden determinista.
     """
     if not checks:
         return WebTechnicalStatus.BLOCKED, ("no se evaluó ninguna comprobación determinista",)
 
-    measured = tuple(check for check in checks if check.ran)
-    if not measured:
+    applicable = tuple(check for check in checks if check.applicable)
+    if not applicable:
         return WebTechnicalStatus.BLOCKED, (
-            f"ninguna de las {len(checks)} comprobaciones llegó a medirse: "
+            f"ninguna de las {len(checks)} comprobaciones aplica a esta sesión: "
             + ", ".join(check.kind.value for check in checks),
         )
 
-    failed = tuple(check for check in checks if check.ran and not check.passed)
+    measured = tuple(check for check in applicable if check.ran)
+    if not measured:
+        return WebTechnicalStatus.BLOCKED, (
+            f"ninguna de las {len(applicable)} comprobaciones aplicables llegó a medirse: "
+            + ", ".join(check.kind.value for check in applicable),
+        )
+
+    no_signal = tuple(check for check in applicable if not check.ran)
+    failed = tuple(check for check in measured if not check.passed)
     blocking = tuple(check for check in failed if check.blocking)
-    not_run = tuple(check for check in checks if not check.ran)
+    not_applicable = tuple(check for check in checks if not check.applicable)
 
     reasons: list[str] = []
     if blocking:
@@ -87,11 +102,19 @@ def determine_web_status(
         reasons.append(
             "comprobación(es) no superada(s): " + ", ".join(check.kind.value for check in failed)
         )
-    if not_run:
+    if no_signal:
         reasons.append(
-            "comprobación(es) sin señal: " + ", ".join(check.kind.value for check in not_run)
+            "comprobación(es) aplicable(s) sin señal: "
+            + ", ".join(check.kind.value for check in no_signal)
+        )
+    if not_applicable:
+        reasons.append(
+            "comprobación(es) no aplicable(s): "
+            + ", ".join(check.kind.value for check in not_applicable)
         )
 
+    if no_signal:
+        return WebTechnicalStatus.BLOCKED, tuple(reasons)
     if failed:
         return WebTechnicalStatus.FAIL, tuple(reasons)
     return WebTechnicalStatus.PASS, tuple(reasons)

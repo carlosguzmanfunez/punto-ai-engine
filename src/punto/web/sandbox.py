@@ -44,11 +44,13 @@ navegador.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import json
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,12 +97,17 @@ WEB_SANDBOX_BUILD_COMMAND: Final[str] = (
 #: Etiqueta de los contenedores web de PUNTO, para poder limpiarlos.
 WEB_SANDBOX_LABEL: Final[str] = "punto.sandbox.web=1"
 
-#: Nombre del probe y de sus piezas.
+#: Nombre de las piezas del probe. La de preview corre en el contenedor **no** confiable; la de
+#: medición, en el confiable. Son dos programas porque son dos zonas de confianza distintas.
 PROBE_SCRIPT_NAME: Final[str] = "run_web_session.py"
 CAPTURE_SCRIPT_NAME: Final[str] = "capture.cjs"
-PAYLOAD_FILE_NAME: Final[str] = "payload.json"
+PREVIEW_SCRIPT_NAME: Final[str] = "run_preview.py"
+PREVIEW_PAYLOAD_FILE_NAME: Final[str] = "preview-payload.json"
+MEASURE_PAYLOAD_FILE_NAME: Final[str] = "measure-payload.json"
 
-#: Prefijo de la carpeta temporal que PUNTO crea dentro del workspace.
+#: Nombre reservado que PUNTO **nunca** debe crear dentro del workspace. Se conserva como invariante
+#: comprobable: desde ENGINE-5.3.1 el probe no vive en el workspace, así que su ausencia es una
+#: propiedad de la frontera, no una limpieza.
 PROBE_DIR_PREFIX: Final[str] = ".punto-web-session-"
 
 #: Runtime OCI del sandbox web. **Solo podman**, que es la frontera aprobada en ENGINE-1.R3.
@@ -128,7 +135,21 @@ SCREENSHOT_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
 #: el probe lo cerrara, los dos hashes no coinciden y la sesión se bloquea.
 EVIDENCE_DIGEST_MARKER: Final[str] = "PUNTO_EVIDENCE_SHA256"
 
-#: Puerto por defecto de la preview dentro del contenedor (loopback).
+#: Marca con la que el probe de medición publica el sha256 de **su propio código**. El host lo
+#: recalcula sobre los ficheros que montó: demuestra que el código que midió es el que PUNTO puso.
+PROBE_DIGEST_MARKER: Final[str] = "PUNTO_PROBE_SHA256"
+
+#: Rutas **dentro de los contenedores**. El código de medición y el control se montan read-only; la
+#: evidencia se monta escribible **solo** en el contenedor de medición.
+PROBE_MOUNT: Final[str] = "/opt/punto/probe"
+EVIDENCE_MOUNT: Final[str] = "/punto/evidence"
+
+#: Prefijos de la red interna y del alias de la preview. La red es ``--internal``: los dos
+#: contenedores se ven entre sí y nadie tiene ruta hacia Internet.
+WEB_NETWORK_PREFIX: Final[str] = "punto-web-net-"
+PREVIEW_ALIAS_PREFIX: Final[str] = "punto-preview-"
+
+#: Puerto por defecto de la preview dentro de su contenedor.
 DEFAULT_PREVIEW_PORT: Final[int] = 4173
 
 #: Directorio de los probes en el repositorio (``sandbox/web/probes``).
@@ -136,17 +157,92 @@ PROBE_SOURCE_DIR: Final[Path] = (
     Path(__file__).resolve().parents[3] / "sandbox" / "web" / "probes"
 )
 
-#: Carpetas temporales de probe pendientes de borrar (red de seguridad ante una salida dura).
-_PROBE_TEMP_DIRS: list[Path] = []
+#: Directorios temporales del host pendientes de borrar (red de seguridad ante una salida dura).
+_HOST_TEMP_DIRS: list[Path] = []
 
 
-def _cleanup_probe_dirs() -> None:
-    """Elimina las carpetas de probe que hayan quedado pendientes."""
-    while _PROBE_TEMP_DIRS:
-        shutil.rmtree(_PROBE_TEMP_DIRS.pop(), ignore_errors=True)
+def _cleanup_host_dirs() -> None:
+    """Elimina los directorios temporales del host que hayan quedado pendientes."""
+    while _HOST_TEMP_DIRS:
+        shutil.rmtree(_HOST_TEMP_DIRS.pop(), ignore_errors=True)
 
 
-atexit.register(_cleanup_probe_dirs)
+atexit.register(_cleanup_host_dirs)
+
+
+def _make_host_dir(kind: str) -> Path:
+    """Crea un directorio temporal del host, **fuera** del workspace, y lo registra.
+
+    Estar fuera del workspace es la mitad de la frontera: el proyecto no confiable solo tiene
+    montado su propio workspace, así que no puede ver ni escribir el código de medición, el control
+    ni la evidencia.
+    """
+    directory = Path(tempfile.mkdtemp(prefix=f"punto-web-{kind}-"))
+    _HOST_TEMP_DIRS.append(directory)
+    return directory
+
+
+def _remove_host_dir(directory: Path) -> None:
+    """Elimina un directorio temporal del host y lo quita de la lista de pendientes."""
+    if directory in _HOST_TEMP_DIRS:
+        _HOST_TEMP_DIRS.remove(directory)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _stage_probe(sources: Path, probe_root: Path) -> None:
+    """Copia el probe y sus dos payloads al directorio que se montará **read-only**.
+
+    Raises:
+        WebSandboxUnavailableError: si falta alguna pieza del probe en el repositorio.
+    """
+    for name in (PREVIEW_SCRIPT_NAME, PROBE_SCRIPT_NAME, CAPTURE_SCRIPT_NAME):
+        source = sources / name
+        if not source.is_file():
+            raise WebSandboxUnavailableError(f"falta la pieza del probe {name!r} en {sources}")
+        shutil.copy2(source, probe_root / name)
+
+
+def _write_payload(path: Path, payload: Mapping[str, object]) -> None:
+    """Escribe un payload de control con salto de línea final."""
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def _probe_digest(probe_root: Path) -> str:
+    """sha256 del código de medición, en el orden en que el probe lo calcula.
+
+    El probe concatena los bytes de su script y los de ``capture.cjs``: el host hace exactamente lo
+    mismo sobre los ficheros que montó. Si dentro del contenedor hubiera cambiado un solo byte, la
+    comparación fallaría.
+    """
+    digest = hashlib.sha256()
+    for name in (PROBE_SCRIPT_NAME, CAPTURE_SCRIPT_NAME):
+        digest.update((probe_root / name).read_bytes())
+    return digest.hexdigest()
+
+
+def _verify_probe_digest(stdout: str, expected: str) -> None:
+    """Comprueba que el código que midió es el que PUNTO montó.
+
+    Raises:
+        WebSandboxEvidenceError: si el probe no publicó su digest o no coincide con el del host.
+    """
+    published = ""
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(PROBE_DIGEST_MARKER):
+            published = stripped[len(PROBE_DIGEST_MARKER) :].strip()
+    if not published:
+        raise WebSandboxEvidenceError(
+            f"el probe de medición no publicó {PROBE_DIGEST_MARKER}: no se puede demostrar que el "
+            "código que midió sea el que PUNTO montó"
+        )
+    if published != expected:
+        raise WebSandboxEvidenceError(
+            "el código de medición cambió dentro del contenedor: "
+            f"el host montó {expected[:16]}… y el probe ejecutó {published[:16]}…"
+        )
 
 
 def probe_source_dir() -> Path:
@@ -213,6 +309,8 @@ class WebSandboxLimits:
     capture_timeout_seconds: float = 90.0
     #: Tiempo máximo de un comando de proyecto previo a la preview (build, generación, ...).
     command_timeout_seconds: float = 300.0
+    #: Tiempo máximo que la medición espera a que la preview responda por la red interna.
+    preview_timeout_seconds: float = 60.0
     #: Memoria del contenedor. Chromium necesita más que un ``pytest``.
     memory: str = "2g"
     #: CPUs asignadas.
@@ -444,28 +542,36 @@ class WebSandboxBackend:
             route=route,
             viewports=chosen_viewports,
         )
-        sources = probe_source_dir()
-        probe_name = f"{PROBE_DIR_PREFIX}{uuid4().hex[:12]}"
-        probe_dir = safe_workspace / probe_name
-        output_dir = probe_dir / "out"
-        container = f"punto-web-{uuid4().hex[:12]}"
 
-        try:
-            probe_dir.mkdir(parents=True, exist_ok=False)
-        except OSError as exc:
-            raise WebSandboxSessionError(
-                f"no se pudo preparar la carpeta del probe en el workspace: {exc}"
-            ) from exc
-        _PROBE_TEMP_DIRS.append(probe_dir)
-        try:
-            shutil.copy2(sources / PROBE_SCRIPT_NAME, probe_dir / PROBE_SCRIPT_NAME)
-            shutil.copy2(sources / CAPTURE_SCRIPT_NAME, probe_dir / CAPTURE_SCRIPT_NAME)
-            (output_dir / "screenshots").mkdir(parents=True, exist_ok=True)
-            payload = {
+        sources = probe_source_dir()
+        suffix = uuid4().hex[:12]
+        alias = f"{PREVIEW_ALIAS_PREFIX}{suffix}"
+        network = f"{WEB_NETWORK_PREFIX}{suffix}"
+        preview_container = f"punto-preview-{suffix}"
+        measure_container = f"punto-measure-{suffix}"
+
+        # Tres rutas del host, y ninguna dentro del workspace: el proyecto no confiable solo ve su
+        # propio workspace. El código de medición y el control se montan **read-only**; la evidencia
+        # se monta **solo** en el contenedor de medición.
+        probe_root = _make_host_dir("probe")
+        evidence_root = _make_host_dir("evidence")
+        (evidence_root / "screenshots").mkdir(parents=True, exist_ok=True)
+        _stage_probe(sources, probe_root)
+        _write_payload(
+            probe_root / PREVIEW_PAYLOAD_FILE_NAME,
+            {
                 "project": _as_posix(project),
                 "commands": [list(argv) for argv in project_commands],
                 "preview_argv": [list(argv) for argv in preview_commands],
                 "preview_port": preview_port,
+                "command_timeout_seconds": self._limits.command_timeout_seconds,
+                "preview_timeout_seconds": self._preview_wait(effective_timeout),
+            },
+        )
+        _write_payload(
+            probe_root / MEASURE_PAYLOAD_FILE_NAME,
+            {
+                "base_url": f"http://{alias}:{preview_port}",
                 "route": logical_route,
                 "viewports": [
                     {
@@ -476,49 +582,72 @@ class WebSandboxBackend:
                     for viewport in chosen_viewports
                 ],
                 "required_markers": list(markers),
-                "output_dir": f"{probe_name}/out",
-                "command_timeout_seconds": self._limits.command_timeout_seconds,
+                "output_dir": EVIDENCE_MOUNT,
                 "capture_timeout_seconds": self._limits.capture_timeout_seconds,
-                "preview_timeout_seconds": min(60.0, effective_timeout),
-            }
-            (probe_dir / PAYLOAD_FILE_NAME).write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
+                "preview_timeout_seconds": self._preview_wait(effective_timeout),
+            },
+        )
+        expected_probe_digest = _probe_digest(probe_root)
 
-            arguments = self._container_arguments(
-                workspace=safe_workspace,
-                probe_name=probe_name,
-                container=container,
+        self._create_network(network)
+        try:
+            self._start_container(
+                self._preview_arguments(
+                    workspace=safe_workspace,
+                    probe_root=probe_root,
+                    network=network,
+                    alias=alias,
+                    container=preview_container,
+                ),
+                container=preview_container,
             )
             completed = self._run_container(
-                arguments, timeout=effective_timeout, container=container
+                self._measure_arguments(
+                    evidence_root=evidence_root,
+                    probe_root=probe_root,
+                    network=network,
+                    container=measure_container,
+                ),
+                timeout=effective_timeout,
+                container=measure_container,
             )
+            diagnostics_path = evidence_root / "diagnostics.json"
             try:
-                diagnostics = _load_json_object(output_dir / "diagnostics.json")
+                diagnostics = _load_json_object(diagnostics_path)
             except WebSandboxSessionError:
-                # Sin diagnóstico no se puede culpar al proyecto: el fallo fue del contenedor o
-                # del runtime, y su salida es la única evidencia disponible.
+                # Sin diagnóstico no se puede culpar al proyecto: el fallo fue del contenedor o del
+                # runtime, y la salida de los dos contenedores es la única evidencia disponible.
                 if completed.returncode != 0:
-                    evidence = _sanitize(
-                        _excerpt(completed.stderr) or _excerpt(completed.stdout),
+                    failed = _sanitize(
+                        _excerpt(completed.stderr)
+                        or _excerpt(completed.stdout)
+                        or self._container_logs(preview_container),
                         workspace=safe_workspace,
                     )
                     raise WebSandboxSessionError(
-                        f"la sesión web falló con exit={completed.returncode} y el probe no dejó "
-                        f"diagnóstico: {evidence or 'sin salida'}"
+                        f"la sesión web falló con exit={completed.returncode} y el probe de "
+                        f"medición no dejó diagnóstico (el detalle puede venir del log no "
+                        f"confiable del contenedor del proyecto): {failed or 'sin salida'}"
                     ) from None
                 raise
             if completed.returncode != 0:
                 raise WebSandboxSessionError(
-                    _session_failure_detail(completed, diagnostics, workspace=safe_workspace)
+                    _session_failure_detail(
+                        completed,
+                        diagnostics,
+                        workspace=safe_workspace,
+                        preview_log=self._container_logs(preview_container),
+                    )
                 )
 
-            # El manifiesto lo cierra el probe; su digest viaja por stdout, que nadie puede
-            # reescribir después. Si los dos no coinciden, la evidencia se manipuló.
-            _verify_evidence_digest(completed.stdout, output_dir / "diagnostics.json")
-            observations = _load_observations(output_dir / "observations.json")
+            # Doble comprobación de integridad, contra el stdout del contenedor de medición: el
+            # manifiesto en disco es el que el probe cerró, y el código de medición es el que el
+            # host montó. El proyecto no confiable no participa en ninguna de las dos.
+            evidence_digest = _verify_evidence_digest(completed.stdout, diagnostics_path)
+            _verify_probe_digest(completed.stdout, expected_probe_digest)
+            observations = _load_observations(evidence_root / "observations.json")
             artifacts, screenshots = self._verify_evidence(
-                output_dir=output_dir,
+                output_dir=evidence_root,
                 diagnostics=diagnostics,
                 viewports=chosen_viewports,
                 observations=observations,
@@ -533,15 +662,28 @@ class WebSandboxBackend:
                 artifacts=artifacts,
                 runtime=observations.runtime,
                 notes=observations.notes,
-                diagnostics=diagnostics,
+                diagnostics={
+                    **diagnostics,
+                    # Procedencia de la evidencia, para que quede escrito de dónde salió y con qué
+                    # hashes se verificó. Se guardan aquí, y no solo en el stdout acotado, porque el
+                    # extracto puede recortar las líneas finales del probe.
+                    "evidence": {
+                        "produced_by": "contenedor de medición confiable",
+                        "evidence_digest": evidence_digest,
+                        "probe_digest": expected_probe_digest,
+                        "untrusted_preview_visible": False,
+                    },
+                },
                 exit_code=completed.returncode,
                 stdout_excerpt=_excerpt(completed.stdout),
                 stderr_excerpt=_excerpt(completed.stderr),
             )
         finally:
-            if probe_dir in _PROBE_TEMP_DIRS:
-                _PROBE_TEMP_DIRS.remove(probe_dir)
-            shutil.rmtree(probe_dir, ignore_errors=True)
+            self._force_remove(preview_container)
+            self._force_remove(measure_container)
+            self._remove_network(network)
+            _remove_host_dir(probe_root)
+            _remove_host_dir(evidence_root)
 
     # --------------------------------------------------------------- auditar
     def _audit_session_started(
@@ -604,39 +746,124 @@ class WebSandboxBackend:
         return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
     def destroy(self) -> None:
-        """Elimina los contenedores web de esta sesión y los huérfanos de PUNTO."""
+        """Elimina los contenedores web de esta sesión, los huérfanos y las redes de PUNTO."""
         for container in tuple(self._containers):
             self._force_remove(container)
         for container in self.list_containers():
             self._force_remove(container)
         self._containers.clear()
-        _cleanup_probe_dirs()
+        for network in self.list_networks():
+            self._remove_network(network)
+        _cleanup_host_dirs()
+
+    def list_networks(self) -> tuple[str, ...]:
+        """Redes internas de PUNTO que siguen existiendo (debería ser vacío)."""
+        if self._binary is None:
+            return ()
+        result = self._run_runtime(
+            ["network", "ls", "--filter", f"label={WEB_SANDBOX_LABEL}", "--format", "{{.Name}}"],
+            timeout=60.0,
+        )
+        if result.returncode != 0:
+            return ()
+        return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def _create_network(self, name: str) -> None:
+        """Crea la red interna que conecta preview y medición, sin ruta hacia Internet.
+
+        ``--internal`` es la propiedad que importa: los dos contenedores se ven entre sí y ninguno
+        tiene salida. Es el equivalente (o mejor) de ``--network none`` para una topología de dos
+        contenedores, y no se abre por comodidad.
+
+        Raises:
+            WebSandboxUnavailableError: si el runtime no puede crear la red.
+        """
+        result = self._run_runtime(
+            ["network", "create", "--internal", "--label", WEB_SANDBOX_LABEL, name],
+            timeout=120.0,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "sin salida"
+            raise WebSandboxUnavailableError(
+                f"no se pudo crear la red interna del sandbox web ({name}): {detail}"
+            )
+
+    def _remove_network(self, name: str) -> None:
+        """Elimina la red interna, sin propagar errores (ruta de limpieza)."""
+        if self._binary is None:  # pragma: no cover - defensivo
+            return
+        with contextlib.suppress(WebSandboxUnavailableError):
+            self._run_runtime(["network", "rm", "-f", name], timeout=60.0)
+
+    def _start_container(self, arguments: list[str], *, container: str) -> None:
+        """Arranca un contenedor en segundo plano y comprueba que el runtime lo aceptó.
+
+        Raises:
+            WebSandboxSessionError: si el runtime no acepta el arranque.
+        """
+        completed = self._run_container(arguments, timeout=120.0, container=container)
+        if completed.returncode != 0:
+            detail = _excerpt(completed.stderr) or _excerpt(completed.stdout) or "sin salida"
+            raise WebSandboxSessionError(
+                f"no se pudo arrancar el contenedor {container}: {detail}"
+            )
+
+    def _container_logs(self, container: str) -> str:
+        """Salida acotada de un contenedor, para mensajes de error.
+
+        Es contenido **no confiable** (lo escribió la zona del proyecto), así que se acota y se
+        sanea antes de usarlo: sirve para diagnosticar, nunca como evidencia.
+        """
+        if self._binary is None:  # pragma: no cover - defensivo
+            return ""
+        with contextlib.suppress(WebSandboxUnavailableError):
+            result = self._run_runtime(
+                ["logs", "--tail", "60", container], timeout=60.0
+            )
+            if result.returncode == 0:
+                return _excerpt(result.stdout) or _excerpt(result.stderr)
+        return ""
 
     # ---------------------------------------------------------------- internos
-    def _container_arguments(
-        self, *, workspace: Path, probe_name: str, container: str
-    ) -> list[str]:
-        """Argumentos del contenedor con el endurecimiento aprobado de ENGINE-1.R3.
+    def _preview_wait(self, effective_timeout: float) -> float:
+        """Espera máxima a que la preview responda, acotada por el tiempo de la sesión."""
+        return max(1.0, min(self._limits.preview_timeout_seconds, effective_timeout))
 
-        Propiedades, todas explícitas y ninguna negociable: red apagada, rootfs de solo lectura,
-        capacidades vacías, sin escalada de privilegios, usuario no-root, ``/dev/shm`` y tmpfs
-        acotados, límites de CPU/memoria/PIDs y un único montaje (el workspace, ``rw``).
+    def _hardened_arguments(
+        self,
+        *,
+        network: str,
+        container: str,
+        detached: bool,
+        keep_after_exit: bool = False,
+    ) -> list[str]:
+        """Argumentos comunes con el endurecimiento aprobado de ENGINE-1.R3.
+
+        Propiedades, todas explícitas y ninguna negociable: red **interna** (sin ruta a Internet),
+        rootfs de solo lectura, capacidades vacías, sin escalada de privilegios, usuario no-root,
+        ``/dev/shm`` y tmpfs acotados, y límites de CPU/memoria/PIDs. Nada de esto se degrada por
+        pasar a dos contenedores: se aplica igual a los dos.
 
         El ``mode=1777`` de ``/home/punto`` no es decorativo: sin él, uid 10001 no puede escribir
         su propio HOME y npm (y con él cualquier build) falla al cachear. Está medido y
         documentado en ``sandbox/web/Containerfile``.
+
+        ``keep_after_exit`` existe por una razón de diagnóstico: un contenedor con ``--rm`` que
+        falla desaparece antes de que el host pueda leer su log, y ese log es lo único que explica
+        **por qué** falló la preparación del proyecto. Cuando se pide conservarlo, la limpieza la
+        garantiza el ``finally`` de la sesión (y, si el proceso muriera, la etiqueta de PUNTO).
         """
         limits = self._limits
-        return [
+        arguments = [
             "run",
-            "--rm",
             "--name",
             container,
             "--label",
             WEB_SANDBOX_LABEL,
-            # Aislamiento de red: el navegador no navega a Internet. Loopback sigue disponible.
+            # Aislamiento de red: red interna del sandbox, sin salida a Internet. Los dos
+            # contenedores se ven entre sí y nadie más.
             "--network",
-            "none",
+            network,
             # Sistema de archivos raíz inmutable.
             "--read-only",
             "--cap-drop",
@@ -659,16 +886,76 @@ class WebSandboxBackend:
             limits.cpus,
             "--pids-limit",
             str(limits.pids),
-            # Único montaje: el workspace. `:Z` etiqueta el contenido para SELinux cuando aplica.
+        ]
+        # Las banderas van justo después de ``run`` y antes de ``--name``: insertarlas en cualquier
+        # otra posición desplazaría el nombre del contenedor y el runtime intentaría descargar una
+        # imagen llamada como el contenedor.
+        prefix: list[str] = ["-d"] if detached else []
+        if not keep_after_exit:
+            prefix.append("--rm")
+        arguments[1:1] = prefix
+        return arguments
+
+    def _preview_arguments(
+        self,
+        *,
+        workspace: Path,
+        probe_root: Path,
+        network: str,
+        alias: str,
+        container: str,
+    ) -> list[str]:
+        """Argumentos del contenedor **no confiable**: el proyecto y su preview.
+
+        Monta el workspace ``rw`` (es su zona de trabajo) y el probe ``ro`` (lo ejecuta, no lo
+        escribe). No monta la evidencia: no puede verla, así que no puede falsificarla.
+        """
+        return [
+            *self._hardened_arguments(
+                network=network, container=container, detached=True, keep_after_exit=True
+            ),
+            "--network-alias",
+            alias,
             "-v",
             f"{workspace}:/workspace:rw,Z",
+            "-v",
+            f"{probe_root}:{PROBE_MOUNT}:ro,Z",
             "-w",
             "/workspace",
             WEB_SANDBOX_IMAGE,
             "python3",
-            f"/workspace/{probe_name}/{PROBE_SCRIPT_NAME}",
+            f"{PROBE_MOUNT}/{PREVIEW_SCRIPT_NAME}",
             "--payload",
-            f"/workspace/{probe_name}/{PAYLOAD_FILE_NAME}",
+            f"{PROBE_MOUNT}/{PREVIEW_PAYLOAD_FILE_NAME}",
+        ]
+
+    def _measure_arguments(
+        self,
+        *,
+        evidence_root: Path,
+        probe_root: Path,
+        network: str,
+        container: str,
+    ) -> list[str]:
+        """Argumentos del contenedor **confiable de medición**: el navegador y la evidencia.
+
+        No monta el workspace: no lo necesita (mide por HTTP) y no tenerlo elimina la vía por la que
+        un proyecto hostil podría tocar lo que se mide. El probe va ``ro`` y la evidencia es el
+        único montaje escribible, y solo existe aquí.
+        """
+        return [
+            *self._hardened_arguments(network=network, container=container, detached=False),
+            "-v",
+            f"{probe_root}:{PROBE_MOUNT}:ro,Z",
+            "-v",
+            f"{evidence_root}:{EVIDENCE_MOUNT}:rw,Z",
+            "-w",
+            "/tmp",
+            WEB_SANDBOX_IMAGE,
+            "python3",
+            f"{PROBE_MOUNT}/{PROBE_SCRIPT_NAME}",
+            "--payload",
+            f"{PROBE_MOUNT}/{MEASURE_PAYLOAD_FILE_NAME}",
         ]
 
     def _run_container(
@@ -1078,11 +1365,14 @@ def _sanitize(text: str, *, workspace: Path | None = None) -> str:
     return _excerpt(sanitized)
 
 
-def _verify_evidence_digest(stdout: str, manifest: Path) -> None:
+def _verify_evidence_digest(stdout: str, manifest: Path) -> str:
     """Comprueba que el manifiesto en disco es el que el probe cerró.
 
     El probe publica en **stdout** el sha256 de su manifiesto. El stdout del proceso no lo puede
     reescribir el proyecto: si el archivo se manipuló después, los hashes no coinciden.
+
+    Returns:
+        El digest publicado, para poder dejarlo escrito en la procedencia de la evidencia.
 
     Raises:
         WebSandboxEvidenceError: si el probe no publicó el digest o no coincide con el archivo.
@@ -1109,6 +1399,7 @@ def _verify_evidence_digest(stdout: str, manifest: Path) -> None:
             "el manifiesto de evidencia cambió después de que el probe lo cerrara: "
             "la sesión se bloquea y no se acepta ningún artefacto"
         )
+    return published
 
 
 def _session_failure_detail(
@@ -1116,14 +1407,26 @@ def _session_failure_detail(
     diagnostics: Mapping[str, object],
     *,
     workspace: Path | None = None,
+    preview_log: str = "",
 ) -> str:
-    """Mensaje de fallo de sesión con el diagnóstico del probe, acotado y sin rutas del host."""
+    """Mensaje de fallo de sesión con el diagnóstico del probe, acotado y sin rutas del host.
+
+    El log de la preview es contenido **no confiable**: se añade acotado y saneado, solo para
+    diagnosticar, nunca como prueba de nada.
+    """
     error = _as_str(diagnostics.get("error"))
     raw = error or _excerpt(completed.stderr) or _excerpt(completed.stdout) or "sin detalle"
     detail = _sanitize(raw, workspace=workspace)
+    preview = _sanitize(preview_log, workspace=workspace) if preview_log else ""
+    suffix = (
+        f" | log NO CONFIABLE del contenedor del proyecto (puede haberlo escrito el propio "
+        f"proyecto, solo sirve para diagnosticar): {preview}"
+        if preview
+        else ""
+    )
     return (
         f"la sesión web falló con exit={completed.returncode}: {detail} "
-        f"(diagnóstico del probe: {_diagnostics_summary(diagnostics)})"
+        f"(diagnóstico del probe: {_diagnostics_summary(diagnostics)}){suffix}"
     )
 
 
@@ -1169,10 +1472,17 @@ __all__ = [
     "CAPTURE_SCRIPT_NAME",
     "DEFAULT_PREVIEW_PORT",
     "EVIDENCE_DIGEST_MARKER",
-    "PAYLOAD_FILE_NAME",
+    "EVIDENCE_MOUNT",
+    "MEASURE_PAYLOAD_FILE_NAME",
+    "PREVIEW_ALIAS_PREFIX",
+    "PREVIEW_PAYLOAD_FILE_NAME",
+    "PREVIEW_SCRIPT_NAME",
+    "PROBE_DIGEST_MARKER",
+    "PROBE_MOUNT",
     "PROBE_SCRIPT_NAME",
     "PROBE_SOURCE_DIR",
     "SCREENSHOT_NAME_PATTERN",
+    "WEB_NETWORK_PREFIX",
     "WEB_SANDBOX_BUILD_COMMAND",
     "WEB_SANDBOX_IMAGE",
     "WEB_SANDBOX_LABEL",

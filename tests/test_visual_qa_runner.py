@@ -30,6 +30,7 @@ from punto.schemas.web import DEFAULT_VIEWPORTS, WebTechnicalStatus
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import VisualQARunnerNotConfiguredError
 from punto.visualqa.claude import (
+    BLOCKED_VISUAL_COVERAGE,
     BLOCKED_VISUAL_IMAGES,
     BLOCKED_VISUAL_PROVIDER_ERROR,
     BLOCKED_VISUAL_PROVIDER_REFUSAL,
@@ -191,14 +192,13 @@ def test_a_missing_capture_blocks() -> None:
     assert report.status is VisualQAStatus.BLOCKED
     gate = report.gate(VisualQAGateName.SCREENSHOTS)
     assert gate is not None and gate.passed is False and gate.blocking is True
-    assert report.screenshots_analyzed == (
-        "home-mobile.png",
-        "home-tablet.png",
-        "home-desktop.png",
-        "precios-tablet.png",
-        "precios-desktop.png",
-    )
-    assert api.calls == 1, "el modelo respondió; lo que falta es una captura"
+    assert "precios @ MOBILE" in gate.detail
+    # No se envió nada: informar de las cinco capturas que sí había sería declarar como analizado
+    # lo que el modelo nunca vio.
+    assert report.screenshots_analyzed == ()
+    assert report.routes_analyzed == ()
+    assert BLOCKED_VISUAL_COVERAGE in report.error
+    assert api.calls == 0, "no se evalúa una parte haciéndola pasar por el todo"
 
 
 def test_the_image_budget_blocks_before_any_call() -> None:
@@ -216,7 +216,7 @@ def test_the_image_budget_blocks_before_any_call() -> None:
 
 
 def test_a_mismatched_image_is_rejected_before_the_call() -> None:
-    """Una imagen que no corresponde al artefacto no viaja."""
+    """Una imagen que no enlaza con el artefacto no viaja, y el motivo queda en el informe."""
     task, raw = make_visual_task()
     artifact = task.screenshots[0]
     images = visual_images(task, raw)
@@ -230,7 +230,52 @@ def test_a_mismatched_image_is_rejected_before_the_call() -> None:
     report = runner.evaluate(task, images)
 
     assert report.status is VisualQAStatus.BLOCKED
-    assert report.error
+    assert BLOCKED_VISUAL_COVERAGE in report.error
+    assert artifact.logical_name in report.error
+    assert api.calls == 0
+
+
+def test_same_size_with_a_different_hash_is_rejected_before_the_call() -> None:
+    """V53-05: mismo tamaño y distinto sha256 no llega al proveedor.
+
+    Es el ataque que la frontera del runner tiene que parar por sí sola: un llamante que construya
+    el ``ImagePayload`` a mano puede conservar el tamaño declarado y cambiar los bytes. La
+    revalidación contra el artefacto lo detecta y se bloquea sin gastar una llamada.
+    """
+    task, raw = make_visual_task()
+    artifact = task.screenshots[0]
+    original = raw[artifact.logical_name]
+    tampered = original[:-1] + bytes([original[-1] ^ 0xFF])
+    assert len(tampered) == len(original)
+    images = visual_images(task, raw)
+    images[artifact.logical_name] = ImagePayload(
+        data=tampered, media_type="image/png", logical_name=artifact.logical_name
+    )
+    runner, api = make_runner([proposal_response()])
+
+    report = runner.evaluate(task, images)
+
+    assert report.status is VisualQAStatus.BLOCKED
+    assert BLOCKED_VISUAL_COVERAGE in report.error
+    assert api.calls == 0
+
+
+def test_a_wrong_media_type_is_rejected_before_the_call() -> None:
+    """Una media type que contradice al artefacto se rechaza: no se canonicaliza en silencio."""
+    task, raw = make_visual_task()
+    artifact = task.screenshots[0]
+    images = visual_images(task, raw)
+    images[artifact.logical_name] = ImagePayload(
+        data=raw[artifact.logical_name],
+        media_type="image/jpeg",
+        logical_name=artifact.logical_name,
+    )
+    runner, api = make_runner([proposal_response()])
+
+    report = runner.evaluate(task, images)
+
+    assert report.status is VisualQAStatus.BLOCKED
+    assert "image/jpeg" in report.error
     assert api.calls == 0
 
 

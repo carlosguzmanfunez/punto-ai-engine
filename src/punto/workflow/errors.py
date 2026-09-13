@@ -57,7 +57,6 @@ class WorkflowInvalidTransitionError(WorkflowError):
 
 class WorkflowTerminalError(WorkflowError):
     """Se intentó avanzar un workflow que ya está en un estado terminal.
-
     Reanudar un workflow terminado no es continuarlo: es otro workflow. Se falla en vez de
     reabrir el anterior para que un ``COMPLETED`` o un ``FAILED`` no puedan cambiar de
     significado después de haberse reportado.
@@ -168,14 +167,62 @@ class WorkflowRepairDeferredError(WorkflowError):
         super().__init__(WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED, detail)
 
 
+class WorkflowApprovalProofInvalidError(WorkflowError):
+    """La autorización presentada para salir de un Human Gate no sirve.
+
+    Cubre la proof de otra tarea, la de otra decisión de política, la de otro gate, la ya
+    consumida y la fabricada. Un booleano no demuestra que un humano aprobara nada: solo la
+    prueba emitida por ``HumanGate.authorize_resume`` lo hace, y solo para el gate que la emitió.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(WorkflowFailureCode.WORKFLOW_APPROVAL_PROOF_INVALID, detail)
+
+
+class WorkflowIdempotencyConflictError(WorkflowError):
+    """La misma clave de idempotencia llegó con contenido distinto.
+
+    No es una repetición: es otra petición disfrazada. Devolver el workflow anterior daría por
+    hecho un trabajo que nadie pidió.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(WorkflowFailureCode.WORKFLOW_IDEMPOTENCY_CONFLICT, detail)
+
+
+class WorkflowPolicyRejectedError(WorkflowError):
+    """El Policy Engine rechazó la acción de forma dura (default deny o recurso protegido).
+
+    Es un fallo de política, no del producto: no se crea workflow y no se ejecuta nada.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(WorkflowFailureCode.WORKFLOW_POLICY_REJECTED, detail)
+
+
+class WorkflowEffectReconciliationError(WorkflowError):
+    """Hay un efecto en vuelo cuyo resultado se desconoce.
+
+    No se repite a ciegas: se bloquea para reconciliar. Repetir un efecto irreversible porque no
+    sabemos si ocurrió es exactamente el daño que esta frontera existe para evitar.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(WorkflowFailureCode.WORKFLOW_EFFECT_RECONCILIATION_REQUIRED, detail)
+
+
 __all__ = [
+    "WorkflowApprovalProofInvalidError",
     "WorkflowBudgetExceededError",
     "WorkflowCheckpointInvalidError",
+    "WorkflowEffectReconciliationError",
     "WorkflowError",
     "WorkflowHumanApprovalRequiredError",
+    "WorkflowIdempotencyConflictError",
     "WorkflowIncompleteEvidenceError",
     "WorkflowInvalidTransitionError",
     "WorkflowLoopDetectedError",
+    "WorkflowPolicyRejectedError",
     "WorkflowProviderUnavailableError",
     "WorkflowRepairDeferredError",
     "WorkflowResumeFailedError",

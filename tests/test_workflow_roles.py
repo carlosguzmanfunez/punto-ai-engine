@@ -10,7 +10,11 @@ Lo que se fija aquí, y por qué:
 - **no hay fallback silencioso**: un proveedor no disponible falla antes de llamar a CAMUS y un
   runner ausente se reporta como hueco, no se sustituye por otro;
 - **no se copian secretos**: la normalización lee una lista cerrada de campos, y una prueba con
-  valor canario lo demuestra sobre el resultado serializado.
+  valor canario lo demuestra sobre el resultado serializado;
+- **una etapa es una llamada** (V60-03): ``ARCHITECT`` ejecuta solo al Architect y ``PLANNER``
+  solo al Planner, con el diseño del Architect reconstruido desde su referencia durable. Las
+  pruebas de esa parte usan el ``Camus`` **real** y ``CamusRoleExecutor`` **real** con dobles que
+  cuentan llamadas: un ``FakeRoleExecutor`` no podría demostrar que la duplicación desapareció.
 """
 
 from __future__ import annotations
@@ -22,10 +26,25 @@ from uuid import uuid4
 import pytest
 
 from engine5_support import make_finding, make_security_report
+from planning_support import PYTHON_API_ARCHITECT, PYTHON_API_PLANNER
+from punto.architect.base import ArchitectRequest, ArchitectRunner, ArchitectureOutcome
+from punto.audit.logger import AuditLogger
+from punto.orchestrator.camus import Camus
+from punto.orchestrator.planner import Planner
+from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
+from punto.policy.human_gate import HumanGate
+from punto.policy.policy_engine import PolicyEngine
 from punto.schemas.cross_audit import CrossAuditStatus
 from punto.schemas.enums import FindingSeverity, TaskStatus
 from punto.schemas.execution import DeveloperRunStatus, ModelUsage
-from punto.schemas.planning import ModelExecutionSummary, ProjectPlanStatus
+from punto.schemas.planning import (
+    ArchitectureProposal,
+    ModelExecutionSummary,
+    ProjectIntent,
+    ProjectPlanStatus,
+    Roadmap,
+    TaskGraph,
+)
 from punto.schemas.qa import QAStatus
 from punto.schemas.review import ReviewStatus
 from punto.schemas.security import SecurityStatus
@@ -34,6 +53,7 @@ from punto.schemas.workflow import (
     MAX_WORKFLOW_FINDINGS,
     MAX_WORKFLOW_SUMMARY_CHARS,
     MAX_WORKFLOW_TEXT_CHARS,
+    ArtifactReference,
     CredentialState,
     ProviderCapability,
     RoleExecutionRequest,
@@ -42,7 +62,12 @@ from punto.schemas.workflow import (
     RoleStatus,
     WorkflowFailureCode,
 )
-from punto.tools.errors import QARunnerNotConfiguredError
+from punto.tasks.manager import TaskManager
+from punto.tools.errors import (
+    ArchitectRunnerNotConfiguredError,
+    PlanningValidationError,
+    QARunnerNotConfiguredError,
+)
 from punto.workflow.errors import WorkflowProviderUnavailableError
 from punto.workflow.roles import (
     CallableRoleExecutor,
@@ -78,8 +103,14 @@ _EXITO: dict[RoleName, str] = {
 # ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
-def _request(role: RoleName) -> RoleExecutionRequest:
-    """Petición de rol mínima y válida para las pruebas."""
+def _request(
+    role: RoleName, *, references: tuple[ArtifactReference, ...] = ()
+) -> RoleExecutionRequest:
+    """Petición de rol mínima y válida para las pruebas.
+
+    ``references`` es la vía por la que una etapa entrega su artefacto a la siguiente: el diseño
+    del Architect viaja ahí, no en una variable del proceso anterior.
+    """
     return RoleExecutionRequest(
         workflow_id=uuid4(),
         step_index=0,
@@ -88,6 +119,7 @@ def _request(role: RoleName) -> RoleExecutionRequest:
         task_id=uuid4(),
         project_id=uuid4(),
         objective="normalizar el informe real del rol",
+        references=references,
         idempotency_key=f"paso-{role.value}",
     )
 
@@ -169,11 +201,21 @@ def _payload(role: RoleName) -> object:
     """Entrada sintética que ``build_input`` debe devolver para cada rol."""
     if role in (RoleName.DEVELOPER, RoleName.VISUAL_QA):
         return ("tarea", "contexto")
+    if role is RoleName.ARCHITECT:
+        return "intención"
+    if role is RoleName.PLANNER:
+        # El Planner recibe la pareja (intención, diseño ya validado): sin diseño no hay plan.
+        return ("intención", SimpleNamespace(proposal=SimpleNamespace()))
     return "entrada"
 
 
 class _FakeCamus:
-    """Doble de CAMUS que cuenta llamadas y devuelve el informe preparado."""
+    """Doble de CAMUS que cuenta llamadas y devuelve el informe preparado.
+
+    ``plan_project`` **no** responde: compone las dos etapas de planificación, así que un
+    adaptador de rol que lo llamara ejecutaría Architect + Planner en cada paso (V60-03). El
+    doble lo deja ruidoso a propósito, para que esa regresión no pueda pasar desapercibida.
+    """
 
     def __init__(self, response: object, *, error: Exception | None = None) -> None:
         self.calls: list[tuple[str, tuple[object, ...]]] = []
@@ -188,8 +230,19 @@ class _FakeCamus:
         return self._response
 
     def plan_project(self, intent: object) -> object:
-        """Método público de CAMUS que cubre Architect y Planner."""
-        return self._respond("plan_project", (intent,))
+        """Método compuesto: ningún adaptador de rol debe llamarlo."""
+        raise AssertionError(
+            "el adaptador de un rol no puede llamar a plan_project: ejecutaría Architect y "
+            "Planner en una sola etapa"
+        )
+
+    def analyze_project(self, intent: object) -> object:
+        """Método público de CAMUS que ejecuta solo al Architect."""
+        return self._respond("analyze_project", (intent,))
+
+    def plan_project_from_architecture(self, intent: object, architecture: object) -> object:
+        """Método público de CAMUS que ejecuta solo al Planner sobre el diseño recibido."""
+        return self._respond("plan_project_from_architecture", (intent, architecture))
 
     def execute_developer_task(self, task: object, context: object) -> object:
         """Método público de CAMUS para el Developer."""
@@ -622,8 +675,8 @@ def test_camus_role_executor_sin_runner_configurado_no_sustituye_proveedor() -> 
 @pytest.mark.parametrize(
     ("rol", "metodo"),
     [
-        (RoleName.ARCHITECT, "plan_project"),
-        (RoleName.PLANNER, "plan_project"),
+        (RoleName.ARCHITECT, "analyze_project"),
+        (RoleName.PLANNER, "plan_project_from_architecture"),
         (RoleName.DEVELOPER, "execute_developer_task"),
         (RoleName.QA, "qa_task"),
         (RoleName.SECURITY, "security_task"),
@@ -682,3 +735,414 @@ def test_ningun_resultado_serializado_contiene_credenciales() -> None:
     for clave in ("api_key", "credential", "secret", "authorization", "bearer"):
         assert clave not in serializado
     assert '"provider":"deepseek"' in serializado
+
+
+# ---------------------------------------------------------------------------
+# V60-03: una etapa, una llamada (CAMUS real + adaptador real)
+# ---------------------------------------------------------------------------
+#: Diseño y plan **válidos de verdad**: los dobles devuelven artefactos que CAMUS revalida con
+#: sus propios invariantes, así que las pruebas ejercitan el flujo real, no un atajo.
+_ARCHITECTURE_PROPOSAL = ArchitectureProposal.model_validate(PYTHON_API_ARCHITECT)
+_PLANNER_ROADMAP = Roadmap.model_validate(
+    {clave: valor for clave, valor in PYTHON_API_PLANNER.items() if clave != "notes"}
+)
+_PLANNER_TASK_GRAPH = TaskGraph(
+    project_name=_PLANNER_ROADMAP.project_name, tasks=_PLANNER_ROADMAP.tasks
+)
+_INTENT = ProjectIntent(name="StockFlow", description="Intención sintética de prueba")
+
+
+class _CountingArchitectRunner(ArchitectRunner):
+    """Doble del Architect: cuenta llamadas y devuelve un diseño válido, siempre el mismo."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.outcome: ArchitectureOutcome | None = None
+
+    @property
+    def provider(self) -> str:
+        """Proveedor declarado por el doble."""
+        return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble declara usar IA, como el runner real."""
+        return True
+
+    def design(self, request: ArchitectRequest) -> ArchitectureOutcome:
+        """Registra la llamada y devuelve el diseño válido preparado."""
+        del request
+        self.calls += 1
+        self.outcome = ArchitectureOutcome(
+            status=ProjectPlanStatus.PASS,
+            proposal=_ARCHITECTURE_PROPOSAL,
+            summary=ModelExecutionSummary(runner="CountingArchitectRunner", attempts_used=1),
+        )
+        return self.outcome
+
+
+class _CountingPlannerRunner(PlannerRunner):
+    """Doble del Planner: cuenta llamadas, recuerda la petición y puede fallar a propósito."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls = 0
+        self.requests: list[PlannerRequest] = []
+        self._fail = fail
+
+    @property
+    def provider(self) -> str:
+        """Proveedor declarado por el doble."""
+        return "doble"
+
+    def plan(self, request: PlannerRequest) -> PlanningOutcome:
+        """Registra la llamada y devuelve el plan preparado, o el fallo declarado."""
+        self.calls += 1
+        self.requests.append(request)
+        if self._fail:
+            return PlanningOutcome(
+                status=ProjectPlanStatus.FAILED,
+                error="el Planner no pudo dividir el trabajo",
+            )
+        return PlanningOutcome(
+            status=ProjectPlanStatus.PASS,
+            roadmap=_PLANNER_ROADMAP,
+            task_graph=_PLANNER_TASK_GRAPH,
+            summary=ModelExecutionSummary(runner="CountingPlannerRunner", attempts_used=1),
+        )
+
+
+class _EngineArtifactStore:
+    """Almacén mínimo del motor: guarda el diseño bajo una referencia durable y lo devuelve."""
+
+    def __init__(self) -> None:
+        self._designs: dict[str, ArchitectureOutcome] = {}
+
+    def save_design(self, name: str, outcome: ArchitectureOutcome) -> ArtifactReference:
+        """Guarda el diseño de una etapa y devuelve la referencia que viajará a la siguiente."""
+        self._designs[name] = outcome
+        return ArtifactReference(
+            kind="ARCHITECTURE", label="diseño del Architect", store="engine", reference=name
+        )
+
+    def load_design(self, references: tuple[ArtifactReference, ...]) -> ArchitectureOutcome | None:
+        """Reconstruye el diseño desde su referencia, o ``None`` si no está en el almacén."""
+        for item in references:
+            found = self._designs.get(item.reference)
+            if item.store == "engine" and found is not None:
+                return found
+        return None
+
+
+def _planning_camus(
+    *,
+    task_manager: TaskManager,
+    policy_engine: PolicyEngine,
+    human_gate: HumanGate,
+    architect: ArchitectRunner | None,
+    planner: PlannerRunner | None,
+) -> Camus:
+    """CAMUS real con los dos runners de planificación inyectados."""
+    return Camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        audit=AuditLogger(),
+        planner=Planner(),
+        architect_runner=architect,
+        planner_runner=planner,
+    )
+
+
+def _camus_role(camus: Camus, role: RoleName, store: _EngineArtifactStore) -> CamusRoleExecutor:
+    """Adaptador **real** del rol, con un ``build_input`` que resuelve el diseño por referencia."""
+
+    def architect_input(request: RoleExecutionRequest) -> object:
+        # El Architect solo necesita la intención: es la primera etapa.
+        del request
+        return _INTENT
+
+    def planner_input(request: RoleExecutionRequest) -> object:
+        # El Planner no recibe el diseño en la mano: lo reconstruye de la referencia durable.
+        return (_INTENT, store.load_design(request.references))
+
+    return CamusRoleExecutor(
+        camus=camus,
+        role=role,
+        build_input=architect_input if role is RoleName.ARCHITECT else planner_input,
+    )
+
+
+def _invalid_design() -> ArchitectureOutcome:
+    """Diseño que el runner declara aceptado pero que incumple un invariante de PUNTO."""
+    return ArchitectureOutcome(
+        status=ProjectPlanStatus.PASS,
+        proposal=_ARCHITECTURE_PROPOSAL.model_copy(
+            update={
+                "architecture": _ARCHITECTURE_PROPOSAL.architecture.model_copy(
+                    update={"components": ()}
+                )
+            }
+        ),
+    )
+
+
+def test_el_rol_architect_ejecuta_una_vez_y_no_toca_al_planner(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V60-03: la etapa ARCHITECT ejecuta al Architect una vez y no llama al Planner."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    executor = _camus_role(camus, RoleName.ARCHITECT, _EngineArtifactStore())
+
+    assert isinstance(executor, RoleExecutor)
+    resultado = executor.execute(_request(RoleName.ARCHITECT))
+
+    assert architect.calls == 1
+    assert planner.calls == 0
+    assert resultado.role is RoleName.ARCHITECT
+    assert resultado.status is RoleStatus.COMPLETED
+    assert resultado.error_code is None
+    assert resultado.artifacts == ("C1", "C2", "C3")
+
+
+def test_el_rol_planner_usa_el_diseno_durable_y_no_repite_al_architect(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V60-03: tras ARCHITECT, la etapa PLANNER planifica el diseño durable sin re-diseñarlo."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    store = _EngineArtifactStore()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    arquitectura = _camus_role(camus, RoleName.ARCHITECT, store).execute(
+        _request(RoleName.ARCHITECT)
+    )
+    assert architect.calls == 1
+    assert arquitectura.status is RoleStatus.COMPLETED
+    assert architect.outcome is not None
+    reference = store.save_design("design-1", architect.outcome)
+
+    plan = _camus_role(camus, RoleName.PLANNER, store).execute(
+        _request(RoleName.PLANNER, references=(reference,))
+    )
+
+    assert arquitectura.artifacts == ("C1", "C2", "C3")
+    assert architect.calls == 1, "el Planner no puede volver a ejecutar al Architect"
+    assert planner.calls == 1
+    assert plan.role is RoleName.PLANNER
+    assert plan.status is RoleStatus.COMPLETED
+    assert plan.artifacts == tuple(task.id for task in _PLANNER_ROADMAP.tasks)
+
+
+def test_el_resultado_del_planner_refleja_el_diseno_del_architect(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """El Planner planifica **el** diseño del Architect: su ``project_spec`` es el mismo objeto."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    store = _EngineArtifactStore()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    _camus_role(camus, RoleName.ARCHITECT, store).execute(_request(RoleName.ARCHITECT))
+    assert architect.outcome is not None and architect.outcome.proposal is not None
+    diseno = architect.outcome.proposal
+    reference = store.save_design("design-1", architect.outcome)
+
+    plan = _camus_role(camus, RoleName.PLANNER, store).execute(
+        _request(RoleName.PLANNER, references=(reference,))
+    )
+
+    assert planner.requests, "el Planner debe haber sido invocado una vez"
+    visto = planner.requests[0]
+    assert visto.project_spec is diseno.project_spec
+    assert visto.architecture is diseno.architecture
+    assert visto.capability_profile is diseno.capability_profile
+    assert visto.project_spec.project_name == "StockFlow"
+    assert plan.status is RoleStatus.COMPLETED
+    assert plan.artifacts == tuple(task.id for task in _PLANNER_ROADMAP.tasks)
+
+
+def test_un_fallo_del_planner_aparece_en_su_paso_y_no_en_el_del_architect(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """El fallo del Planner se queda en la etapa PLANNER: la del Architect sigue en pie."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner(fail=True)
+    store = _EngineArtifactStore()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    arquitectura = _camus_role(camus, RoleName.ARCHITECT, store).execute(
+        _request(RoleName.ARCHITECT)
+    )
+    assert architect.outcome is not None
+    reference = store.save_design("design-1", architect.outcome)
+
+    plan = _camus_role(camus, RoleName.PLANNER, store).execute(
+        _request(RoleName.PLANNER, references=(reference,))
+    )
+
+    # ``FAILED`` del Planner significa «hay algo que rehacer»: el kernel lo ve como reparación.
+    assert plan.status is RoleStatus.NEEDS_REPAIR
+    assert "no pudo dividir el trabajo" in plan.summary
+    # El paso del Architect no carga con el fallo ajeno y no se repite para compensarlo.
+    assert arquitectura.status is RoleStatus.COMPLETED
+    assert arquitectura.error_code is None
+    assert architect.calls == 1
+    assert planner.calls == 1
+
+
+def test_el_planner_sin_diseno_falla_sin_repetir_al_architect(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Sin diseño que reconstruir, la etapa PLANNER falla: no se vuelve a ejecutar al Architect."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    store = _EngineArtifactStore()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    _camus_role(camus, RoleName.ARCHITECT, store).execute(_request(RoleName.ARCHITECT))
+
+    # La petición del Planner llega **sin** la referencia del diseño.
+    plan = _camus_role(camus, RoleName.PLANNER, store).execute(_request(RoleName.PLANNER))
+
+    assert plan.role is RoleName.PLANNER
+    assert plan.status is RoleStatus.FAILED
+    assert plan.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "PLANNER" in plan.error_detail
+    assert "references" in plan.error_detail
+    assert planner.calls == 0
+    assert architect.calls == 1, "el Architect no se re-ejecuta para suplir el diseño ausente"
+
+
+def test_un_diseno_invalido_de_la_referencia_falla_sin_ejecutar_al_planner(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Un diseño corrupto en el almacén se rechaza con el error tipado, no se planifica."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    store = _EngineArtifactStore()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    reference = store.save_design("design-roto", _invalid_design())
+
+    plan = _camus_role(camus, RoleName.PLANNER, store).execute(
+        _request(RoleName.PLANNER, references=(reference,))
+    )
+
+    assert plan.status is RoleStatus.FAILED
+    assert plan.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "componente" in plan.error_detail
+    assert planner.calls == 0
+    assert architect.calls == 0
+
+
+def test_camus_separa_las_etapas_y_plan_project_las_compone_una_vez(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """CAMUS real: cada método público ejecuta su etapa, y ``plan_project`` compone las dos."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    arquitectura = camus.analyze_project(_INTENT)
+    assert architect.calls == 1
+    assert planner.calls == 0
+    assert arquitectura.succeeded
+
+    outcome = camus.plan_project_from_architecture(_INTENT, arquitectura)
+    assert planner.calls == 1
+    assert architect.calls == 1
+    assert outcome.succeeded
+
+    result = camus.plan_project(_INTENT)
+    assert result.status is ProjectPlanStatus.PASS
+    assert architect.calls == 2
+    assert planner.calls == 2
+
+
+def test_analyze_project_sin_architect_runner_falla_explicitamente(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Sin Architect inyectado, la etapa de diseño falla de forma explícita (como hoy)."""
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=None,
+        planner=planner,
+    )
+
+    with pytest.raises(ArchitectRunnerNotConfiguredError):
+        camus.analyze_project(_INTENT)
+    assert planner.calls == 0
+
+
+def test_plan_project_from_architecture_rechaza_un_diseno_invalido(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """El diseño se revalida antes de planificar y se rechaza con el error tipado del motor."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+
+    with pytest.raises(PlanningValidationError) as caught:
+        camus.plan_project_from_architecture(_INTENT, _invalid_design())
+
+    assert any("componente" in item for item in caught.value.violations)
+    assert planner.calls == 0
+
+    sin_diseno = ArchitectureOutcome(
+        status=ProjectPlanStatus.FAILED, error="el Architect no produjo diseño"
+    )
+    with pytest.raises(PlanningValidationError):
+        camus.plan_project_from_architecture(_INTENT, sin_diseno)
+    assert planner.calls == 0

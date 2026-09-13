@@ -3,24 +3,38 @@
 Se ejercita el comportamiento real: ficheros en disco, escritura atómica, detección de
 corrupción, reanudación sin repetir etapas y la garantía de que un workflow no puede quedar
 falsamente ``COMPLETED``. Todo con ``tmp_path``: ningún test toca el directorio del proyecto.
+
+La carga es de confianza cero (hallazgo V60-06): ``load`` valida **siempre** la integridad de los
+metadatos contra los bytes y la coherencia entre run y checkpoint, así que aquí se manipulan los
+metadatos y el contenido uno a uno para comprobar que ninguna anomalía pasa en silencio y que
+nunca se retrocede al checkpoint anterior.
 """
 
 from __future__ import annotations
 
 import hashlib
+import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
 from punto.common import utc_now
-from punto.schemas.enums import TaskStatus
+from punto.schemas.enums import AuthorityLevel, FindingSeverity, RiskLevel, TaskStatus
 from punto.schemas.planning import SCHEMA_VERSION
 from punto.schemas.workflow import (
+    ArtifactReference,
+    EffectRecord,
+    EffectStatus,
     RoleName,
     RoleStatus,
+    StageArtifacts,
+    WorkflowCheckpoint,
     WorkflowDecisionKind,
+    WorkflowFailureCode,
+    WorkflowFinding,
     WorkflowRequest,
     WorkflowResult,
     WorkflowRun,
@@ -40,6 +54,9 @@ CHECKPOINT_DIRNAME = "checkpoints"
 
 #: Contexto normal y representativo de una etapa: sin secretos, como exige el contrato.
 NORMAL_CONTEXT = "Contexto de la etapa: objetivo, criterios de aceptación y rutas del proyecto."
+
+#: Acción canónica de la petición: el contrato exige declararla, no se inventa.
+REQUEST_ACTION = "modify_file"
 
 #: Cadenas que jamás deben aparecer en un fichero de checkpoint.
 FORBIDDEN_IN_CHECKPOINTS = (
@@ -63,8 +80,16 @@ def make_run(
     completed_at: datetime | None = None,
     context_summary: str = NORMAL_CONTEXT,
     schema_version: str = SCHEMA_VERSION,
+    action: str = REQUEST_ACTION,
+    project_path: str = "",
+    request_fingerprint: str = "",
+    stage_artifacts: tuple[StageArtifacts, ...] = (),
+    effects: tuple[EffectRecord, ...] = (),
+    policy_decision_id: UUID | None = None,
+    effective_authority: AuthorityLevel | None = None,
+    effective_risk: RiskLevel | None = None,
 ) -> WorkflowRun:
-    """Run mínimo y válido para las pruebas de checkpointing."""
+    """Run mínimo y válido para las pruebas de checkpointing, con el contrato completo."""
     identifier = workflow_id if workflow_id is not None else uuid4()
     return WorkflowRun(
         workflow_id=identifier,
@@ -73,13 +98,21 @@ def make_run(
             task_id=uuid4(),
             project_id=uuid4(),
             objective="Implementar el checkpointing determinista del kernel",
+            action=action,
             acceptance_criteria=("el run se reanuda sin repetir etapas",),
             context_summary=context_summary,
+            project_path=project_path,
             idempotency_key=f"request:{identifier}",
         ),
         status=status,
         revision=revision,
         steps=steps,
+        request_fingerprint=request_fingerprint,
+        stage_artifacts=stage_artifacts,
+        effects=effects,
+        policy_decision_id=policy_decision_id,
+        effective_authority=effective_authority,
+        effective_risk=effective_risk,
         result=result,
         completed_at=completed_at,
     )
@@ -104,6 +137,50 @@ def make_step(
     )
 
 
+def make_stage_artifacts(step_index: int = 0) -> StageArtifacts:
+    """Handoff estructurado de una etapa, con referencias y un hallazgo real."""
+    return StageArtifacts(
+        role=RoleName.DEVELOPER,
+        stage=TaskStatus.IN_PROGRESS,
+        step_index=step_index,
+        summary="La etapa deja el módulo listo para QA.",
+        references=(
+            ArtifactReference(
+                kind="patch",
+                label="diff del módulo",
+                store="artifacts",
+                reference="art-0001",
+                digest="a" * 64,
+                bytes_written=1_234,
+            ),
+            ArtifactReference(kind="log", label="salida de pruebas", reference="log-0001"),
+        ),
+        findings=(
+            WorkflowFinding(
+                role=RoleName.DEVELOPER,
+                severity=FindingSeverity.LOW,
+                category="STYLE",
+                message="hallazgo no bloqueante de la etapa",
+                evidence="evidencia de la etapa",
+            ),
+        ),
+    )
+
+
+def make_effect(step_index: int = 0) -> EffectRecord:
+    """Efecto ya resuelto, con la intención durable que impide repetirlo a ciegas."""
+    return EffectRecord(
+        idempotency_key=f"effect:{step_index}",
+        action=REQUEST_ACTION,
+        role=RoleName.DEVELOPER,
+        step_index=step_index,
+        status=EffectStatus.APPLIED,
+        reversible=True,
+        detail="escritura aplicada una sola vez",
+        resolved_at=utc_now(),
+    )
+
+
 def run_path(root: Path, workflow_id: UUID, sequence: int) -> Path:
     """Ruta del contenido de un checkpoint, tal como la fija el formato en disco."""
     return root / str(workflow_id) / f"{sequence:04d}.json"
@@ -117,6 +194,24 @@ def meta_path(root: Path, workflow_id: UUID, sequence: int) -> Path:
 def serialize(run: WorkflowRun) -> bytes:
     """Bytes exactos que el store debe escribir para un run."""
     return (run.model_dump_json(indent=2) + "\n").encode("utf-8")
+
+
+def serialize_meta(checkpoint: WorkflowCheckpoint) -> bytes:
+    """Bytes exactos que el store debe escribir para unos metadatos."""
+    return (checkpoint.model_dump_json(indent=2) + "\n").encode("utf-8")
+
+
+def write_meta(
+    root: Path,
+    workflow_id: UUID,
+    sequence: int,
+    checkpoint: WorkflowCheckpoint,
+    updates: dict[str, Any] | None = None,
+) -> WorkflowCheckpoint:
+    """Reescribe los metadatos en disco con los cambios pedidos, como haría una manipulación."""
+    patched = checkpoint if updates is None else checkpoint.model_copy(update=updates)
+    meta_path(root, workflow_id, sequence).write_bytes(serialize_meta(patched))
+    return patched
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +236,72 @@ def test_guardar_y_cargar_devuelve_exactamente_el_mismo_run(tmp_path: Path) -> N
 
     assert loaded.model_dump() == run.model_dump()
     assert loaded == run
+
+
+def test_ida_y_vuelta_con_stage_artifacts_y_effects_vacios(tmp_path: Path) -> None:
+    """El run nuevo con las colecciones nuevas vacías vuelve byte a byte igual."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    run = make_run(
+        workflow_id=workflow_id,
+        revision=4,
+        status=TaskStatus.QA,
+        steps=(make_step(workflow_id, 0, RoleName.DEVELOPER, TaskStatus.IN_PROGRESS),),
+        request_fingerprint=hashlib.sha256(b"peticion").hexdigest(),
+        stage_artifacts=(),
+        effects=(),
+    )
+    assert run.stage_artifacts == ()
+    assert run.effects == ()
+
+    store.save(run)
+    loaded = store.load(workflow_id)
+
+    assert loaded.stage_artifacts == ()
+    assert loaded.effects == ()
+    assert loaded.model_dump() == run.model_dump()
+    assert loaded == run
+
+
+def test_ida_y_vuelta_con_stage_artifacts_y_effects_con_contenido(tmp_path: Path) -> None:
+    """Handoff y efectos con contenido real sobreviven al checkpoint sin perder un campo."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    decision_id = uuid4()
+    run = make_run(
+        workflow_id=workflow_id,
+        revision=6,
+        status=TaskStatus.REVIEW,
+        steps=(
+            make_step(workflow_id, 0, RoleName.DEVELOPER, TaskStatus.IN_PROGRESS),
+            make_step(workflow_id, 1, RoleName.QA, TaskStatus.QA),
+        ),
+        action="modify_file",
+        project_path="src/punto",
+        request_fingerprint="b" * 64,
+        stage_artifacts=(make_stage_artifacts(),),
+        effects=(make_effect(),),
+        policy_decision_id=decision_id,
+        effective_authority=AuthorityLevel.LEVEL_2_CAMUS,
+        effective_risk=RiskLevel.MEDIUM,
+    )
+
+    checkpoint = store.save(run)
+    loaded = store.load(workflow_id)
+
+    assert loaded.model_dump() == run.model_dump()
+    assert loaded == run
+    assert loaded.stage_artifacts[0].references[0].digest == "a" * 64
+    assert loaded.stage_artifacts[0].findings[0].severity is FindingSeverity.LOW
+    assert loaded.effects[0].status is EffectStatus.APPLIED
+    assert loaded.effects[0].resolved_at is not None
+    assert loaded.policy_decision_id == decision_id
+    assert loaded.effective_authority is AuthorityLevel.LEVEL_2_CAMUS
+    assert loaded.effective_risk is RiskLevel.MEDIUM
+    assert loaded.request.action == "modify_file"
+    assert loaded.request.project_path == "src/punto"
+    assert loaded.request_fingerprint == "b" * 64
+    assert checkpoint.sequence == 6
 
 
 def test_el_checkpoint_declara_el_digest_y_el_tamano_reales(tmp_path: Path) -> None:
@@ -221,7 +382,7 @@ def test_los_metadatos_se_escriben_junto_al_contenido(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integridad: corrupción, esquema y ausencias
+# Integridad del contenido: corrupción, esquema y ausencias
 # ---------------------------------------------------------------------------
 def test_un_byte_alterado_invalida_el_checkpoint(tmp_path: Path) -> None:
     """Corrupción silenciosa detectada por el digest: ``latest`` la ve, ``load`` la rechaza."""
@@ -260,17 +421,12 @@ def test_un_contenido_que_no_es_un_run_valido_falla(tmp_path: Path) -> None:
     path = run_path(store.root, run.workflow_id, checkpoint.sequence)
     payload = b'{"no": "es un workflow"}'
     path.write_bytes(payload)
-    meta = meta_path(store.root, run.workflow_id, checkpoint.sequence)
-    meta.write_bytes(
-        (
-            checkpoint.model_copy(
-                update={
-                    "digest": hashlib.sha256(payload).hexdigest(),
-                    "bytes_written": len(payload),
-                }
-            ).model_dump_json(indent=2)
-            + "\n"
-        ).encode("utf-8")
+    write_meta(
+        store.root,
+        run.workflow_id,
+        checkpoint.sequence,
+        checkpoint,
+        {"digest": hashlib.sha256(payload).hexdigest(), "bytes_written": len(payload)},
     )
 
     with pytest.raises(WorkflowCheckpointInvalidError, match="WorkflowRun"):
@@ -278,13 +434,14 @@ def test_un_contenido_que_no_es_un_run_valido_falla(tmp_path: Path) -> None:
 
 
 def test_schema_version_distinta_falla_al_cargar(tmp_path: Path) -> None:
-    """Un checkpoint de otra versión de esquema se rechaza de forma explícita al reanudar."""
+    """Un checkpoint de otra versión de esquema se rechaza de forma explícita al cargar."""
     store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
     run = make_run(schema_version="0.0.1")
     store.save(run)
 
-    with pytest.raises(WorkflowCheckpointInvalidError, match="schema_version"):
+    with pytest.raises(WorkflowCheckpointInvalidError, match="schema_version") as excinfo:
         store.load(run.workflow_id)
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
 
 
 def test_cargar_un_workflow_sin_checkpoints_falla(tmp_path: Path) -> None:
@@ -335,6 +492,153 @@ def test_un_contenido_sin_metadatos_no_es_un_checkpoint(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Manipulación de metadatos (V60-06): nada pasa en silencio
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("updates", "esperado"),
+    [
+        pytest.param({"status": TaskStatus.REVIEW}, "estado", id="status-cambiado"),
+        pytest.param({"revision": 4}, "retrocede", id="revision-adelantada"),
+        pytest.param({"revision": 2}, "obsoleto", id="revision-retrocedida"),
+        pytest.param({"sequence": 4}, "secuencia", id="sequence-cambiada"),
+        pytest.param({"bytes_written": 999_999}, "bytes_written", id="bytes-written-cambiado"),
+        pytest.param({"digest": "0" * 64}, "digest", id="digest-alterado"),
+        pytest.param(
+            {"workflow_id": UUID("00000000-0000-0000-0000-0000000000ff")},
+            "workflow",
+            id="workflow-cambiado",
+        ),
+    ],
+)
+def test_metadatos_manipulados_fallan_al_cargar(
+    tmp_path: Path, updates: dict[str, Any], esperado: str
+) -> None:
+    """Cada campo de los metadatos se comprueba: manipularlo es un error explícito, no un aviso."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    run = make_run(workflow_id=workflow_id, revision=3, status=TaskStatus.QA)
+    checkpoint = store.save(run)
+    write_meta(store.root, workflow_id, checkpoint.sequence, checkpoint, updates)
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match=esperado) as excinfo:
+        store.load(workflow_id)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
+
+
+def test_metadatos_obsoletos_copiados_a_una_secuencia_nueva_fallan(tmp_path: Path) -> None:
+    """Copiar los metadatos viejos a la secuencia nueva no los convierte en los de ese contenido."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    first = store.save(make_run(workflow_id=workflow_id, revision=0))
+    store.save(
+        make_run(
+            workflow_id=workflow_id,
+            revision=1,
+            context_summary="Segundo guardado, con contenido distinto del primero.",
+        )
+    )
+    # Los metadatos del primer checkpoint, tal cual, sobre el nombre de la secuencia nueva.
+    meta_path(store.root, workflow_id, 1).write_bytes(
+        meta_path(store.root, workflow_id, 0).read_bytes()
+    )
+
+    assert first.sequence == 0
+    with pytest.raises(WorkflowCheckpointInvalidError, match="secuencia"):
+        store.load(workflow_id)
+    with pytest.raises(WorkflowCheckpointInvalidError, match="secuencia"):
+        store.latest(workflow_id)
+
+
+def test_metadatos_obsoletos_con_la_secuencia_retocada_fallan_por_el_digest(tmp_path: Path) -> None:
+    """Retocar el ``sequence`` no basta: ``digest`` y ``bytes_written`` siguen siendo los viejos."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    first = store.save(make_run(workflow_id=workflow_id, revision=0))
+    store.save(
+        make_run(
+            workflow_id=workflow_id,
+            revision=1,
+            context_summary="Segundo guardado, con contenido distinto del primero.",
+        )
+    )
+    stale = first.model_copy(update={"sequence": 1})
+    meta_path(store.root, workflow_id, 1).write_bytes(serialize_meta(stale))
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="digest") as excinfo:
+        store.load(workflow_id)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
+
+
+def test_load_valida_la_coherencia_aunque_no_sea_una_reanudacion(tmp_path: Path) -> None:
+    """Digest y tamaño pueden cuadrar y el checkpoint seguir siendo inválido: describen otro estado.
+
+    Es el corazón de V60-06: ``load`` no se limita a comprobar la integridad de los bytes, también
+    comprueba que los metadatos digan lo mismo que el run que se va a devolver.
+    """
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    stored = make_run(workflow_id=workflow_id, revision=5, status=TaskStatus.QA)
+    checkpoint = store.save(stored)
+    other = make_run(
+        workflow_id=workflow_id,
+        revision=6,
+        status=TaskStatus.REVIEW,
+        context_summary="Contenido de otro estado, con metadatos del anterior.",
+    )
+    payload = serialize(other)
+    run_path(store.root, workflow_id, checkpoint.sequence).write_bytes(payload)
+    write_meta(
+        store.root,
+        workflow_id,
+        checkpoint.sequence,
+        checkpoint,
+        {"digest": hashlib.sha256(payload).hexdigest(), "bytes_written": len(payload)},
+    )
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="no describe al run") as excinfo:
+        store.load(workflow_id)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
+
+
+def test_load_falla_si_el_ultimo_checkpoint_esta_corrupto_y_no_retrocede(tmp_path: Path) -> None:
+    """El penúltimo sigue en disco, pero ``load`` no baja a él: reanudaría otro estado."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    store.save(make_run(workflow_id=workflow_id, revision=0))
+    second = store.save(
+        make_run(
+            workflow_id=workflow_id,
+            revision=1,
+            context_summary="Segundo guardado, que se corrompe a continuación.",
+        )
+    )
+    path = run_path(store.root, workflow_id, second.sequence)
+    path.write_bytes(path.read_bytes()[:-40])
+
+    assert [checkpoint.sequence for checkpoint in store.list_checkpoints(workflow_id)] == [0, 1]
+    assert store.latest(workflow_id) == second
+    with pytest.raises(WorkflowCheckpointInvalidError, match="digest") as excinfo:
+        store.load(workflow_id)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
+
+
+def test_load_detecta_un_directorio_copiado_de_otro_workflow(tmp_path: Path) -> None:
+    """Un directorio entero copiado a otro workflow describe al run equivocado: se rechaza."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    store.save(make_run(workflow_id=workflow_id, revision=1))
+    other = uuid4()
+    shutil.copytree(store.root / str(workflow_id), store.root / str(other))
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="workflow"):
+        store.load(other)
+
+
+# ---------------------------------------------------------------------------
 # Escritura atómica
 # ---------------------------------------------------------------------------
 def test_dos_guardados_seguidos_dejan_el_ultimo_y_ningun_temporal(tmp_path: Path) -> None:
@@ -358,10 +662,34 @@ def test_dos_guardados_seguidos_dejan_el_ultimo_y_ningun_temporal(tmp_path: Path
         if path.is_file()
     )
     assert written == ["0000.json", "0001.json", "meta/0000.json", "meta/0001.json"]
+    strays = [
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*")
+        if path.is_file() and (path.name.startswith(".") or path.suffix == ".tmp")
+    ]
+    assert strays == []
     content = run_path(store.root, workflow_id, 1).read_bytes()
     assert content == serialize(second)
     assert b"Contenido final tras el segundo guardado." in content
     assert store.load(workflow_id).model_dump() == second.model_dump()
+
+
+def test_un_guardado_rechazado_no_deja_restos(tmp_path: Path) -> None:
+    """La validación ocurre antes de tocar el disco: un rechazo no deja temporales ni carpetas."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    workflow_id = uuid4()
+    rejected = make_run(
+        workflow_id=workflow_id,
+        revision=1,
+        status=TaskStatus.COMPLETED,
+        completed_at=utc_now(),
+    )
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="sin result"):
+        store.save(rejected)
+
+    assert store.latest(workflow_id) is None
+    assert not (store.root / str(workflow_id)).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +873,7 @@ def test_un_run_no_terminal_se_guarda_sin_resultado(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reanudación: coherencia entre run y checkpoint
+# validate_checkpoint: coherencia entre run y checkpoint
 # ---------------------------------------------------------------------------
 def test_validate_checkpoint_acepta_el_checkpoint_correspondiente(tmp_path: Path) -> None:
     """El caso normal no levanta nada: el checkpoint describe al run."""
@@ -554,6 +882,12 @@ def test_validate_checkpoint_acepta_el_checkpoint_correspondiente(tmp_path: Path
     checkpoint = store.save(run)
 
     validate_checkpoint(run, checkpoint)
+    validate_checkpoint(
+        run,
+        checkpoint,
+        expected_sequence=checkpoint.sequence,
+        durable_bytes=serialize(run),
+    )
 
 
 def test_validate_checkpoint_detecta_otro_workflow(tmp_path: Path) -> None:
@@ -563,8 +897,10 @@ def test_validate_checkpoint_detecta_otro_workflow(tmp_path: Path) -> None:
     checkpoint = store.save(run)
     other = make_run(workflow_id=uuid4(), status=TaskStatus.QA, revision=5)
 
-    with pytest.raises(WorkflowResumeFailedError, match="workflow"):
+    with pytest.raises(WorkflowResumeFailedError, match="workflow") as excinfo:
         validate_checkpoint(other, checkpoint)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_RESUME_FAILED
 
 
 def test_validate_checkpoint_detecta_revision_que_retrocede(tmp_path: Path) -> None:
@@ -602,6 +938,47 @@ def test_validate_checkpoint_detecta_estado_distinto(tmp_path: Path) -> None:
         validate_checkpoint(other_status, checkpoint)
 
 
+def test_validate_checkpoint_detecta_schema_version_distinta(tmp_path: Path) -> None:
+    """Un documento de otra versión de esquema no se interpreta: es un checkpoint inválido."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    run = make_run(status=TaskStatus.QA, revision=5, schema_version="9.9.9")
+    checkpoint = store.save(run)
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="schema_version") as excinfo:
+        validate_checkpoint(run, checkpoint)
+
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_CHECKPOINT_INVALID
+
+
+def test_validate_checkpoint_detecta_una_secuencia_que_no_es_la_del_fichero(
+    tmp_path: Path,
+) -> None:
+    """La secuencia declarada tiene que ser la que impone el nombre del fichero."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    run = make_run(status=TaskStatus.QA, revision=5)
+    checkpoint = store.save(run)
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="secuencia"):
+        validate_checkpoint(run, checkpoint, expected_sequence=checkpoint.sequence + 1)
+
+
+def test_validate_checkpoint_detecta_metadatos_que_no_corresponden_a_los_bytes(
+    tmp_path: Path,
+) -> None:
+    """``digest`` y ``bytes_written`` se comprueban contra los bytes, no contra su declaración."""
+    store = FileCheckpointStore(tmp_path / CHECKPOINT_DIRNAME)
+    run = make_run(status=TaskStatus.QA, revision=5)
+    checkpoint = store.save(run)
+    payload = serialize(run)
+
+    with pytest.raises(WorkflowCheckpointInvalidError, match="digest"):
+        validate_checkpoint(run, checkpoint, durable_bytes=payload + b" ")
+
+    stale_size = checkpoint.model_copy(update={"bytes_written": len(payload) + 1})
+    with pytest.raises(WorkflowCheckpointInvalidError, match="bytes_written"):
+        validate_checkpoint(run, stale_size, durable_bytes=payload)
+
+
 # ---------------------------------------------------------------------------
 # Nada de secretos en el checkpoint
 # ---------------------------------------------------------------------------
@@ -614,6 +991,8 @@ def test_ningun_fichero_contiene_credenciales(tmp_path: Path) -> None:
         revision=1,
         status=TaskStatus.IN_PROGRESS,
         steps=(make_step(workflow_id, 0, RoleName.DEVELOPER, TaskStatus.IN_PROGRESS),),
+        stage_artifacts=(make_stage_artifacts(),),
+        effects=(make_effect(),),
     )
     checkpoint = store.save(run)
 

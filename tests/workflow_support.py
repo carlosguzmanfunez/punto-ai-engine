@@ -19,6 +19,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from punto.common import utc_now
+from punto.policy.human_gate import HumanApprovalProof, HumanGate
+from punto.policy.policy_engine import PolicyEngine
 from punto.schemas.enums import AuthorityLevel, FindingSeverity, RiskLevel, TaskStatus
 from punto.schemas.execution import ModelUsage
 from punto.schemas.workflow import (
@@ -31,6 +33,7 @@ from punto.schemas.workflow import (
     WorkflowRequest,
     WorkflowRun,
 )
+from punto.workflow.policy import WorkflowPolicy
 
 
 def make_finding(
@@ -56,17 +59,23 @@ def make_request(
     task_id: UUID | None = None,
     project_id: UUID | None = None,
     idempotency_key: str = "wf-test",
+    action: str = "create_file",
     risk: RiskLevel = RiskLevel.LOW,
     authority: AuthorityLevel = AuthorityLevel.LEVEL_0_AUTONOMOUS,
     web_visual_required: bool = False,
     cross_audit_required: bool = True,
     **overrides: Any,
 ) -> WorkflowRequest:
-    """Petición de workflow lista para el kernel."""
+    """Petición de workflow lista para el kernel.
+
+    La acción por defecto es autónoma y reversible (``create_file``): si una prueba quiere un
+    Human Gate, declara una acción L3 real o sube el riesgo declarado.
+    """
     base: dict[str, Any] = {
         "task_id": task_id or uuid4(),
         "project_id": project_id or uuid4(),
         "objective": "implementar una función pura de normalización",
+        "action": action,
         "acceptance_criteria": ("normaliza etiquetas",),
         "workspace_path": ".",
         "changed_files": ("runner.py",),
@@ -79,6 +88,26 @@ def make_request(
     }
     base.update(overrides)
     return WorkflowRequest(**base)
+
+
+def make_policy(engine: PolicyEngine, gate: HumanGate) -> WorkflowPolicy:
+    """Frontera de política real (Policy Engine + Human Gate del repositorio)."""
+    return WorkflowPolicy(engine=engine, gate=gate)
+
+
+def approve_human_gate(
+    human_gate: HumanGate, run: WorkflowRun, *, resolved_by: str = "humano-de-prueba"
+) -> HumanApprovalProof:
+    """Aprueba el Human Gate del workflow y emite la autorización de reanudación.
+
+    Es el único camino real: la prueba la emite ``HumanGate.authorize_resume``, nunca el kernel ni
+    la prueba a mano.
+    """
+    if run.human_gate is None or run.human_gate.approval_id is None:
+        raise AssertionError("el workflow no tiene un Human Gate con solicitud registrada")
+    human_gate.approve(run.human_gate.approval_id, resolved_by=resolved_by)
+    return human_gate.authorize_resume(run.human_gate.approval_id, task_id=run.task_id)
+
 
 
 def make_run(
@@ -118,6 +147,7 @@ class FakeRoleExecutor:
         provider: str = "fake",
         model: str = "fake-model",
         tokens: int = 7,
+        model_calls: int = 1,
         capability_info: ProviderCapability | None = None,
     ) -> None:
         self.role = role
@@ -131,6 +161,7 @@ class FakeRoleExecutor:
         self.provider = provider
         self.model = model
         self.tokens = tokens
+        self.model_calls = model_calls
         self.capability_info = capability_info
         self.calls: list[RoleExecutionRequest] = []
 
@@ -150,6 +181,7 @@ class FakeRoleExecutor:
             attempts=len(self.calls),
             started_at=started,
             completed_at=started,
+            model_calls=self.model_calls,
             usage=ModelUsage(
                 prompt_tokens=self.tokens,
                 completion_tokens=1,
@@ -220,10 +252,12 @@ def clock_after(seconds: float) -> Callable[[], datetime]:
 __all__ = [
     "FakeRoleExecutor",
     "all_stage_executors",
+    "approve_human_gate",
     "clock_after",
     "decision_sequence",
     "executor_map",
     "make_finding",
+    "make_policy",
     "make_request",
     "make_run",
     "role_sequence",

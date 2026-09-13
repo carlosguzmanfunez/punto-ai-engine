@@ -6,8 +6,13 @@ una reparación infinita; el presupuesto se calcula comparando el consumo declar
 :class:`WorkflowRun` con los límites de :class:`WorkflowBudget`, y ese cálculo tiene que ser
 auditable y reproducible fuera del motor.
 
-Tres decisiones, todas con el mismo motivo —que el veredicto no dependa de nadie:
+Cuatro decisiones, todas con el mismo motivo —que el veredicto no dependa de nadie:
 
+- **El presupuesto se comprueba antes de gastar, no después.** Es la frontera constitucional
+  (hallazgo V60-05): si el veredicto llegara después de la invocación, el límite sería un
+  informe y no un límite. Por eso la operación normal es :func:`reserve_budget`, que pregunta
+  «¿cabe lo que voy a hacer?» con el consumo todavía intacto, y :func:`check_budget`, que
+  pregunta lo mismo para el paso siguiente.
 - **Nada de excepciones aquí.** Estas funciones devuelven :class:`BudgetCheck` y es el kernel
   quien decide si un veredicto es un fallo, una pausa o una petición humana. Lanzar la
   excepción dentro del cálculo ataría la política del workflow a este módulo.
@@ -40,26 +45,62 @@ class BudgetCheck:
 
     ``allowed`` es la respuesta; ``code`` y ``detail`` explican el «no» con el mismo vocabulario
     que el resto del kernel, para que el motor pueda construir su ``WorkflowFailure`` sin
-    traducir nada.
+    traducir nada. ``limit``, ``used`` y ``maximum`` viajan por separado y no solo dentro del
+    texto: quien audita un bloqueo necesita las tres cifras sin volver a parsear un mensaje
+    legible, y el detalle puede cambiar de redacción sin romper a nadie.
+
+    Cuando ``allowed`` es ``True`` los campos van vacíos o a cero: un permiso no tiene límite
+    excedido que nombrar, y dejar los números del último límite mirado haría creer que ese
+    límite fue el veredicto.
     """
 
     allowed: bool
     code: WorkflowFailureCode | None = None
     detail: str = ""
+    #: Nombre del límite que decidió el veredicto: ``"max_role_calls"``, ``"max_state_visits"``…
+    limit: str = ""
+    #: Consumo observado (o visitas que tendría la entrada) en el momento del veredicto.
+    used: float = 0.0
+    #: Máximo declarado del límite nombrado.
+    maximum: float = 0.0
 
 
-def check_budget(run: WorkflowRun, *, elapsed_seconds: float) -> BudgetCheck:
-    """Comprueba todos los límites de consumo y devuelve el **primer** límite excedido.
+def reserve_budget(
+    run: WorkflowRun,
+    *,
+    steps: int = 0,
+    role_calls: int = 0,
+    model_calls: int = 0,
+    transitions: int = 0,
+    failures: int = 0,
+    tokens: int = 0,
+    elapsed_seconds: float = 0.0,
+) -> BudgetCheck:
+    """Comprueba si **cabe** lo que se está a punto de gastar, antes de gastarlo.
 
-    El orden de comprobación es fijo —pasos, llamadas de rol, llamadas de modelo, tokens,
-    tiempo de pared, fallos y transiciones— para que dos ejecuciones del mismo caso reporten
-    el mismo límite: un presupuesto que informa de un motivo distinto según el orden de
+    Es la operación primaria del presupuesto y la que convierte los límites en una frontera:
+    el kernel reserva lo que la operación va a consumir —una invocación de rol, sus llamadas de
+    modelo, sus tokens, la transición que la acompaña— y solo ejecuta si el veredicto permite.
+    Quien llama es responsable de reservar todo lo que su operación gasta: cada intento técnico
+    se reserva como una llamada de rol, y una operación compuesta reserva de una vez las dos
+    transiciones que aplica, porque reservar de una en una permitiría que la segunda mitad
+    pasara el límite.
+
+    La condición es ``usado + solicitado <= máximo`` para cada límite. Es deliberado que sea
+    ``<=`` y no ``<``: el máximo declarado es gastable hasta el último céntimo, pero **estando
+    en el máximo ya no cabe nada más**, que es exactamente lo que un tope significa. La
+    comparación anterior (``usado > máximo``) solo detectaba el exceso una vez cometido.
+
+    Los límites se comprueban en un orden fijo —pasos, llamadas de rol, llamadas de modelo,
+    tokens, tiempo de pared, fallos y transiciones— para que dos ejecuciones del mismo caso
+    reporten el mismo límite: un presupuesto que informa de un motivo distinto según el orden de
     evaluación no sirve para diagnosticar.
 
     ``max_wall_time_seconds`` se mide contra ``elapsed_seconds`` y no contra
     ``usage.wall_time_seconds``: el tiempo que decide si un workflow se ha pasado de tiempo es
     el tiempo real transcurrido que mide el kernel, no un acumulado que alguien podría olvidar
-    actualizar.
+    actualizar. El tiempo no se reserva —no hay forma de saber de antemano cuánto durará el
+    paso— así que se compara el ya transcurrido.
 
     ``max_repairs`` no se comprueba aquí a propósito: en ENGINE-6.0 el workflow llega a
     ``REPAIRING`` y se detiene (``WORKFLOW_REPAIR_DEFERRED``), así que el consumo de
@@ -68,61 +109,97 @@ def check_budget(run: WorkflowRun, *, elapsed_seconds: float) -> BudgetCheck:
 
     Args:
         run: Ejecución con el presupuesto declarado y el consumo acumulado.
+        steps: Pasos que consumirá la operación.
+        role_calls: Invocaciones de rol que consumirá (una por intento técnico).
+        model_calls: Llamadas reales al modelo que consumirá.
+        transitions: Transiciones que aplicará (2 si la operación es compuesta).
+        failures: Fallos que registrará.
+        tokens: Tokens que consumirá.
         elapsed_seconds: Segundos transcurridos desde el inicio, medidos por el kernel.
 
     Returns:
-        ``BudgetCheck(True)`` si todo está dentro de los límites; si no, ``allowed=False`` con
-        el código ``WORKFLOW_BUDGET_EXCEEDED`` y el límite, el usado y el máximo en el detalle.
+        ``BudgetCheck(allowed=True)`` si todo cabe; si no, ``allowed=False`` con el código
+        ``WORKFLOW_BUDGET_EXCEEDED``, el nombre del límite y sus tres cifras. Un solicitado
+        negativo se trata como cero: un presupuesto no se devuelve.
     """
     budget = run.request.budget
     usage = run.usage
-    # Una tupla con nombre y valores, en orden fijo: el primer excedido gana.
-    limits: tuple[tuple[str, float, float], ...] = (
-        ("max_steps", usage.steps, budget.max_steps),
-        ("max_role_calls", usage.role_calls, budget.max_role_calls),
-        ("max_model_calls", usage.model_calls, budget.max_model_calls),
-        ("max_total_tokens", usage.total_tokens, budget.max_total_tokens),
-        ("max_wall_time_seconds", elapsed_seconds, budget.max_wall_time_seconds),
-        ("max_failures", usage.failures, budget.max_failures),
-        ("max_transitions", usage.transitions, budget.max_transitions),
+    # (límite, usado, solicitado, máximo) en orden fijo: el primer límite que no cabe gana.
+    reservations: tuple[tuple[str, float, float, float], ...] = (
+        ("max_steps", usage.steps, max(0, steps), budget.max_steps),
+        ("max_role_calls", usage.role_calls, max(0, role_calls), budget.max_role_calls),
+        ("max_model_calls", usage.model_calls, max(0, model_calls), budget.max_model_calls),
+        ("max_total_tokens", usage.total_tokens, max(0, tokens), budget.max_total_tokens),
+        ("max_wall_time_seconds", elapsed_seconds, 0.0, budget.max_wall_time_seconds),
+        ("max_failures", usage.failures, max(0, failures), budget.max_failures),
+        ("max_transitions", usage.transitions, max(0, transitions), budget.max_transitions),
     )
-    for name, observed, allowed in limits:
-        if observed > allowed:
-            return _exceeded(name, observed, allowed)
+    for name, used, requested, maximum in reservations:
+        if used + requested > maximum:
+            return _exceeded(name, used, requested, maximum)
     return BudgetCheck(allowed=True)
 
 
+def check_budget(run: WorkflowRun, *, elapsed_seconds: float) -> BudgetCheck:
+    """Comprueba que **aún cabe un paso más** con su invocación de rol.
+
+    Es :func:`reserve_budget` con la reserva del paso siguiente: un paso y una llamada de rol.
+    De ahí que estar justo en el máximo bloquee: el límite no pregunta por lo ya gastado, sino
+    por si el trabajo que queda por delante todavía tiene sitio.
+
+    No reserva llamadas de modelo (las declara el resultado del rol, y quien las conoce es quien
+    debe reservarlas) ni transiciones (cada transición se reserva donde se aplica).
+
+    Args:
+        run: Ejecución con el presupuesto declarado y el consumo acumulado.
+        elapsed_seconds: Segundos transcurridos desde el inicio, medidos por el kernel.
+
+    Returns:
+        ``BudgetCheck(allowed=True)`` si el paso siguiente cabe; si no, ``allowed=False`` con el
+        código ``WORKFLOW_BUDGET_EXCEEDED`` y el límite que lo impide.
+    """
+    return reserve_budget(run, steps=1, role_calls=1, elapsed_seconds=elapsed_seconds)
+
+
 def loop_check(
-    run: WorkflowRun, next_status: TaskStatus, budget: WorkflowBudget | None = None
+    run: WorkflowRun, target_status: TaskStatus, budget: WorkflowBudget | None = None
 ) -> BudgetCheck:
-    """Comprueba si entrar en ``next_status`` agotaría las visitas permitidas a ese estado.
+    """Comprueba si entrar en ``target_status`` agotaría las visitas permitidas a ese estado.
 
     Es la protección contra bucles del workflow y **no** la decide el modelo: el contador de
     visitas lo lleva PUNTO en el consumo, y un estado no se visita más veces de las declaradas
-    aunque el plan parezca estar progresando. Se compara ``visitas + 1 > máximo`` porque la
-    pregunta es por la entrada que está a punto de ocurrir, no por el histórico.
+    aunque el plan parezca estar progresando.
+
+    Se evalúa el **estado destino real**, no la reentrada al estado actual: la pregunta es si
+    cabe la entrada que está a punto de ocurrir, así que se compara ``visitas + 1`` con el
+    máximo. Con ``max_state_visits=1`` la primera entrada en un estado cabe —el camino limpio
+    pasa por cada etapa una vez y no puede marcarse como bucle— y la segunda no. Mirar el estado
+    actual en lugar del destino convertía cada paso normal en un falso bucle.
 
     Args:
         run: Ejecución con el histórico de visitas.
-        next_status: Estado en el que el kernel está a punto de entrar.
+        target_status: Estado en el que el kernel está a punto de entrar.
         budget: Presupuesto explícito. Si es ``None`` se usa el de la petición, que es el
             camino normal; el parámetro existe para que el motor pueda razonar sobre un
             presupuesto distinto (por ejemplo, el de una reanudación) sin fabricar un ``run``.
 
     Returns:
-        ``BudgetCheck(True)`` si aún cabe una visita más; si no, ``allowed=False`` con el
-        código ``WORKFLOW_LOOP_DETECTED``.
+        ``BudgetCheck(allowed=True)`` si aún cabe una visita más; si no, ``allowed=False`` con el
+        código ``WORKFLOW_LOOP_DETECTED`` y las visitas que tendría frente al máximo.
     """
     limits = run.request.budget if budget is None else budget
-    visits = run.usage.visit_count(next_status)
-    if visits + 1 > limits.max_state_visits:
+    visits = run.usage.visit_count(target_status)
+    if visits >= limits.max_state_visits:
         return BudgetCheck(
             allowed=False,
             code=WorkflowFailureCode.WORKFLOW_LOOP_DETECTED,
             detail=(
-                f"entrar en {next_status.value} sería la visita {visits + 1} y el máximo de "
+                f"entrar en {target_status.value} sería la visita {visits + 1} y el máximo de "
                 f"visitas por estado es {limits.max_state_visits}"
             ),
+            limit="max_state_visits",
+            used=visits + 1,
+            maximum=limits.max_state_visits,
         )
     return BudgetCheck(allowed=True)
 
@@ -141,6 +218,10 @@ def consume_step(
     tokens que llegue mal desde un resultado de rol— pasaría la validación de Pydantic sin
     ser visto y haría que el presupuesto se pudiera «devolver», que es justo lo contrario de
     lo que un presupuesto significa.
+
+    Esta función **no** decide si el paso cabía: eso se reservó antes con
+    :func:`reserve_budget`. Aquí solo se anota lo gastado, y por eso los fallos y las
+    transiciones no se tocan: los consume quien los provoca.
 
     Args:
         usage: Consumo actual.
@@ -216,12 +297,27 @@ def next_step_index(run: WorkflowRun) -> int:
     return 0 if last is None else last.index + 1
 
 
-def _exceeded(limit: str, observed: float, allowed: float) -> BudgetCheck:
-    """Construye el veredicto de un límite excedido, con usado y máximo en el detalle."""
+def _exceeded(limit: str, used: float, requested: float, maximum: float) -> BudgetCheck:
+    """Construye el veredicto de un límite que no admite lo solicitado.
+
+    El detalle dice las tres cifras —lo usado, lo pedido y el máximo— porque un bloqueo sin
+    números obliga a reproducir el caso para entenderlo, y un presupuesto tiene que poder
+    auditarse leyendo el veredicto.
+    """
+    if requested > 0:
+        detail = (
+            f"{limit} agotado: {_short(used)} consumido más {_short(requested)} solicitado "
+            f"llegaría a {_short(used + requested)} y el máximo es {_short(maximum)}"
+        )
+    else:
+        detail = f"{limit} excedido: {_short(used)} supera el máximo de {_short(maximum)}"
     return BudgetCheck(
         allowed=False,
         code=WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
-        detail=f"{limit} excedido: {_short(observed)} supera el máximo de {_short(allowed)}",
+        detail=detail,
+        limit=limit,
+        used=used,
+        maximum=maximum,
     )
 
 

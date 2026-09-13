@@ -25,15 +25,16 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
-from punto.architect.base import ArchitectRequest, ArchitectRunner
+from punto.architect.base import ArchitectRequest, ArchitectRunner, ArchitectureOutcome
 from punto.common import utc_now
 from punto.crossaudit.base import CrossAuditRunner
 from punto.developer.base import DeveloperRunner
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
-from punto.planner.base import PlannerRequest, PlannerRunner
+from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.planning.capabilities import detect_capability_gaps
 from punto.planning.graph import (
+    PlanningValidation,
     validate_architecture_plan,
     validate_capability_profile,
     validate_project_spec,
@@ -58,6 +59,7 @@ from punto.schemas.evaluation import TaskEvaluation, build_task_evaluation
 from punto.schemas.execution import DeveloperExecutionResult, DeveloperRunStatus
 from punto.schemas.planning import (
     ArchitecturePlan,
+    ArchitectureProposal,
     ModelExecutionSummary,
     OpenQuestion,
     ProjectCapabilityProfile,
@@ -83,6 +85,7 @@ from punto.tools.errors import (
     CrossAuditRunnerNotConfiguredError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
+    PlanningValidationError,
     QARunnerNotConfiguredError,
     ReviewerRunnerNotConfiguredError,
     SecurityRunnerNotConfiguredError,
@@ -189,6 +192,15 @@ def _blocked_reason_from_decision(decision: PolicyDecision) -> BlockedReason:
 #: aparece en los motivos de transición para que la auditoría distinga sin
 #: ambigüedad una validación simulada de una validación real.
 DETERMINISTIC_PLACEHOLDER_VALIDATION: Final[str] = "DETERMINISTIC_PLACEHOLDER_VALIDATION"
+
+
+#: Motivo con el que :meth:`Camus.analyze_project` marca un diseño que el runner dio por bueno
+#: pero que la revalidación independiente de CAMUS rechazó.
+#:
+#: Es el mismo texto que :meth:`Camus.plan_project` propaga como ``reason`` del bloqueo, y la
+#: propuesta viaja **dentro** del ``ArchitectureOutcome`` para que la etapa que bloquea conserve
+#: el diseño como evidencia en vez de perderlo.
+ARCHITECT_PLAN_INVALID_REASON: Final[str] = "ARCHITECT_PLAN_INVALID"
 
 
 class Camus:
@@ -522,6 +534,10 @@ class Camus:
         perfil, el roadmap y el grafo por su cuenta. Un artefacto inválido que
         llegara desde una implementación defectuosa se detecta aquí.
 
+        La planificación son **dos etapas separadas**, y este método es su composición: ejecuta
+        :meth:`analyze_project` (solo Architect) y, con el diseño ya validado, ejecuta
+        :meth:`plan_project_from_architecture` (solo Planner). Cada etapa se ejecuta una vez.
+
         **No ejecuta al Developer.** ENGINE-3 planifica; ejecutar es una decisión
         posterior (§16).
 
@@ -529,17 +545,12 @@ class Camus:
             ArchitectRunnerNotConfiguredError: si no hay Architect inyectado.
             PlannerRunnerNotConfiguredError: si no hay Planner inyectado.
         """
-        if self._architect is None:
-            raise ArchitectRunnerNotConfiguredError()
-        if self._planner_runner is None:
-            raise PlannerRunnerNotConfiguredError()
+        self._require_planning_runners()
 
         started_at = utc_now()
         project_id = intent.id
 
-        architecture_outcome = self._architect.design(
-            ArchitectRequest(project_id=project_id, intent=intent)
-        )
+        architecture_outcome = self.analyze_project(intent)
 
         if architecture_outcome.proposal is None:
             return self._blocked_plan(
@@ -561,21 +572,17 @@ class Camus:
         architecture = proposal.architecture
         profile = proposal.capability_profile
 
-        # Revalidación independiente: la palabra del runner no basta.
-        violations = (
-            validate_project_spec(spec)
-            .merged(validate_architecture_plan(architecture))
-            .merged(validate_capability_profile(profile))
-        )
-        if not violations.valid:
+        # La propuesta llegó, pero la revalidación independiente de CAMUS la rechazó:
+        # ``analyze_project`` lo marca con su motivo y conserva el diseño como evidencia.
+        if architecture_outcome.error == ARCHITECT_PLAN_INVALID_REASON:
             return self._blocked_plan(
                 intent=intent,
                 started_at=started_at,
                 architect=architecture_outcome.summary,
                 status=ProjectPlanStatus.BLOCKED,
-                reason="ARCHITECT_PLAN_INVALID",
+                reason=ARCHITECT_PLAN_INVALID_REASON,
                 detail="la revalidación independiente de CAMUS encontró violaciones",
-                violations=violations.violations,
+                violations=architecture_outcome.violations,
                 project_spec=spec,
                 architecture=architecture,
                 capability_profile=profile,
@@ -599,15 +606,7 @@ class Camus:
                 deferred_questions=spec.deferred_questions,
             )
 
-        planning_outcome = self._planner_runner.plan(
-            PlannerRequest(
-                project_id=project_id,
-                intent=intent,
-                project_spec=spec,
-                architecture=architecture,
-                capability_profile=profile,
-            )
-        )
+        planning_outcome = self.plan_project_from_architecture(intent, architecture_outcome)
 
         if planning_outcome.roadmap is None or planning_outcome.task_graph is None:
             return self._blocked_plan(
@@ -704,6 +703,110 @@ class Camus:
             attempts=attempts,
             started_at=started_at,
             completed_at=utc_now(),
+        )
+
+    def analyze_project(self, intent: ProjectIntent) -> ArchitectureOutcome:
+        """Ejecuta **solo** al Architect y devuelve su diseño ya validado.
+
+        Es la primera mitad de :meth:`plan_project`, expuesta por separado porque hay quien
+        necesita el diseño antes de decidir si se planifica: el rol ``ARCHITECT`` del workflow,
+        por ejemplo, que no debe arrastrar al Planner.
+
+        CAMUS no se fía del runner: además de pedirle el diseño, lo revalida por su cuenta con
+        los mismos invariantes deterministas de siempre. Si el runner declara ``PASS`` con un
+        diseño que incumple un invariante, el resultado es un ``ArchitectureOutcome`` en
+        ``BLOCKED``, con la propuesta **dentro** como evidencia y
+        :data:`ARCHITECT_PLAN_INVALID_REASON` en ``error``. Un runner que no produjo propuesta
+        devuelve su propio fallo sin reinterpretarlo.
+
+        Nunca ejecuta al Planner.
+
+        Raises:
+            ArchitectRunnerNotConfiguredError: si no hay Architect inyectado.
+        """
+        if self._architect is None:
+            raise ArchitectRunnerNotConfiguredError()
+
+        outcome = self._architect.design(ArchitectRequest(project_id=intent.id, intent=intent))
+        if outcome.proposal is None:
+            return outcome
+
+        violations = self._design_violations(outcome.proposal)
+        if violations.valid:
+            return outcome
+        return ArchitectureOutcome(
+            status=ProjectPlanStatus.BLOCKED,
+            proposal=outcome.proposal,
+            summary=outcome.summary,
+            violations=violations.violations,
+            error=ARCHITECT_PLAN_INVALID_REASON,
+        )
+
+    def plan_project_from_architecture(
+        self, intent: ProjectIntent, architecture: ArchitectureOutcome
+    ) -> PlanningOutcome:
+        """Ejecuta **solo** al Planner sobre un diseño ya validado.
+
+        Es la segunda mitad de :meth:`plan_project` y el contrato que usa el rol ``PLANNER`` del
+        workflow: recibe el diseño que produjo :meth:`analyze_project` —o el que una etapa
+        siguiente reconstruya desde su referencia durable— y devuelve el ``PlanningOutcome``
+        del Planner.
+
+        El diseño se revalida aquí antes de planificar, con la misma validación que aplica el
+        Architect: un diseño ausente o inválido se rechaza con el error tipado de la capa de
+        planificación (:class:`~punto.tools.errors.PlanningValidationError`) en vez de pedirle
+        al Architect que lo repita. Esta función **nunca** ejecuta al Architect.
+
+        Raises:
+            PlannerRunnerNotConfiguredError: si no hay Planner inyectado.
+            PlanningValidationError: si el diseño no trae propuesta o incumple un invariante.
+        """
+        if self._planner_runner is None:
+            raise PlannerRunnerNotConfiguredError()
+
+        proposal = architecture.proposal
+        if proposal is None:
+            raise PlanningValidationError(("el diseño no trae propuesta de arquitectura",))
+
+        self._design_violations(proposal).raise_if_invalid()
+
+        return self._planner_runner.plan(
+            PlannerRequest(
+                project_id=intent.id,
+                intent=intent,
+                project_spec=proposal.project_spec,
+                architecture=proposal.architecture,
+                capability_profile=proposal.capability_profile,
+            )
+        )
+
+    def _require_planning_runners(self) -> None:
+        """Comprueba los dos runners de planificación, en el orden de siempre.
+
+        Se comprueba **antes** de llamar a nadie: sin Planner no se ejecuta el Architect, porque
+        no tiene sentido gastar una llamada al modelo en un plan que no se puede completar.
+
+        Raises:
+            ArchitectRunnerNotConfiguredError: si no hay Architect inyectado.
+            PlannerRunnerNotConfiguredError: si no hay Planner inyectado.
+        """
+        if self._architect is None:
+            raise ArchitectRunnerNotConfiguredError()
+        if self._planner_runner is None:
+            raise PlannerRunnerNotConfiguredError()
+
+    @staticmethod
+    def _design_violations(proposal: ArchitectureProposal) -> PlanningValidation:
+        """Revalida un diseño completo con los invariantes deterministas de PUNTO.
+
+        Es **una sola** validación para las dos etapas: la usa :meth:`analyze_project` para
+        juzgar lo que devolvió el runner y :meth:`plan_project_from_architecture` para rechazar
+        un diseño que llegue por otra vía (una referencia durable, por ejemplo).
+        """
+        return (
+            validate_project_spec(proposal.project_spec)
+            .merged(validate_architecture_plan(proposal.architecture))
+            .merged(validate_capability_profile(proposal.capability_profile))
         )
 
     def _blocked_plan(

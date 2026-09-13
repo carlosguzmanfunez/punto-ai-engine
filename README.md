@@ -30,6 +30,7 @@
 | **ENGINE-5.3.1** | **Trusted Web Evidence + Visual Completeness Hardening.** Frontera de dos contenedores para la medición, cobertura visual exigida por la especificación, aplicabilidad explícita de los checks y gates vivos de Visual QA. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 | **ENGINE-5.3.2** | **Final Route Identity Hardening.** La identidad de ruta se decide por la URL final renderizada, la cobertura solo acredita la ruta realmente renderizada y los nombres lógicos de captura son resistentes a colisiones. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 | **ENGINE-6.0** | **Autonomous Workflow Kernel.** CAMUS conduce una intención por etapas y roles con máquina de estados explícita, autoridad, Human Gates no autoaprobables, presupuesto, protección de bucles, checkpoints, reanudación idempotente y routing provider-neutral sin fallback. | ✅ Implementada (live `PENDING_API_KEY`; ciclo de reparación en 6.1) |
+| **ENGINE-6.0.1** | **Authority, Real Handoff & Budget Hardening.** Gobierno real de autoridad (default deny, L3 no rebajable), Human Gate con prueba verificable, etapas Architect/Planner sin duplicación, handoff durable por artefactos, presupuesto pre-gasto, checkpoints coherentes, conflicto de idempotencia, colecciones acotadas, aplicabilidad visual por perfil web y efectos que no se repiten a ciegas. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -2993,10 +2994,14 @@ el presupuesto dentro de límites: el modelo no puede escribir «completed» y s
 ### Human Gates
 
 Se reutilizan las políticas existentes. Una solicitud declara `reason_code`, `requested_action`,
-`risk`, `authority_required`, `current_state`, `proposed_next_state`, `context_summary` y
-`created_at`; **no** lleva secretos, volcados de código ni razonamiento interno. El kernel se detiene
-en `HUMAN_APPROVAL` y no puede aprobarse a sí mismo: solo `resume(workflow_id, approved=True)`
-continúa, y con `approved=False` la reanudación falla de forma explícita.
+`risk`, `authority_required`, `current_state`, `proposed_next_state`, `context_summary`,
+`policy_decision_id` y `created_at`; **no** lleva secretos, volcados de código ni razonamiento
+interno. El kernel se detiene en `HUMAN_APPROVAL` y no puede aprobarse a sí mismo ni aprobar con un
+booleano: la **única** forma de continuar es `resume(workflow_id, proof=...)` con la
+`HumanApprovalProof` que emite `HumanGate.authorize_resume`, y esa prueba se verifica contra la tarea,
+la solicitud y la decisión de política exactas. Sin prueba, la reanudación falla con
+`WORKFLOW_HUMAN_APPROVAL_REQUIRED`; si no corresponde a este workflow, con
+`WORKFLOW_APPROVAL_PROOF_INVALID`. Una prueba ya consumida, de otra tarea o hecha a mano no vale.
 
 ### Presupuesto y bucles
 
@@ -3012,9 +3017,12 @@ continúa, y con `approved=False` la reanudación falla de forma explícita.
 | `max_state_visits` | 4 |
 | `max_transitions` | 48 |
 
-Se comprueban **antes** de gastar. Al excederse, el workflow queda `BLOCKED` con
+Se comprueban **antes** de gastar: cada intento técnico reserva su llamada de rol antes de ejecutarse,
+cada transición se reserva antes de aplicarse y `check_budget` pregunta si aún cabe un paso más, así
+que estar en el máximo exacto **bloquea**. Al excederse, el workflow queda `BLOCKED` con
 `WORKFLOW_BUDGET_EXCEEDED`; si un estado se repite más allá del límite, con
-`WORKFLOW_LOOP_DETECTED`. Nada continúa en silencio, y la detección de bucles no depende del modelo.
+`WORKFLOW_LOOP_DETECTED`. Nada continúa en silencio, y la detección de bucles no depende del modelo:
+se evalúa sobre el estado **destino real**.
 
 ### Checkpoints, idempotencia y reanudación
 
@@ -3054,13 +3062,40 @@ ni cadenas de razonamiento. Los errores usan códigos estables (`WORKFLOW_INVALI
 exacto (estados, roles, decisiones, checkpoints y auditoría), además de los escenarios de fallo
 (Developer que falla, defecto de QA, HIGH de Security, rechazo del Reviewer, proveedor ausente,
 Human Gate, presupuesto agotado, transición ilegal, reanudación tras interrupción y reanudación
-repetida). `tests/test_workflow_visual_e2e.py` cubre la capacidad visual opcional (aprobada, cambios
-pedidos y proveedor no disponible).
+repetida) y del gobierno de autoridad de 6.0.1 (prueba de aprobación obligatoria, default deny,
+acción L3 que no se rebaja, conflicto de idempotencia y efecto interrumpido que no se repite).
+`tests/test_workflow_visual_e2e.py` cubre la capacidad visual opcional (aprobada, cambios pedidos y
+proveedor no disponible) y su aplicabilidad por perfil web determinista.
+
+### ENGINE-6.0.1 — Autoridad, handoff real y presupuesto
+
+Endurecimiento de la fase, hallazgo por hallazgo:
+
+| Hallazgo | Cómo se cierra |
+| --- | --- |
+| V60-01 Human Gate puenteable | `resume` ya no acepta un booleano: exige `HumanApprovalProof` verificada (`workflow/policy.py::verify_proof`) |
+| V60-02 Autoridad sin gobierno | El Policy Engine gobierna en `create()`: `REJECT` no crea workflow (default deny) y declarar `LOW`/`L0` no rebaja una acción L3 |
+| V60-03 Architect y Planner dos veces | `Camus.analyze_project` y `Camus.plan_project_from_architecture` separan las etapas; ningún adaptador llama a `plan_project` |
+| V60-04 Handoff en memoria | `workflow/artifacts.py`: referencias tipadas con digest en el checkpoint y contenido en un almacén estable; un proceso nuevo reconstruye la entrada |
+| V60-05 Presupuesto a posteriori | `reserve_budget` exige `usado + solicitado <= máximo` en cada límite |
+| V60-06 Checkpoints incoherentes | `load()` valida siempre secuencia, digest, tamaño y coherencia, y no retrocede a un checkpoint anterior en silencio |
+| V60-07 Idempotencia ambigua | Huella canónica de la petición: misma clave con otro contenido ⇒ `WORKFLOW_IDEMPOTENCY_CONFLICT` |
+| V60-08 Colecciones sin cota | `max_length` en cada colección del contrato y recorte explícito al registrar una etapa |
+| V60-09 Visual QA anulable | `visual_qa_required` combina la señal declarada con el perfil web determinista; `False` no anula una necesidad objetiva |
+| V60-10 Efectos repetidos | `workflow/effects.py`: intención durable `IN_FLIGHT`, dedupe por clave y `WORKFLOW_EFFECT_RECONCILIATION_REQUIRED` en vez de repetir |
+
+Los hallazgos reales de cada rol se conservan en `WorkflowResult` (`roles_executed`, `findings` y
+`evidence`), así que el cierre no pierde lo que encontraron las verificaciones.
 
 ### Limitación declarada
 
 - **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
   `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
+- ENGINE-6.0.1 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
+  programador en jefe.
+- La reconciliación de un efecto interrumpido (`EffectLedger.reconcile`) existe y desbloquea el
+  registro, pero **no** reintenta el efecto: repetirlo tras una caída seguiría siendo una decisión
+  explícita, no automática.
 - Ejecución **secuencial** por diseño; el paralelismo y el DAG llegan más adelante.
 - El reintento técnico del kernel está acotado (2 intentos) y solo cubre tropiezos técnicos; los
   reintentos de transporte ya viven en cada cliente de proveedor.

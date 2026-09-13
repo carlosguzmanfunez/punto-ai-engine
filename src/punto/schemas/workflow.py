@@ -42,6 +42,14 @@ MAX_WORKFLOW_SUMMARY_CHARS: Final[int] = 600
 MAX_WORKFLOW_CONTEXT_CHARS: Final[int] = 4_000
 MAX_WORKFLOW_ARTIFACTS: Final[int] = 40
 MAX_WORKFLOW_EVIDENCE: Final[int] = 40
+#: Cotas de las colecciones del contrato. Son explícitas y pequeñas: el checkpoint de un workflow no
+#: puede crecer sin límite porque un rol decida devolver más cosas.
+MAX_ACCEPTANCE_CRITERIA: Final[int] = 20
+MAX_CHANGED_FILES: Final[int] = 80
+MAX_CONTEXT_ENTRIES: Final[int] = 24
+MAX_EFFECT_RECORDS: Final[int] = 48
+MAX_ROLES_EXECUTED: Final[int] = 12
+MAX_ROLE_SUPPORT: Final[int] = 12
 
 
 class RoleName(StrEnum):
@@ -104,6 +112,16 @@ class WorkflowFailureCode(StrEnum):
     WORKFLOW_CHECKPOINT_INVALID = "WORKFLOW_CHECKPOINT_INVALID"
     WORKFLOW_RESUME_FAILED = "WORKFLOW_RESUME_FAILED"
     WORKFLOW_INCOMPLETE_EVIDENCE = "WORKFLOW_INCOMPLETE_EVIDENCE"
+    #: La autorización presentada para salir de un Human Gate no es válida, no corresponde a esta
+    #: tarea/decisión o ya se consumió.
+    WORKFLOW_APPROVAL_PROOF_INVALID = "WORKFLOW_APPROVAL_PROOF_INVALID"
+    #: La misma clave de idempotencia llegó con contenido distinto: no es la misma petición.
+    WORKFLOW_IDEMPOTENCY_CONFLICT = "WORKFLOW_IDEMPOTENCY_CONFLICT"
+    #: El Policy Engine rechazó la acción de forma dura (default deny o archivo protegido).
+    WORKFLOW_POLICY_REJECTED = "WORKFLOW_POLICY_REJECTED"
+    #: Hay un efecto en vuelo cuyo resultado se desconoce: se bloquea para reconciliar, no se
+    #: repite.
+    WORKFLOW_EFFECT_RECONCILIATION_REQUIRED = "WORKFLOW_EFFECT_RECONCILIATION_REQUIRED"
     #: El workflow llegó a ``REPAIRING`` y se detiene ahí: el ciclo de reparación completo es
     #: ENGINE-6.1. Es un código propio para no disfrazar la pausa de otra cosa.
     WORKFLOW_REPAIR_DEFERRED = "WORKFLOW_REPAIR_DEFERRED"
@@ -115,6 +133,19 @@ class CredentialState(StrEnum):
     PRESENT = "PRESENT"
     ABSENT = "ABSENT"
     PENDING_CREDENTIALS = "PENDING_CREDENTIALS"
+
+
+class EffectStatus(StrEnum):
+    """Estado de un efecto con efectos secundarios.
+
+    ``IN_FLIGHT`` significa «se pidió y no sabemos si ocurrió»: es el estado que impide repetir un
+    efecto a ciegas tras una caída.
+    """
+
+    IN_FLIGHT = "IN_FLIGHT"
+    APPLIED = "APPLIED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
 
 
 class WorkflowBudget(BaseModel):
@@ -201,7 +232,9 @@ class ProviderCapability(BaseModel):
 
     provider: str = Field(..., min_length=1, max_length=40)
     model: str = Field(default="", max_length=120)
-    role_support: tuple[RoleName, ...] = Field(default=(), description="Roles que puede cubrir.")
+    role_support: tuple[RoleName, ...] = Field(
+        default=(), max_length=MAX_ROLE_SUPPORT, description="Roles que puede cubrir."
+    )
     vision: bool = Field(default=False, description="True si acepta imágenes.")
     structured_output: bool = Field(default=False, description="True si respeta un JSON Schema.")
     available: bool = Field(default=False, description="True si se puede invocar ahora mismo.")
@@ -228,10 +261,15 @@ class RoleExecutionRequest(BaseModel):
     task_id: UUID = Field(..., description="Tarea del motor asociada.")
     project_id: UUID = Field(..., description="Proyecto asociado.")
     objective: str = Field(..., min_length=1, max_length=MAX_WORKFLOW_TEXT_CHARS)
-    acceptance_criteria: tuple[str, ...] = Field(default=())
+    acceptance_criteria: tuple[str, ...] = Field(default=(), max_length=MAX_ACCEPTANCE_CRITERIA)
     workspace_path: str = Field(default="", max_length=MAX_WORKFLOW_TEXT_CHARS)
-    changed_files: tuple[str, ...] = Field(default=())
+    changed_files: tuple[str, ...] = Field(default=(), max_length=MAX_CHANGED_FILES)
     context_summary: str = Field(default="", max_length=MAX_WORKFLOW_CONTEXT_CHARS)
+    #: Referencias a artefactos de etapas anteriores. El siguiente rol reconstruye su entrada desde
+    #: el checkpoint y los almacenes del motor, no desde variables de un proceso anterior.
+    references: tuple[ArtifactReference, ...] = Field(
+        default=(), max_length=MAX_WORKFLOW_ARTIFACTS
+    )
     attempt: int = Field(default=1, ge=1, description="Intento técnico, no reparación.")
     idempotency_key: str = Field(..., min_length=1, max_length=120)
 
@@ -249,13 +287,29 @@ class RoleExecutionResult(BaseModel):
     status: RoleStatus = Field(..., description="Resultado normalizado.")
     summary: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
     artifacts: tuple[str, ...] = Field(
-        default=(), description=f"Referencias acotadas (máx. {MAX_WORKFLOW_ARTIFACTS})."
+        default=(),
+        max_length=MAX_WORKFLOW_ARTIFACTS,
+        description=f"Referencias acotadas (máx. {MAX_WORKFLOW_ARTIFACTS}).",
+    )
+    #: Referencias **tipadas** a artefactos que el rol ya dejó en un almacén estable (con su
+    #: ``store``, su digest y su tamaño). Son el handoff durable: viajan al checkpoint y un proceso
+    #: nuevo las resuelve sin volver a ejecutar la etapa que las produjo. ``artifacts`` sigue siendo
+    #: el sitio de los punteros declarados como texto (ids de componentes, nombres de informe).
+    artifact_references: tuple[ArtifactReference, ...] = Field(
+        default=(),
+        max_length=MAX_WORKFLOW_ARTIFACTS,
+        description=f"Artefactos durables referenciados (máx. {MAX_WORKFLOW_ARTIFACTS}).",
     )
     findings: tuple[WorkflowFinding, ...] = Field(
-        default=(), description=f"Hallazgos normalizados (máx. {MAX_WORKFLOW_FINDINGS})."
+        default=(),
+        max_length=MAX_WORKFLOW_FINDINGS,
+        description=f"Hallazgos normalizados (máx. {MAX_WORKFLOW_FINDINGS}).",
     )
     recommendation: str = Field(default="", max_length=MAX_WORKFLOW_TEXT_CHARS)
     usage: ModelUsage = Field(default_factory=ModelUsage)
+    #: Llamadas reales al modelo que hizo el rol. No se infieren de los tokens: un rol puede llamar
+    #: tres veces gastando pocos tokens, o una sola gastando muchos.
+    model_calls: int = Field(default=0, ge=0, le=64)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
     attempts: int = Field(default=1, ge=1)
@@ -330,7 +384,82 @@ class HumanGateRequest(BaseModel):
     current_state: TaskStatus = Field(...)
     proposed_next_state: TaskStatus = Field(...)
     context_summary: str = Field(default="", max_length=MAX_WORKFLOW_CONTEXT_CHARS)
+    #: Referencias a la autorización **real** del Policy Engine / Human Gate. El kernel no sustituye
+    #: ninguno de los dos: los referencia. Sin decisión de política no hay aprobación que valga.
+    policy_decision_id: UUID | None = Field(default=None)
+    policy_outcome: str = Field(default="", max_length=40)
+    approval_id: UUID | None = Field(
+        default=None, description="Solicitud del HumanGate real que se está pidiendo aprobar."
+    )
+    human_gate_resume_status: TaskStatus = Field(
+        default=TaskStatus.IN_PROGRESS,
+        description=(
+            "Estado de reanudación registrado en el HumanGate. Debe pertenecer a los estados "
+            "reanudables del motor; no es el destino del workflow, que va en "
+            "``proposed_next_state``."
+        ),
+    )
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ArtifactReference(BaseModel):
+    """Referencia **segura** a un artefacto de una etapa.
+
+    No guarda el contenido: guarda cómo encontrarlo y cómo comprobar que es el mismo (etiqueta,
+    digest, tamaño y referencia al almacén estable del motor). Así el checkpoint no crece con
+    código privado ni con volcados, y a la vez la etapa siguiente puede reconstruir su entrada en
+    un proceso nuevo.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str = Field(..., min_length=1, max_length=60, description="Tipo del artefacto.")
+    label: str = Field(default="", max_length=200, description="Nombre legible y acotado.")
+    store: str = Field(default="", max_length=80, description="Almacén estable donde vive.")
+    reference: str = Field(default="", max_length=400, description="Identificador en ese almacén.")
+    digest: str = Field(
+        default="", max_length=64, description="sha256 del contenido, si se conoce."
+    )
+    bytes_written: int = Field(default=0, ge=0)
+
+
+class StageArtifacts(BaseModel):
+    """Lo que una etapa deja para las siguientes, en forma estructurada y acotada."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: RoleName = Field(...)
+    stage: TaskStatus = Field(...)
+    step_index: int = Field(..., ge=0)
+    summary: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
+    references: tuple[ArtifactReference, ...] = Field(
+        default=(), max_length=MAX_WORKFLOW_ARTIFACTS
+    )
+    findings: tuple[WorkflowFinding, ...] = Field(
+        default=(), max_length=MAX_WORKFLOW_FINDINGS
+    )
+    recorded_at: datetime = Field(default_factory=utc_now)
+
+
+class EffectRecord(BaseModel):
+    """Efecto con efectos secundarios, con su intención durable y su estado.
+
+    El kernel apunta la **intención** antes de ejecutar un efecto y la resuelve después. Si el
+    proceso muere en medio, el registro queda ``IN_FLIGHT`` y una reanudación no repite el efecto a
+    ciegas: bloquea para reconciliar.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    idempotency_key: str = Field(..., min_length=1, max_length=120)
+    action: str = Field(..., min_length=1, max_length=120)
+    role: RoleName = Field(...)
+    step_index: int = Field(..., ge=0)
+    status: EffectStatus = Field(default=EffectStatus.IN_FLIGHT)
+    reversible: bool = Field(default=True, description="False si repetirlo sería irreversible.")
+    detail: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = Field(default=None)
 
 
 class WorkflowFailure(BaseModel):
@@ -352,10 +481,16 @@ class WorkflowResult(BaseModel):
 
     status: TaskStatus = Field(...)
     summary: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
-    roles_executed: tuple[RoleName, ...] = Field(default=())
-    findings: tuple[WorkflowFinding, ...] = Field(default=())
+    roles_executed: tuple[RoleName, ...] = Field(default=(), max_length=MAX_ROLES_EXECUTED)
+    findings: tuple[WorkflowFinding, ...] = Field(
+        default=(),
+        max_length=MAX_WORKFLOW_FINDINGS,
+        description="Hallazgos reales de los roles: no se pierden al cerrar el workflow.",
+    )
     evidence: tuple[str, ...] = Field(
-        default=(), description=f"Evidencia acotada (máx. {MAX_WORKFLOW_EVIDENCE})."
+        default=(),
+        max_length=MAX_WORKFLOW_EVIDENCE,
+        description=f"Evidencia acotada (máx. {MAX_WORKFLOW_EVIDENCE}).",
     )
     completed_at: datetime = Field(default_factory=utc_now)
 
@@ -373,14 +508,24 @@ class WorkflowRequest(BaseModel):
     task_id: UUID = Field(...)
     project_id: UUID = Field(...)
     objective: str = Field(..., min_length=1, max_length=MAX_WORKFLOW_TEXT_CHARS)
-    acceptance_criteria: tuple[str, ...] = Field(default=())
+    #: Acción canónica del catálogo de autoridad. Es lo que evalúa el Policy Engine: sin acción
+    #: declarada no se inventa una, y una acción desconocida cae en *default deny*.
+    action: str = Field(..., min_length=1, max_length=120)
+    acceptance_criteria: tuple[str, ...] = Field(
+        default=(), max_length=MAX_ACCEPTANCE_CRITERIA
+    )
     workspace_path: str = Field(default="", max_length=MAX_WORKFLOW_TEXT_CHARS)
-    changed_files: tuple[str, ...] = Field(default=())
+    changed_files: tuple[str, ...] = Field(default=(), max_length=MAX_CHANGED_FILES)
     context_summary: str = Field(default="", max_length=MAX_WORKFLOW_CONTEXT_CHARS)
-    #: Verificación visual: solo entra si la tarea o el perfil la exigen.
+    #: Verificación visual declarada por el llamante. Es una **señal a favor**: si el perfil web del
+    #: proyecto la exige, se ejecuta aunque esto venga en ``False``.
     web_visual_required: bool = Field(default=False)
+    #: Ruta del proyecto en el workspace, para que el perfil web pueda decidir aplicabilidad.
+    project_path: str = Field(default="", max_length=MAX_WORKFLOW_TEXT_CHARS)
     #: Auditoría cruzada: verificación independiente en la frontera de aprobación.
     cross_audit_required: bool = Field(default=True)
+    #: Riesgo y autoridad **declarados** por el llamante. El kernel usa los efectivos que calcula el
+    #: Policy Engine: declarar menos no rebaja una acción L3.
     risk: RiskLevel = Field(default=RiskLevel.LOW)
     authority: AuthorityLevel = Field(default=AuthorityLevel.LEVEL_0_AUTONOMOUS)
     budget: WorkflowBudget = Field(default_factory=WorkflowBudget)
@@ -399,11 +544,26 @@ class WorkflowRun(BaseModel):
     schema_version: str = Field(default=SCHEMA_VERSION)
     workflow_id: UUID = Field(...)
     request: WorkflowRequest = Field(...)
+    #: Huella canónica de la petición: distingue dos peticiones con la misma clave de idempotencia
+    #: pero contenido distinto (eso es un conflicto, no una repetición).
+    request_fingerprint: str = Field(default="", max_length=64)
     status: TaskStatus = Field(default=TaskStatus.NEW)
     revision: int = Field(default=0, ge=0, description="Sube en cada transición aplicada.")
-    steps: tuple[WorkflowStep, ...] = Field(default=())
-    transitions: tuple[WorkflowTransition, ...] = Field(default=())
+    steps: tuple[WorkflowStep, ...] = Field(default=(), max_length=MAX_WORKFLOW_STEPS)
+    transitions: tuple[WorkflowTransition, ...] = Field(
+        default=(), max_length=MAX_WORKFLOW_TRANSITIONS
+    )
     usage: WorkflowUsage = Field(default_factory=WorkflowUsage)
+    #: Lo que cada etapa deja para las siguientes: handoff estructurado y durable.
+    stage_artifacts: tuple[StageArtifacts, ...] = Field(
+        default=(), max_length=MAX_CONTEXT_ENTRIES
+    )
+    #: Intenciones y resultados de efectos con efectos secundarios, para no repetirlos a ciegas.
+    effects: tuple[EffectRecord, ...] = Field(default=(), max_length=MAX_EFFECT_RECORDS)
+    #: Decisión de política vigente, si la hay: es la autoridad efectiva del workflow.
+    policy_decision_id: UUID | None = Field(default=None)
+    effective_authority: AuthorityLevel | None = Field(default=None)
+    effective_risk: RiskLevel | None = Field(default=None)
     human_gate: HumanGateRequest | None = Field(default=None)
     human_gate_approved: bool = Field(
         default=False,
@@ -469,6 +629,12 @@ PAUSED_WORKFLOW_STATUSES: Final[frozenset[TaskStatus]] = frozenset(
 
 
 __all__ = [
+    "MAX_ACCEPTANCE_CRITERIA",
+    "MAX_CHANGED_FILES",
+    "MAX_CONTEXT_ENTRIES",
+    "MAX_EFFECT_RECORDS",
+    "MAX_ROLES_EXECUTED",
+    "MAX_ROLE_SUPPORT",
     "MAX_WORKFLOW_ARTIFACTS",
     "MAX_WORKFLOW_CONTEXT_CHARS",
     "MAX_WORKFLOW_EVIDENCE",
@@ -482,13 +648,17 @@ __all__ = [
     "MAX_WORKFLOW_TRANSITIONS",
     "PAUSED_WORKFLOW_STATUSES",
     "TERMINAL_WORKFLOW_STATUSES",
+    "ArtifactReference",
     "CredentialState",
+    "EffectRecord",
+    "EffectStatus",
     "HumanGateRequest",
     "ProviderCapability",
     "RoleExecutionRequest",
     "RoleExecutionResult",
     "RoleName",
     "RoleStatus",
+    "StageArtifacts",
     "WorkflowBudget",
     "WorkflowCheckpoint",
     "WorkflowDecisionKind",

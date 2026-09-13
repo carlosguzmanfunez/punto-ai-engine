@@ -51,6 +51,14 @@ Un rol sin proveedor no se sustituye por otro: se devuelve un resultado ``PROVID
 con el código ``WORKFLOW_PROVIDER_UNAVAILABLE`` y un detalle que dice **qué rol** y **qué falta**.
 Los runners de CAMUS son *opt-in*: si el rol no está inyectado, su ``*NotConfiguredError`` se
 traduce a ese mismo resultado en lugar de improvisar una evaluación.
+
+Una etapa, una llamada
+----------------------
+Cada rol ejecuta **solo** su etapa: el ``ARCHITECT`` llama a ``camus.analyze_project`` y el
+``PLANNER`` a ``camus.plan_project_from_architecture``, nunca a ``camus.plan_project`` —que es la
+composición de las dos—. El Planner recibe el diseño del Architect reconstruido desde la
+referencia durable de la petición; si esa referencia no resuelve a un diseño válido, la etapa
+falla con ``WORKFLOW_ROLE_FAILED`` en vez de repetir el diseño por su cuenta.
 """
 
 from __future__ import annotations
@@ -83,6 +91,7 @@ from punto.tools.errors import (
     CrossAuditRunnerNotConfiguredError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
+    PlanningValidationError,
     QARunnerNotConfiguredError,
     ReviewerRunnerNotConfiguredError,
     SecurityRunnerNotConfiguredError,
@@ -93,6 +102,7 @@ from punto.workflow.errors import WorkflowProviderUnavailableError
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from punto.architect.base import ArchitectureOutcome
     from punto.developer.context import ExecutionContext
     from punto.orchestrator.camus import Camus
     from punto.providers.base import ImagePayload
@@ -257,19 +267,26 @@ class CamusRoleExecutor:
 
     Forma de ``build_input`` por rol, porque cada método de CAMUS recibe cosas distintas:
 
-    - ``ARCHITECT`` y ``PLANNER``: un ``ProjectIntent``. CAMUS no expone un método por rol de
-      planificación, así que ambos usan ``camus.plan_project`` —que ejecuta Architect y Planner y
-      devuelve un ``ProjectPlanResult``—; el normalizador lee de ahí el resumen del rol que toca
-      (``architect`` o ``planner``);
+    - ``ARCHITECT``: un ``ProjectIntent``. Se ejecuta ``camus.analyze_project``, que hace
+      **solo** el diseño y devuelve un ``ArchitectureOutcome``;
+    - ``PLANNER``: la pareja ``(ProjectIntent, ArchitectureOutcome)``. Se ejecuta
+      ``camus.plan_project_from_architecture``, que hace **solo** la planificación sobre el
+      diseño del Architect. ``build_input`` es quien reconstruye ese diseño desde la referencia
+      durable que viaja en ``RoleExecutionRequest.references`` (el ``reference`` apunta a un
+      artefacto del almacén del motor): el adaptador no lo adivina ni vuelve a ejecutar al
+      Architect para rellenar el hueco;
     - ``DEVELOPER``: la pareja ``(DeveloperTask, ExecutionContext)``;
     - ``QA``: un ``QATask``; ``SECURITY``: un ``SecurityTask``; ``REVIEWER``: un ``ReviewTask``;
       ``CROSS_AUDIT``: un ``CrossAuditTask``;
     - ``VISUAL_QA``: la pareja ``(VisualQATask, Mapping[str, ImagePayload])``.
 
+    Ningún rol de planificación usa ``camus.plan_project``: ese método compone las dos etapas, y
+    llamarlo desde los dos adaptadores ejecutaría Architect + Planner dos veces.
+
     Si se da ``registry``, la capacidad se consulta con ``require(role, provider)`` **antes** de
     llamar a CAMUS: un rol sin proveedor utilizable no llega a ejecutarse. Cualquier excepción que
-    no sea un fallo tipado de configuración o de proveedor se propaga tal cual: ocultarla
-    convertiría un defecto real en un resultado inventado.
+    no sea un fallo tipado de configuración, de proveedor o de validación del diseño se propaga
+    tal cual: ocultarla convertiría un defecto real en un resultado inventado.
     """
 
     def __init__(
@@ -288,8 +305,8 @@ class CamusRoleExecutor:
         self._provider = provider
         self._handlers: Mapping[RoleName, Callable[[object], object]] = MappingProxyType(
             {
-                RoleName.ARCHITECT: self._call_plan_project,
-                RoleName.PLANNER: self._call_plan_project,
+                RoleName.ARCHITECT: self._call_analyze_project,
+                RoleName.PLANNER: self._call_plan_from_architecture,
                 RoleName.DEVELOPER: self._call_developer,
                 RoleName.QA: self._call_qa,
                 RoleName.SECURITY: self._call_security,
@@ -335,6 +352,17 @@ class CamusRoleExecutor:
                 self._role,
                 request,
                 f"el rol {self._role.value} no tiene proveedor disponible: {error}",
+            )
+        except PlanningValidationError as error:
+            return _failure(
+                self._role,
+                request,
+                status=RoleStatus.FAILED,
+                code=WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
+                detail=(
+                    f"la entrada del rol {self._role.value} no es un diseño válido de PUNTO: "
+                    f"{error}. Se rechaza en vez de volver a ejecutar al Architect"
+                ),
             )
         except _InvalidRoleInputError as error:
             return _failure(
@@ -388,9 +416,31 @@ class CamusRoleExecutor:
             raise _InvalidRoleInputError(msg)
         return handler(payload)
 
-    def _call_plan_project(self, payload: object) -> object:
-        """``plan_project`` cubre Architect y Planner: es el único método público de ambos."""
-        return self._camus.plan_project(cast("ProjectIntent", payload))
+    def _call_analyze_project(self, payload: object) -> object:
+        """``analyze_project`` ejecuta **solo** al Architect y devuelve su informe."""
+        return self._camus.analyze_project(cast("ProjectIntent", payload))
+
+    def _call_plan_from_architecture(self, payload: object) -> object:
+        """``plan_project_from_architecture`` ejecuta **solo** al Planner sobre el diseño.
+
+        ``build_input`` debe devolver la pareja ``(ProjectIntent, ArchitectureOutcome)``, con el
+        diseño del Architect reconstruido desde la referencia durable de la petición. Si el
+        diseño no llega, se falla aquí: volver a ejecutar al Architect para rellenar el hueco
+        sería exactamente la duplicación que este adaptador debe impedir.
+        """
+        intent, architecture = _pair(
+            payload, RoleName.PLANNER, "ProjectIntent y ArchitectureOutcome"
+        )
+        if getattr(architecture, "proposal", None) is None:
+            msg = (
+                "falta el diseño del Architect: build_input debe reconstruirlo desde las "
+                "referencias durables de la petición (RoleExecutionRequest.references). "
+                "PUNTO no vuelve a ejecutar al Architect para suplirlo"
+            )
+            raise _InvalidRoleInputError(msg)
+        return self._camus.plan_project_from_architecture(
+            cast("ProjectIntent", intent), cast("ArchitectureOutcome", architecture)
+        )
 
     def _call_developer(self, payload: object) -> object:
         """``execute_developer_task`` recibe la tarea de desarrollo y su contexto de ejecución."""
@@ -431,8 +481,10 @@ class CamusRoleExecutor:
 def normalize_architecture(outcome: object, request: RoleExecutionRequest) -> RoleExecutionResult:
     """Normaliza el resultado real del Architect.
 
-    Acepta ``ArchitectureOutcome`` y también el ``ProjectPlanResult`` que devuelve
-    ``camus.plan_project``, porque CAMUS no expone un método de arquitectura por separado.
+    La entrada real es el ``ArchitectureOutcome`` que devuelve ``camus.analyze_project``. También
+    se tolera —sin usarlo ya el adaptador— el ``ProjectPlanResult`` de ``camus.plan_project``, que
+    lleva el mismo informe en ``architect``: leerlo no cuesta nada y evita que un llamante antiguo
+    se quede sin normalizador.
     """
     status, error_code, status_detail = _map_status(outcome)
     summary = _model_summary(outcome, RoleName.ARCHITECT)
@@ -460,8 +512,9 @@ def normalize_architecture(outcome: object, request: RoleExecutionRequest) -> Ro
 def normalize_planning(outcome: object, request: RoleExecutionRequest) -> RoleExecutionResult:
     """Normaliza el resultado real del Planner.
 
-    Igual que el Architect, acepta ``PlanningOutcome`` y el ``ProjectPlanResult`` de
-    ``camus.plan_project``; en el segundo caso el resumen del Planner está en ``planner``.
+    La entrada real es el ``PlanningOutcome`` que devuelve
+    ``camus.plan_project_from_architecture``. Igual que el Architect, también tolera el
+    ``ProjectPlanResult`` de ``camus.plan_project``; en ese caso el resumen está en ``planner``.
     """
     status, error_code, status_detail = _map_status(outcome)
     summary = _model_summary(outcome, RoleName.PLANNER)
@@ -826,9 +879,9 @@ def _nested(report: object, *fields: str) -> object | None:
 def _model_summary(report: object, role: RoleName) -> ModelExecutionSummary | None:
     """Resumen de ejecución del rol, si el informe lo declara.
 
-    ``ArchitectureOutcome`` y ``PlanningOutcome`` lo llevan en ``summary``; el
-    ``ProjectPlanResult`` que devuelve ``camus.plan_project`` lo separa en ``architect`` y
-    ``planner``. Se aceptan los dos porque el adaptador de CAMUS comparte método público.
+    ``ArchitectureOutcome`` y ``PlanningOutcome`` —lo que devuelven ``analyze_project`` y
+    ``plan_project_from_architecture``— lo llevan en ``summary``; el ``ProjectPlanResult`` de
+    ``camus.plan_project`` lo separa en ``architect`` y ``planner``. Se aceptan los dos.
     """
     direct = getattr(report, "summary", None)
     if isinstance(direct, ModelExecutionSummary):

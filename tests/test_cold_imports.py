@@ -124,6 +124,20 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.visualqa.prompts",
     "punto.visualqa.validation",
     "punto.visualqa.claude",
+    # --- ENGINE-6.0 / 6.0.1: kernel de workflow autónomo -----------------------
+    "punto.workflow",
+    "punto.workflow.artifacts",
+    "punto.workflow.budgets",
+    "punto.workflow.checkpoints",
+    "punto.workflow.decisions",
+    "punto.workflow.effects",
+    "punto.workflow.errors",
+    "punto.workflow.kernel",
+    "punto.workflow.pipeline",
+    "punto.workflow.policy",
+    "punto.workflow.providers",
+    "punto.workflow.roles",
+    "punto.workflow.state_machine",
 )
 
 

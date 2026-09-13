@@ -65,6 +65,25 @@ entre procesos, entre máquinas y entre reanudaciones, porque solo depende de da
 el propio run. Una etapa ya presente en ``run.steps`` está **confirmada** —su resultado se
 persistió, su transición se aplicó y su checkpoint se guardó—, así que reanudar no la vuelve a
 ejecutar. Eso es exactamente lo que hace segura la reanudación: el trabajo pagado no se repite.
+
+Validación al cargar
+--------------------
+Cargar un checkpoint es una operación de **confianza cero**: :meth:`FileCheckpointStore.load`
+valida la integridad y la coherencia **siempre**, no solo cuando la carga precede a una
+reanudación. En este orden:
+
+1. que el ``sequence`` declarado en los metadatos sea el que impone el nombre del fichero: unos
+   metadatos copiados a otra secuencia describen a otro checkpoint;
+2. que ``digest`` y ``bytes_written`` describan los bytes reales del fichero del run, **antes** de
+   interpretarlos: unos bytes cuyo digest no cuadra no llegan a convertirse en estado;
+3. que el contenido sea un ``WorkflowRun`` del ``schema_version`` que escribe este motor;
+4. que el run y los metadatos digan lo mismo: mismo workflow, misma revisión y mismo estado.
+
+Cualquier anomalía es :class:`~punto.workflow.errors.WorkflowCheckpointInvalidError`. La secuencia
+se toma del nombre del fichero de metadatos —el mayor confirmado—, así que si el último checkpoint
+está corrupto la carga **falla**: nunca se baja al penúltimo en silencio, porque eso sería reanudar
+un estado que no es el que se había guardado. :meth:`FileCheckpointStore.latest` sigue devolviendo
+el de secuencia mayor, y tampoco devuelve unos metadatos que se contradicen con su propio nombre.
 """
 
 from __future__ import annotations
@@ -127,14 +146,17 @@ class CheckpointStore(Protocol):
         """Metadatos del checkpoint de secuencia mayor, o ``None`` si no hay ninguno.
 
         Solo lee los metadatos del último: un checkpoint anterior corrupto no puede impedir
-        reanudar desde el más reciente.
+        reanudar desde el más reciente. Si esos metadatos se contradicen con el nombre del
+        fichero que los contiene, se reportan como inválidos en vez de devolverse.
         """
         ...
 
     def load(self, workflow_id: UUID) -> WorkflowRun:
-        """Devuelve el run del último checkpoint, validando integridad y versión de esquema.
+        """Devuelve el run del último checkpoint, validándolo **siempre** y por completo.
 
-        La corrupción se **detecta y se reporta**; nunca se salta al checkpoint anterior en
+        Valida la integridad de los metadatos contra los bytes, el ``schema_version`` del
+        contenido y la coherencia entre run y checkpoint (workflow, revisión y estado). La
+        corrupción se **detecta y se reporta**; nunca se salta al checkpoint anterior en
         silencio, porque eso sería reanudar un estado que no es el que se guardó.
         """
         ...
@@ -182,14 +204,50 @@ def next_pending_step(run: WorkflowRun, keys: Sequence[str]) -> str | None:
     return None
 
 
-def validate_checkpoint(run: WorkflowRun, checkpoint: WorkflowCheckpoint) -> None:
+def validate_checkpoint(
+    run: WorkflowRun,
+    checkpoint: WorkflowCheckpoint,
+    *,
+    expected_sequence: int | None = None,
+    durable_bytes: bytes | None = None,
+    path: Path | None = None,
+) -> None:
     """Comprueba que ``checkpoint`` describe exactamente a ``run``.
 
-    Se valida en la reanudación, antes de continuar: reanudar desde un checkpoint de otro
-    workflow, de otra revisión o de otro estado produciría un estado imposible. Una revisión
-    que retrocede significa que el checkpoint es más nuevo que el run; una que avanza, que el
-    checkpoint ya está obsoleto. Ambos casos se rechazan en vez de elegir uno en silencio.
+    Tres familias de comprobación, con la misma exigencia: nada se elige en silencio.
+
+    - **Contrato**: el ``schema_version`` del run tiene que ser el que escribe este motor. Se
+      comprueba primero porque un documento de otra versión no se interpreta: se rechaza.
+    - **Coherencia run/checkpoint**: mismo workflow, misma revisión —una que retrocede significa
+      que el checkpoint es más nuevo que el run; una que avanza, que el checkpoint ya está
+      obsoleto— y mismo estado. Los dos desajustes de revisión se rechazan en vez de elegir uno.
+    - **Dirección en disco**, cuando el llamante la aporta: ``expected_sequence`` es la secuencia
+      que impone el nombre del fichero y ``durable_bytes`` su contenido real. Así se detectan los
+      metadatos de otro checkpoint y los **metadatos obsoletos copiados a una secuencia nueva**,
+      que de otro modo describirían un checkpoint que nunca existió.
+
+    Args:
+        run: Run interpretado del contenido del checkpoint.
+        checkpoint: Metadatos que dicen describirlo.
+        expected_sequence: Secuencia deducida del nombre del fichero de metadatos.
+        durable_bytes: Bytes exactos del fichero de contenido, para verificar ``bytes_written``
+            y ``digest``.
+        path: Fichero del contenido, solo para los mensajes de error.
+
+    Raises:
+        WorkflowCheckpointInvalidError: esquema, secuencia o metadatos que no corresponden a los
+            bytes del checkpoint.
+        WorkflowResumeFailedError: el checkpoint es íntegro pero no describe a este run.
     """
+    if run.schema_version != SCHEMA_VERSION:
+        raise WorkflowCheckpointInvalidError(
+            f"{_checkpoint_at(path)} declara schema_version {run.schema_version!r} y este motor "
+            f"escribe {SCHEMA_VERSION!r}"
+        )
+    if expected_sequence is not None:
+        _assert_sequence_matches_name(checkpoint, expected_sequence, path)
+    if durable_bytes is not None:
+        _assert_metadata_matches_bytes(checkpoint, durable_bytes, path)
     if checkpoint.workflow_id != run.workflow_id:
         raise WorkflowResumeFailedError(
             f"el checkpoint pertenece al workflow {checkpoint.workflow_id} "
@@ -256,45 +314,60 @@ class FileCheckpointStore:
         return checkpoint
 
     def latest(self, workflow_id: UUID) -> WorkflowCheckpoint | None:
-        """Metadatos del último checkpoint, o ``None`` si el workflow no tiene ninguno."""
+        """Metadatos del último checkpoint, o ``None`` si el workflow no tiene ninguno.
+
+        «Último» es la secuencia mayor **confirmada** (la que tiene metadatos). Solo se leen esos:
+        un checkpoint anterior corrupto no impide leer el más reciente. Unos metadatos que declaran
+        una secuencia distinta de la de su propio fichero no se devuelven como si fueran válidos.
+        """
         meta_directory = self._workflow_dir(workflow_id) / _META_DIRNAME
         sequences = _committed_sequences(meta_directory)
         if not sequences:
             return None
-        return _read_checkpoint(meta_directory / _checkpoint_name(max(sequences)))
+        sequence = max(sequences)
+        path = meta_directory / _checkpoint_name(sequence)
+        checkpoint = _read_checkpoint(path)
+        _assert_sequence_matches_name(checkpoint, sequence, path)
+        return checkpoint
 
     def load(self, workflow_id: UUID) -> WorkflowRun:
-        """Carga el run del último checkpoint, verificando digest y ``schema_version``.
+        """Carga el run del último checkpoint y lo valida **siempre** y por completo.
 
-        Cualquier anomalía —fichero ausente, JSON ilegible, contenido que no es un
-        ``WorkflowRun``, digest que no cuadra o esquema de otra versión— se convierte en
-        :class:`~punto.workflow.errors.WorkflowCheckpointInvalidError`. Nunca se devuelve un
-        run dudoso ni se retrocede al checkpoint anterior por conveniencia.
+        La secuencia sale del nombre del fichero de metadatos —el marcador de commit—, nunca del
+        contenido: si el último checkpoint está corrupto o sus metadatos no le corresponden, se
+        falla en vez de bajar al penúltimo en silencio.
+
+        Raises:
+            WorkflowCheckpointInvalidError: no hay ningún checkpoint, falta el contenido, el
+                digest o el tamaño no cuadran, el contenido no es un ``WorkflowRun``, el
+                ``schema_version`` es de otro motor, la secuencia declarada no es la del fichero,
+                o el checkpoint no describe al run.
         """
         directory = self._workflow_dir(workflow_id)
-        checkpoint = self.latest(workflow_id)
-        if checkpoint is None:
+        meta_directory = directory / _META_DIRNAME
+        sequences = _committed_sequences(meta_directory)
+        if not sequences:
             raise WorkflowCheckpointInvalidError(
                 f"el workflow {workflow_id} no tiene ningún checkpoint en {directory}"
             )
-        path = directory / _checkpoint_name(checkpoint.sequence)
+        sequence = max(sequences)
+        checkpoint = _read_checkpoint(meta_directory / _checkpoint_name(sequence))
+        path = directory / _checkpoint_name(sequence)
         payload = _read_bytes(path)
-        digest = hashlib.sha256(payload).hexdigest()
-        if digest != checkpoint.digest:
-            raise WorkflowCheckpointInvalidError(
-                f"el digest del checkpoint {path} no coincide con su contenido "
-                f"(esperado {checkpoint.digest}, calculado {digest}): corrupción o "
-                "manipulación"
-            )
+        # Integridad de los metadatos contra los bytes **antes** de interpretarlos: unos bytes
+        # cuyo digest ya no cuadra no llegan a convertirse en estado del workflow.
+        _assert_sequence_matches_name(checkpoint, sequence, path)
+        _assert_metadata_matches_bytes(checkpoint, payload, path)
         run = _parse_run(payload, path)
-        if run.schema_version != SCHEMA_VERSION:
+        try:
+            validate_checkpoint(run, checkpoint)
+        except WorkflowResumeFailedError as exc:
             raise WorkflowCheckpointInvalidError(
-                f"el checkpoint {path} declara schema_version {run.schema_version!r} y este "
-                f"motor escribe {SCHEMA_VERSION!r}"
-            )
+                f"{_checkpoint_at(path)} no describe al run {run.workflow_id}: {exc.detail}"
+            ) from exc
         if run.workflow_id != workflow_id:
             raise WorkflowCheckpointInvalidError(
-                f"el checkpoint {path} contiene el workflow {run.workflow_id} en lugar de "
+                f"{_checkpoint_at(path)} contiene el workflow {run.workflow_id} en lugar de "
                 f"{workflow_id}"
             )
         return run
@@ -400,6 +473,49 @@ def _committed_sequences(meta_directory: Path) -> tuple[int, ...]:
         if entry.is_file() and entry.suffix == _CHECKPOINT_SUFFIX and entry.stem.isdigit()
     ]
     return tuple(sorted(sequences))
+
+
+def _checkpoint_at(path: Path | None) -> str:
+    """Sujeto de los mensajes: «el checkpoint <ruta>» o «el checkpoint» si no hay ruta."""
+    return f"el checkpoint {path}" if path is not None else "el checkpoint"
+
+
+def _assert_sequence_matches_name(
+    checkpoint: WorkflowCheckpoint, expected_sequence: int, path: Path | None
+) -> None:
+    """El nombre del fichero y la secuencia declarada tienen que ser la misma cosa.
+
+    La secuencia viaja **dentro** de los metadatos, así que puede copiarse de un fichero a otro:
+    si la que declaran no es la que les da el nombre, describen a otro checkpoint y no al que se
+    está leyendo.
+    """
+    if checkpoint.sequence == expected_sequence:
+        return
+    raise WorkflowCheckpointInvalidError(
+        f"{_checkpoint_at(path)} declara la secuencia {checkpoint.sequence} y el fichero es de la "
+        f"secuencia {expected_sequence}: los metadatos no son de este checkpoint"
+    )
+
+
+def _assert_metadata_matches_bytes(
+    checkpoint: WorkflowCheckpoint, payload: bytes, path: Path | None
+) -> None:
+    """``digest`` y ``bytes_written`` tienen que describir **estos** bytes.
+
+    Es lo que distingue un checkpoint real de unos metadatos obsoletos copiados a una secuencia
+    nueva: sin esta comprobación, el nombre del fichero diría una cosa y su contenido otra.
+    """
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != checkpoint.digest:
+        raise WorkflowCheckpointInvalidError(
+            f"{_checkpoint_at(path)} no tiene el digest de su contenido (esperado "
+            f"{checkpoint.digest}, calculado {digest}): corrupción o manipulación"
+        )
+    if checkpoint.bytes_written != len(payload):
+        raise WorkflowCheckpointInvalidError(
+            f"{_checkpoint_at(path)} declara bytes_written {checkpoint.bytes_written} y el "
+            f"contenido tiene {len(payload)} bytes: los metadatos no corresponden a estos bytes"
+        )
 
 
 def _read_bytes(path: Path) -> bytes:

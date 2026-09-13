@@ -23,6 +23,7 @@ from punto.schemas.visual import (
 from punto.schemas.web import (
     DEFAULT_VIEWPORTS,
     Viewport,
+    ViewportName,
     WebCheckKind,
     WebCheckOutcome,
     WebTechnicalStatus,
@@ -37,6 +38,7 @@ from punto.visualqa.gates import (
     evaluate_visual_gates,
 )
 from punto.visualqa.validation import validate_visual_proposal
+from punto.web.routes import screenshot_logical_name
 from visual_support import (
     make_session,
     make_spec,
@@ -99,7 +101,11 @@ def test_screenshots_gate_blocks_when_a_capture_is_missing() -> None:
     coverage = coverage_for(
         ("/", "/precios"),
         DEFAULT_VIEWPORTS,
-        drop=("precios-mobile.png", "precios-tablet.png", "precios-desktop.png"),
+        drop=(
+            screenshot_logical_name("/precios", ViewportName.MOBILE),
+            screenshot_logical_name("/precios", ViewportName.TABLET),
+            screenshot_logical_name("/precios", ViewportName.DESKTOP),
+        ),
     )
 
     gate = evaluate_screenshots_gate(coverage)
@@ -270,7 +276,10 @@ def test_missing_required_screenshot_blocks() -> None:
 
     result = visual_status(
         session,
-        coverage=coverage_for(("/", "/precios"), drop=("home-desktop.png",)),
+        coverage=coverage_for(
+            ("/", "/precios"),
+            drop=(screenshot_logical_name("/", ViewportName.DESKTOP),),
+        ),
     )
 
     assert result is VisualQAStatus.BLOCKED

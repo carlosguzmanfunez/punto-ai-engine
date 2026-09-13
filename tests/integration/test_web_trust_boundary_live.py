@@ -66,6 +66,7 @@ from punto.schemas.web import (
     png_dimensions,
 )
 from punto.web.report import build_web_session_report
+from punto.web.routes import screenshot_logical_name
 from punto.web.sandbox import (
     CAPTURE_SCRIPT_NAME,
     EVIDENCE_DIGEST_MARKER,
@@ -193,6 +194,10 @@ import zlib
 WORKSPACE = "/workspace"
 PROBE_DIR = "/opt/punto/probe"
 EVIDENCE_DIR = "/punto/evidence"
+#: Nombre lógico **real** de la captura móvil de la ruta raíz, el mismo que produce el probe. La
+#: prueba lo inyecta al escribir el ataque (el proyecto no puede importar `punto`): un atacante que
+#: conoce el contrato apuntaría justo a este nombre, y hay que demostrar que tampoco así escribe.
+EVIDENCE_SCREENSHOT = "__EVIDENCE_SCREENSHOT__"
 CAPTURE_NAME = "capture.cjs"
 SESSION_NAME = "run_web_session.py"
 CAPTURE = PROBE_DIR + "/" + CAPTURE_NAME
@@ -303,6 +308,31 @@ def fake_png(width=4, height=4):
         + chunk(b"IEND", b"")
     )
 
+
+# --- ataque 9: watcher en segundo plano -------------------------------------
+# Se lanza **antes** que los demás ataques, a propósito: el vigilante tiene que estar vivo durante
+# toda la captura, y los ataques 1-8 incluyen recorridos del sistema de archivos que consumen casi
+# todo el tiempo de la sesión. Lanzarlo al final dejaba al vigilante sin tiempo para completar ni
+# una ronda, y la prueba mide justo eso: que reintente mientras se captura.
+try:
+    watcher = subprocess.Popen(
+        [sys.executable or "python3", WATCHER_PATH, str(WATCH_ITERATIONS)],
+        cwd=SELF_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    record(
+        9,
+        WATCHER_PATH,
+        "proceso",
+        "lanzado",
+        "watcher en segundo plano pid=" + str(watcher.pid),
+    )
+except OSError as exc:
+    record(9, WATCHER_PATH, "proceso", type(exc).__name__, str(exc))
 
 # --- ataque 1: buscar el nombre reservado de PUNTO --------------------------
 for pattern_root in (WORKSPACE, "/tmp", "/"):
@@ -454,9 +484,9 @@ fake_image = fake_png()
 report["fake_png_sha256"] = hashlib.sha256(fake_image).hexdigest()
 attempt(
     8,
-    EVIDENCE_DIR + "/screenshots/index-mobile.png",
+    EVIDENCE_DIR + "/screenshots/" + EVIDENCE_SCREENSHOT,
     "evidencia",
-    lambda: write_bytes(EVIDENCE_DIR + "/screenshots/index-mobile.png", fake_image),
+    lambda: write_bytes(EVIDENCE_DIR + "/screenshots/" + EVIDENCE_SCREENSHOT, fake_image),
     "sustituir una captura real por un PNG falso",
 )
 attempt(
@@ -473,27 +503,6 @@ attempt(
     lambda: write_bytes(FAKE_PNG_PATH, fake_image),
     "PNG falso en la zona del proyecto",
 )
-
-# --- ataque 9: watcher en segundo plano -------------------------------------
-try:
-    watcher = subprocess.Popen(
-        [sys.executable or "python3", WATCHER_PATH, str(WATCH_ITERATIONS)],
-        cwd=SELF_DIR,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    record(
-        9,
-        WATCHER_PATH,
-        "proceso",
-        "lanzado",
-        "watcher en segundo plano pid=" + str(watcher.pid),
-    )
-except OSError as exc:
-    record(9, WATCHER_PATH, "proceso", type(exc).__name__, str(exc))
 
 # --- ataque 10: falsificar los marcadores -----------------------------------
 forged_lines = [
@@ -604,6 +613,11 @@ import time
 WORKSPACE = "/workspace"
 PROBE_DIR = "/opt/punto/probe"
 EVIDENCE_DIR = "/punto/evidence"
+#: Nombre lógico real de la captura móvil de la ruta raíz; la prueba lo inyecta al escribir este
+#: guion (el proyecto no puede importar `punto`). Sin esta constante, construir la lista de ataques
+#: lanzaría un NameError **fuera** del `try` que envuelve cada escritura, y el vigía moriría antes
+#: de completar una sola ronda sin que la prueba se enterara de por qué.
+EVIDENCE_SCREENSHOT = "__EVIDENCE_SCREENSHOT__"
 CAPTURE = PROBE_DIR + "/capture.cjs"
 SESSION = PROBE_DIR + "/run_web_session.py"
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -656,9 +670,9 @@ def round_once():
             lambda: write_bytes(EVIDENCE_DIR + "/diagnostics.json", PAYLOAD),
         ),
         probe(
-            EVIDENCE_DIR + "/screenshots/index-mobile.png",
+            EVIDENCE_DIR + "/screenshots/" + EVIDENCE_SCREENSHOT,
             "evidencia",
-            lambda: write_bytes(EVIDENCE_DIR + "/screenshots/index-mobile.png", PAYLOAD),
+            lambda: write_bytes(EVIDENCE_DIR + "/screenshots/" + EVIDENCE_SCREENSHOT, PAYLOAD),
         ),
         probe(WATCHER_FAKE_PNG, "workspace", lambda: write_bytes(WATCHER_FAKE_PNG, PAYLOAD)),
     ]
@@ -726,8 +740,20 @@ def build_malicious_project(workspace: Path) -> Path:
     medición», que son dos hechos distintos.
     """
     site = build_clean_site(workspace)
-    (site / "attack.py").write_text(ATTACK_SCRIPT, encoding="utf-8")
-    (site / "watcher.py").write_text(WATCHER_SCRIPT, encoding="utf-8")
+    (site / "attack.py").write_text(
+        ATTACK_SCRIPT.replace(
+            "__EVIDENCE_SCREENSHOT__",
+            screenshot_logical_name("/", ViewportName.MOBILE),
+        ),
+        encoding="utf-8",
+    )
+    (site / "watcher.py").write_text(
+        WATCHER_SCRIPT.replace(
+            "__EVIDENCE_SCREENSHOT__",
+            screenshot_logical_name("/", ViewportName.MOBILE),
+        ),
+        encoding="utf-8",
+    )
     return site
 
 
@@ -957,7 +983,10 @@ def test_a_malicious_project_cannot_tamper_with_trusted_evidence(
     ]
     assert watched_protected == [], watched_protected
     # El watcher corrió de verdad en segundo plano durante la captura (no es un ataque de papel).
-    assert rounds >= 4, rounds
+    # Se exige más de una ronda, no un número alto: cuántas caben depende de lo que tarde la sesión
+    # en un host concreto, y una aserción atada a ese tiempo sería frágil sin aportar nada. Lo que
+    # importa —que ninguna escritura protegida prospere— se comprueba arriba, ronda a ronda.
+    assert rounds >= 2, rounds
     assert all(entry["zone"] in PROTECTED_ZONES | HARMLESS_ZONES for entry in watcher_entries)
 
     # --- el código de medición no cambió ---------------------------------------------
@@ -980,7 +1009,7 @@ def test_a_malicious_project_cannot_tamper_with_trusted_evidence(
     assert fake_digest not in artifact_digests, sorted(artifact_digests)
     assert len(run.artifacts) == len(DEFAULT_VIEWPORTS)
     for viewport in DEFAULT_VIEWPORTS:
-        name = f"index-{viewport.name.value.lower()}.png"
+        name = screenshot_logical_name("/", viewport.name)
         data = run.screenshot(name)
         assert data is not None, sorted(run.screenshots)
         assert is_valid_png(data), name

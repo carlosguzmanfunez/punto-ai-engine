@@ -368,9 +368,30 @@ class RouteObservation(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    route: str = Field(..., min_length=1, description="Ruta lógica renderizada.")
+    route: str = Field(..., min_length=1, description="Ruta lógica solicitada al navegador.")
     viewport: ViewportName = Field(..., description="Viewport de la observación.")
-    local_url: str = Field(default="", description="URL local usada, sin credenciales.")
+    local_url: str = Field(default="", description="URL local solicitada, sin credenciales.")
+    final_url: str = Field(
+        default="",
+        description=(
+            "URL final que reportó el navegador tras cargar y asentarse, sin credenciales. Es "
+            "evidencia: una redirección cambia lo que se está viendo."
+        ),
+    )
+    final_route: str = Field(
+        default="",
+        description=(
+            "Ruta lógica final (pathname, sin query ni fragmento). Es la que decide si la captura "
+            "corresponde de verdad a la ruta solicitada."
+        ),
+    )
+    route_mismatch: bool = Field(
+        default=False,
+        description=(
+            "True si el navegador terminó en una ruta distinta de la solicitada. La captura se "
+            "conserva para diagnóstico, pero no acredita la ruta pedida."
+        ),
+    )
     http_status: int | None = Field(default=None, description="Código HTTP observado.")
     load_error: str = Field(default="", description="Error de navegación, si lo hubo.")
     timed_out: bool = Field(default=False, description="True si agotó el tiempo de espera.")
@@ -442,7 +463,15 @@ class ScreenshotArtifact(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     logical_name: str = Field(..., min_length=1, description="Nombre lógico del artefacto.")
-    route: str = Field(..., min_length=1, description="Ruta lógica renderizada.")
+    route: str = Field(..., min_length=1, description="Ruta lógica solicitada para la captura.")
+    rendered_route: str = Field(
+        default="",
+        description=(
+            "Ruta que el navegador renderizó de verdad (la final). Vacía significa «no "
+            "verificado»: sin ella la captura no puede acreditar ninguna ruta, y la cobertura la "
+            "trata como ausente en lugar de darla por buena."
+        ),
+    )
     viewport: ViewportName = Field(..., description="Viewport de la captura.")
     width: int = Field(..., ge=1, description="Ancho real del PNG en píxeles.")
     height: int = Field(..., ge=1, description="Alto real del PNG en píxeles.")
@@ -599,6 +628,7 @@ def build_screenshot_artifact(
     route: str,
     viewport: Viewport,
     data: bytes,
+    rendered_route: str = "",
     browser: str = "",
     playwright_version: str = "",
 ) -> ScreenshotArtifact:
@@ -607,6 +637,9 @@ def build_screenshot_artifact(
     Valida el PNG y extrae las dimensiones **reales** de la cabecera: el artefacto declara lo que
     la imagen es, no lo que se pidió que fuera.
 
+    ``rendered_route`` es la ruta que el navegador renderizó de verdad. No se rellena con ``route``
+    por comodidad: si no se conoce, se deja vacía y la cobertura la trata como no verificada.
+
     Raises:
         ValueError: si los bytes no son un PNG válido.
     """
@@ -614,6 +647,7 @@ def build_screenshot_artifact(
     return ScreenshotArtifact(
         logical_name=logical_name,
         route=route,
+        rendered_route=rendered_route,
         viewport=viewport.name,
         width=width,
         height=height,

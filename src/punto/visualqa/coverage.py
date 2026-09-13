@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from punto.providers.base import ImagePayload
 from punto.schemas.visual import VisualSpec
 from punto.schemas.web import ScreenshotArtifact, ViewportName
+from punto.web.routes import route_matches
 
 #: Identidad semántica de una captura: la ruta lógica y el viewport, no el nombre del archivo.
 CoverageKey = tuple[str, ViewportName]
@@ -52,6 +53,12 @@ class VisualCoverage:
     artifacts_without_payload: tuple[str, ...] = ()
     payloads_without_artifact: tuple[str, ...] = ()
     invalid_bindings: tuple[str, ...] = ()
+    #: Artefactos repetidos por nombre lógico: dos capturas con el mismo nombre son ambiguas.
+    duplicate_names: tuple[str, ...] = ()
+    #: Artefactos sin ruta renderizada verificada: no acreditan ninguna ruta.
+    unverified_routes: tuple[str, ...] = ()
+    #: Artefactos cuyo navegador terminó en otra ruta (V53-06), con el detalle.
+    route_mismatches: tuple[str, ...] = ()
     #: Payloads **canónicos**, reconstruidos desde el artefacto, en el orden de la especificación.
     payloads: tuple[tuple[CoverageKey, ImagePayload], ...] = ()
 
@@ -63,6 +70,9 @@ class VisualCoverage:
             and not self.missing
             and not self.duplicates
             and not self.invalid_bindings
+            and not self.duplicate_names
+            and not self.unverified_routes
+            and not self.route_mismatches
         )
 
     @property
@@ -124,6 +134,19 @@ class VisualCoverage:
             )
         if self.invalid_bindings:
             parts.append("imagen(es) que no enlazan: " + "; ".join(self.invalid_bindings[:3]))
+        if self.route_mismatches:
+            parts.append(
+                "captura(s) de otra ruta: " + "; ".join(self.route_mismatches[:3])
+            )
+        if self.unverified_routes:
+            parts.append(
+                "captura(s) sin ruta renderizada verificada: "
+                + ", ".join(self.unverified_routes[:5])
+            )
+        if self.duplicate_names:
+            parts.append(
+                "nombre(s) lógico(s) repetido(s): " + ", ".join(self.duplicate_names[:5])
+            )
         if self.unexpected:
             parts.append(
                 "par(es) no pedido(s): " + ", ".join(_label(key) for key in self.unexpected[:5])
@@ -169,20 +192,43 @@ def evaluate_visual_coverage(
     expected_set = set(expected)
 
     seen: set[CoverageKey] = set()
+    seen_names: set[str] = set()
     present: list[CoverageKey] = []
     duplicates: list[CoverageKey] = []
+    duplicate_names: list[str] = []
     unexpected: list[CoverageKey] = []
     without_payload: list[str] = []
     invalid: list[str] = []
+    unverified: list[str] = []
+    mismatches: list[str] = []
     bound: list[tuple[CoverageKey, ImagePayload]] = []
     used_names: set[str] = set()
 
     for artifact in artifacts:
+        # Dos artefactos con el mismo nombre lógico son ambiguos: no se puede saber cuál de los dos
+        # corresponde a qué captura, así que la cobertura se bloquea en lugar de elegir uno.
+        if artifact.logical_name in seen_names:
+            duplicate_names.append(artifact.logical_name)
+            continue
+        seen_names.add(artifact.logical_name)
+
         key = (artifact.route, artifact.viewport)
         if key in seen:
             duplicates.append(key)
             continue
         seen.add(key)
+
+        # V53-06: la captura solo acredita la ruta que el navegador **renderizó**. Sin ruta final
+        # verificada no acredita nada, y si terminó en otra ruta, la solicitada queda ausente.
+        if not artifact.rendered_route:
+            unverified.append(artifact.logical_name)
+            continue
+        if not route_matches(artifact.route, artifact.rendered_route):
+            mismatches.append(
+                f"{artifact.logical_name} (solicitada {artifact.route}, renderizada "
+                f"{artifact.rendered_route})"
+            )
+            continue
 
         payload = payloads.get(artifact.logical_name)
         if payload is None:
@@ -228,6 +274,9 @@ def evaluate_visual_coverage(
         artifacts_without_payload=tuple(without_payload),
         payloads_without_artifact=orphans,
         invalid_bindings=tuple(invalid),
+        duplicate_names=tuple(dict.fromkeys(duplicate_names)),
+        unverified_routes=tuple(unverified),
+        route_mismatches=tuple(mismatches),
         payloads=tuple(bound),
     )
 

@@ -28,19 +28,24 @@ Responsabilidades, en orden:
    directorio de evidencia;
 5. validar cada PNG en Python (firma + dimensiones de la cabecera IHDR) y anotar **tamaño y sha256
    calculados aquí**, de modo que el host pueda verificar los bytes sin confiar en el probe;
-6. escribir ``observations.json`` con la forma exacta de ``WebObservations``
+6. contrastar la ruta **solicitada** con la que el navegador acabó renderizando (``final_route``):
+   una redirección —302 o ``location.href``— haría pasar por cobertura completa una ruta que nadie
+   renderizó, y la captura de la portada seguiría declarándose como ``/pricing`` (hallazgo V53-06);
+7. escribir ``observations.json`` con la forma exacta de ``WebObservations``
    (``punto/schemas/web.py``, campos en snake_case) y ``diagnostics.json`` con el manifiesto;
-7. publicar por stdout el sha256 de ``diagnostics.json`` y el sha256 del **código de medición**
+8. publicar por stdout el sha256 de ``diagnostics.json`` y el sha256 del **código de medición**
    (``run_web_session.py`` seguido de ``capture.cjs``), para que el host pueda demostrar que el
    código que midió es el que él montó.
 
 Contrato de salida, dentro de ``output_dir`` (montaje del host, fuera del workspace):
 
 - ``observations.json``: forma exacta de ``WebObservations``. Solo se escribe si la sesión terminó
-  bien (exit 0): el host no acepta observaciones parciales como si fueran completas.
+  bien (exit 0): el host no acepta observaciones parciales como si fueran completas. Cada
+  observación lleva ``final_url`` / ``final_route`` / ``route_mismatch``: lo que el navegador
+  muestra de verdad, no lo que se le pidió.
 - ``diagnostics.json``: se escribe **siempre**, incluso al fallar. Lleva versiones, el resultado de
-  cada captura, notas y el manifiesto de screenshots (nombre, ruta lógica, viewport, dimensiones,
-  bytes y sha256).
+  cada captura, notas y el manifiesto de screenshots (nombre, ruta lógica solicitada, ruta final
+  renderizada, viewport, dimensiones, bytes y sha256).
 - ``screenshots/<nombre>.png``: los PNG capturados.
 
 Marcadores de stdout: ``PUNTO_EVIDENCE_SHA256 <sha256 de diagnostics.json>`` (no se imprime si no
@@ -67,6 +72,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -279,14 +285,148 @@ def _output_dir(value: object) -> Path:
     return resolved
 
 
-def _normalize_route(value: object) -> str:
-    """Ruta lógica a medir, siempre empezando por ``/``.
+# ---------------------------------------------------------------------------
+# Identidad de ruta: copia del contrato del host
+# ---------------------------------------------------------------------------
+# Todo lo que sigue es una **copia literal** de la política de ``src/punto/web/routes.py``. Este
+# archivo corre dentro de la imagen de medición, que no instala el paquete ``punto``: el probe no
+# puede importar código del proyecto auditado, y el proyecto no confiable no debe poder influir en
+# cómo se decide si la ruta medida es la ruta pedida. La política, con sus decisiones explícitas:
+#
+# - la ruta es el **pathname**: el query y el fragmento no cambian la identidad (``/pricing?x=1`` y
+#   ``/pricing`` son la misma página con otro estado);
+# - la barra final es indiferente: ``/pricing`` y ``/pricing/`` son la misma ruta;
+# - todo lo demás se compara tal cual (mayúsculas, barras repetidas, porcentajes), porque es
+#   preferible declarar una diferencia que darla por equivalente sin motivo;
+# - de una URL se descarta la autoridad, así que unas credenciales nunca forman parte de la ruta ni
+#   del nombre del archivo.
+#
+# El host **no se fía** de esta copia: vuelve a comprobar la coherencia entre la ruta solicitada, la
+# final y la del artefacto. Si su política cambia, esta copia queda desalineada y esa comprobación
+# es la que lo detecta.
 
-    La URL de la preview se compone como ``base_url + route``; una ruta vacía dejaría la URL sin
-    camino, y el host fija la base (aquí no se aceptan URLs completas en ``route``).
+#: Ruta raíz normalizada (mismo nombre que en el contrato del host, para poder comparar las dos
+#: implementaciones línea a línea).
+ROOT_ROUTE = "/"
+
+#: Slug usado cuando la ruta no aporta ningún carácter aprovechable (por ejemplo, la raíz).
+ROUTE_SLUG_FALLBACK = "index"
+
+#: Longitud máxima del slug legible de una ruta.
+ROUTE_SLUG_LIMIT = 40
+
+#: Caracteres del digest de ruta que se incorporan al nombre lógico.
+ROUTE_DIGEST_CHARS = 8
+
+#: Caracteres no admitidos en un nombre lógico de captura (mismo patrón que el host).
+_UNSAFE_SLUG_CHARS = re.compile(r"[^a-z0-9]+")
+
+#: Credenciales embebidas en la autoridad de una URL, que nunca deben acabar en un informe.
+_URL_CREDENTIALS = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@")
+
+
+def _normalize_route(value: object) -> str:
+    """Ruta lógica normalizada según la política del host, siempre empezando por ``/``.
+
+    Se normaliza la **identidad**, no la petición: sirve para decidir si dos rutas son la misma y
+    para nombrar el artefacto, de modo que una barra final de más no se convierta ni en un falso
+    «no coincide» ni en dos nombres distintos para la misma página. Lo que se pide al servidor es
+    lo que el host pidió (ver :func:`_requested_route`): un servidor puede servir ``/pricing/`` y
+    ``/pricing`` de forma distinta, y la equivalencia se decide al comparar, no al pedir.
     """
-    text = str(value or "").strip() or "/"
+    text = str(value or "").strip()
+    if not text:
+        return ROOT_ROUTE
+    if "://" in text or text.startswith("//"):
+        text = urllib.parse.urlsplit(text).path or ROOT_ROUTE
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    if not text.startswith("/"):
+        text = f"/{text}"
+    if len(text) > 1 and text.endswith("/"):
+        text = text.rstrip("/") or ROOT_ROUTE
+    return text or ROOT_ROUTE
+
+
+def _requested_route(value: object) -> str:
+    """Ruta que el host pidió medir, con ``/`` inicial garantizado.
+
+    La URL de la preview se compone como ``base_url + route``, y una ruta vacía dejaría la URL sin
+    camino, así que el ``/`` inicial es obligatorio. No se canoniza aquí a propósito: se pide
+    exactamente lo que el host pidió, y la equivalencia «blanda» (barra final) se aplica solo al
+    comparar la ruta solicitada con la renderizada.
+    """
+    text = str(value or "").strip() or ROOT_ROUTE
     return text if text.startswith("/") else f"/{text}"
+
+
+def _route_matches(requested: str, rendered: str) -> bool:
+    """True si la ruta realmente renderizada corresponde a la solicitada.
+
+    Es la copia de ``punto.web.routes.route_matches``: con esta comparación ``/pricing`` y
+    ``/pricing/`` son equivalentes, el query y el fragmento no intervienen, y ``/pricing`` frente a
+    ``/`` es una diferencia que hay que declarar.
+    """
+    return _normalize_route(requested) == _normalize_route(rendered)
+
+
+def _safe_route_slug(route: str) -> str:
+    """Slug legible y acotado de una ruta, para el nombre del archivo de captura."""
+    normalized = _normalize_route(route).strip("/").lower()
+    slug = _UNSAFE_SLUG_CHARS.sub("-", normalized).strip("-")
+    return slug[:ROUTE_SLUG_LIMIT].strip("-") or ROUTE_SLUG_FALLBACK
+
+
+def _route_digest(route: str) -> str:
+    """Digest corto y determinista de la ruta normalizada."""
+    normalized = _normalize_route(route)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:ROUTE_DIGEST_CHARS]
+
+
+def _screenshot_logical_name(route: str, viewport_name: str) -> str:
+    """Nombre lógico determinista, legible y **resistente a colisiones**.
+
+    Es el mismo algoritmo que ``punto.web.routes.screenshot_logical_name``: el slug solo es
+    legible, así que dos rutas distintas pueden producir el mismo (``/a/b`` frente a ``/a-b``) y el
+    nombre incorpora un digest corto de la ruta normalizada. Con el digest, dos rutas diferentes
+    nunca comparten nombre, y el nombre nunca contiene una ruta del host porque se construye desde
+    el pathname.
+    """
+    viewport = str(viewport_name).lower()
+    return f"{_safe_route_slug(route)}-{_route_digest(route)}-{viewport}.png"
+
+
+def _sanitize_url(value: object) -> str:
+    """URL acotada y sin credenciales embebidas.
+
+    El saneado ya lo hace ``capture.cjs`` dentro de la imagen, pero el probe no delega en él la
+    única garantía que no puede fallar: el navegador puede acabar en una URL con usuario y
+    contraseña, y de ahí sale ``final_url``. Se repite aquí para que un cambio en el script de
+    captura no pueda meter unas credenciales en el informe.
+    """
+    return _URL_CREDENTIALS.sub(r"\1", _truncate(value))
+
+
+def _final_url(payload: dict[str, Any]) -> str:
+    """URL final que reportó el navegador, acotada y sin credenciales.
+
+    Es la evidencia primaria de V53-06: el host recalcula la ruta a partir de **esta** cadena, así
+    que todo lo demás (la ruta final, el desajuste, el manifiesto) se deriva de aquí y no de otra
+    fuente que pudiera contradecirla.
+    """
+    return _sanitize_url(payload.get("final_url", ""))
+
+
+def _rendered_route(payload: dict[str, Any]) -> str:
+    """Ruta final normalizada, derivada de la URL final que el probe publica.
+
+    Se deriva de la URL publicada, y no de lo que declare por su cuenta ``capture.cjs``, porque el
+    host contrasta las dos cosas: si vinieran de fuentes distintas, un recorte o un saneado
+    diferente podría hacer que se contradijeran y la sesión se bloquearía por una incoherencia del
+    propio probe. La cadena vacía es un hecho, no un ``/``: sin URL final no hay ruta final que
+    declarar, y el host lo trata como no verificado en lugar de dar la ruta por buena.
+    """
+    final_url = _final_url(payload)
+    return _normalize_route(final_url) if final_url else ""
 
 
 def _base_url(value: object) -> str:
@@ -340,14 +480,6 @@ def _normalize_markers(value: object) -> list[str]:
             raise ValueError("required_markers debe contener cadenas no vacías")
         markers.append(item.strip())
     return markers
-
-
-def _screenshot_name(route: str, viewport_name: str) -> str:
-    """Nombre lógico determinista del screenshot de una ruta y un viewport."""
-    slug = "".join(
-        character if character.isalnum() else "-" for character in route.strip("/")
-    ).strip("-")
-    return f"{slug or 'index'}-{viewport_name.lower()}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +595,7 @@ def _capture_viewport(
     manipulable el código de medición.
     """
     name = str(viewport["name"])
-    logical_name = _screenshot_name(route, name)
+    logical_name = _screenshot_logical_name(route, name)
     png_path = output_dir / "screenshots" / logical_name
     json_path = output_dir / f"capture-{name.lower()}.json"
     argv = [
@@ -510,7 +642,13 @@ def _build_observation(
     route: str,
     logical_name: str,
 ) -> dict[str, Any]:
-    """Traduce el JSON de ``capture.cjs`` a la forma exacta de ``RouteObservation``."""
+    """Traduce el JSON de ``capture.cjs`` a la forma exacta de ``RouteObservation``.
+
+    Aquí se cierra V53-06: ``route`` es lo que se pidió y ``final_route`` lo que el navegador
+    renderizó. Si no coinciden, la observación se conserva entera (la captura es evidencia útil),
+    pero se declara el desajuste y se rellena ``load_error``, que es lo que hace fallar el check
+    ``PAGE_LOAD_ERROR`` del host sin inventar una comprobación nueva.
+    """
     resources: list[dict[str, Any]] = []
     raw_resources = payload.get("failed_resources")
     if isinstance(raw_resources, list):
@@ -544,12 +682,29 @@ def _build_observation(
             "axe_violations": _as_str_list(raw_accessibility.get("axe_violations"), 25),
         }
 
+    final_route = _rendered_route(payload)
+    # Con ``final_route`` vacío no se declara desajuste: no medir la URL final no es lo mismo que
+    # medirla y que no cuadre, y convertir la ausencia de dato en un fallo sería inventar evidencia.
+    route_mismatch = bool(final_route) and not _route_matches(route, final_route)
+    load_error = _truncate(payload.get("load_error", ""))
+    if route_mismatch:
+        # El mensaje es determinista y nombra las dos rutas: el host no tiene que interpretar el
+        # error del navegador para saber que lo capturado no es lo pedido. Si además hubo un error
+        # de navegación, se conserva detrás para no perder el hecho original.
+        mismatch_detail = f"la ruta solicitada {route} terminó en {final_route}"
+        load_error = _truncate(
+            f"{mismatch_detail}; {load_error}" if load_error else mismatch_detail
+        )
+
     return {
         "route": route,
         "viewport": viewport["name"],
-        "local_url": _truncate(payload.get("local_url", "")),
+        "local_url": _sanitize_url(payload.get("local_url", "")),
+        "final_url": _final_url(payload),
+        "final_route": final_route,
+        "route_mismatch": route_mismatch,
         "http_status": _as_int_or_none(payload.get("http_status")),
-        "load_error": _truncate(payload.get("load_error", "")),
+        "load_error": load_error,
         "timed_out": bool(payload.get("timed_out", False)),
         "console_errors": _as_str_list(payload.get("console_errors"), MAX_CONSOLE_ERRORS),
         "console_warning_count": max(
@@ -723,7 +878,7 @@ def main() -> int:
             diagnostics["error"] = f"payload inválido: {exc}"
             return _finish(diagnostics, output_dir, EXIT_PAYLOAD_INVALID, probe_digest)
 
-        route = _normalize_route(payload.get("route"))
+        route = _requested_route(payload.get("route"))
         preview_url = f"{base_url}{route}"
         diagnostics["route"] = route
         # Etiqueta informativa, si el host la envía: sirve para los mensajes de error, no se usa
@@ -811,6 +966,10 @@ def main() -> int:
                 {
                     "name": logical_name,
                     "route": route,
+                    # Lo que el navegador renderizó de verdad, al lado de lo que se pidió: sin
+                    # este campo, un manifiesto con `route: /pricing` y la portada dentro
+                    # parece correcto.
+                    "rendered_route": _rendered_route(capture_payload),
                     "viewport": viewport["name"],
                     "width": width,
                     "height": height,

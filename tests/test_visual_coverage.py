@@ -29,6 +29,7 @@ from punto.visualqa.coverage import (
     expected_visual_coverage,
 )
 from punto.visualqa.gates import evaluate_screenshots_gate
+from punto.web.routes import screenshot_logical_name
 from test_anthropic_client import FakeAnthropicAPI, make_client, message_response
 from visual_support import (
     make_spec,
@@ -224,6 +225,7 @@ def test_an_extra_pair_cannot_hide_a_missing_required_pair() -> None:
     extra = build_screenshot_artifact(
         logical_name="extra-desktop.png",
         route="/otra",
+        rendered_route="/otra",
         viewport=ViewportName.DESKTOP,
         data=png_bytes(1440, 900),
     )
@@ -260,6 +262,7 @@ def test_identity_is_the_pair_and_not_the_file_name() -> None:
     renamed = build_screenshot_artifact(
         logical_name="otro-nombre.png",
         route="/",
+        rendered_route="/",
         viewport=DEFAULT_VIEWPORTS[0],
         data=raw[artifacts[0].logical_name],
     )
@@ -395,6 +398,6 @@ def test_the_spec_supplies_the_expectation_even_with_extra_viewports() -> None:
     # Y el prompt no puede anunciar capturas que no van adjuntas: la lista de capturas del prompt
     # y las imágenes de la petición salen de la misma fuente.
     prompt = api.last_body["messages"][0]["content"][0]["text"]
-    assert "- home-mobile.png" in prompt
-    assert "- home-tablet.png" not in prompt
-    assert "- home-desktop.png" not in prompt
+    assert f'- {screenshot_logical_name("/", ViewportName.MOBILE)}' in prompt
+    assert f'- {screenshot_logical_name("/", ViewportName.TABLET)}' not in prompt
+    assert f'- {screenshot_logical_name("/", ViewportName.DESKTOP)}' not in prompt

@@ -40,6 +40,7 @@ from punto.schemas.web import (
     WebTechnicalStatus,
     build_screenshot_artifact,
 )
+from punto.web.routes import screenshot_logical_name
 
 
 def png_bytes(width: int, height: int, *, color: tuple[int, int, int] = (16, 24, 40)) -> bytes:
@@ -70,16 +71,23 @@ def screenshots_for(
     *,
     color: tuple[int, int, int] = (16, 24, 40),
 ) -> tuple[tuple[Any, ...], dict[str, bytes]]:
-    """Artefactos y bytes reales para cada combinación ruta x viewport."""
+    """Artefactos y bytes reales para cada combinación ruta x viewport.
+
+    Los artefactos declaran la ruta **renderizada** igual que la solicitada: son capturas de una
+    sesión que el host ya verificó, y sin esa ruta la cobertura las trataría como no verificadas.
+    El nombre lógico sale del mismo generador que usa el probe, para que las pruebas no dependan de
+    una cadena escrita a mano.
+    """
     artifacts = []
     payloads: dict[str, bytes] = {}
     for route in routes:
         for viewport in viewports:
             data = png_bytes(viewport.width, viewport.height, color=color)
-            name = f"{route.strip('/') or 'home'}-{viewport.name.value.lower()}.png"
+            name = screenshot_logical_name(route, viewport.name)
             artifact = build_screenshot_artifact(
                 logical_name=name,
                 route=route,
+                rendered_route=route,
                 viewport=viewport,
                 data=data,
                 browser="chromium 153.0.8010.12",

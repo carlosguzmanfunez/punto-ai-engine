@@ -26,7 +26,7 @@ from punto.providers.base import ImagePayload
 from punto.providers.json_schema import provider_schema_for
 from punto.schemas.audit import AuditEventType
 from punto.schemas.visual import VisualQAGateName, VisualQAProposal, VisualQAStatus
-from punto.schemas.web import DEFAULT_VIEWPORTS, WebTechnicalStatus
+from punto.schemas.web import DEFAULT_VIEWPORTS, ViewportName, WebTechnicalStatus
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import VisualQARunnerNotConfiguredError
 from punto.visualqa.claude import (
@@ -38,6 +38,7 @@ from punto.visualqa.claude import (
     ClaudeVisualQARunner,
 )
 from punto.visualqa.prompts import VISUAL_SYSTEM_PROMPT
+from punto.web.routes import screenshot_logical_name
 from test_anthropic_client import (
     FAKE_KEY,
     FakeAnthropicAPI,
@@ -89,7 +90,9 @@ def test_clean_proposal_over_green_session_passes() -> None:
     ]
     assert report.provider == "anthropic"
     assert report.model.startswith("claude")
-    assert report.screenshots_analyzed == ("home-mobile.png",)
+    assert report.screenshots_analyzed == (
+        screenshot_logical_name("/", ViewportName.MOBILE),
+    )
     assert report.routes_analyzed == ("/",)
     assert report.viewports_analyzed == ("MOBILE",)
     assert report.model_usage.total_tokens > 0
@@ -184,7 +187,7 @@ def test_a_missing_capture_blocks() -> None:
     """Evaluar sin todas las capturas exigidas: BLOCKED, aunque el modelo conteste."""
     task, raw = make_visual_task(routes=("/", "/precios"))
     images = visual_images(task, raw)
-    del images["precios-mobile.png"]
+    del images[screenshot_logical_name("/precios", ViewportName.MOBILE)]
     runner, api = make_runner([proposal_response()])
 
     report = runner.evaluate(task, images)

@@ -70,6 +70,7 @@ from punto.schemas.web import (
     DEFAULT_VIEWPORTS,
     MAX_SCREENSHOT_BYTES,
     MAX_SCREENSHOTS,
+    RouteObservation,
     ScreenshotArtifact,
     Viewport,
     WebObservations,
@@ -78,6 +79,7 @@ from punto.schemas.web import (
     png_dimensions,
 )
 from punto.tools.errors import SandboxUnavailableError, WebCommandPolicyError
+from punto.web.routes import normalize_route, route_from_url, route_matches
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
@@ -685,6 +687,67 @@ class WebSandboxBackend:
             _remove_host_dir(probe_root)
             _remove_host_dir(evidence_root)
 
+    def _verify_route_identity(
+        self,
+        observation: RouteObservation,
+        declared: Mapping[str, object],
+        session_route: str,
+    ) -> None:
+        """Contrasta la ruta solicitada, la final observada y la del artefacto (V53-06).
+
+        El host no se fía de que el probe diga la verdad: recalcula él mismo dónde terminó el
+        navegador a partir de la URL final y decide si eso corresponde a la ruta solicitada. Si el
+        probe declarara una cosa y la URL dijera otra, la sesión se bloquea en lugar de aceptar una
+        captura que acredita una ruta que nadie renderizó.
+
+        Raises:
+            WebSandboxEvidenceError: si falta la URL final, si la ruta final declarada no
+                corresponde a esa URL, si el manifiesto contradice a la observación, o si el
+                veredicto del probe y el del host sobre la coincidencia no son el mismo.
+        """
+        viewport = observation.viewport.value
+        if not observation.final_url:
+            raise WebSandboxEvidenceError(
+                f"la observación de {viewport} no declara la URL final del navegador: sin ella no "
+                "se puede verificar qué ruta se renderizó"
+            )
+        host_final = route_from_url(observation.final_url)
+        if observation.final_route and normalize_route(observation.final_route) != host_final:
+            raise WebSandboxEvidenceError(
+                f"la ruta final declarada en {viewport} ({observation.final_route!r}) no "
+                f"corresponde a la URL final observada ({host_final!r})"
+            )
+        host_mismatch = not route_matches(observation.route, host_final)
+        if host_mismatch != observation.route_mismatch:
+            raise WebSandboxEvidenceError(
+                f"contradicción en {viewport}: el probe declara route_mismatch="
+                f"{observation.route_mismatch} y la URL final observada dice {host_mismatch}"
+            )
+        declared_route = _as_str(declared.get("route"))
+        if declared_route and declared_route != observation.route:
+            raise WebSandboxEvidenceError(
+                f"la observación de {viewport} declara la ruta {observation.route!r} y el "
+                f"manifiesto {declared_route!r}: contradicción entre observación y artefacto"
+            )
+        declared_rendered = _as_str(declared.get("rendered_route"))
+        if declared_rendered and normalize_route(declared_rendered) != host_final:
+            raise WebSandboxEvidenceError(
+                f"el manifiesto declara la ruta renderizada {declared_rendered!r} en {viewport} y "
+                f"el navegador terminó en {host_final!r}"
+            )
+        if not declared_rendered:
+            raise WebSandboxEvidenceError(
+                f"el manifiesto no declara la ruta renderizada de {viewport}: una captura sin ruta "
+                "renderizada verificada no acredita ninguna ruta"
+            )
+        if observation.route != session_route and not route_matches(
+            observation.route, session_route
+        ):
+            raise WebSandboxEvidenceError(
+                f"la observación de {viewport} pertenece a la ruta {observation.route!r} y la "
+                f"sesión pidió {session_route!r}"
+            )
+
     # --------------------------------------------------------------- auditar
     def _audit_session_started(
         self,
@@ -1040,12 +1103,14 @@ class WebSandboxBackend:
                 f"faltan observaciones para los viewports {missing}: la sesión está incompleta"
             )
         declared_names = {_as_str(item.get("name")) for item in declared}
+        by_name = {_as_str(item.get("name")): item for item in declared}
         for observation in observations.observations:
             if observation.screenshot_name not in declared_names:
                 raise WebSandboxEvidenceError(
                     f"la observación de {observation.viewport.value} declara el screenshot "
                     f"{observation.screenshot_name!r} y el manifiesto no lo contiene"
                 )
+            self._verify_route_identity(observation, by_name[observation.screenshot_name], route)
 
         artifacts: list[ScreenshotArtifact] = []
         screenshots: dict[str, bytes] = {}
@@ -1122,6 +1187,7 @@ class WebSandboxBackend:
             artifact = build_screenshot_artifact(
                 logical_name=name,
                 route=_as_str(item.get("route")) or route,
+                rendered_route=_as_str(item.get("rendered_route")),
                 viewport=viewport,
                 data=data,
                 browser=_as_str(item.get("browser")),

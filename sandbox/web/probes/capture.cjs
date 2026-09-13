@@ -25,6 +25,10 @@
  *   - solo se navega a la URL local recibida: el contenedor no tiene red;
  *   - nada de secretos ni de rutas absolutas del host se escriben en el JSON (las URL se
  *     sanean quitando credenciales);
+ *   - la URL **final** que reporta el navegador se publica como evidencia (`final_url` saneada y
+ *     `final_route` normalizada): `route` y `local_url` son lo pedido, y sin ese contraste una
+ *     redirección —302 o `location.href`— haría pasar por cobertura completa una ruta que nadie
+ *     renderizó (hallazgo V53-06);
  *   - todo va acotado a los máximos del contrato (`punto/schemas/web.py`): 50 mensajes de
  *     consola, 25 errores de página, 25 recursos fallidos y 2000 caracteres por texto;
  *   - las claves del JSON son las del contrato (`RouteObservation` / `AccessibilityObservation`)
@@ -96,6 +100,66 @@ function sanitizeUrl(value) {
   // con `[^/@]*@` una contraseña que contuviera `@` dejaba la cola visible en el informe.
   url = url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/]*@/, '$1');
   return url;
+}
+
+/**
+ * Pathname de una URL absoluta, sin esquema ni autoridad.
+ *
+ * Se extrae a mano, y no con `new URL()`, porque `new URL()` solo acepta URLs con esquema: la
+ * política del host (`src/punto/web/routes.py`) trata como URL únicamente lo que lleva `://` o
+ * empieza por `//`, y esta función tiene que dar **exactamente** el mismo resultado que aquella,
+ * incluido lo raro (`about:blank` no es una URL para la política, así que su pathname no es
+ * `blank`). Cualquier divergencia aquí haría que el probe y el host discreparan sobre si dos rutas
+ * son la misma.
+ *
+ * @param {string} text Texto con forma de URL.
+ * @returns {string} Pathname, o cadena vacía si la autoridad no deja camino.
+ */
+function urlPath(text) {
+  const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?/.exec(text);
+  if (withScheme) {
+    return withScheme[1] || '';
+  }
+  if (text.startsWith('//')) {
+    const rest = text.slice(2);
+    const cut = rest.search(/[/?#]/);
+    if (cut === -1) {
+      return '';
+    }
+    const tail = rest.slice(cut);
+    return tail.startsWith('/') ? tail.split(/[?#]/)[0] : '';
+  }
+  return '';
+}
+
+/**
+ * Ruta lógica normalizada: pathname, sin query, sin fragmento y sin barra final salvo la raíz.
+ *
+ * Es una **copia** de la política de `src/punto/web/routes.py::normalize_route`, y aquí no se
+ * puede importar nada de `punto` porque este script corre dentro de la imagen de medición, que no
+ * instala el paquete. La copia existe para que `final_route` signifique lo mismo en los dos lados:
+ * de una URL se descarta la autoridad (así unas credenciales nunca forman parte de la identidad),
+ * el query y el fragmento no cambian la ruta, y la barra final es indiferente.
+ *
+ * @param {string} value URL final o ruta observada.
+ * @returns {string} Ruta normalizada, siempre empezando por `/`.
+ */
+function normalizeRoute(value) {
+  let text = String(value === undefined || value === null ? '' : value).trim();
+  if (!text) {
+    return '/';
+  }
+  if (text.includes('://') || text.startsWith('//')) {
+    text = urlPath(text) || '/';
+  }
+  text = text.split('?')[0].split('#')[0];
+  if (!text.startsWith('/')) {
+    text = `/${text}`;
+  }
+  if (text.length > 1 && text.endsWith('/')) {
+    text = text.replace(/\/+$/, '') || '/';
+  }
+  return text || '/';
 }
 
 /**
@@ -445,6 +509,11 @@ async function capture(options) {
   let httpStatus = null;
   let loadError = '';
   let timedOut = false;
+  // La URL final, tal como la reporta el navegador después de asentarse. Se inicializa vacía a
+  // propósito: si no se puede leer, el JSON lo dice con cadenas vacías en lugar de inventar que el
+  // navegador se quedó donde se le pidió.
+  let finalUrl = '';
+  let finalRoute = '';
 
   const noteHydration = (text) => {
     const lowered = text.toLowerCase();
@@ -479,6 +548,8 @@ async function capture(options) {
     route: options.route,
     viewport: options.viewport,
     local_url: sanitizeUrl(options.url),
+    final_url: '',
+    final_route: '',
     http_status: null,
     load_error: '',
     timed_out: false,
@@ -573,10 +644,31 @@ async function capture(options) {
       await page.waitForTimeout(options.settleMs);
     }
 
+    // La URL final se lee **después** del settle, no antes: una redirección por JavaScript
+    // (`location.href = "/"`) ocurre después de que la red se quede quieta, y leerla antes dejaría
+    // fuera justo el caso que hay que detectar. `page.url()` es la única fuente: `options.url` es lo
+    // que se pidió, y una redirección hace que lo pedido y lo renderizado no sean lo mismo.
+    try {
+      const reported = page.url();
+      if (typeof reported === 'string' && reported) {
+        // Se normaliza sobre la URL ya saneada: así ninguna credencial de la autoridad puede acabar
+        // formando parte de la ruta publicada, ni siquiera en un caso raro de redirección.
+        finalUrl = sanitizeUrl(reported);
+        finalRoute = normalizeRoute(finalUrl);
+      }
+    } catch (error) {
+      // No poder leer la URL final no puede tumbar una captura que por lo demás salió bien: los dos
+      // campos se quedan vacíos y el host sabrá que esta parte no se midió (no se inventa nada).
+      finalUrl = '';
+      finalRoute = '';
+    }
+
     const facts = await page.evaluate(collectDocumentFacts, options.markers);
 
     result.http_status = httpStatus;
     result.load_error = loadError;
+    result.final_url = finalUrl;
+    result.final_route = finalRoute;
     result.timed_out = timedOut;
     result.console_warning_count = consoleWarningCount;
     result.broken_images = facts.brokenImages;
@@ -626,6 +718,8 @@ async function main() {
       route: options.route,
       viewport: options.viewport,
       local_url: sanitizeUrl(options.url),
+      final_url: '',
+      final_route: '',
       http_status: null,
       load_error: '',
       timed_out: false,

@@ -28,6 +28,7 @@
 | **ENGINE-5.2** | **Multi-Provider + Anthropic/Claude + Cross-Model Audit.** Contrato provider-neutral, `output_config` estructurado, auditoría cruzada real y fundación multimodal. | ✅ Implementada |
 | **ENGINE-5.3** | **Web + Visual Execution Foundation.** Perfil web, sandbox con Chromium real, once checks deterministas, capturas verificadas y Visual QA con gates no anulables. | ✅ Implementada |
 | **ENGINE-5.3.1** | **Trusted Web Evidence + Visual Completeness Hardening.** Frontera de dos contenedores para la medición, cobertura visual exigida por la especificación, aplicabilidad explícita de los checks y gates vivos de Visual QA. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
+| **ENGINE-5.3.2** | **Final Route Identity Hardening.** La identidad de ruta se decide por la URL final renderizada, la cobertura solo acredita la ruta realmente renderizada y los nombres lógicos de captura son resistentes a colisiones. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -2848,7 +2849,73 @@ Mismo tamaño con distinto hash ⇒ bloqueo sin gastar una llamada.
 
 ---
 
-## 27. Licencia
+## 27. ENGINE-5.3.2 — Final Route Identity Hardening
+
+Cierra un bypass residual de completitud visual: el probe declaraba la ruta **solicitada** y nunca
+contrastaba dónde había terminado el navegador. Si `/pricing` respondía 302 hacia `/`, la captura
+contenía la portada, el artefacto seguía diciendo `/pricing` y la cobertura visual se daba por
+completa con una ruta que nadie renderizó.
+
+### La URL final es evidencia
+
+Tras `page.goto(...)` y **después del asentamiento**, el probe lee `page.url()` y publica dos campos
+nuevos en cada observación: `final_url` (sin credenciales) y `final_route` (pathname normalizado).
+El artefacto declara además `rendered_route`, la ruta que el navegador renderizó de verdad.
+
+### Política de identidad de ruta
+
+Definida en un solo sitio (`src/punto/web/routes.py`) y duplicada en el probe con una nota que
+apunta al contrato:
+
+| Caso | ¿Es la misma ruta? |
+| --- | --- |
+| `/pricing` frente a `/pricing/` | **Sí**: la barra final es indiferente |
+| `/pricing` frente a `/` | **No**: es otra ruta |
+| `/pricing?plan=pro` frente a `/pricing` | **Sí**: el query no cambia la identidad (se conserva en `final_url`) |
+| `/pricing#x` frente a `/pricing` | **Sí**: el fragmento tampoco |
+| `/Pricing` frente a `/pricing` | **No**: se compara tal cual |
+| `//pricing` frente a `/pricing` | **No**: se compara tal cual |
+
+Es deliberadamente conservador: solo la barra final se acepta como equivalencia blanda, y todo lo
+demás se declara diferencia antes que darla por equivalente.
+
+### Qué pasa cuando el navegador termina en otra ruta
+
+- La observación queda con `route_mismatch = True` y un `load_error` explícito, así que
+  `PAGE_LOAD_ERROR` falla de forma determinista (no se inventó un duodécimo check).
+- La captura **se conserva para diagnóstico**, pero el par `(ruta solicitada, viewport)` queda
+  **ausente** en la cobertura: no acredita la ruta pedida.
+- Si la incompletitud se conoce antes del modelo, **no hay llamada al modelo**: Visual QA queda
+  `BLOCKED` con la lista de pares ausentes.
+- Cubre las dos formas de redirección: la respuesta HTTP (302/301) y la redirección posterior por
+  JavaScript (`location.href = "/"`), porque la URL final se lee después del asentamiento.
+
+### Verificación en el host
+
+El host no se fía de que el probe diga la verdad: recalcula la ruta final a partir de `final_url` y
+comprueba la coherencia entre **ruta solicitada, ruta final observada y ruta del artefacto**. Una
+contradicción (o una captura sin ruta renderizada verificada) bloquea la sesión en lugar de aceptar
+evidencia que acredita una ruta que nadie renderizó.
+
+### Nombres lógicos sin colisiones
+
+El nombre de la captura pasa de ser un slug de la ruta a
+`<slug>-<digest8>-<viewport>.png`, con el digest corto de la ruta normalizada: dos rutas distintas
+cuyo slug coincidiría (`/a/b` y `/a-b`) ya no comparten nombre, y dos rutas equivalentes por
+política (`/pricing` y `/pricing/`) sí lo comparten, porque son la misma evidencia. La cobertura
+**bloquea** además si dos artefactos llegan con el mismo nombre lógico, en lugar de elegir uno.
+
+### Limitación declarada
+
+- La política ignora query y fragmento al comparar rutas: una aplicación que sirva contenido
+  distinto según el query no queda distinguida por la cobertura. Se documenta como decisión, y el
+  query sí queda registrado en `final_url` para quien audite la sesión.
+- La medición sigue corriendo dentro de la página (`page.evaluate`): una página que sobrescriba
+  `scrollWidth` o `getComputedStyle` puede falsear sus propias medidas.
+
+---
+
+## 28. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

@@ -40,6 +40,7 @@ from punto.schemas.web import (
     png_dimensions,
 )
 from punto.web.checks import evaluate_web_checks
+from punto.web.routes import screenshot_logical_name
 from punto.web.sandbox import (
     PROBE_DIR_PREFIX,
     WEB_SANDBOX_REQUIRED,
@@ -272,7 +273,7 @@ def test_a_real_browser_captures_the_three_viewports(
     assert len(run.screenshots) == len(DEFAULT_VIEWPORTS)
     assert len(run.artifacts) == len(DEFAULT_VIEWPORTS)
     for viewport in DEFAULT_VIEWPORTS:
-        name = f"index-{viewport.name.value.lower()}.png"
+        name = screenshot_logical_name("/", viewport.name)
         data = run.screenshot(name)
         assert data is not None, sorted(run.screenshots)
         assert is_valid_png(data), name
@@ -380,7 +381,7 @@ def test_a_defective_page_fails_the_corresponding_checks(
     # La evidencia del fallo es texto acotado, y el PNG del viewport móvil sigue siendo válido.
     assert all(isinstance(item.evidence, str) for item in findings)
     assert any("[404]" in item.message for item in findings), report_failures(run.observations)
-    mobile = run.screenshot("index-mobile.png")
+    mobile = run.screenshot(screenshot_logical_name("/", ViewportName.MOBILE))
     assert mobile is not None
     assert png_dimensions(mobile) == EXPECTED_DIMENSIONS[ViewportName.MOBILE]
 

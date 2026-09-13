@@ -302,6 +302,13 @@ def _check_page_load(observations: WebObservations) -> _CheckResult:
             problems.append("se agotó el tiempo de espera")
         if item.load_error:
             problems.append(f"error de navegación: {item.load_error}")
+        if item.route_mismatch:
+            # V53-06: el navegador terminó en otra ruta. La captura existe, pero no es evidencia de
+            # la ruta solicitada, así que la carga de esa ruta no se puede dar por buena.
+            problems.append(
+                f"la ruta solicitada {item.route} no es la renderizada "
+                f"({item.final_route or 'desconocida'})"
+            )
         if item.http_status is not None and item.http_status >= 400:
             problems.append(f"HTTP {item.http_status}")
         if problems:

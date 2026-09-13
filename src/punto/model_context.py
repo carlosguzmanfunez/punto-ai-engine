@@ -61,6 +61,7 @@ class ModelReviewContext:
     omitted_paths: tuple[str, ...] = ()
     unsafe_paths: tuple[str, ...] = ()
     invalid_paths: tuple[str, ...] = ()
+    absent_paths: tuple[str, ...] = ()
     truncated_paths: tuple[str, ...] = ()
     content: str = ""
     line_counts: tuple[tuple[str, int], ...] = ()
@@ -74,6 +75,16 @@ class ModelReviewContext:
     def visible_set(self) -> frozenset[str]:
         """Conjunto exacto de rutas visibles, para validar hallazgos."""
         return frozenset(self.visible_paths)
+
+    @property
+    def absent_set(self) -> frozenset[str]:
+        """Rutas declaradas que no existen o no se pudieron leer.
+
+        Estar en el contexto visible **no** basta: si el archivo no existe, el modelo no vio su
+        contenido. Esta distinción es la que impide que un archivo obligatorio inexistente pase
+        por contexto completo (ENGINE-5.3, NF-01).
+        """
+        return frozenset(self.absent_paths)
 
     def line_map(self) -> dict[str, int]:
         """Líneas visibles por ruta, con la convención del motor."""
@@ -112,6 +123,13 @@ class ModelReviewContext:
                 f"{detail}; {len(self.invalid_paths)} no son rutas válidas y quedan "
                 f"declaradas como inválidas ({invalid}{invalid_suffix})"
             )
+        if self.absent_paths:
+            absent = ", ".join(self.absent_paths[:5])
+            absent_suffix = "…" if len(self.absent_paths) > 5 else ""
+            detail = (
+                f"{detail}; {len(self.absent_paths)} están declarados pero no existen o no se "
+                f"pudieron leer ({absent}{absent_suffix})"
+            )
         return detail
 
     def annotated_content(self) -> str:
@@ -138,6 +156,12 @@ class ModelReviewContext:
                 f"declarado(s) como inválido(s): "
                 f"{', '.join(self.invalid_paths[:5])}"
                 f"{'…' if len(self.invalid_paths) > 5 else ''}"
+            )
+        if self.absent_paths:
+            notes.append(
+                f"declarado(s) pero inexistente(s) o ilegible(s): "
+                f"{', '.join(self.absent_paths[:5])}"
+                f"{'…' if len(self.absent_paths) > 5 else ''}"
             )
         body = self.content or "(no se declararon archivos)"
         return f"{body}\n\n[{'; '.join(notes)}]"
@@ -197,6 +221,7 @@ def build_model_review_context(
 
     chunks: list[str] = []
     line_counts: list[tuple[str, int]] = []
+    absent: list[str] = []
     truncated: list[str] = []
     total = 0
 
@@ -216,14 +241,24 @@ def build_model_review_context(
         total += len(block)
         chunks.append(block)
         line_counts.append((relative, _visible_line_count(body)))
+        if body in (MISSING_FILE_MARKER, UNREADABLE_FILE_MARKER):
+            # Declarado pero sin contenido legible: el modelo lo sabe, pero no es contexto.
+            absent.append(relative)
         if truncated_at is not None:
             truncated.append(relative)
+
+    # Todo archivo declarado sin contenido legible queda también entre las omisiones: aparece
+    # en los informes y quien decide puede bloquear si era obligatorio (NF-01).
+    for path in absent:
+        if path not in omitted:
+            omitted.append(path)
 
     return ModelReviewContext(
         visible_paths=tuple(path for path, _ in line_counts),
         omitted_paths=tuple(omitted),
         unsafe_paths=tuple(unsafe),
         invalid_paths=tuple(invalid),
+        absent_paths=tuple(absent),
         truncated_paths=tuple(truncated),
         content="\n\n".join(chunks),
         line_counts=tuple(line_counts),
@@ -255,16 +290,29 @@ def resolve_within_workspace(workspace: Path | str, relative: str) -> Path | Non
     return _contained(root, _resolved_root(root), normalized)
 
 
-def missing_paths(context: ModelReviewContext, required: Iterable[str]) -> tuple[str, ...]:
+def missing_paths(
+    context: ModelReviewContext,
+    required: Iterable[str],
+    *,
+    deleted: Iterable[str] = (),
+) -> tuple[str, ...]:
     """Rutas declaradas como obligatorias que **no** llegaron al modelo.
 
-    Es la comprobación que impide aprobar una revisión parcial como si fuera completa.
+    Es la comprobación que impide aprobar una revisión parcial como si fuera completa. Una ruta
+    obligatoria falta si:
 
-    Una ruta obligatoria **inválida** también falta: no puede estar en el contexto visible, así
-    que cuenta como no cubierta y se devuelve con una representación saneada. Desaparecer de
-    las dos capas (ni visible ni faltante) sería justamente el agujero que esto cierra.
+    - no está en el contexto visible;
+    - es una ruta inválida (no puede estar visible nunca);
+    - **está declarada pero el archivo no existe o no se pudo leer**: aparecer en el contexto
+      como ``(no existe)`` no es haberlo revisado (ENGINE-5.3, NF-01).
+
+    ``deleted`` es la única excepción, y tiene que ser **explícita**: la tarea declara qué
+    archivos eliminó. PUNTO no deduce una eliminación de la ausencia de un archivo, porque
+    «no está» y «se borró a propósito» no son lo mismo.
     """
     visible = context.visible_set
+    absent = context.absent_set
+    removed = _normalized(deleted)
     missing: list[str] = []
     for raw in _iter_paths(required):
         try:
@@ -274,9 +322,22 @@ def missing_paths(context: ModelReviewContext, required: Iterable[str]) -> tuple
             if label not in missing:
                 missing.append(label)
             continue
-        if relative not in visible and relative not in missing:
+        if relative in removed:
+            continue
+        if (relative not in visible or relative in absent) and relative not in missing:
             missing.append(relative)
     return tuple(missing)
+
+
+def _normalized(paths: Iterable[str]) -> frozenset[str]:
+    """Conjunto normalizado de rutas declaradas; las inválidas se descartan."""
+    result: set[str] = set()
+    for raw in _iter_paths(paths):
+        try:
+            result.add(normalize_relative_path(raw))
+        except ValueError:
+            continue
+    return frozenset(result)
 
 
 def safe_path_label(path: str) -> str:

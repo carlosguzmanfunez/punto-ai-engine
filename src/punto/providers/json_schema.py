@@ -139,6 +139,19 @@ DROPPED_KEYWORDS: Final[frozenset[str]] = frozenset(
 
 LOCAL_REF_PREFIX: Final[str] = "#/"
 
+#: Máximo de parámetros **opcionales** que admite Structured Outputs.
+#:
+#: Se cuenta, sobre el provider schema ya transformado, cada propiedad que **no** figura en el
+#: ``required`` de su objeto. Un esquema con más opcionales de los admitidos se rechaza en
+#: PUNTO, antes de gastar una llamada HTTP en un 400.
+MAX_OPTIONAL_PARAMETERS: Final[int] = 24
+
+#: Máximo de parámetros **de unión** que admite Structured Outputs.
+#:
+#: Se cuenta cada nodo que declara ``anyOf``: una posición del esquema que puede tomar más de
+#: una forma. Los ``anyOf`` anidados cuentan uno por nodo, que es como los ve el dialecto.
+MAX_UNION_PARAMETERS: Final[int] = 16
+
 #: Profundidad máxima de expansión de referencias, para no depender de la recursión de Python.
 MAX_REF_DEPTH: Final[int] = 12
 
@@ -170,7 +183,80 @@ def prepare_json_schema(schema: Any) -> dict[str, Any]:
     if not isinstance(transformed, dict):  # pragma: no cover - defensivo
         raise SchemaValidationError("el esquema raíz dejó de ser un objeto")
     validate_provider_schema(transformed)
+    validate_complexity_limits(transformed)
     return transformed
+
+
+def count_optional_parameters(schema: Any) -> int:
+    """Cuenta los parámetros opcionales del esquema.
+
+    Un parámetro opcional es cada propiedad de un objeto que no figura en el ``required`` de ese
+    mismo objeto. Es la definición que usa el dialecto: ``required`` y ``properties`` viven en el
+    mismo nivel, así que el recuento es por objeto, no global.
+    """
+    total = 0
+    for node in _walk_schema_nodes(schema):
+        properties = node.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        required = node.get("required")
+        required_names = set(required) if isinstance(required, list) else set()
+        total += sum(1 for name in properties if name not in required_names)
+    return total
+
+
+def count_union_parameters(schema: Any) -> int:
+    """Cuenta los parámetros de unión del esquema: cada nodo con ``anyOf`` es uno."""
+    return sum(1 for node in _walk_schema_nodes(schema) if "anyOf" in node)
+
+
+def validate_complexity_limits(schema: Any) -> None:
+    """Exige los límites de complejidad documentados por el proveedor.
+
+    Se comprueban **antes** de cualquier llamada HTTP: un esquema demasiado complejo no se
+    descubre con un 400, se descubre aquí.
+
+    Raises:
+        SchemaValidationError: si se supera el máximo de opcionales o de uniones.
+    """
+    optional = count_optional_parameters(schema)
+    if optional > MAX_OPTIONAL_PARAMETERS:
+        raise SchemaValidationError(
+            f"el esquema declara {optional} parámetros opcionales y el máximo es "
+            f"{MAX_OPTIONAL_PARAMETERS}"
+        )
+    unions = count_union_parameters(schema)
+    if unions > MAX_UNION_PARAMETERS:
+        raise SchemaValidationError(
+            f"el esquema declara {unions} parámetros de unión (anyOf) y el máximo es "
+            f"{MAX_UNION_PARAMETERS}"
+        )
+
+
+def _walk_schema_nodes(node: Any) -> list[dict[str, Any]]:
+    """Todos los nodos de esquema alcanzables, en orden determinista."""
+    found: list[dict[str, Any]] = []
+    if isinstance(node, list):
+        for item in node:
+            found.extend(_walk_schema_nodes(item))
+        return found
+    if not isinstance(node, dict):
+        return found
+    found.append(node)
+    for keyword in ("properties",):
+        value = node.get(keyword)
+        if isinstance(value, dict):
+            for child in value.values():
+                found.extend(_walk_schema_nodes(child))
+    for keyword in ("items", "additionalProperties"):
+        value = node.get(keyword)
+        if isinstance(value, dict):
+            found.extend(_walk_schema_nodes(value))
+    for keyword in ("anyOf", "allOf"):
+        value = node.get(keyword)
+        if isinstance(value, list):
+            found.extend(_walk_schema_nodes(value))
+    return found
 
 
 def provider_schema_for(model: type[BaseModel]) -> dict[str, Any]:
@@ -515,14 +601,19 @@ __all__ = [
     "CONSTRAINT_NOTES",
     "DROPPED_KEYWORDS",
     "LOCAL_REF_PREFIX",
+    "MAX_OPTIONAL_PARAMETERS",
     "MAX_REF_DEPTH",
+    "MAX_UNION_PARAMETERS",
     "RESOLVED_KEYWORDS",
     "STRUCTURAL_KEYWORDS",
     "SUPPORTED_KEYWORDS",
     "SUPPORTED_MIN_ITEMS",
     "UNSUPPORTED_CONSTRAINTS",
     "SchemaValidationError",
+    "count_optional_parameters",
+    "count_union_parameters",
     "prepare_json_schema",
     "provider_schema_for",
+    "validate_complexity_limits",
     "validate_provider_schema",
 ]

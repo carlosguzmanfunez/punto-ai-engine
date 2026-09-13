@@ -69,17 +69,23 @@ class PathKind(StrEnum):
 def normalize_relative_path(path: str) -> str:
     """Normaliza una ruta relativa a formato posix, o lanza ``ValueError``.
 
+    Los caracteres de control se comprueban sobre la cadena **original**, antes de recortar
+    espacios: un ``\\t`` o un ``\\n`` al principio o al final desaparecerían con ``strip()`` y la
+    ruta pasaría como si fuera limpia, que es justo lo que no debe ocurrir. Los espacios
+    ordinarios del borde sí se recortan: no son caracteres de control.
+
     Raises:
         ValueError: si la ruta es vacía, absoluta, de unidad Windows, contiene ``..``, usa
-            separadores mixtos de forma ambigua o incluye caracteres de control (incluido NUL).
+            separadores mixtos de forma ambigua o incluye caracteres de control (0x00-0x1F y
+            0x7F) en cualquier posición, NUL incluido.
     """
-    raw = path.strip().replace("\\", "/")
-    if not raw:
-        raise ValueError("ruta vacía")
-    if CONTROL_CHARACTER_PATTERN.search(raw):
+    if CONTROL_CHARACTER_PATTERN.search(path):
         # Un NUL o un salto de línea incrustado no es una ruta: es un intento de que la
         # frontera vea una cosa y el sistema de archivos otra.
         raise ValueError(f"ruta con caracteres de control no permitida: {path!r}")
+    raw = path.strip().replace("\\", "/")
+    if not raw:
+        raise ValueError("ruta vacía")
     if raw.startswith("/") or raw.startswith("~"):
         raise ValueError(f"ruta absoluta no permitida: {path!r}")
     if re.match(r"^[A-Za-z]:", raw):

@@ -162,7 +162,9 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
 
         # Frontera de contexto (ENGINE-5.1/5.1.1): se reutiliza, no se reimplementa.
         context = build_model_review_context(task.workspace_path, task.reviewable_paths)
-        uncovered = missing_paths(context, task.changed_files)
+        uncovered = missing_paths(
+            context, task.changed_files, deleted=task.deleted_files
+        )
 
         self._audit_request_started(task)
 

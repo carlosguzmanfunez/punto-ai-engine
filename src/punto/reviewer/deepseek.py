@@ -152,7 +152,11 @@ class DeepSeekReviewerRunner(ReviewerRunner):
         context = build_model_review_context(
             task.workspace_path, (*task.changed_files, *task.context_files)
         )
-        uncovered = missing_paths(context, task.changed_files)
+        # Un archivo modificado que no existe no es contexto revisado; si la tarea declaró una
+        # eliminación explícita, esa ruta concreta queda exenta (NF-01).
+        uncovered = missing_paths(
+            context, task.changed_files, deleted=task.deleted_files
+        )
 
         self._audit_request_started(task)
 

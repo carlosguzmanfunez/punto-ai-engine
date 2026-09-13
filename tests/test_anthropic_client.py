@@ -1,4 +1,4 @@
-"""Pruebas del cliente de Anthropic (ENGINE-5.3).
+"""Pruebas del cliente de Anthropic (ENGINE-5.2).
 
 Todo se verifica contra un ``httpx.MockTransport``: **no** hay red real en esta suite, ni
 falta de credencial que la bloquee. La llamada viva a la API vive aparte, en los live

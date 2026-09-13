@@ -2257,9 +2257,18 @@ contrato de PUNTO y no se toca: `Model.model_validate(...)` lo sigue aplicando e
    debe declarar `items` **con esquema**, cada unión debe ser una lista no vacía de esquemas,
    `enum`/`const` solo admiten escalares, `type` debe ser uno de los siete tipos básicos y
    ningún keyword desconocido llega al proveedor. Un campo `dict[str, X]` de Pydantic, por
-   ejemplo, falla aquí antes de llamar a la API.
+   ejemplo, falla aquí antes de llamar a la API;
+6. exige los **límites de complejidad** documentados por el proveedor: como máximo **24
+   parámetros opcionales** (propiedades que no están en el `required` de su objeto) y **16
+   parámetros de unión** (cada nodo con `anyOf`). El contrato de producción usa 14 y 1; un
+   esquema que supere el límite se rechaza en PUNTO, no con un 400 de la API.
 
 Un esquema que no cumple falla en PUNTO con `SchemaValidationError` y **cero** peticiones HTTP.
+
+La normalización de rutas comprueba los **caracteres de control (0x00-0x1F y 0x7F) sobre la
+cadena original**, antes de recortar espacios: un `\t` o un `\n` en el borde de una ruta
+desaparecería con `strip()` y la ruta pasaría como limpia. El espacio ordinario del borde sí se
+recorta, porque no es un carácter de control.
 
 Retirar una restricción del provider schema **no** relaja nada: `Field(min_length=1)` se anota
 en la descripción para el modelo, pero `model_validate(...)` sigue rechazando la cadena vacía.
@@ -2372,6 +2381,13 @@ Una ruta declarada **inválida** (carácter de control, `..`, absoluta) tampoco 
 registra en `invalid_paths` y en las omisiones con una representación saneada —nunca con los
 caracteres de control crudos— y, si era un archivo obligatorio, cuenta como no cubierto. La
 auditoría queda `BLOCKED` **antes** de llamar al modelo.
+
+Un archivo **obligatorio que no existe** tampoco pasa por contexto completo: aparece como
+`(no existe)` en el prompt —el modelo debe saberlo— pero se registra en `absent_paths`, cuenta
+como omitido y `missing_paths` lo devuelve como no cubierto. La revisión se bloquea sin llamar
+al modelo. La única excepción es una **eliminación declarada explícitamente** por la tarea
+(`deleted_files`): PUNTO no deduce un borrado de la ausencia de un archivo, porque «no está» y
+«se borró a propósito» no son lo mismo.
 
 ### Estado live
 

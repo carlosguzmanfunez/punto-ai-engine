@@ -143,19 +143,26 @@ def test_live_b_structured_json_is_parseable(client: AnthropicClient) -> None:
     payload = json.loads(completion.content)
 
     assert isinstance(payload, dict)
-    # El contrato de producción: mismas claves, sin extras (additionalProperties: false).
-    assert set(payload) == set(production_schema["properties"])
-    assert isinstance(payload["findings"], list)
-    for field in (
-        "architecture_assessment",
-        "qa_assessment",
-        "security_assessment",
-        "maintainability_assessment",
-        "scope_assessment",
-    ):
-        assert isinstance(payload[field], str)
+    # 1. Ninguna clave desconocida: el esquema es cerrado (additionalProperties: false).
+    properties = production_schema["properties"]
+    unknown = sorted(set(payload) - set(properties))
+    assert not unknown, f"claves fuera del contrato: {unknown}"
+    # 2. Todas las obligatorias están.
+    missing = sorted(set(production_schema["required"]) - set(payload))
+    assert not missing, f"faltan claves obligatorias: {missing}"
+    # 3. Cada opcional **presente** cumple su tipo; los ausentes no son un fallo.
+    for name, value in payload.items():
+        expected = properties[name].get("type")
+        if expected == "array":
+            assert isinstance(value, list), f"{name} debería ser lista"
+        elif expected == "string":
+            assert isinstance(value, str), f"{name} debería ser cadena"
+    # 4. La frontera final es el contrato real de PUNTO, que admite omitir opcionales.
+    proposal = CrossAuditProposal.model_validate(payload)
+    assert proposal.summary
     print(
         f"\nB. structured con schema de producción: claves={sorted(payload)} "
+        f"(opcionales omitidos={sorted(set(properties) - set(payload))}) "
         f"stop={completion.stop_reason!r} tokens={completion.usage.total_tokens}"
     )
 

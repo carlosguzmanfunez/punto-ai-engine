@@ -116,6 +116,14 @@ class CrossAuditTask(BaseModel):
     acceptance_criteria: tuple[str, ...] = Field(default=(), description="Contrato de la tarea.")
     changed_files: tuple[str, ...] = Field(default=(), description="Archivos modificados.")
     context_files: tuple[str, ...] = Field(default=(), description="Archivos de contexto.")
+    deleted_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Archivos que la tarea eliminó **explícitamente**. Es la única excepción a la regla "
+            "de que un archivo modificado debe existir para poder auditarse: PUNTO no deduce una "
+            "eliminación de la ausencia de un archivo."
+        ),
+    )
     workspace_path: str = Field(..., min_length=1, description="Workspace (solo lectura).")
     project_spec_context: str = Field(default="", description="Especificación relevante.")
     architecture_context: str = Field(default="", description="Arquitectura relevante.")

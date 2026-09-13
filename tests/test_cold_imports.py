@@ -109,6 +109,21 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.crossaudit.validation",
     "punto.crossaudit.gates",
     "punto.crossaudit.claude",
+    # --- ENGINE-5.3: ejecución web y Visual QA --------------------------------
+    "punto.schemas.web",
+    "punto.schemas.visual",
+    "punto.web",
+    "punto.web.detection",
+    "punto.web.commands",
+    "punto.web.checks",
+    "punto.web.sandbox",
+    "punto.web.report",
+    "punto.visualqa",
+    "punto.visualqa.base",
+    "punto.visualqa.gates",
+    "punto.visualqa.prompts",
+    "punto.visualqa.validation",
+    "punto.visualqa.claude",
 )
 
 

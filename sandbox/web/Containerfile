@@ -1,0 +1,233 @@
+# =============================================================================
+# PUNTO AI ENGINE - Sandbox WEB (Node.js + Python + Playwright + Chromium)
+# =============================================================================
+# Imagen de ejecución para tareas web UNTRUSTED_MODEL dentro del
+# ContainerSandboxBackend: compilar y servir una aplicación Next.js y manejarla
+# con un navegador real (Playwright + Chromium).
+#
+# Principios (idénticos a sandbox/Containerfile, la imagen hermana de Python):
+#   - no contiene secretos;
+#   - no contiene código privado: el workspace se monta en runtime;
+#   - usuario NO-root (uid/gid 10001) por defecto;
+#   - el sistema de archivos raíz está pensado para montarse con --read-only,
+#     de modo que TODA ruta escribible en runtime sea un tmpfs explícito.
+#
+# -----------------------------------------------------------------------------
+# COMANDO EXACTO DE CONSTRUCCIÓN
+# -----------------------------------------------------------------------------
+#   podman build -t localhost/punto-sandbox-web:0.1 sandbox/web/
+#
+# El contexto es sandbox/web/: además de este Containerfile contiene
+# probes/ (run_web_session.py y capture.cjs). La imagen NO lleva ninguna
+# instrucción COPY, así que no copia nada del repositorio y no puede filtrar
+# código ni secretos al construirla; los probes se copian al workspace en
+# runtime, desde el host y verificados antes de usarse.
+# -----------------------------------------------------------------------------
+#
+# ELECCIÓN DE LA IMAGEN BASE (verificada, no supuesta)
+# -----------------------------------------------------------------------------
+#   docker.io/library/node:24-bookworm-slim
+#
+#   - El tag resuelve a Node.js v24.21.0 con npm 11.19.0, comprobado con
+#     `podman run --rm docker.io/library/node:24-bookworm-slim node --version`.
+#   - Node.js 24.x es la línea **Active LTS** ("Krypton") desde el 2025-10-28 y
+#     con fin de vida el 2028-04-30, según el calendario oficial del Release
+#     Working Group (https://github.com/nodejs/Release#release-schedule).
+#     Node.js 22.x ya está en Maintenance LTS, por eso NO se elige.
+#   - Next.js actual es 16.3.5 en el registro npm y declara
+#     engines.node = ">=20.9.0" (comprobado con `npm view next engines --json`),
+#     requisito que v24.21.0 cumple con margen.
+#   - Debian 12 "bookworm" es una de las distribuciones que Playwright soporta
+#     de forma nativa en `playwright install --with-deps` (libnss3, libgbm1,
+#     libasound2, libatk*, ... están en sus repositorios).
+#   - La variante "slim" evita el toolchain de compilación que no hace falta:
+#     el tamaño de la imagen lo domina Chromium, no la base.
+#
+#   Digest del índice multi-arquitectura observado al construir esta versión:
+#     sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553
+#   (Se fija el tag, no el digest, para que la imagen siga siendo construible en
+#    otras arquitecturas; el digest queda registrado aquí como referencia.)
+# =============================================================================
+FROM docker.io/library/node:24-bookworm-slim
+
+
+# -----------------------------------------------------------------------------
+# BLOQUE 1 - Dependencias del sistema operativo
+# -----------------------------------------------------------------------------
+# python3          : los probes de PUNTO (sandbox/probes/*.py) y sus
+#                    verificaciones de aislamiento son Python; sin intérprete la
+#                    imagen no puede ejecutar el probe de entorno de PUNTO.
+# ca-certificates  : cadena TLS para que npm y Playwright descarguen durante la
+#                    construcción, y para futuras sondas HTTP.
+# xz-utils         : Playwright descomprime con xz los tarballs de Chromium.
+# curl             : sonda HTTP mínima y descarga de artefactos.
+# fonts-liberation : métricas tipográficas reales en los screenshots (Playwright
+#                    la instala igualmente vía --with-deps; se declara explícita
+#                    para que el render no dependa de un efecto colateral).
+#
+# Las bibliotecas compartidas que exige Chromium (libnss3, libgbm1, libatk*,
+# libasound2, libcups2, libdrm2, libxkbcommon0, libvulkan1, xdg-utils, ...) las
+# instala el propio Playwright en el BLOQUE 3 con --with-deps: esa lista es la
+# fuente de verdad y no se duplica a mano aquí, para que no se desincronice con
+# la versión de Chromium cuando cambie el pin del BLOQUE 2.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 \
+      ca-certificates \
+      curl \
+      xz-utils \
+      fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
+
+
+# -----------------------------------------------------------------------------
+# BLOQUE 2 - Playwright (paquete npm) y ruta estable de los navegadores
+# -----------------------------------------------------------------------------
+# PLAYWRIGHT_BROWSERS_PATH es la pieza clave para que el usuario final pueda usar
+# los navegadores:
+#   - por defecto Playwright descarga los navegadores en
+#     $HOME/.cache/ms-playwright del usuario que EJECUTA la instalación, que
+#     durante el build es root;
+#   - en runtime el contenedor corre como uid 10001 y, además, PUNTO monta
+#     /home/punto como tmpfs vacío, así que un navegador guardado en el home
+#     sería invisible o inaccesible;
+#   - fijando una ruta absoluta fuera del home, los navegadores quedan dentro de
+#     la imagen (capa de solo lectura, ideal para --read-only) y los ve cualquier
+#     uid. El chmod -R a+rX del BLOQUE 4 garantiza el permiso de ejecución.
+#
+# Versión fijada (pin) a la última publicada en el registro npm al escribir esta
+# imagen, comprobada con `npm view playwright version` = 1.63.0. Se fija para que
+# la imagen sea reproducible: "latest" cambiaría el binario de Chromium sin
+# tocar este archivo.
+#
+# @playwright/test se instala junto a playwright para que un proyecto Next.js
+# pueda ejecutar `playwright test` sin red (el contenedor corre con
+# --network none, así que un `npm install` en runtime es imposible).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ARG PLAYWRIGHT_VERSION=1.63.0
+RUN npm install --global --no-fund --no-audit \
+      "playwright@${PLAYWRIGHT_VERSION}" \
+      "@playwright/test@${PLAYWRIGHT_VERSION}" \
+ && npm cache clean --force
+
+
+# -----------------------------------------------------------------------------
+# BLOQUE 3 - Chromium y sus bibliotecas (playwright install --with-deps)
+# -----------------------------------------------------------------------------
+# --with-deps ejecuta apt-get para instalar TODAS las bibliotecas compartidas
+# que Chromium necesita en Debian; se hace como root, el único momento en que se
+# puede. La descarga aterriza en PLAYWRIGHT_BROWSERS_PATH (BLOQUE 2).
+#
+# Solo se instala chromium: el sandbox WEB de PUNTO valida con Chromium y cada
+# motor adicional (firefox, webkit) añade cientos de MB sin aportar cobertura.
+# El `rm -rf /var/lib/apt/lists/*` es necesario porque --with-deps vuelve a
+# rellenar el índice de apt después del BLOQUE 1.
+RUN apt-get update \
+ && playwright install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/*
+
+
+# -----------------------------------------------------------------------------
+# BLOQUE 4 - Usuario NO-root y permisos de los navegadores
+# -----------------------------------------------------------------------------
+# uid/gid 10001 (los mismos que la imagen hermana de Python) para que el backend
+# del sandbox aplique una única política `--user 10001:10001` sin ramas.
+# La imagen node oficial ya trae un usuario "node" con uid 1000: se ignora.
+#
+# /workspace se crea aquí para que exista aunque no se monte nada, y /home/punto
+# pertenece al usuario 10001. chmod -R a+rX deja /ms-playwright legible por todos
+# y ejecutable donde ya lo era (directorios y binarios), que es lo que necesita
+# el proceso Chromium lanzado como uid 10001.
+RUN groupadd --gid 10001 punto \
+ && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/punto \
+      --shell /usr/sbin/nologin punto \
+ && mkdir -p /workspace \
+ && chown -R 10001:10001 /workspace /home/punto \
+ && chmod -R a+rX /ms-playwright
+
+
+# -----------------------------------------------------------------------------
+# BLOQUE 5 - Entorno de ejecución
+# -----------------------------------------------------------------------------
+# HOME=/home/punto : Chromium y Node escriben perfiles y cachés en el home. Con
+#                    --read-only ese home DEBE montarse como tmpfs (ver el
+#                    bloque de runtime al final); a propósito no se deja
+#                    escribible dentro de la imagen.
+# TMPDIR=/tmp      : Playwright crea el perfil temporal del navegador en el
+#                    directorio temporal; con --read-only /tmp también debe ser
+#                    tmpfs.
+# NODE_PATH        : `npm install -g` deja los módulos en
+#                    /usr/local/lib/node_modules, que NO está en la ruta de
+#                    resolución de un script ejecutado desde /workspace. NODE_PATH
+#                    permite `require('playwright')` desde el workspace sin
+#                    reinstalar nada (obligatorio, porque en runtime no hay red).
+# NODE_ENV se deja SIN definir a propósito: un sandbox WEB debe poder instalar y
+# compilar dependencias de desarrollo de Next.js (typescript, tailwindcss, ...);
+# con NODE_ENV=production npm las omitiría.
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    HOME=/home/punto \
+    TMPDIR=/tmp \
+    NODE_PATH=/usr/local/lib/node_modules \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false
+
+
+USER 10001:10001
+WORKDIR /workspace
+
+
+# -----------------------------------------------------------------------------
+# CÓMO SE EJECUTA (el Containerfile es el contrato; esto lo documenta)
+# -----------------------------------------------------------------------------
+# Propiedades de seguridad de PUNTO, idénticas a las de la imagen de Python:
+#
+#   podman run --rm \
+#     --network none \
+#     --read-only \
+#     --cap-drop ALL \
+#     --security-opt no-new-privileges \
+#     --user 10001:10001 \
+#     --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+#     --tmpfs /home/punto:rw,exec,nosuid,size=1g,mode=1777 \
+#     -v <carpeta-del-host>:/workspace:rw,Z \
+#     localhost/punto-sandbox-web:0.1 \
+#     <comando>
+#
+# Rutas que --read-only obliga a montar como tmpfs:
+#   /tmp        -> perfiles temporales de Chromium y de Node (TMPDIR).
+#                  noexec es correcto aquí: solo se escriben datos.
+#   /home/punto -> HOME del usuario 10001 (perfiles y cachés de Chromium).
+#                  Se respeta "exec" tal como lo pide PUNTO.
+#   /workspace  -> debe montarse rw; sin montaje no es escribible con --read-only.
+#
+# mode=1777 en /home/punto NO es decorativo, está MEDIDO: sin él, podman crea el
+# tmpfs como root:root con modo 755, de modo que uid 10001 no puede escribir su
+# propio HOME. Chromium sobrevive porque Playwright crea el perfil en TMPDIR, pero
+# npm SÍ falla: su caché vive en ~/.npm, así que `npm install` y por tanto un
+# `next build` en el sandbox no podrían cachear nada. Comprobado con el comando
+# literal de PUNTO: `touch $HOME/prueba` -> "Permission denied" y
+# `mkdir -p $HOME/.npm` -> "Permission denied"; con mode=1777 ambas operaciones
+# pasan a "OK". Es un cambio de permisos del tmpfs, NO una renuncia a ninguna
+# propiedad de seguridad: el rootfs sigue siendo de solo lectura.
+#
+# /ms-playwright NO necesita tmpfs: vive en la capa de solo lectura de la imagen.
+#
+# /dev/shm lo monta podman por su cuenta con 63 MiB por defecto (medido). Ese
+# tamaño bastó para la página trivial de la prueba de humo, pero Chromium lo usa
+# como memoria compartida del renderizador y una página pesada lo agota; para
+# cargas reales añádase --shm-size=512m. Verificado que --shm-size=512m convive
+# sin problema con --read-only (dentro del contenedor /dev/shm pasa a 512 MiB).
+# Nunca se debe resolver este problema quitando --read-only.
+#
+# Chromium se lanza en las pruebas con --no-sandbox (chromiumSandbox: false).
+# Motivo: dentro de un contenedor rootless no hay user namespaces anidados para
+# el sandbox setuid de Chromium, y --cap-drop ALL + no-new-privileges impiden que
+# el binario auxiliar chrome_sandbox obtenga privilegios. Ese --no-sandbox es
+# SOLO del navegador: el aislamiento real lo aportan el contenedor (namespaces,
+# red ninguna, rootfs de solo lectura, capacidades vacías), nunca el sandbox
+# interno de Chromium.
+CMD ["node", "--version"]

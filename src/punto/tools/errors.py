@@ -330,6 +330,51 @@ class CrossAuditRunnerNotConfiguredError(CrossAuditError):
         )
 
 
+class WebError(RuntimeError):
+    """Base de los errores de la capa de ejecución web."""
+
+
+class WebSandboxUnavailableError(WebError):
+    """El sandbox web no está disponible: no hay imagen de contenedor utilizable.
+
+    Se falla de forma explícita. **Nunca** se ejecuta el navegador ni el proyecto en el host
+    confiable por no tener el sandbox a mano.
+    """
+
+
+class WebCommandPolicyError(WebError):
+    """La acción web pedida no está permitida o no aplica al proyecto detectado."""
+
+
+class WebSessionError(WebError):
+    """La sesión web no se pudo completar: el proyecto no arrancó o el navegador falló."""
+
+
+class VisualQAError(RuntimeError):
+    """Base de los errores del rol de Visual QA."""
+
+
+class VisualQAValidationError(VisualQAError):
+    """La propuesta visual incumple un invariante determinista."""
+
+    def __init__(self, violations: tuple[str, ...] | list[str]) -> None:
+        self.violations = tuple(violations)
+        detail = "; ".join(self.violations) if self.violations else "sin detalle"
+        super().__init__(
+            f"Propuesta visual inválida ({len(self.violations)} violación/es): {detail}"
+        )
+
+
+class VisualQARunnerNotConfiguredError(VisualQAError):
+    """No hay ningún ``VisualQARunner`` inyectado en CAMUS."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No hay VisualQARunner configurado: injecta uno en Camus("
+            "visual_qa_runner=...) para evaluar la interfaz."
+        )
+
+
 __all__ = [
     "ArchitectRunnerNotConfiguredError",
     "BranchPolicyViolationError",
@@ -360,5 +405,12 @@ __all__ = [
     "SecurityValidationError",
     "TrustBoundaryError",
     "UntrustedExecutionDeniedError",
+    "VisualQAError",
+    "VisualQARunnerNotConfiguredError",
+    "VisualQAValidationError",
+    "WebCommandPolicyError",
+    "WebError",
+    "WebSandboxUnavailableError",
+    "WebSessionError",
     "WorkspaceViolationError",
 ]

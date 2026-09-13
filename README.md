@@ -21,16 +21,22 @@
 | **ENGINE-1** | Capa de ejecución controlada: `DeveloperRunner`, `ExecutionContext`, Filesystem, Shell, Git, Validator, `LocalDeveloperRunner`, auditoría de ejecución, fixture y demo real. | ✅ Implementada |
 | **ENGINE-1.R1** | Frontera de ejecución confiable: separación `TRUSTED_LOCAL` / `UNTRUSTED_MODEL`, `ExecutionBackend`, `TrustedLocalBackend`, contrato `SandboxedBackend`, entorno saneado y fallo cerrado. | ✅ Implementada |
 | **ENGINE-1.R3** | Sandbox **real**: WSL2 + Podman, `ContainerSandboxBackend`, verificación de capacidades por sondas, imagen reproducible y los **cuatro aislamientos demostrados**. | ✅ Implementada |
-| **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz y **exigiendo sandbox**. | ⏳ Futura |
+| **ENGINE-2** | **DeepSeek Developer Integration.** Integración real del modelo mediante `DeepSeekDeveloperRunner`, sobre la misma interfaz y **exigiendo sandbox**. | ✅ Implementada |
+| **ENGINE-3** | **Architect + Planner.** Diseño de arquitectura y planificación del proyecto antes de escribir código. | ✅ Implementada |
+| **ENGINE-4** | **Independent QA Agent.** QA determinista más evaluación independiente, con gates que el modelo no puede anular. | ✅ Implementada |
+| **ENGINE-5** | **Security + Reviewer.** Análisis de seguridad, revisión independiente, frontera de contexto del modelo y evaluación completa de la tarea. | ✅ Implementada |
+| **ENGINE-5.2** | **Multi-Provider + Anthropic/Claude + Cross-Model Audit.** Contrato provider-neutral, `output_config` estructurado, auditoría cruzada real y fundación multimodal. | ✅ Implementada |
+| **ENGINE-5.3** | **Web + Visual Execution Foundation.** Perfil web, sandbox con Chromium real, once checks deterministas, capturas verificadas y Visual QA con gates no anulables. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
 sobre un repositorio local de prueba sin ningún modelo de IA. Todo el
 comportamiento es local, reproducible y verificable por pruebas.
 
-> **Proveedor de IA.** El Developer AI principal de PUNTO AI ENGINE será
-> **DeepSeek**, integrado en ENGINE-2. ENGINE-1 no conecta ningún proveedor de
-> modelo: su ejecutor es determinista.
+> **Proveedor de IA.** Desde ENGINE-2 el motor conecta proveedores reales: **DeepSeek** para los
+> roles de ingeniería y **Anthropic/Claude** para la auditoría cruzada y Visual QA. Ninguno de los
+> dos es necesario para que la suite estándar pase: sin credencial, la operación que la requiere
+> queda `BLOCKED` / `PENDING_API_KEY`, nunca sustituida por otro proveedor.
 
 
 ---
@@ -2441,7 +2447,283 @@ Los gates vivos están endurecidos para no poder confundir un bloqueo con un éx
 
 ---
 
-## 25. Licencia
+## 25. ENGINE-5.3 — Web + Visual Execution Foundation
+
+ENGINE-5.3 cierra el eslabón que faltaba entre «el código compila» y «la interfaz se ve y se
+comporta»: un **perfil de capacidad web**, un **sandbox con navegador real**, **once
+comprobaciones deterministas** y **Visual QA** con Claude, con el veredicto calculado por PUNTO.
+
+Lo que esta fase **no** hace: no ejecuta un pipeline autónomo, no repara lo que encuentra, no
+cambia de proveedor cuando uno falla, no despliega y no necesita ninguna credencial para
+funcionar. La API HTTP no cambia.
+
+### Perfil de capacidad web
+
+`detect_web_project(workspace)` (`src/punto/web/detection.py`) lee el proyecto del workspace y
+devuelve un `WebProjectProfile` con **evidencia** de cada hallazgo: framework, gestor de
+paquetes, lockfile, TypeScript, Tailwind, scripts, dependencias y requisito de Node.
+
+| Dato | Regla determinista |
+| --- | --- |
+| Framework | prioridad `NEXTJS` > `VUE` > `SVELTE` > `ASTRO` > `REACT`; sin dependencia reconocible, `NONE` |
+| Gestor de paquetes | `packageManager` del `package.json` manda; si no, prioridad de lockfile: `pnpm-lock.yaml` > `yarn.lock` > `bun.lock` > `bun.lockb` > `package-lock.json`; sin lockfile, `NPM` |
+| Tailwind | v4 por `@import "tailwindcss"` en el CSS, o configuración explícita |
+| TypeScript | `tsconfig.json` presente |
+| Scripts | nombres declarados en `package.json`, acotados por el contrato |
+
+Nada se infiere por olfato: si no hay evidencia, el campo dice que no la hay.
+
+### Política de red
+
+La regla de la fase, y la que más fácil es romper por conveniencia:
+
+| Momento | Red | Por qué |
+| --- | --- | --- |
+| Sesión de navegador, build y comandos de proyecto | `--network none` | la ejecución del proyecto **nunca** navega a Internet; el *loopback* del contenedor sigue disponible y está verificado |
+| Plan de dependencias (`INSTALL_DEPENDENCIES`) | no la pide | un plan de comando no puede ampliar permisos: la red la decide el backend del sandbox, no el plan |
+| Resolución de dependencias | fuera de la sesión | resolver dependencias **no** es ejecutar el producto; en esta fase la sesión no tiene red general, así que un proyecto cuyas dependencias no estén ya disponibles no se puede construir. Es una limitación declarada, no un fallback silencioso |
+
+`src/punto/web/commands.py` traduce acciones conceptuales a un `argv` controlado y **sin shell**:
+no hay comando libre, no hay `eval`, no hay cadenas interpretadas por un shell. `TYPECHECK` y
+`RUN_PLAYWRIGHT` usan `npx --no-install` para que una herramienta ausente sea un error explícito
+y no una descarga por sorpresa.
+
+### Sandbox web
+
+La imagen la construye `sandbox/web/Containerfile`:
+
+```
+podman build -t localhost/punto-sandbox-web:0.1 sandbox/web/
+```
+
+Contiene Node v24.21.0, npm 11.19.0, Python 3.11.2, Playwright 1.63.0 y Chromium
+153.0.8010.12 en `/ms-playwright`. La sesión corre con las propiedades endurecidas de ENGINE-1.R3,
+todas explícitas: `--rm --network none --read-only --cap-drop ALL --security-opt
+no-new-privileges --user 10001:10001`, `--shm-size` acotado, `/tmp` y `/home/punto` como tmpfs
+con tamaño máximo, límites de memoria, CPU y PIDs, y **un solo montaje**: el workspace.
+
+El runtime es **podman y solo podman**: es la frontera aprobada, no una preferencia. Pedir otro
+runtime es un `WebCommandPolicyError` y no hay lista de candidatos que elija «el primero que
+aparezca»; si podman no está, la operación se bloquea con `WEB_SANDBOX_REQUIRED`.
+`BROWSER_SESSION_STARTED` deja escrito con qué runtime y con qué imagen se ejecutó de verdad.
+
+Los comandos de proyecto y de preview pasan por una **allowlist de programas**
+(`node`, `npm`, `npx`, `pnpm`, `yarn`, `bun`, `python`, `python3`) y se rechaza cualquier `argv[0]`
+con ruta: la política de comandos vive en `commands.py`, y esto es la última puerta antes del
+contenedor.
+
+Dos hallazgos medidos que están documentados en el propio Containerfile porque costaron tiempo:
+`/home/punto` necesita `mode=1777` (sin él, uid 10001 no puede escribir su HOME y el caché de npm
+rompe cualquier build) y Chromium necesita `--no-sandbox` **dentro** del contenedor, que ya está
+aislado por el runtime.
+
+El navegador **nunca** se ejecuta en el host: si la imagen no está, la operación falla con
+`WEB_SANDBOX_REQUIRED` y el comando exacto de construcción. No hay degradación a un modo sin
+capturas.
+
+### Once comprobaciones deterministas
+
+`evaluate_web_checks()` (`src/punto/web/checks.py`) trabaja sobre las observaciones del probe y no
+necesita navegador para probarse.
+
+| Comprobación | Qué demuestra |
+| --- | --- |
+| `PAGE_LOAD_ERROR` | la página cargó y respondió con un estado aceptable |
+| `CONSOLE_ERROR` | la consola no registró errores (las advertencias se informan, no suspenden) |
+| `PAGE_ERROR` | no hubo excepciones no capturadas en la página |
+| `FAILED_RESOURCE` | no hay recursos críticos caídos; el código HTTP viaja en la evidencia |
+| `HORIZONTAL_OVERFLOW` | el documento no desborda el viewport (tolerancia por defecto: 1 px) |
+| `VIEWPORT_CLIPPING` | el contenido no queda recortado por `overflow` |
+| `BROKEN_IMAGE` | no hay imágenes que no se puedan mostrar |
+| `MISSING_REQUIRED_ELEMENT` | los marcadores exigidos por la especificación están presentes |
+| `HYDRATION_ERROR` | no hay señales de fallo de hidratación |
+| `RESPONSIVE_CHECK` | cada ruta se midió en cada viewport exigido |
+| `ACCESSIBILITY_CHECK` | título, idioma, `alt`, etiquetas, regiones y reglas de `axe` informadas |
+
+Un `PASS` aquí **no** dice que la interfaz sea buena: dice que carga, no rompe y no desborda. La
+comprobación sin señal devuelve `ran=False` y no suspende una página por algo que no se midió: se
+declara como no ejecutada y se informa. El informe acota todo (50 mensajes de consola, 25 errores
+de página, 25 recursos, 2000 caracteres por extracto) y cada hallazgo lleva su ruta, su viewport y
+su evidencia.
+
+### Capturas verificadas
+
+Los tres viewports del contrato son `MOBILE` 390x844, `TABLET` 768x1024 y `DESKTOP` 1440x900, y
+el máximo es de 8 capturas, alineado con `MAX_IMAGES` del contrato multimodal.
+
+El host **no se cree nada** de lo que declara el probe: lee cada PNG, comprueba firma, dimensiones
+(cabecera IHDR), tamaño y `sha256`, y lo compara con el manifiesto y con el viewport pedido. Un
+byte de diferencia es un error explícito, y un par artefacto/bytes descuadrado nunca se convierte
+en un `ImagePayload`. Un screenshot sin sus observaciones no se puede interpretar y unas
+observaciones sin bytes no se pueden auditar, así que viajan juntos.
+
+El nombre lógico de cada captura viene del manifiesto, así que se sanea antes de tocar disco: se
+exige un nombre simple terminado en `.png`, sin separadores ni `..`, y además se comprueba que la
+ruta resuelta siga dentro de la carpeta de capturas. Una ruta absoluta no puede acabar siendo el
+`logical_name` de un artefacto.
+
+Y la evidencia se contrasta con lo que el probe **publicó por stdout**: el probe imprime
+`PUNTO_EVIDENCE_SHA256 <sha256>` al cerrar su manifiesto, y el host recalcula ese hash sobre el
+archivo que lee. Si alguien reescribió el manifiesto después de que el probe lo cerrara, los dos
+valores no coinciden y la sesión se bloquea sin aceptar ningún artefacto.
+
+### Contratos visuales
+
+`VisualSpec` es la respuesta a «no me digas que quede bonito»: rutas, viewports, elementos
+obligatorios con marcador verificable, expectativas de responsive, accesibilidad, contenido y
+notas. `VisualQATask` lleva además la sesión técnica ya medida, el objetivo, los criterios de
+aceptación y el contexto de origen.
+
+`VisualQAProposal` **no** admite `status`: el veredicto no lo escribe el modelo. Si intenta
+escribirlo, la propuesta se rechaza y se le pide de nuevo, igual que en la auditoría cruzada.
+
+### Gates y reglas de estado
+
+| Gate | Condición | Efecto |
+| --- | --- | --- |
+| PROVIDER | el modelo visual no respondió | **BLOCKED** |
+| SCREENSHOTS | falta una captura exigida | **BLOCKED** |
+| TECHNICAL | la sesión web quedó `BLOCKED` | **BLOCKED** |
+| TECHNICAL | hubo fallos deterministas medidos | `CHANGES_REQUESTED` (nunca PASS) |
+| FINDINGS | hallazgo visual `HIGH`/`CRITICAL` | `CHANGES_REQUESTED` |
+| Todo verde | sesión en verde, capturas completas, propuesta válida y sin hallazgos graves | **PASS** |
+
+Precedencia: bloqueante > cambios pedidos > PASS. El estado técnico se calcula con una regla
+explícita (`determine_web_status`): `BLOCKED` solo si no hubo nada que medir, `FAIL` si alguna
+comprobación encontró un problema y `PASS` si todo lo que se ejecutó pasó. Un fallo bloqueante
+medido en una página que sí se pudo mirar es `FAIL`, no `BLOCKED`: la página existía, y Visual QA
+pedirá cambios en consecuencia.
+
+### Runner visual
+
+`ClaudeVisualQARunner` (`src/punto/visualqa/claude.py`) reutiliza **todo** lo aprobado en
+ENGINE-5.2: el mismo cliente, el mismo contrato multimodal, el mismo dialecto de esquema y las
+mismas reglas de proveedor caído, negativa y error. Lo nuevo es la materia prima: capturas en
+lugar de archivos.
+
+| Situación | Resultado |
+| --- | --- |
+| Más capturas de las que admite el contrato | `VISUAL_IMAGE_BUDGET_EXCEEDED`, **sin** llamar al modelo |
+| Credencial inválida | `PROVIDER_UNAVAILABLE` (cero reintentos) |
+| Negativa del modelo | `PROVIDER_REFUSAL` |
+| Error del servidor o timeout | `PROVIDER_ERROR`, con reintentos acotados |
+| Respuesta truncada | se detecta **antes** de interpretar el JSON y no filtra el texto recibido |
+| Propuesta inválida | se rechaza, se dice por qué y se pide de nuevo (máximo 3 intentos, 4 llamadas) |
+
+Los cuatro gates se evalúan **siempre**, incluso si el proveedor falla: un Claude caído no
+convierte una página rota en un PASS. La credencial se redacta de todo lo que se persiste o se
+informa.
+
+### Flujo de extremo a extremo
+
+`tests/integration/test_web_visual_fake_live.py` recorre el ciclo completo con **todo real
+excepto la llamada HTTP a Anthropic**: proyecto real en el workspace, contenedor real, Chromium
+real, capturas reales en los tres viewports, checks reales, informe real, tarea real y Claude
+falso. Es la prueba de que las piezas encajan sin depender de una credencial.
+
+El sandbox con navegador real se prueba en `tests/integration/test_web_browser_live.py`:
+
+```
+.\.venv\Scripts\python.exe -m pytest tests/integration/test_web_browser_live.py -q -s
+```
+
+Esa suite **no** se salta si falta la imagen: la ausencia del sandbox web es un bloqueo declarado
+con el código `WEB_SANDBOX_REQUIRED`.
+
+### Puente manual de Claude
+
+Cuando exista `ANTHROPIC_API_KEY`, el puente es manual y explícito: se ejecuta
+`tests/integration/test_anthropic_live.py` (gates A-E de ENGINE-5.2) y la suite visual viva. Sin
+credencial no se ejecuta nada de eso y **no se declara nada**: no se inventan resultados, no se
+simula que Claude respondió y no se pide la credencial por el chat.
+
+### Estado live
+
+| Gate vivo | Estado |
+| --- | --- |
+| A. Autenticación | PENDING_API_KEY |
+| B. JSON estructurado | PENDING_API_KEY |
+| C. Credencial inválida | PENDING_API_KEY |
+| D. Multimodal | PENDING_API_KEY |
+| E. Auditoría cruzada | PENDING_API_KEY |
+| F. Visual QA con capturas reales | PENDING_API_KEY |
+
+La suite estándar mantiene **0 failed / 0 skipped** y no necesita credencial ni Podman para pasar.
+
+### Auditoría
+
+Trece tipos de evento nuevos (WEB_PROFILE_DETECTED, WEB_BUILD_STARTED/COMPLETED,
+BROWSER_SESSION_STARTED, BROWSER_CHECK_RECORDED, SCREENSHOT_CAPTURED,
+VISUAL_QA_REQUEST_STARTED, VISUAL_QA_PROPOSAL_RECEIVED/REJECTED/ACCEPTED,
+VISUAL_QA_FINDING_RECORDED, VISUAL_QA_COMPLETED y VISUAL_QA_BLOCKED) registran **metadatos**: qué
+se detectó, qué se ejecutó, cuántas capturas se enviaron y con qué resultado. Nunca se registran
+bytes de imagen, ni base64, ni rutas del host, ni la credencial.
+
+Están cableados en las rutas que existen: el perfil detectado, el arranque de la sesión (con su
+runtime y su imagen), cada comprobación determinista, cada captura verificada y todo el ciclo
+visual. `WEB_BUILD_STARTED` pertenece al llamante que lanza la construcción —es el único que puede
+afirmar que empezó— y en esta fase no hay pipeline autónomo que lo lance; queda declarado.
+
+El detalle de un fallo también se sanea: el runtime escribe rutas del host en sus errores
+(`Error: statfs /mnt/c/...`), y esas rutas se sustituyen por la que el contenedor conoce antes de
+que el texto llegue a un informe.
+
+### Hallazgos de la auditoría adversarial
+
+La capa web se auditó en adversarial antes de cerrar la fase. Lo que se corrigió:
+
+| Hallazgo | Corrección |
+| --- | --- |
+| El runtime se elegía entre podman y docker, y la sustitución no quedaba registrada | podman-only, con error explícito y runtime e imagen en el evento de sesión |
+| El nombre de un screenshot venía del manifiesto sin sanear y se usaba como ruta | patrón de nombre simple más comprobación de contención en la carpeta de capturas |
+| Sin ninguna comprobación medida, `determine_web_status` devolvía PASS | sin medición el estado es BLOCKED |
+| El manifiesto de evidencia era escribible por el proyecto auditado y su autenticidad no se comprobaba | el digest viaja por stdout y el host lo contrasta con el archivo que lee |
+| El `argv[0]` de los comandos solo se validaba en `commands.py` | allowlist de programas en el propio sandbox, sin rutas |
+| El detalle de un fallo no estaba acotado y filtraba rutas del host | saneado y acotado antes de informar |
+| Una nota de recorte vacía contaba como medición | una nota sin viewport del contrato no es una medición |
+| La evidencia del informe copiaba las notas del probe sin límite | acotada nota a nota |
+| Una URL con `@` en la contraseña dejaba parte de la credencial a la vista | el saneado borra toda la autoridad hasta el último `@` |
+
+Lo que **no** se corrige en esta fase, y se declara:
+
+- **El canal de evidencia vive en el workspace montado `rw`.** El probe escribe su manifiesto y sus
+  PNG en una carpeta del workspace y el proyecto auditado corre en el mismo contenedor mientras
+  se captura. El digest por stdout detecta que el manifiesto se reescriba **después** de que el
+  probe lo cierre, pero un proyecto hostil que reescriba los PNG durante la captura podría, en
+  teoría, fabricar evidencia coherente. Cerrarlo del todo exige un montaje o un proceso aparte que
+  esta fase no introduce; queda como límite declarado, no como garantía.
+- **Los checks confían en los campos por observación del probe.** El host no puede volver a medir
+  sin navegador: un campo que el probe deje vacío se lee como «sin problema». `missing_markers`,
+  `broken_images` y compañía llevan la misma forma, y el host no la puede reproducir.
+- **La medición corre dentro de la página** (`page.evaluate`): una página que sobrescriba
+  `getComputedStyle` o `scrollWidth` puede falsear sus propias medidas. Es inherente a observar con
+  JavaScript en la página, y por eso un `PASS` técnico no sustituye a la revisión humana.
+- Chromium corre con `--no-sandbox` **dentro** del contenedor: el contenedor es la frontera real,
+  pero es defensa en profundidad que se pierde dentro.
+
+### Generalidad, API y portabilidad
+
+La capa web **no** depende conceptualmente de Next.js: el framework se detecta y se declara, pero
+el perfil, los comandos, el navegador, los checks y Visual QA valen para cualquier stack web. No
+hay endpoints nuevos: la API de ENGINE-0 a ENGINE-5.2 queda intacta. Tampoco hay rutas absolutas
+del host en el código, ni dependencias nuevas de Python (Playwright y Chromium viven **dentro** de
+la imagen del sandbox).
+
+### Limitación declarada
+
+- Sin credencial de Anthropic, Visual QA contra Claude queda `PENDING_API_KEY`: la fase se cierra
+  con `CLAUDE VISUAL LIVE = PENDING_API_KEY` y `ENGINE-5.3 FINAL LIVE CERTIFICATION = PENDING`.
+- Un proyecto cuyas dependencias no estén ya disponibles no se puede preparar: la sesión corre sin
+  red, por diseño.
+- Los identificadores de modelo por defecto siguen siendo los documentados
+  (`claude-sonnet-5` para los roles visuales) y el acceso de esta cuenta a ellos continúa
+  `LIVE_ACCOUNT_ACCESS_UNVERIFIED`.
+- `ACCESSIBILITY_CHECK` es una comprobación acotada, **no** una certificación WCAG.
+- No hay bucle de reparación ni pipeline autónomo: eso es ENGINE-6.
+
+---
+
+## 26. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

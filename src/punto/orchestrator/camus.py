@@ -18,6 +18,7 @@ acción marcada como no autónoma.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -41,6 +42,7 @@ from punto.planning.graph import (
 )
 from punto.policy.human_gate import HumanGate, HumanGateError, HumanGateNotFoundError
 from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
+from punto.providers.base import ImagePayload
 from punto.qa.base import QARunner
 from punto.reviewer.base import ReviewerRunner
 from punto.schemas.cross_audit import CrossAuditReport, CrossAuditTask
@@ -73,6 +75,7 @@ from punto.schemas.result import ExecutionResult
 from punto.schemas.review import ReviewReport, ReviewTask
 from punto.schemas.security import SecurityReport, SecurityTask
 from punto.schemas.task import Task
+from punto.schemas.visual import VisualQAReport, VisualQATask
 from punto.security.base import SecurityRunner
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import (
@@ -83,7 +86,9 @@ from punto.tools.errors import (
     QARunnerNotConfiguredError,
     ReviewerRunnerNotConfiguredError,
     SecurityRunnerNotConfiguredError,
+    VisualQARunnerNotConfiguredError,
 )
+from punto.visualqa.base import VisualQARunner
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
@@ -205,6 +210,7 @@ class Camus:
         security_runner: SecurityRunner | None = None,
         reviewer_runner: ReviewerRunner | None = None,
         cross_audit_runner: CrossAuditRunner | None = None,
+        visual_qa_runner: VisualQARunner | None = None,
     ) -> None:
         self._tasks = task_manager
         self._policy = policy_engine
@@ -229,6 +235,9 @@ class Camus:
         #: Auditoría cruzada entre proveedores (ENGINE-5.2). Opt-in: sin ella, CAMUS no
         #: sustituye el rol por otro proveedor, simplemente falla de forma explícita.
         self._cross_audit = cross_audit_runner
+        #: Visual QA (ENGINE-5.3). Opt-in como todos los demás: CAMUS no inventa un veredicto
+        #: visual ni ejecuta el navegador por su cuenta.
+        self._visual_qa = visual_qa_runner
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -374,6 +383,40 @@ class Camus:
                 severity=finding.severity.value,
                 category=finding.category.value,
                 file=finding.file,
+            )
+        return report
+
+    # ----------------------------------------------------------- ENGINE-5.3
+    @property
+    def visual_qa_runner(self) -> VisualQARunner | None:
+        """Rol de Visual QA inyectado, si existe (ENGINE-5.3)."""
+        return self._visual_qa
+
+    def visual_qa(
+        self, task: VisualQATask, screenshots: Mapping[str, ImagePayload]
+    ) -> VisualQAReport:
+        """Evalúa la interfaz a partir de capturas y hechos técnicos ya medidos.
+
+        CAMUS no mira imágenes ni ejecuta el navegador: delega en el ``VisualQARunner``
+        inyectado, que recibe **bytes** verificados y nunca rutas. Los hechos deterministas viajan
+        en la tarea y el modelo visual no puede contradecirlos.
+
+        Raises:
+            VisualQARunnerNotConfiguredError: si no hay Visual QA inyectado.
+        """
+        if self._visual_qa is None:
+            raise VisualQARunnerNotConfiguredError()
+
+        report = self._visual_qa.evaluate(task, screenshots)
+        for finding in report.findings:
+            self._audit.log_visual_qa_finding_recorded(
+                project_id=report.project_id,
+                task_id=report.task_id,
+                finding_id=finding.id,
+                severity=finding.severity.value,
+                category=finding.category.value,
+                route=finding.route,
+                viewport=finding.viewport,
             )
         return report
 

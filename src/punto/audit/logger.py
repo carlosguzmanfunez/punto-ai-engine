@@ -718,11 +718,14 @@ class AuditLogger:
         model: str,
         attempt: int,
         prompt_chars: int,
+        images: int = 0,
         actor: str | None = None,
     ) -> AuditEvent:
         """Registra el inicio de una llamada al modelo.
 
-        Se registra el **tamaño** del prompt, nunca su contenido ni la credencial.
+        Se registra el **tamaño** del prompt y cuántas imágenes viajan, nunca su contenido ni la
+        credencial: una captura puede contener datos del cliente y no tiene por qué acabar en un
+        registro.
         """
         return self.record(
             AuditEventType.MODEL_REQUEST_STARTED,
@@ -735,6 +738,7 @@ class AuditLogger:
                 "model": model,
                 "attempt": attempt,
                 "prompt_chars": prompt_chars,
+                "images": images,
             },
         )
 
@@ -2040,6 +2044,366 @@ class AuditLogger:
         return self.record(
             AuditEventType.CROSS_AUDIT_BLOCKED,
             action="cross_audit_blocked",
+            resource_id=task_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "reason": reason[:300],
+                "provider": provider,
+                "model": model,
+                "detail": detail[:500],
+            },
+        )
+
+    # ------------------------------------------------------------- web + visual
+    def log_web_profile_detected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        framework: str,
+        package_manager: str,
+        has_typescript: bool,
+        has_tailwind: bool,
+        evidence: Sequence[str] = (),
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el perfil web detectado y la evidencia que lo sostiene."""
+        return self.record(
+            AuditEventType.WEB_PROFILE_DETECTED,
+            action="web_profile_detected",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "framework": framework,
+                "package_manager": package_manager,
+                "has_typescript": has_typescript,
+                "has_tailwind": has_tailwind,
+                "evidence": list(evidence)[:10],
+            },
+        )
+
+    def log_web_build_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        command: str,
+        argv: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una acción web. Se guarda el argv, nunca un comando de shell."""
+        return self.record(
+            AuditEventType.WEB_BUILD_STARTED,
+            action="web_build_started",
+            resource_id=task_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "command": command,
+                "argv": list(argv),
+            },
+        )
+
+    def log_web_build_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        command: str,
+        status: str,
+        exit_code: int | None,
+        duration_ms: int,
+        warnings: int = 0,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el fin de una acción web con su resultado, sin volcar su salida."""
+        return self.record(
+            AuditEventType.WEB_BUILD_COMPLETED,
+            action="web_build_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "command": command,
+                "status": status,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "warnings": warnings,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_browser_session_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        routes: Sequence[str],
+        viewports: Sequence[str],
+        image: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una sesión de navegador dentro del sandbox web."""
+        return self.record(
+            AuditEventType.BROWSER_SESSION_STARTED,
+            action="browser_session_started",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "routes": list(routes),
+                "viewports": list(viewports),
+                "sandbox_image": image,
+            },
+        )
+
+    def log_browser_check_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        check: str,
+        ran: bool,
+        passed: bool,
+        blocking: bool,
+        findings: int = 0,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el resultado de una comprobación determinista del navegador."""
+        return self.record(
+            AuditEventType.BROWSER_CHECK_RECORDED,
+            action="browser_check_recorded",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if passed else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "check": check,
+                "ran": ran,
+                "passed": passed,
+                "blocking": blocking,
+                "findings": findings,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_screenshot_captured(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        logical_name: str,
+        route: str,
+        viewport: str,
+        width: int,
+        height: int,
+        bytes_count: int,
+        sha256: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un screenshot por sus **metadatos**: nunca sus bytes ni una ruta del host."""
+        return self.record(
+            AuditEventType.SCREENSHOT_CAPTURED,
+            action="screenshot_captured",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "logical_name": logical_name,
+                "route": route,
+                "viewport": viewport,
+                "width": width,
+                "height": height,
+                "bytes": bytes_count,
+                "sha256": sha256,
+            },
+        )
+
+    def log_visual_qa_request_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        routes: Sequence[str] = (),
+        viewports: Sequence[str] = (),
+        screenshots: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de una evaluación visual."""
+        return self.record(
+            AuditEventType.VISUAL_QA_REQUEST_STARTED,
+            action="visual_qa_request_started",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "provider": provider,
+                "model": model,
+                "prompt_version": prompt_version,
+                "routes": list(routes),
+                "viewports": list(viewports),
+                "screenshots": screenshots,
+            },
+        )
+
+    def log_visual_qa_proposal_received(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta visual recibida, antes de validarla."""
+        return self.record(
+            AuditEventType.VISUAL_QA_PROPOSAL_RECEIVED,
+            action="visual_qa_proposal_received",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+            },
+        )
+
+    def log_visual_qa_proposal_accepted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        findings: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta visual aceptada por PUNTO."""
+        return self.record(
+            AuditEventType.VISUAL_QA_PROPOSAL_ACCEPTED,
+            action="visual_qa_proposal_accepted",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "findings": findings,
+            },
+        )
+
+    def log_visual_qa_proposal_rejected(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        attempt: int,
+        violations: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una propuesta visual rechazada con sus violaciones."""
+        return self.record(
+            AuditEventType.VISUAL_QA_PROPOSAL_REJECTED,
+            action="visual_qa_proposal_rejected",
+            resource_id=task_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "attempt": attempt,
+                "violation_count": len(violations),
+                "violations": [item[:300] for item in violations],
+            },
+        )
+
+    def log_visual_qa_finding_recorded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        finding_id: str,
+        severity: str,
+        category: str,
+        route: str = "",
+        viewport: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un hallazgo visual: gravedad, categoría y ubicación, nunca la imagen."""
+        return self.record(
+            AuditEventType.VISUAL_QA_FINDING_RECORDED,
+            action="visual_qa_finding_recorded",
+            resource_id=task_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "finding_id": finding_id,
+                "severity": severity,
+                "category": category,
+                "route": route,
+                "viewport": viewport,
+            },
+        )
+
+    def log_visual_qa_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        status: str,
+        provider: str,
+        model: str,
+        findings: int = 0,
+        blocking_findings: int = 0,
+        gates: Sequence[str] = (),
+        screenshots: int = 0,
+        attempts: int = 0,
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de una evaluación visual con su veredicto."""
+        return self.record(
+            AuditEventType.VISUAL_QA_COMPLETED,
+            action="visual_qa_completed",
+            resource_id=task_id,
+            result=AuditResult.SUCCESS if status == "PASS" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "status": status,
+                "provider": provider,
+                "model": model,
+                "findings": findings,
+                "blocking_findings": blocking_findings,
+                "gates": list(gates),
+                "screenshots": screenshots,
+                "attempts": attempts,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_visual_qa_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        reason: str,
+        provider: str = "",
+        model: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una evaluación visual bloqueada, con su motivo."""
+        return self.record(
+            AuditEventType.VISUAL_QA_BLOCKED,
+            action="visual_qa_blocked",
             resource_id=task_id,
             result=AuditResult.DENIED,
             actor=actor,

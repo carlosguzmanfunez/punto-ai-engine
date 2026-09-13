@@ -115,6 +115,20 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.CROSS_AUDIT_FINDING_RECORDED: "cross_audit_finding",
     AuditEventType.CROSS_AUDIT_COMPLETED: "cross_audit_report",
     AuditEventType.CROSS_AUDIT_BLOCKED: "cross_audit_report",
+    # --- Web + visual execution (ENGINE-5.3) ----------------------------------
+    AuditEventType.WEB_PROFILE_DETECTED: "web_profile",
+    AuditEventType.WEB_BUILD_STARTED: "web_command",
+    AuditEventType.WEB_BUILD_COMPLETED: "web_command",
+    AuditEventType.BROWSER_SESSION_STARTED: "browser_session",
+    AuditEventType.BROWSER_CHECK_RECORDED: "browser_check",
+    AuditEventType.SCREENSHOT_CAPTURED: "screenshot",
+    AuditEventType.VISUAL_QA_REQUEST_STARTED: "visual_qa_request",
+    AuditEventType.VISUAL_QA_PROPOSAL_RECEIVED: "visual_qa_proposal",
+    AuditEventType.VISUAL_QA_PROPOSAL_REJECTED: "visual_qa_proposal",
+    AuditEventType.VISUAL_QA_PROPOSAL_ACCEPTED: "visual_qa_proposal",
+    AuditEventType.VISUAL_QA_FINDING_RECORDED: "visual_qa_finding",
+    AuditEventType.VISUAL_QA_COMPLETED: "visual_qa_report",
+    AuditEventType.VISUAL_QA_BLOCKED: "visual_qa_report",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

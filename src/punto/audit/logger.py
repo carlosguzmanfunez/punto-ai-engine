@@ -2417,6 +2417,367 @@ class AuditLogger:
         )
 
     # -------------------------------------------------------------------- read
+    # ------------------------------------------------------------------
+    # Kernel de workflow autónomo (ENGINE-6.0)
+    # ------------------------------------------------------------------
+    def log_workflow_created(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        risk: str,
+        authority: str,
+        objective_chars: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la creación de un workflow, con su riesgo y su autoridad declarada."""
+        return self.record(
+            AuditEventType.WORKFLOW_CREATED,
+            action="workflow_created",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "risk": risk,
+                "authority": authority,
+                "objective_chars": objective_chars,
+            },
+        )
+
+    def log_workflow_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        status: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el arranque de la ejecución de un workflow."""
+        return self.record(
+            AuditEventType.WORKFLOW_STARTED,
+            action="workflow_started",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "status": status,
+            },
+        )
+
+    def log_workflow_resumed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        status: str,
+        revision: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una reanudación explícita desde un checkpoint."""
+        return self.record(
+            AuditEventType.WORKFLOW_RESUMED,
+            action="workflow_resumed",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "status": status,
+                "revision": revision,
+            },
+        )
+
+    def log_workflow_step_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        step_index: int,
+        role: str,
+        stage: str,
+        attempt: int = 1,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de un paso (una invocación de rol)."""
+        return self.record(
+            AuditEventType.WORKFLOW_STEP_STARTED,
+            action="workflow_step_started",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "step_index": step_index,
+                "role": role,
+                "stage": stage,
+                "attempt": attempt,
+            },
+        )
+
+    def log_workflow_step_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        step_index: int,
+        role: str,
+        role_status: str,
+        decision: str,
+        findings: int = 0,
+        blocking_findings: int = 0,
+        total_tokens: int = 0,
+        duration_ms: int = 0,
+        provider: str = "",
+        model: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un paso completado, con la decisión que PUNTO calculó."""
+        return self.record(
+            AuditEventType.WORKFLOW_STEP_COMPLETED,
+            action="workflow_step_completed",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "step_index": step_index,
+                "role": role,
+                "role_status": role_status,
+                "decision": decision,
+                "findings": findings,
+                "blocking_findings": blocking_findings,
+                "total_tokens": total_tokens,
+                "duration_ms": duration_ms,
+                "provider": provider,
+                "model": model,
+            },
+        )
+
+    def log_workflow_step_failed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        step_index: int,
+        role: str,
+        error_code: str,
+        attempt: int = 1,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un paso fallido con su código estable."""
+        return self.record(
+            AuditEventType.WORKFLOW_STEP_FAILED,
+            action="workflow_step_failed",
+            resource_id=workflow_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "step_index": step_index,
+                "role": role,
+                "error_code": error_code,
+                "attempt": attempt,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_transition(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        sequence: int,
+        from_status: str,
+        to_status: str,
+        decision: str,
+        reason: str = "",
+        authority: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una transición de estado aplicada."""
+        return self.record(
+            AuditEventType.WORKFLOW_TRANSITION,
+            action="workflow_transition",
+            resource_id=workflow_id,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "sequence": sequence,
+                "from_status": from_status,
+                "to_status": to_status,
+                "decision": decision,
+                "reason": reason[:300],
+                "authority": authority,
+            },
+        )
+
+    def log_workflow_blocked(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        code: str,
+        status: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un bloqueo del workflow, con su código estable."""
+        return self.record(
+            AuditEventType.WORKFLOW_BLOCKED,
+            action="workflow_blocked",
+            resource_id=workflow_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "code": code,
+                "status": status,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_human_gate(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        gate_id: UUID,
+        reason_code: str,
+        risk: str,
+        authority_required: str,
+        current_state: str,
+        proposed_next_state: str,
+        requested_action: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la solicitud de un Human Gate. Sin secretos ni razonamiento interno."""
+        return self.record(
+            AuditEventType.WORKFLOW_HUMAN_GATE,
+            action="workflow_human_gate",
+            resource_id=workflow_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "gate_id": str(gate_id),
+                "reason_code": reason_code,
+                "risk": risk,
+                "authority_required": authority_required,
+                "current_state": current_state,
+                "proposed_next_state": proposed_next_state,
+                "requested_action": requested_action[:300],
+            },
+        )
+
+    def log_workflow_budget_exceeded(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        limit: str,
+        used: float,
+        maximum: float,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que un límite del presupuesto se agotó."""
+        return self.record(
+            AuditEventType.WORKFLOW_BUDGET_EXCEEDED,
+            action="workflow_budget_exceeded",
+            resource_id=workflow_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "limit": limit,
+                "used": used,
+                "maximum": maximum,
+            },
+        )
+
+    def log_workflow_completed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        status: str,
+        steps: int,
+        roles: Sequence[str],
+        findings: int = 0,
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de un workflow con su resultado."""
+        return self.record(
+            AuditEventType.WORKFLOW_COMPLETED,
+            action="workflow_completed",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS if status == "COMPLETED" else AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "status": status,
+                "steps": steps,
+                "roles": list(roles)[:12],
+                "findings": findings,
+                "total_tokens": total_tokens,
+            },
+        )
+
+    def log_workflow_cancelled(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        reason: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la cancelación explícita de un workflow."""
+        return self.record(
+            AuditEventType.WORKFLOW_CANCELLED,
+            action="workflow_cancelled",
+            resource_id=workflow_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "reason": reason[:300],
+            },
+        )
+
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""
         return tuple(self._events)

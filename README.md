@@ -29,6 +29,7 @@
 | **ENGINE-5.3** | **Web + Visual Execution Foundation.** Perfil web, sandbox con Chromium real, once checks deterministas, capturas verificadas y Visual QA con gates no anulables. | ✅ Implementada |
 | **ENGINE-5.3.1** | **Trusted Web Evidence + Visual Completeness Hardening.** Frontera de dos contenedores para la medición, cobertura visual exigida por la especificación, aplicabilidad explícita de los checks y gates vivos de Visual QA. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 | **ENGINE-5.3.2** | **Final Route Identity Hardening.** La identidad de ruta se decide por la URL final renderizada, la cobertura solo acredita la ruta realmente renderizada y los nombres lógicos de captura son resistentes a colisiones. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
+| **ENGINE-6.0** | **Autonomous Workflow Kernel.** CAMUS conduce una intención por etapas y roles con máquina de estados explícita, autoridad, Human Gates no autoaprobables, presupuesto, protección de bucles, checkpoints, reanudación idempotente y routing provider-neutral sin fallback. | ✅ Implementada (live `PENDING_API_KEY`; ciclo de reparación en 6.1) |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -2915,7 +2916,165 @@ política (`/pricing` y `/pricing/`) sí lo comparten, porque son la misma evide
 
 ---
 
-## 28. Licencia
+## 28. ENGINE-6.0 — Autonomous Workflow Kernel
+
+El principio constitucional que abre esta fase: PUNTO no pide intervención humana para decisiones
+técnicas reversibles que estén dentro de sus permisos, su presupuesto y su nivel de riesgo. Analiza,
+decide, ejecuta, verifica y continúa. Solo se detiene ante un Human Gate, un límite, una credencial
+que falta, una acción irreversible, producción, pagos, secretos maestros, un cambio legal o
+comercial, un riesgo HIGH/CRITICAL fuera de autoridad, o cuando no puede seguir con seguridad.
+
+### Arquitectura
+
+| Módulo | Responsabilidad |
+| --- | --- |
+| `src/punto/schemas/workflow.py` | Contratos: `WorkflowRequest/Run/Step/Transition/Checkpoint/Failure/Result`, `WorkflowBudget`, `HumanGateRequest`, `RoleExecutionRequest/Result`, `ProviderCapability` |
+| `workflow/state_machine.py` | Tabla de transiciones explícita, protección de terminales y tabla de reanudación |
+| `workflow/pipeline.py` | Qué roles se ejecutan en cada etapa y cuál es la siguiente |
+| `workflow/decisions.py` | Motor de decisión determinista posterior a cada rol |
+| `workflow/kernel.py` | CAMUS: conduce el workflow paso a paso, con presupuesto, checkpoints y auditoría |
+| `workflow/roles.py` | Adaptadores a los roles que ya existen, con resultados normalizados |
+| `workflow/budgets.py` | Límites y protección de bucles |
+| `workflow/checkpoints.py` | Persistencia atómica, idempotencia por paso y reanudación |
+| `workflow/providers.py` | Capacidades declaradas por proveedor y routing sin fallback |
+| `workflow/errors.py` | Taxonomía de errores con códigos estables |
+
+### Máquina de estados
+
+```
+NEW -> ANALYZING -> PLANNING -> READY -> IN_PROGRESS -> QA -> SECURITY -> REVIEW -> APPROVED -> COMPLETED
+```
+
+Estados de pausa y cierre: `REPAIRING`, `BLOCKED`, `HUMAN_APPROVAL`, `FAILED`, `CANCELLED`. Cada
+etapa admite además sus destinos de bloqueo, pausa y cancelación, y **nada más**: `NEW -> COMPLETED`,
+`QA -> APPROVED` o `REPAIRING -> IN_PROGRESS` no existen. Un estado terminal (`COMPLETED`, `FAILED`,
+`CANCELLED`) no vuelve a activo: para retomar el asunto hace falta un workflow nuevo. `BLOCKED` y
+`HUMAN_APPROVAL` sí se reanudan, pero solo con la operación explícita de reanudación.
+
+### CAMUS: una etapa por paso
+
+Cada paso ejecuta **un** rol (o entra en una etapa sin roles) y aplica **una** transición. CAMUS no
+escribe código de producto: coordina agentes y herramientas. Los roles son los que ya existían
+(Architect, Planner, Developer, QA, Security, Reviewer, CrossAudit, VisualQA) y se invocan a través
+de adaptadores que normalizan su resultado; ninguno se reescribió. La auditoría cruzada y la
+verificación visual se ejecutan dentro de la etapa de revisión, antes de aprobar, y la visual **solo**
+si la tarea o el perfil la exigen.
+
+### Autoridad
+
+| Nivel | Significado |
+| --- | --- |
+| L0 | Autónomo |
+| L1 | Autónomo con revisión automática |
+| L2 | Autónomo bajo CAMUS y las políticas del motor |
+| L3 | Humano obligatorio |
+
+Un modelo **no** puede cambiar su propio nivel de autoridad, ni escribir el estado del workflow, el
+presupuesto, la decisión de un Human Gate, la aprobación, el permiso de despliegue ni la decisión de
+cierre. Todo eso lo calcula PUNTO.
+
+### Decisión posterior a cada rol
+
+| Decisión | Cuándo |
+| --- | --- |
+| `BLOCK` | el rol no tiene proveedor disponible, quedó bloqueado, o hay defecto sin presupuesto de reparación |
+| `FAIL` | el rol terminó en fallo |
+| `ENTER_REPAIR` | hay hallazgos bloqueantes (incluido un HIGH/CRITICAL de Security) y queda presupuesto |
+| `CONTINUE` | quedan verificaciones en la misma etapa |
+| `READY_FOR_NEXT_STAGE` | etapa terminada en verde |
+| `REQUEST_HUMAN` | la petición exige aprobación humana antes de cerrar |
+| `COMPLETE` | todas las etapas y verificaciones exigidas aprobaron |
+
+Precedencia: proveedor ausente y bloqueo van antes que cualquier aprobación; un hallazgo HIGH o
+CRITICAL de Security nunca se ignora, ni por el Reviewer ni por CAMUS. La regla de cierre exige que
+cada rol exigido haya terminado en verde, sin hallazgos bloqueantes, sin Human Gate pendiente y con
+el presupuesto dentro de límites: el modelo no puede escribir «completed» y saltárselas.
+
+### Human Gates
+
+Se reutilizan las políticas existentes. Una solicitud declara `reason_code`, `requested_action`,
+`risk`, `authority_required`, `current_state`, `proposed_next_state`, `context_summary` y
+`created_at`; **no** lleva secretos, volcados de código ni razonamiento interno. El kernel se detiene
+en `HUMAN_APPROVAL` y no puede aprobarse a sí mismo: solo `resume(workflow_id, approved=True)`
+continúa, y con `approved=False` la reanudación falla de forma explícita.
+
+### Presupuesto y bucles
+
+| Límite | Por defecto |
+| --- | --- |
+| `max_steps` | 32 |
+| `max_role_calls` | 24 |
+| `max_model_calls` | 48 |
+| `max_repairs` | 0 (el ciclo de reparación es ENGINE-6.1) |
+| `max_total_tokens` | 200 000 |
+| `max_wall_time_seconds` | 3 600 |
+| `max_failures` | 3 |
+| `max_state_visits` | 4 |
+| `max_transitions` | 48 |
+
+Se comprueban **antes** de gastar. Al excederse, el workflow queda `BLOCKED` con
+`WORKFLOW_BUDGET_EXCEEDED`; si un estado se repite más allá del límite, con
+`WORKFLOW_LOOP_DETECTED`. Nada continúa en silencio, y la detección de bucles no depende del modelo.
+
+### Checkpoints, idempotencia y reanudación
+
+Cada guardado escribe el workflow serializado y su digest `sha256` de forma **atómica** (temporal +
+`os.replace`) en un directorio local, con los metadatos del checkpoint como marca de commit. El orden
+es: resultado del rol → decisión → transición → checkpoint. Si el proceso muere antes del
+checkpoint, el paso no está registrado y se repite; nunca queda un workflow falsamente cerrado. Cada
+paso lleva una clave de idempotencia (`workflow_id:paso:rol:etapa`) y `resume(workflow_id)` lee el
+último checkpoint válido, valida su coherencia y continúa sin repetir etapas completadas. Repetir la
+misma petición devuelve el mismo workflow: no duplica efectos.
+
+### Proveedores
+
+`ProviderCapability` declara proveedor, modelo, roles que cubre, visión, salida estructurada,
+disponibilidad, estado de credencial y si una ejecución real lo verificó. CAMUS **consulta** esa
+tabla; no la supone. Hoy: DeepSeek cubre los roles de ingeniería si hay credencial; Anthropic cubre
+auditoría cruzada y Visual QA (visión) si hay credencial; OpenAI queda `PENDING_CREDENTIALS`; y el
+proveedor `fake` está siempre disponible para las pruebas offline. Sin credencial, la operación queda
+`PROVIDER_UNAVAILABLE` / `PENDING_CREDENTIALS` y **no** se sustituye por otro proveedor: el cambio de
+proveedor exige una política determinista explícita, que esta fase no habilita.
+
+### Auditoría y errores
+
+Doce eventos nuevos (`WORKFLOW_CREATED`, `WORKFLOW_STARTED`, `WORKFLOW_RESUMED`,
+`WORKFLOW_STEP_STARTED/COMPLETED/FAILED`, `WORKFLOW_TRANSITION`, `WORKFLOW_BLOCKED`,
+`WORKFLOW_HUMAN_GATE`, `WORKFLOW_BUDGET_EXCEEDED`, `WORKFLOW_COMPLETED`, `WORKFLOW_CANCELLED`)
+registran metadatos: nunca claves de API, credenciales, capturas en base64, código privado completo
+ni cadenas de razonamiento. Los errores usan códigos estables (`WORKFLOW_INVALID_TRANSITION`,
+`WORKFLOW_TERMINAL`, `WORKFLOW_BUDGET_EXCEEDED`, `WORKFLOW_LOOP_DETECTED`,
+`WORKFLOW_PROVIDER_UNAVAILABLE`, `WORKFLOW_ROLE_FAILED`, `WORKFLOW_HUMAN_APPROVAL_REQUIRED`,
+`WORKFLOW_CHECKPOINT_INVALID`, `WORKFLOW_RESUME_FAILED`, `WORKFLOW_INCOMPLETE_EVIDENCE` y
+`WORKFLOW_REPAIR_DEFERRED`): el kernel no expone excepciones genéricas.
+
+### Pruebas
+
+`tests/test_workflow_kernel_e2e.py` conduce el kernel **real** con ejecutores falsos y exige el camino
+exacto (estados, roles, decisiones, checkpoints y auditoría), además de los escenarios de fallo
+(Developer que falla, defecto de QA, HIGH de Security, rechazo del Reviewer, proveedor ausente,
+Human Gate, presupuesto agotado, transición ilegal, reanudación tras interrupción y reanudación
+repetida). `tests/test_workflow_visual_e2e.py` cubre la capacidad visual opcional (aprobada, cambios
+pedidos y proveedor no disponible).
+
+### Limitación declarada
+
+- **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
+  `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
+- Ejecución **secuencial** por diseño; el paralelismo y el DAG llegan más adelante.
+- El reintento técnico del kernel está acotado (2 intentos) y solo cubre tropiezos técnicos; los
+  reintentos de transporte ya viven en cada cliente de proveedor.
+- Un veredicto `FAILED` o `TIMEOUT` de un rol se trata como «hay que rehacer» (reparación), no como
+  fallo técnico del kernel.
+- Sin endpoint público para lanzar workflows: el kernel es interno y `GET /health` sigue intacto.
+- **MW-01** (MEDIUM): las mediciones del `main world` del navegador son falsificables por la propia
+  página; no bloquea ENGINE-6.0, pero debe cerrarse antes del piloto, y `ACCESSIBILITY_CHECK` no se
+  usa como garantía fuerte en decisiones autónomas mientras dependa de señal cooperativa.
+- **V532-01** (LOW): el origen de `final_url` no se verifica explícitamente; no es alcance de 6.0.
+
+---
+
+## 29. Licencia
 
 Propietario — Punto Inmobiliario HN. `Private :: Do Not Upload`.
 

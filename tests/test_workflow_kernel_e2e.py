@@ -56,6 +56,7 @@ from workflow_support import (
     make_policy,
     make_request,
     make_run,
+    offline_policy,
     role_sequence,
     state_sequence,
 )
@@ -82,7 +83,11 @@ def make_kernel(
     clock: Callable[[], datetime] | None = None,
     policy: WorkflowPolicy | None = None,
 ) -> tuple[WorkflowKernel, AuditLogger, dict[RoleName, FakeRoleExecutor]]:
-    """Kernel con almacén real en disco, auditoría en memoria y ejecutores falsos."""
+    """Kernel con almacén real en disco, auditoría en memoria y ejecutores falsos.
+
+    La frontera de política es la **real** del repositorio (``offline_policy()``) salvo que la
+    prueba inyecte otra: el kernel no se construye sin política.
+    """
     logger = audit or AuditLogger()
     chosen = executors if executors is not None else all_stage_executors()
     kernel = WorkflowKernel(
@@ -90,7 +95,7 @@ def make_kernel(
         store=FileCheckpointStore(store_root),
         audit=logger,
         clock=clock,
-        policy=policy,
+        policy=policy if policy is not None else offline_policy(),
     )
     return kernel, logger, chosen
 
@@ -516,7 +521,11 @@ def test_a_crashed_effect_is_not_repeated_blindly(tmp_path: Path) -> None:
     store = FileCheckpointStore(tmp_path)
     ledger = EffectLedger()
     kernel = WorkflowKernel(
-        executors=dict(executors), store=store, audit=AuditLogger(), effects=ledger
+        executors=dict(executors),
+        store=store,
+        audit=AuditLogger(),
+        effects=ledger,
+        policy=offline_policy(),
     )
     request = make_request(idempotency_key="efecto-interrumpido")
     run = kernel.create(request)
@@ -542,7 +551,11 @@ def test_a_crashed_effect_is_not_repeated_blindly(tmp_path: Path) -> None:
     store.save(run)  # estado durable de la caída: intención apuntada, efecto sin resolver
 
     fresh = WorkflowKernel(
-        executors=dict(executors), store=store, audit=AuditLogger(), effects=EffectLedger()
+        executors=dict(executors),
+        store=store,
+        audit=AuditLogger(),
+        effects=EffectLedger(),
+        policy=offline_policy(),
     )
     stepped = fresh.step(fresh.load(run.workflow_id))
 
@@ -598,6 +611,7 @@ def test_the_wall_time_budget_blocks(tmp_path: Path) -> None:
         store=FileCheckpointStore(tmp_path),
         audit=AuditLogger(),
         clock=clock,
+        policy=offline_policy(),
     )
     run = kernel.create(make_request())
     run = kernel.step(run)
@@ -663,14 +677,18 @@ def test_a_new_kernel_resumes_from_the_last_checkpoint_once(tmp_path: Path) -> N
     """I. Tras una interrupción, otro kernel reanuda y no repite los pasos completados."""
     executors = all_stage_executors()
     store = FileCheckpointStore(tmp_path)
-    first_kernel = WorkflowKernel(executors=dict(executors), store=store, audit=AuditLogger())
+    first_kernel = WorkflowKernel(
+        executors=dict(executors), store=store, audit=AuditLogger(), policy=offline_policy()
+    )
     request = make_request()
     run = first_kernel.create(request)
     for _ in range(5):
         run = first_kernel.step(run)
     calls_before = {role: len(executor.calls) for role, executor in executors.items()}
 
-    second_kernel = WorkflowKernel(executors=dict(executors), store=store, audit=AuditLogger())
+    second_kernel = WorkflowKernel(
+        executors=dict(executors), store=store, audit=AuditLogger(), policy=offline_policy()
+    )
     resumed = second_kernel.resume(run.workflow_id)
 
     assert resumed.status is TaskStatus.COMPLETED

@@ -15,12 +15,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from punto.common import utc_now
 from punto.policy.human_gate import HumanApprovalProof, HumanGate
-from punto.policy.policy_engine import PolicyEngine
+from punto.policy.policy_engine import PolicyConfigBundle, PolicyEngine
 from punto.schemas.enums import AuthorityLevel, FindingSeverity, RiskLevel, TaskStatus
 from punto.schemas.execution import ModelUsage
 from punto.schemas.workflow import (
@@ -93,6 +95,25 @@ def make_request(
 def make_policy(engine: PolicyEngine, gate: HumanGate) -> WorkflowPolicy:
     """Frontera de política real (Policy Engine + Human Gate del repositorio)."""
     return WorkflowPolicy(engine=engine, gate=gate)
+
+
+@lru_cache(maxsize=1)
+def _config_bundle() -> PolicyConfigBundle:
+    """Configuración de política del repositorio, leída una sola vez por proceso de prueba."""
+    from punto.policy.config_loader import ConfigLoader
+
+    loader = ConfigLoader(Path(__file__).resolve().parents[1] / "config")
+    return PolicyConfigBundle.from_loader(loader)
+
+
+def offline_policy() -> WorkflowPolicy:
+    """Frontera de política **real** para las pruebas offline.
+
+    El kernel exige una política (hallazgo V602-02): no existe el camino «sin política». Las pruebas
+    usan el Policy Engine real leído de ``config/`` con un Human Gate nuevo en cada llamada, de modo
+    que nunca comparten estado de aprobaciones entre casos.
+    """
+    return WorkflowPolicy(engine=PolicyEngine.from_bundle(_config_bundle()), gate=HumanGate())
 
 
 def approve_human_gate(
@@ -260,6 +281,7 @@ __all__ = [
     "make_policy",
     "make_request",
     "make_run",
+    "offline_policy",
     "role_sequence",
     "state_sequence",
 ]

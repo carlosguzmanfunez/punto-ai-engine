@@ -202,6 +202,32 @@ class EffectLedger:
         """
         return _apply_resolution(run, key=key, status=status, detail=detail)
 
+    def mark_unknown(
+        self, run: WorkflowRun, *, key: str, detail: str = ""
+    ) -> WorkflowRun:
+        """Declara que un efecto apuntado tiene resultado **incierto** (``UNKNOWN``).
+
+        No es una resolución: es el reconocimiento de que no se sabe si el efecto ocurrió (el rol
+        pudo aplicarlo y caerse después). El kernel lo usa para dejar el libro en un estado que no
+        admite repetición automática: ``UNKNOWN`` sigue siendo «sin resolver», así que un reintento
+        se rechaza igual que con ``IN_FLIGHT``, pero la traza dice explícitamente que la
+        incertidumbre fue observada y no solo heredada (hallazgo V602-05).
+
+        No inventa registros (una clave ausente es un no-op) y no reescribe una resolución previa.
+        """
+        index = _index_of(run, key)
+        if index is None:
+            return run
+        record = run.effects[index]
+        if record.status not in _UNRESOLVED_STATUSES:
+            return run
+        updated = record.model_copy(
+            update={"status": EffectStatus.UNKNOWN, "detail": _clip(detail) or record.detail}
+        )
+        effects = list(run.effects)
+        effects[index] = updated
+        return run.model_copy(update={"effects": tuple(effects)})
+
     def pending(self, run: WorkflowRun) -> tuple[EffectRecord, ...]:
         """Efectos cuyo resultado se desconoce, en el orden en que se apuntaron.
 

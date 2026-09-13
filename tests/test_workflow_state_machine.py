@@ -80,16 +80,25 @@ def test_new_cannot_jump_to_completed() -> None:
 
 
 def test_qa_cannot_approve_directly() -> None:
-    """La calidad no aprueba: QA pasa a Security o a reparación."""
+    """La calidad no aprueba: QA pasa a Security, a reparación o a una pausa.
+
+    ``HUMAN_APPROVAL`` figura entre los destinos porque un Human Gate puede abrirse desde
+    cualquier etapa activa (ENGINE-6.0.2, hallazgo V602-01): una pausa humana no es una aprobación.
+    Lo que sigue prohibido —y es lo que esta prueba protege— es que QA llegue a ``APPROVED`` o
+    ``COMPLETED`` sin pasar por Security y por la revisión.
+    """
     assert MACHINE.allowed_from(TaskStatus.QA) == frozenset(
         {
             TaskStatus.SECURITY,
             TaskStatus.REPAIRING,
             TaskStatus.BLOCKED,
+            TaskStatus.HUMAN_APPROVAL,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }
     )
+    assert TaskStatus.APPROVED not in MACHINE.allowed_from(TaskStatus.QA)
+    assert TaskStatus.COMPLETED not in MACHINE.allowed_from(TaskStatus.QA)
 
 
 def test_repairing_does_not_return_to_work_in_engine_6_0() -> None:

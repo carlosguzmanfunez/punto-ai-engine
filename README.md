@@ -30,7 +30,8 @@
 | **ENGINE-5.3.1** | **Trusted Web Evidence + Visual Completeness Hardening.** Frontera de dos contenedores para la medición, cobertura visual exigida por la especificación, aplicabilidad explícita de los checks y gates vivos de Visual QA. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 | **ENGINE-5.3.2** | **Final Route Identity Hardening.** La identidad de ruta se decide por la URL final renderizada, la cobertura solo acredita la ruta realmente renderizada y los nombres lógicos de captura son resistentes a colisiones. | ✅ Implementada (certificación live `PENDING_API_KEY`) |
 | **ENGINE-6.0** | **Autonomous Workflow Kernel.** CAMUS conduce una intención por etapas y roles con máquina de estados explícita, autoridad, Human Gates no autoaprobables, presupuesto, protección de bucles, checkpoints, reanudación idempotente y routing provider-neutral sin fallback. | ✅ Implementada (live `PENDING_API_KEY`; ciclo de reparación en 6.1) |
-| **ENGINE-6.0.1** | **Authority, Real Handoff & Budget Hardening.** Gobierno real de autoridad (default deny, L3 no rebajable), Human Gate con prueba verificable, etapas Architect/Planner sin duplicación, handoff durable por artefactos, presupuesto pre-gasto, checkpoints coherentes, conflicto de idempotencia, colecciones acotadas, aplicabilidad visual por perfil web y efectos que no se repiten a ciegas. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
+| **ENGINE-6.0.1** | **Authority, Real Handoff & Budget Hardening.** Gobierno real de autoridad (default deny, L3 no rebajable), Human Gate con prueba verificable, etapas Architect/Planner sin duplicación, handoff durable por artefactos, presupuesto pre-gasto, checkpoints coherentes, conflicto de idempotencia, colecciones acotadas, aplicabilidad visual por perfil web y efectos que no se repiten a ciegas. | ✅ Implementada |
+| **ENGINE-6.0.2** | **Final Autonomy Boundary Hardening.** La prueba humana autoriza exactamente la transición que se aplica, la política es obligatoria y se re-evalúa en cada paso y antes del efecto, el handoff durable vive en los adaptadores reales, el presupuesto es pre-gasto también en modelo/tokens y en transiciones, un efecto incierto no se reintenta y la verificación visual no se desactiva omitiendo metadatos. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -3087,15 +3088,33 @@ Endurecimiento de la fase, hallazgo por hallazgo:
 Los hallazgos reales de cada rol se conservan en `WorkflowResult` (`roles_executed`, `findings` y
 `evidence`), así que el cierre no pierde lo que encontraron las verificaciones.
 
+### ENGINE-6.0.2 — Frontera de autonomía
+
+Segunda pasada de endurecimiento, sobre los defectos residuales de la primera:
+
+| Hallazgo | Cómo se cierra |
+| --- | --- |
+| V602-01 Destino del Human Gate | `proposed_next_state`, `human_gate_resume_status` y `proof.resume_status` son **el mismo estado**; el gate se abre en la etapa real (también `QA`) y `resume` aplica exactamente lo autorizado, sin sustituciones |
+| V602-02 Política opcional | El kernel **no se construye** sin `WorkflowPolicy`; la autoridad se re-evalúa en cada paso y antes de un efecto, así que `REJECT` bloquea y `REQUIRE_HUMAN` pausa aunque la aprobación fuera anterior |
+| V602-03 Handoff real | `workflow/handoff.py` publica y resuelve el diseño y el plan desde `CamusRoleExecutor`: el Architect publica su `ArchitectureOutcome` y el Planner reconstruye desde esa referencia, sin closures ad hoc |
+| V602-04 Presupuesto real | La reserva de cada intento queda **consumida** en el run (``max_role_calls=1`` son una llamada), `_RoleView.model_calls` copia las llamadas reales, el saldo de modelo/tokens viaja en `RoleExecutionRequest.budget_allowance` y **toda** transición pasa por una única frontera que reserva antes de aplicar |
+| V602-05 Efecto y reintento | `EffectLedger.mark_unknown` deja la intención en ``UNKNOWN`` y el kernel **no reintenta**: bloquea con `WORKFLOW_EFFECT_RECONCILIATION_REQUIRED`; la reversibilidad del efecto sale del riesgo efectivo, no del declarado |
+| V602-06 Visual QA omitible | Sin `project_path` se perfila el `workspace_path`; la aplicabilidad tiene tres respuestas y ``UNKNOWN`` **no** se convierte en «no aplica»: el workflow no cierra sin evidencia (`WORKFLOW_INCOMPLETE_EVIDENCE`) |
+
+`HUMAN_GATE_RESUME_STATUSES` (en `punto.schemas.enums`) sigue siendo la **fuente única**: la tabla de
+reanudación del workflow se deriva de ella y el Human Gate valida con ella, así que el destino que la
+autorización describe y el que la máquina permite no pueden divergir.
+
 ### Limitación declarada
 
 - **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
   `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
-- ENGINE-6.0.1 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
+- ENGINE-6.0.2 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
   programador en jefe.
-- La reconciliación de un efecto interrumpido (`EffectLedger.reconcile`) existe y desbloquea el
-  registro, pero **no** reintenta el efecto: repetirlo tras una caída seguiría siendo una decisión
-  explícita, no automática.
+- Un efecto con resultado incierto queda en ``UNKNOWN`` y **no** se reintenta nunca de forma
+  automática: la única salida es una reconciliación explícita (`EffectLedger.reconcile`).
+- La llamada API de tareas de fases anteriores (`Camus.resume(approval_id, approved=...)`) conserva
+  su booleano: no conduce el kernel autónomo, cuyo `resume` exige `HumanApprovalProof`.
 - Ejecución **secuencial** por diseño; el paralelismo y el DAG llegan más adelante.
 - El reintento técnico del kernel está acotado (2 intentos) y solo cubre tropiezos técnicos; los
   reintentos de transporte ya viven en cada cliente de proveedor.

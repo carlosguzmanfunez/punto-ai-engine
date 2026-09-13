@@ -59,6 +59,42 @@ Cada rol ejecuta **solo** su etapa: el ``ARCHITECT`` llama a ``camus.analyze_pro
 composición de las dos—. El Planner recibe el diseño del Architect reconstruido desde la
 referencia durable de la petición; si esa referencia no resuelve a un diseño válido, la etapa
 falla con ``WORKFLOW_ROLE_FAILED`` en vez de repetir el diseño por su cuenta.
+
+El handoff durable es automático (ENGINE-6.0.2)
+-----------------------------------------------
+Desde 6.0.2 el adaptador **real** no necesita ninguna *closure* externa para el handoff (defecto
+V602-03): si se le inyecta un :class:`~punto.workflow.artifacts.ArtifactStore` en ``artifacts``,
+
+- el ``ARCHITECT`` publica su ``ArchitectureOutcome`` completo con
+  :func:`~punto.workflow.handoff.publish_architecture` y reporta la referencia en
+  ``artifact_references``;
+- el ``PLANNER`` resuelve el diseño desde las referencias de la petición
+  (:func:`~punto.workflow.handoff.resolve_architecture`), planifica sobre él y publica el bundle
+  durable del plan con :func:`~punto.workflow.handoff.publish_plan`;
+- el ``DEVELOPER`` resuelve el plan durable
+  (:func:`~punto.workflow.handoff.resolve_plan`) y construye su pareja
+  ``(DeveloperTask, ExecutionContext)`` con el constructor oficial
+  :func:`~punto.workflow.handoff.developer_input`.
+
+Sigue siendo posible inyectar un ``build_input`` explícito —los dobles y los llamantes que ya lo
+tenían siguen funcionando—, pero ya no es la única vía: el defecto reconstruye la entrada desde el
+almacén. Un rol sin constructor oficial (QA, Security, Reviewer, auditoría cruzada y QA visual)
+exige su ``build_input``: PUNTO no improvisa la entrada de un rol que no tiene handoff definido.
+
+Llamadas reales al modelo (V602-04-B)
+-------------------------------------
+``RoleExecutionResult.model_calls`` sale del informe real de cada rol: del ``ModelExecutionSummary``
+del Architect y el Planner, del contador ``model_calls`` del resto de informes y, si el informe no
+declara llamadas, de los intentos que sí declara. **Nunca** se deduce de los tokens: un rol puede
+llamar tres veces gastando pocos tokens o una sola gastando muchos.
+
+Saldo de modelo autorizado (V602-04-C)
+--------------------------------------
+El kernel calcula el saldo del intento (``RoleExecutionRequest.budget_allowance``) **antes** de
+invocar al rol y no lo invoca si está agotado. El adaptador real comprueba además ese saldo justo
+antes de llamar a CAMUS: con cero llamadas o cero tokens autorizados devuelve
+``WORKFLOW_BUDGET_EXCEEDED`` sin tocar el proveedor. El gasto ocurre dentro del adaptador, así que
+la cota del kernel tiene que estar también en la frontera que gasta.
 """
 
 from __future__ import annotations
@@ -69,15 +105,18 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 
+from punto.architect.base import ArchitectureOutcome
 from punto.common import utc_now
+from punto.planner.base import PlanningOutcome
 from punto.schemas.enums import FindingSeverity
 from punto.schemas.execution import ModelUsage
-from punto.schemas.planning import ModelExecutionSummary
+from punto.schemas.planning import ModelExecutionSummary, ProjectIntent
 from punto.schemas.workflow import (
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_FINDINGS,
     MAX_WORKFLOW_SUMMARY_CHARS,
     MAX_WORKFLOW_TEXT_CHARS,
+    ArtifactReference,
     ProviderCapability,
     RoleExecutionRequest,
     RoleExecutionResult,
@@ -89,6 +128,7 @@ from punto.schemas.workflow import (
 from punto.tools.errors import (
     ArchitectRunnerNotConfiguredError,
     CrossAuditRunnerNotConfiguredError,
+    DeveloperExecutionError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
     PlanningValidationError,
@@ -97,18 +137,24 @@ from punto.tools.errors import (
     SecurityRunnerNotConfiguredError,
     VisualQARunnerNotConfiguredError,
 )
-from punto.workflow.errors import WorkflowProviderUnavailableError
+from punto.workflow.artifacts import ArtifactStore
+from punto.workflow.errors import WorkflowError, WorkflowProviderUnavailableError
+from punto.workflow.handoff import (
+    developer_input,
+    publish_architecture,
+    publish_plan,
+    resolve_architecture,
+    resolve_plan,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from punto.architect.base import ArchitectureOutcome
     from punto.developer.context import ExecutionContext
     from punto.orchestrator.camus import Camus
     from punto.providers.base import ImagePayload
     from punto.schemas.cross_audit import CrossAuditTask
     from punto.schemas.execution import DeveloperTask
-    from punto.schemas.planning import ProjectIntent
     from punto.schemas.qa import QATask
     from punto.schemas.review import ReviewTask
     from punto.schemas.security import SecurityTask
@@ -120,6 +166,12 @@ _MAX_PROVIDER_CHARS: Final[int] = 40
 _MAX_MODEL_CHARS: Final[int] = 120
 #: Espejo del máximo de ``WorkflowFinding.category``.
 _MAX_CATEGORY_CHARS: Final[int] = 80
+#: Espejo del máximo de ``RoleExecutionResult.model_calls``: el contrato lo acota a ``le=64``.
+_MAX_MODEL_CALLS: Final[int] = 64
+#: Cota del nombre de la intención que se deriva del objetivo de la petición.
+_MAX_INTENT_NAME_CHARS: Final[int] = 120
+#: Nombre de la intención cuando el objetivo no deja ni un carácter utilizable.
+_DEFAULT_INTENT_NAME: Final[str] = "workflow"
 
 #: Estados reales que significan «el rol hizo su trabajo y es aceptable».
 _COMPLETED_STATES: Final[frozenset[str]] = frozenset({"PASS", "APPROVED", "SUCCESS"})
@@ -183,6 +235,8 @@ class _RoleView:
     artifacts: tuple[str, ...] = ()
     findings: tuple[WorkflowFinding, ...] = ()
     usage: ModelUsage | None = None
+    #: Llamadas reales al modelo declaradas por el informe. ``0`` significa «no las declara».
+    model_calls: int = 0
     #: Intentos declarados por el informe. ``0`` significa «no los declara».
     attempts: int = 0
     started_at: datetime | None = None
@@ -263,30 +317,56 @@ class UnavailableRoleExecutor:
 
 
 class CamusRoleExecutor:
-    """Adaptador real sobre CAMUS: llama al método público del rol y normaliza su informe.
+    """Adaptador real sobre CAMUS: llama al método público del rol, normaliza y publica el handoff.
 
-    Forma de ``build_input`` por rol, porque cada método de CAMUS recibe cosas distintas:
+    Forma de la entrada por rol, porque cada método de CAMUS recibe cosas distintas:
 
     - ``ARCHITECT``: un ``ProjectIntent``. Se ejecuta ``camus.analyze_project``, que hace
       **solo** el diseño y devuelve un ``ArchitectureOutcome``;
     - ``PLANNER``: la pareja ``(ProjectIntent, ArchitectureOutcome)``. Se ejecuta
       ``camus.plan_project_from_architecture``, que hace **solo** la planificación sobre el
-      diseño del Architect. ``build_input`` es quien reconstruye ese diseño desde la referencia
-      durable que viaja en ``RoleExecutionRequest.references`` (el ``reference`` apunta a un
-      artefacto del almacén del motor): el adaptador no lo adivina ni vuelve a ejecutar al
-      Architect para rellenar el hueco;
+      diseño del Architect. El diseño se reconstruye desde la referencia durable que viaja en
+      ``RoleExecutionRequest.references`` (el ``reference`` apunta a un artefacto del almacén del
+      motor): el adaptador no lo adivina ni vuelve a ejecutar al Architect para rellenar el hueco;
     - ``DEVELOPER``: la pareja ``(DeveloperTask, ExecutionContext)``;
     - ``QA``: un ``QATask``; ``SECURITY``: un ``SecurityTask``; ``REVIEWER``: un ``ReviewTask``;
       ``CROSS_AUDIT``: un ``CrossAuditTask``;
     - ``VISUAL_QA``: la pareja ``(VisualQATask, Mapping[str, ImagePayload])``.
 
+    Dos vías para construir esa entrada, y el **defecto** es la durable:
+
+    - ``build_input`` inyectado: la *closure* explícita del llamante. Se mantiene por
+      compatibilidad y para los dobles; si se da, manda;
+    - sin ``build_input`` y con ``artifacts``: el adaptador construye la entrada él mismo. El
+      ``ARCHITECT`` deriva la intención de la petición, el ``PLANNER`` resuelve el diseño del
+      almacén y el ``DEVELOPER`` resuelve el plan durable. Es el camino de producción
+      (ENGINE-6.0.2): el handoff no depende de variables del proceso anterior.
+
+    Un rol sin constructor oficial (``QA``, ``SECURITY``, ``REVIEWER``, ``CROSS_AUDIT`` y
+    ``VISUAL_QA``) sigue exigiendo ``build_input``: PUNTO no improvisa la entrada de un rol cuyo
+    handoff no está definido, y lo dice con un fallo explícito.
+
+    Publicación automática: con ``artifacts`` inyectado, el ``ARCHITECT`` publica su
+    ``ArchitectureOutcome`` completo y el ``PLANNER`` el bundle durable del plan, y ambos reportan
+    la referencia en ``artifact_references``. Nadie tiene que guardar nada a mano.
+
+    Saldo de modelo: antes de invocar a CAMUS se comprueba el ``budget_allowance`` de la petición.
+    Si el kernel autorizó cero llamadas o cero tokens, la etapa falla con
+    ``WORKFLOW_BUDGET_EXCEEDED`` y **no se toca el proveedor**: el saldo es la autorización de gasto
+    del intento, y gastarlo sin permiso es exactamente lo que el presupuesto del kernel existe para
+    impedir. Un saldo positivo **no** se propaga a CAMUS porque ningún método público del motor lo
+    admite como argumento: la cota real la aplica el kernel paso a paso, y el adaptador no puede
+    gastar más de lo autorizado porque el kernel no lo invoca cuando el saldo se agota y, si lo
+    invocara, esta comprobación lo detiene.
+
     Ningún rol de planificación usa ``camus.plan_project``: ese método compone las dos etapas, y
     llamarlo desde los dos adaptadores ejecutaría Architect + Planner dos veces.
 
     Si se da ``registry``, la capacidad se consulta con ``require(role, provider)`` **antes** de
-    llamar a CAMUS: un rol sin proveedor utilizable no llega a ejecutarse. Cualquier excepción que
-    no sea un fallo tipado de configuración, de proveedor o de validación del diseño se propaga
-    tal cual: ocultarla convertiría un defecto real en un resultado inventado.
+    llamar a CAMUS: un rol sin proveedor utilizable no llega a ejecutarse. Los fallos tipados de
+    configuración, de proveedor, de validación del diseño y del handoff se traducen a resultados del
+    contrato; cualquier otra excepción se propaga tal cual, porque ocultarla convertiría un defecto
+    real en un resultado inventado.
     """
 
     def __init__(
@@ -294,13 +374,15 @@ class CamusRoleExecutor:
         *,
         camus: Camus,
         role: RoleName,
-        build_input: Callable[[RoleExecutionRequest], object],
+        build_input: Callable[[RoleExecutionRequest], object] | None = None,
+        artifacts: ArtifactStore | None = None,
         registry: ProviderCapabilityRegistry | None = None,
         provider: str | None = None,
     ) -> None:
         self._camus = camus
         self._role = role
         self._build_input = build_input
+        self._artifacts = artifacts
         self._registry = registry
         self._provider = provider
         self._handlers: Mapping[RoleName, Callable[[object], object]] = MappingProxyType(
@@ -317,7 +399,7 @@ class CamusRoleExecutor:
         )
 
     def execute(self, request: RoleExecutionRequest) -> RoleExecutionResult:
-        """Comprueba la capacidad, delega en CAMUS y normaliza el informe resultante."""
+        """Comprueba la capacidad, delega en CAMUS, normaliza el informe y publica su artefacto."""
         if request.role is not self._role:
             return _failure(
                 self._role,
@@ -334,7 +416,39 @@ class CamusRoleExecutor:
         if blocked is not None:
             return blocked
 
-        payload = self._build_input(request)
+        exhausted = self._allowance_failure(request)
+        if exhausted is not None:
+            return exhausted
+
+        try:
+            payload = self._request_input(request)
+        except _InvalidRoleInputError as error:
+            return _failure(
+                self._role,
+                request,
+                status=RoleStatus.FAILED,
+                code=WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
+                detail=f"entrada inválida para {self._role.value}: {error}",
+            )
+        except WorkflowError as error:
+            return _failure(
+                self._role,
+                request,
+                status=RoleStatus.FAILED,
+                code=error.code,
+                detail=error.detail or str(error),
+            )
+        except DeveloperExecutionError as error:
+            return _failure(
+                self._role,
+                request,
+                status=RoleStatus.FAILED,
+                code=WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
+                detail=(
+                    f"la entrada del rol {self._role.value} no se pudo construir con el workspace "
+                    f"declarado por la petición: {error}"
+                ),
+            )
         try:
             produced = self._invoke(payload)
         except _NOT_CONFIGURED_ERRORS as error:
@@ -372,7 +486,8 @@ class CamusRoleExecutor:
                 code=WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
                 detail=f"entrada inválida para {self._role.value}: {error}",
             )
-        return _NORMALIZERS[self._role](produced, request)
+        result = _NORMALIZERS[self._role](produced, request)
+        return self._publish(request, payload, produced, result)
 
     def capability(self, role: RoleName) -> ProviderCapability | None:
         """Capacidad declarada por el registro, o ``None`` si el rol no se puede cubrir hoy."""
@@ -405,6 +520,169 @@ class CamusRoleExecutor:
                     f"proveedor={capability.provider!r}, available={capability.available}, "
                     f"credential_state={capability.credential_state.value}. No hay fallback"
                 ),
+            )
+        return None
+
+    def _allowance_failure(self, request: RoleExecutionRequest) -> RoleExecutionResult | None:
+        """Frena la etapa si el kernel **no** autorizó saldo de modelo para este intento.
+
+        El kernel calcula el saldo antes de invocar al rol y no lo invoca si está agotado; esto es
+        la segunda línea de defensa del adaptador real, y existe porque el gasto ocurre aquí dentro:
+        sin ella, un ejecutor construido a mano —o un llamante que reutilice la petición— podría
+        tocar el proveedor con saldo cero.
+
+        Se comprueban las dos cotas que el saldo declara: llamadas de modelo y tokens. Cualquiera de
+        las dos agotada detiene la etapa, porque ninguna de las dos se puede recuperar gastando la
+        otra. Un saldo ``None`` significa «el kernel no declaró saldo»: el adaptador no se inventa
+        uno, y la cota que aplica entonces es la del propio contrato del rol.
+        """
+        allowance = request.budget_allowance
+        if allowance is None:
+            return None
+        if allowance.model_calls_remaining > 0 and allowance.tokens_remaining > 0:
+            return None
+        return _failure(
+            self._role,
+            request,
+            status=RoleStatus.FAILED,
+            code=WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
+            detail=(
+                "el saldo de modelo autorizado por el kernel está agotado: no se invoca al "
+                f"proveedor (model_calls_remaining={allowance.model_calls_remaining}, "
+                f"tokens_remaining={allowance.tokens_remaining}). Cero llamadas reales"
+            ),
+        )
+
+    def _request_input(self, request: RoleExecutionRequest) -> object:
+        """Entrada del rol: la inyectada si la hay y, si no, la que PUNTO deriva de la petición.
+
+        El ``build_input`` explícito manda porque es el contrato que ya existía (dobles de prueba y
+        llamantes que construyen su propia entrada). Sin él, el defecto es el handoff durable: para
+        un rol sin constructor oficial se falla explícitamente en vez de improvisar.
+        """
+        if self._build_input is not None:
+            return self._build_input(request)
+        return self._durable_input(request)
+
+    def _durable_input(self, request: RoleExecutionRequest) -> object:
+        """Entrada reconstruida desde el almacén de artefactos, sin ninguna *closure* externa.
+
+        - ``ARCHITECT``: la intención derivada de la petición (es la primera etapa);
+        - ``PLANNER``: la pareja ``(intención, diseño resuelto del almacén)``;
+        - ``DEVELOPER``: la pareja ``(DeveloperTask, ExecutionContext)`` del plan durable.
+
+        Raises:
+            _InvalidRoleInputError: si la etapa no tiene constructor oficial o si falta el
+                artefacto del que depende. El detalle viaja al resultado ``FAILED``.
+        """
+        if self._role is RoleName.ARCHITECT:
+            return _intent_from_request(request)
+        if self._role is RoleName.PLANNER:
+            return (_intent_from_request(request), self._resolve_design(request))
+        if self._role is RoleName.DEVELOPER:
+            return self._developer_input(request)
+        msg = (
+            f"el rol {self._role.value} exige un build_input explícito: PUNTO no improvisa la "
+            "entrada de un rol que no tiene constructor oficial en el handoff durable"
+        )
+        raise _InvalidRoleInputError(msg)
+
+    def _resolve_design(self, request: RoleExecutionRequest) -> ArchitectureOutcome:
+        """Diseño del Architect resuelto desde las referencias durables de la petición.
+
+        Raises:
+            _InvalidRoleInputError: si no hay almacén inyectado o si no hay referencia
+                ``ARCHITECTURE`` resoluble. Un artefacto corrupto no cae aquí: sube como
+                ``WorkflowError`` con su código propio, que es lo que el kernel sabe interpretar.
+        """
+        if self._artifacts is None:
+            msg = (
+                "el rol PLANNER necesita el diseño del Architect y no hay almacén de artefactos "
+                "inyectado: sin 'artifacts' ni 'build_input', el handoff no se puede reconstruir"
+            )
+            raise _InvalidRoleInputError(msg)
+        design = resolve_architecture(self._artifacts, request.references)
+        if design is None:
+            msg = (
+                "falta el diseño del Architect en las referencias durables de la petición "
+                "(RoleExecutionRequest.references): el Planner no planifica sin él y PUNTO no "
+                "vuelve a ejecutar al Architect para suplirlo"
+            )
+            raise _InvalidRoleInputError(msg)
+        return design
+
+    def _developer_input(
+        self, request: RoleExecutionRequest
+    ) -> tuple[DeveloperTask, ExecutionContext]:
+        """Pareja ``(DeveloperTask, ExecutionContext)`` construida desde el plan durable.
+
+        Raises:
+            _InvalidRoleInputError: si no hay almacén inyectado o si la petición no trae una
+                referencia ``PLANNING`` resoluble. PUNTO no vuelve a ejecutar al Planner para
+                rellenar el hueco.
+        """
+        if self._artifacts is None:
+            msg = (
+                "el rol DEVELOPER necesita el plan durable y no hay almacén de artefactos "
+                "inyectado: sin 'artifacts' ni 'build_input', el handoff no se puede reconstruir"
+            )
+            raise _InvalidRoleInputError(msg)
+        plan = resolve_plan(self._artifacts, request.references)
+        if plan is None:
+            msg = (
+                "falta el plan durable en las referencias de la petición "
+                "(RoleExecutionRequest.references): el Developer no trabaja sin plan y PUNTO no "
+                "vuelve a ejecutar al Planner para suplirlo"
+            )
+            raise _InvalidRoleInputError(msg)
+        return developer_input(plan, request)
+
+    def _publish(
+        self,
+        request: RoleExecutionRequest,
+        payload: object,
+        produced: object,
+        result: RoleExecutionResult,
+    ) -> RoleExecutionResult:
+        """Publica el artefacto durable de la etapa y lo reporta, cuando la etapa lo produce.
+
+        Solo se publica un resultado ``COMPLETED``: un informe fallido no deja un artefacto que la
+        etapa siguiente pudiera confundir con un diseño o un plan válidos. Sin almacén inyectado no
+        se publica nada, y el adaptador se comporta como antes de ENGINE-6.0.2.
+        """
+        store = self._artifacts
+        if store is None or result.status is not RoleStatus.COMPLETED:
+            return result
+        reference = self._durable_reference(request, store, payload, produced)
+        if reference is None:
+            return result
+        return result.model_copy(update={"artifact_references": (reference,)})
+
+    def _durable_reference(
+        self,
+        request: RoleExecutionRequest,
+        store: ArtifactStore,
+        payload: object,
+        produced: object,
+    ) -> ArtifactReference | None:
+        """Referencia del artefacto durable de esta etapa, o ``None`` si la etapa no publica.
+
+        El ``ARCHITECT`` publica su outcome completo; el ``PLANNER`` publica el bundle del plan
+        junto al diseño que acaba de usar, que es lo que hace al plan resoluble sin volver a
+        planificar. Los demás roles no producen handoff durable en esta fase.
+        """
+        if self._role is RoleName.ARCHITECT and isinstance(produced, ArchitectureOutcome):
+            if produced.proposal is None:
+                return None
+            return publish_architecture(store, request=request, outcome=produced)
+        if self._role is RoleName.PLANNER and isinstance(produced, PlanningOutcome):
+            if produced.roadmap is None or produced.task_graph is None:
+                return None
+            return publish_plan(
+                store,
+                request=request,
+                outcome=produced,
+                architecture=_design_of(payload),
             )
         return None
 
@@ -500,6 +778,7 @@ def normalize_architecture(outcome: object, request: RoleExecutionRequest) -> Ro
             artifacts=_component_ids(outcome),
             usage=_as_usage(getattr(summary, "usage", None))
             or _as_usage(getattr(outcome, "model_usage", None)),
+            model_calls=_model_calls(outcome, summary),
             attempts=_int(summary, "attempts_used"),
             started_at=_moment(outcome, "started_at"),
             completed_at=_moment(outcome, "completed_at"),
@@ -530,6 +809,7 @@ def normalize_planning(outcome: object, request: RoleExecutionRequest) -> RoleEx
             artifacts=_planned_task_ids(outcome),
             usage=_as_usage(getattr(summary, "usage", None))
             or _as_usage(getattr(outcome, "model_usage", None)),
+            model_calls=_model_calls(outcome, summary),
             attempts=_int(summary, "attempts_used"),
             started_at=_moment(outcome, "started_at"),
             completed_at=_moment(outcome, "completed_at"),
@@ -558,6 +838,7 @@ def normalize_developer(result: object, request: RoleExecutionRequest) -> RoleEx
             model=_text(result, "model"),
             artifacts=_attribute_texts(result, "files_changed", "path"),
             usage=_as_usage(getattr(result, "usage", None)),
+            model_calls=_model_calls(result, None),
             attempts=_int(result, "attempts_used"),
             started_at=_moment(result, "started_at"),
             completed_at=_moment(result, "completed_at"),
@@ -589,6 +870,7 @@ def normalize_qa(report: object, request: RoleExecutionRequest) -> RoleExecution
                 report, RoleName.QA, ("file", "acceptance_criterion", "repair_hint")
             ),
             usage=_as_usage(getattr(report, "model_usage", None)),
+            model_calls=_model_calls(report, None),
             attempts=_int(report, "attempts"),
             started_at=_moment(report, "started_at"),
             completed_at=_moment(report, "completed_at"),
@@ -621,6 +903,7 @@ def normalize_security(report: object, request: RoleExecutionRequest) -> RoleExe
                 report, RoleName.SECURITY, ("impact", "file", "acceptance_criterion")
             ),
             usage=_as_usage(getattr(report, "model_usage", None)),
+            model_calls=_model_calls(report, None),
             attempts=_int(report, "attempts"),
             started_at=_moment(report, "started_at"),
             completed_at=_moment(report, "completed_at"),
@@ -645,6 +928,7 @@ def normalize_review(report: object, request: RoleExecutionRequest) -> RoleExecu
             artifacts=_texts(report, "model_visible_files"),
             findings=_findings(report, RoleName.REVIEWER, ("file", "recommendation")),
             usage=_as_usage(getattr(report, "model_usage", None)),
+            model_calls=_model_calls(report, None),
             attempts=_int(report, "attempts"),
             started_at=_moment(report, "started_at"),
             completed_at=_moment(report, "completed_at"),
@@ -669,6 +953,7 @@ def normalize_cross_audit(report: object, request: RoleExecutionRequest) -> Role
             artifacts=_texts(report, "model_visible_files"),
             findings=_findings(report, RoleName.CROSS_AUDIT, ("file", "recommendation")),
             usage=_as_usage(getattr(report, "model_usage", None)),
+            model_calls=_model_calls(report, None),
             attempts=_int(report, "attempts"),
             started_at=_moment(report, "started_at"),
             completed_at=_moment(report, "completed_at"),
@@ -697,6 +982,7 @@ def normalize_visual_qa(report: object, request: RoleExecutionRequest) -> RoleEx
             ),
             findings=_findings(report, RoleName.VISUAL_QA, ("route", "viewport", "recommendation")),
             usage=_as_usage(getattr(report, "model_usage", None)),
+            model_calls=_model_calls(report, None),
             attempts=_int(report, "attempts"),
             started_at=_moment(report, "started_at"),
             completed_at=_moment(report, "completed_at"),
@@ -737,6 +1023,7 @@ def _result(role: RoleName, request: RoleExecutionRequest, view: _RoleView) -> R
         findings=view.findings[:MAX_WORKFLOW_FINDINGS],
         recommendation=_excerpt(view.recommendation, MAX_WORKFLOW_TEXT_CHARS),
         usage=view.usage if view.usage is not None else ModelUsage(),
+        model_calls=_bounded_model_calls(view.model_calls),
         provider=_excerpt(view.provider, _MAX_PROVIDER_CHARS),
         model=_excerpt(view.model, _MAX_MODEL_CHARS),
         attempts=view.attempts if view.attempts >= 1 else request.attempt,
@@ -781,6 +1068,44 @@ def _pair(payload: object, role: RoleName, expectation: str) -> tuple[object, ob
         f"se recibió {type(payload).__name__}"
     )
     raise _InvalidRoleInputError(msg)
+
+
+def _intent_from_request(request: RoleExecutionRequest) -> ProjectIntent:
+    """Intención que PUNTO deriva de la petición, sin inventar datos del producto.
+
+    El kernel declara el objetivo humano, los criterios y el workspace; **no** declara nombre de
+    producto ni dominio. Así que la intención se construye solo con lo declarado: el objetivo como
+    descripción y su primera línea acotada como nombre. Nada de rellenar campos que la petición no
+    trae: un dato inventado en la intención acabaría en el diseño del Architect como si alguien lo
+    hubiera pedido.
+
+    Es determinista: la misma petición produce siempre la misma intención, sin reloj ni azar.
+    """
+    name = _one_line(request.objective)[:_MAX_INTENT_NAME_CHARS].strip() or _DEFAULT_INTENT_NAME
+    return ProjectIntent(name=name, description=request.objective)
+
+
+def _one_line(text: str) -> str:
+    """Primera línea del texto, sin espacios sobrantes, o cadena vacía si no hay texto."""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    return stripped.splitlines()[0].strip()
+
+
+def _design_of(payload: object) -> ArchitectureOutcome | None:
+    """Diseño del Architect que viajó en la entrada del Planner, si es un diseño de verdad.
+
+    La entrada del Planner es la pareja ``(ProjectIntent, ArchitectureOutcome)``. Se comprueba el
+    tipo en vez de confiar en la posición: si lo que llegó no es un diseño, el bundle del plan se
+    publica sin las piezas del diseño (que es un hueco declarado) en lugar de con un objeto ajeno
+    serializado como si fuera una arquitectura.
+    """
+    if isinstance(payload, tuple) and len(payload) == 2:
+        candidate = payload[1]
+        if isinstance(candidate, ArchitectureOutcome):
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1216,41 @@ def _model_summary(report: object, role: RoleName) -> ModelExecutionSummary | No
     if isinstance(nested, ModelExecutionSummary):
         return nested
     return None
+
+
+def _model_calls(report: object, summary: ModelExecutionSummary | None) -> int:
+    """Llamadas reales al modelo que declara el informe (V602-04-B), con precedencia explícita.
+
+    Orden, de la fuente más específica a la más general:
+
+    1. ``ModelExecutionSummary.model_calls`` del informe: es el contador propio del resumen de
+       ejecución del Architect y del Planner, y el único que declara llamadas de reparación;
+    2. el ``model_calls`` del propio informe: lo declaran el Developer, QA, Security, el Reviewer,
+       la auditoría cruzada y la QA visual;
+    3. los intentos que el informe sí declara —``attempts_used`` y, en los informes que lo llaman
+       así, ``attempts``—: un intento de reparación es una llamada al modelo, y es lo único que
+       queda cuando el informe no cuenta llamadas.
+
+    Si no hay ninguno, ``0``: el informe no declara llamadas y ninguna se inventa. Los **tokens no
+    se usan nunca** como fuente: un rol puede llamar tres veces gastando pocos tokens o una sola
+    gastando muchos, así que los tokens no son un contador de llamadas.
+    """
+    candidates = (
+        None if summary is None else summary.model_calls,
+        _int(report, "model_calls"),
+        None if summary is None else summary.attempts_used,
+        _int(report, "attempts_used"),
+        _int(report, "attempts"),
+    )
+    for declared in candidates:
+        if declared is not None and declared > 0:
+            return declared
+    return 0
+
+
+def _bounded_model_calls(value: int) -> int:
+    """Acota las llamadas al rango del contrato (``ge=0, le=64``) sin cambiar su significado."""
+    return min(max(value, 0), _MAX_MODEL_CALLS)
 
 
 def _component_ids(outcome: object) -> tuple[str, ...]:

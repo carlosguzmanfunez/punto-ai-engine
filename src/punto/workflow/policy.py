@@ -68,7 +68,7 @@ from punto.schemas.workflow import (
     WorkflowRequest,
     WorkflowRun,
 )
-from punto.workflow.errors import WorkflowError
+from punto.workflow.errors import WorkflowApprovalProofInvalidError, WorkflowError
 
 #: Resultados que habilitan la ejecución. Es el mapeo fijo del encargo: el ``outcome`` del motor
 #: es la fuente única de verdad de si la acción puede continuar.
@@ -293,12 +293,16 @@ class WorkflowPolicy:
         Sin ``policy_decision_id`` no se registra nada: una aprobación sin la decisión que la motiva
         no podría autorizar ninguna reanudación, así que se rechaza al entrar.
 
-        El ``resume_status`` se toma de ``gate_request.human_gate_resume_status``; si ese estado no
-        pertenece a :data:`punto.policy.human_gate.RESUMABLE_STATUSES`, se registra
-        ``TaskStatus.IN_PROGRESS``, que sí es un destino de reanudación autorizado.
+        El ``resume_status`` es ``gate_request.human_gate_resume_status``, **sin sustituciones**: si
+        no coincide con ``proposed_next_state`` o no es un destino de reanudación autorizado, no se
+        registra ninguna aprobación (hallazgo V602-01).
 
         Returns:
             La solicitud creada en el Human Gate, en estado ``PENDING``.
+
+        Raises:
+            WorkflowApprovalProofInvalidError: si el destino declarado y el propuesto no coinciden o
+                el declarado no es reanudable.
         """
         decision_id = gate_request.policy_decision_id
         if decision_id is None:
@@ -391,10 +395,25 @@ class WorkflowPolicy:
                 f"cita {gate.policy_decision_id}"
             )
 
+        # Coherencia del destino: el estado que el gate propone aplicar, el que declara autorizar y
+        # el que la prueba autoriza tienen que ser el mismo. Sin esta comprobación una prueba que
+        # autoriza ``IN_PROGRESS`` podía reanudar a ``ANALYZING`` (hallazgo V602-01).
+        if gate.proposed_next_state != gate.human_gate_resume_status:
+            raise _invalid_proof(
+                f"el gate propone {gate.proposed_next_state.value} y declara autorizar "
+                f"{gate.human_gate_resume_status.value}: autorización y destino no coinciden"
+            )
+
         if proof.resume_status != gate.human_gate_resume_status:
             raise _invalid_proof(
                 f"la prueba autoriza reanudar a {proof.resume_status.value} y el gate declaró "
                 f"{gate.human_gate_resume_status.value}"
+            )
+
+        if proof.resume_status != gate.proposed_next_state:
+            raise _invalid_proof(
+                f"la prueba autoriza reanudar a {proof.resume_status.value} y el destino real del "
+                f"workflow es {gate.proposed_next_state.value}"
             )
 
 
@@ -442,16 +461,32 @@ def _reason_for(reason: str, *, role: RoleName, stage: TaskStatus) -> str:
 
 
 def _resume_status_for(gate_request: HumanGateRequest) -> TaskStatus:
-    """Estado de reanudación válido para el Human Gate real.
+    """Estado de reanudación declarado por el gate, sin sustituirlo por otro.
 
-    Se toma del gate y, si no es un destino de reanudación autorizado, se registra
-    ``TaskStatus.IN_PROGRESS``: el gate **exige** un estado reanudable, y reanudar el trabajo donde
-    se interrumpió es el destino conservador y siempre autorizado.
+    Antes se caía a ``IN_PROGRESS`` cuando el estado declarado no era reanudable, y esa
+    sustitución era el defecto V602-01: el gate acababa autorizando un destino distinto del que el
+    workflow iba a aplicar. Ahora la función **exige** coherencia: el estado declarado tiene que ser
+    un destino de reanudación autorizado y tiene que coincidir con el destino propuesto. Si no
+    encaja, no se registra ninguna aprobación, porque una autorización que no describe la
+    reanudación real no autoriza nada.
+
+    Raises:
+        WorkflowApprovalProofInvalidError: si el estado declarado no es reanudable o no coincide
+            con ``proposed_next_state``.
     """
-    status = gate_request.human_gate_resume_status
-    if status in RESUMABLE_STATUSES:
-        return status
-    return TaskStatus.IN_PROGRESS
+    declared = gate_request.human_gate_resume_status
+    proposed = gate_request.proposed_next_state
+    if declared != proposed:
+        raise WorkflowApprovalProofInvalidError(
+            f"el Human Gate declara reanudar a {declared.value} y propone {proposed.value}: el "
+            "destino autorizado y el destino aplicado tienen que ser el mismo estado"
+        )
+    if declared not in RESUMABLE_STATUSES:
+        raise WorkflowApprovalProofInvalidError(
+            f"{declared.value} no es un destino de reanudación autorizado: una aprobación hacia "
+            "ese estado no reanudaría el workflow"
+        )
+    return declared
 
 
 def _swing_note(swing: object | None) -> str:

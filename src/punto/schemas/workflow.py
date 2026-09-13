@@ -249,6 +249,22 @@ class ProviderCapability(BaseModel):
         return role in self.role_support
 
 
+class BudgetAllowance(BaseModel):
+    """Lo que el rol **puede** gastar en modelo, calculado por el kernel antes de ejecutarlo.
+
+    Es la frontera que convierte ``max_model_calls`` y ``max_total_tokens`` en un límite real
+    (hallazgo V602-04): sin ella el kernel solo se enteraba del gasto **después** de la llamada, y
+    un ``max_model_calls=0`` todavía permitía una invocación real al proveedor. El rol recibe el
+    saldo y no puede rebasarlo: si el saldo es cero, no llama al modelo.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model_calls_remaining: int = Field(default=0, ge=0)
+    tokens_remaining: int = Field(default=0, ge=0)
+    wall_time_seconds_remaining: float = Field(default=0.0, ge=0.0)
+
+
 class RoleExecutionRequest(BaseModel):
     """Lo que el kernel le pide a un rol. Sin secretos y con el contexto acotado."""
 
@@ -270,6 +286,9 @@ class RoleExecutionRequest(BaseModel):
     references: tuple[ArtifactReference, ...] = Field(
         default=(), max_length=MAX_WORKFLOW_ARTIFACTS
     )
+    #: Saldo de gasto en modelo autorizado para este intento. ``None`` significa «el kernel no
+    #: declaró saldo»: un ejecutor real no puede inventarse uno y, por defecto, no gasta.
+    budget_allowance: BudgetAllowance | None = Field(default=None)
     attempt: int = Field(default=1, ge=1, description="Intento técnico, no reparación.")
     idempotency_key: str = Field(..., min_length=1, max_length=120)
 

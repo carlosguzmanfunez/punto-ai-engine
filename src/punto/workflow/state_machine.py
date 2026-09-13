@@ -19,7 +19,7 @@ from types import MappingProxyType
 from typing import Final
 
 from punto.common import utc_now
-from punto.schemas.enums import AuthorityLevel, TaskStatus
+from punto.schemas.enums import HUMAN_GATE_RESUME_STATUSES, AuthorityLevel, TaskStatus
 from punto.schemas.workflow import (
     TERMINAL_WORKFLOW_STATUSES,
     WorkflowDecisionKind,
@@ -72,6 +72,7 @@ WORKFLOW_TRANSITIONS: Final[MappingProxyType[TaskStatus, frozenset[TaskStatus]]]
                 TaskStatus.SECURITY,
                 TaskStatus.REPAIRING,
                 TaskStatus.BLOCKED,
+                TaskStatus.HUMAN_APPROVAL,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
             }
@@ -122,20 +123,16 @@ WORKFLOW_TRANSITIONS: Final[MappingProxyType[TaskStatus, frozenset[TaskStatus]]]
 )
 
 #: Estados a los que se puede reanudar desde una pausa, con operación explícita.
+#:
+#: Los destinos desde ``HUMAN_APPROVAL`` se **derivan** de
+#: :data:`punto.schemas.enums.HUMAN_GATE_RESUME_STATUSES`, que es la fuente única que también
+#: valida el Human Gate al registrar la solicitud (hallazgo V602-01): así el destino que la
+#: ``HumanApprovalProof`` autoriza y el que esta tabla permite son, por construcción, el mismo.
+#: Tener dos listas habría dejado abierta la puerta a una prueba que autoriza un estado y una
+#: reanudación que va a otro.
 RESUME_TARGETS: Final[MappingProxyType[TaskStatus, frozenset[TaskStatus]]] = MappingProxyType(
     {
-        TaskStatus.HUMAN_APPROVAL: frozenset(
-            {
-                TaskStatus.ANALYZING,
-                TaskStatus.PLANNING,
-                TaskStatus.READY,
-                TaskStatus.IN_PROGRESS,
-                TaskStatus.QA,
-                TaskStatus.SECURITY,
-                TaskStatus.REVIEW,
-                TaskStatus.APPROVED,
-            }
-        ),
+        TaskStatus.HUMAN_APPROVAL: HUMAN_GATE_RESUME_STATUSES,
         TaskStatus.BLOCKED: frozenset(
             {
                 TaskStatus.ANALYZING,

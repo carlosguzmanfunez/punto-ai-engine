@@ -1,4 +1,4 @@
-"""Pipeline de roles por etapa (ENGINE-6.0).
+"""Pipeline de roles por etapa (ENGINE-6.0 / 6.0.2).
 
 Dos decisiones que conviene dejar escritas:
 
@@ -8,10 +8,17 @@ Dos decisiones que conviene dejar escritas:
   intacto y, a la vez, la aprobación final exige que esas verificaciones hayan pasado.
 - **Nada obligatorio que no aplique.** ``VISUAL_QA`` solo entra si la tarea o el perfil lo exigen;
   una tarea sin interfaz no se bloquea por una verificación visual que no tiene objeto.
+
+Y una tercera, de ENGINE-6.0.2: **la duda no se resuelve a favor de omitir** (hallazgo V602-06). La
+aplicabilidad de la verificación visual tiene tres respuestas —requerida, no requerida y
+**desconocida**— y una ruta que no se puede perfilar no se convierte en «no aplica»: se declara
+desconocida y el workflow no cierra sin evidencia. Omitir el ``project_path`` tampoco desactiva la
+verificación: si no lo declara, se perfila el ``workspace_path``.
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -19,6 +26,19 @@ from typing import Final
 from punto.schemas.enums import TaskStatus
 from punto.schemas.workflow import RoleName, WorkflowRequest
 from punto.web.detection import detect_web_project
+
+
+class VisualApplicability(StrEnum):
+    """Veredicto sobre si la verificación visual es exigible para una petición.
+
+    ``UNKNOWN`` no es un sinónimo de ``NOT_REQUIRED``: significa que PUNTO no pudo decidirlo (no hay
+    ruta de proyecto que perfilar, o no se pudo leer). Tratar la duda como «no aplica» permitiría
+    desactivar la verificación omitiendo metadatos, que es exactamente lo que no puede ocurrir.
+    """
+
+    REQUIRED = "REQUIRED"
+    NOT_REQUIRED = "NOT_REQUIRED"
+    UNKNOWN = "UNKNOWN"
 
 #: Rol o roles que se ejecutan en cada etapa, en orden determinista.
 STAGE_ROLES: Final[MappingProxyType[TaskStatus, tuple[RoleName, ...]]] = MappingProxyType(
@@ -71,7 +91,7 @@ def stage_roles(stage: TaskStatus, request: WorkflowRequest) -> tuple[RoleName, 
 
 
 def visual_qa_required(request: WorkflowRequest) -> bool:
-    """True si la verificación visual es exigible para esta petición.
+    """True si la verificación visual es **exigible** para esta petición.
 
     No basta con el campo declarado por quien llama: un ``False`` (o su omisión) no puede anular una
     necesidad objetiva. La regla es:
@@ -80,28 +100,52 @@ def visual_qa_required(request: WorkflowRequest) -> bool:
     - y si el proyecto tiene un **perfil web determinista** (se detecta con la capa que ya existe),
       también se exige, aunque el llamante no lo haya dicho.
 
-    Un proyecto no web no arrastra una verificación visual que no tiene objeto.
+    La ruta se resuelve con :func:`_project_path`: si no se declara ``project_path``, se perfila el
+    ``workspace_path``, así que omitir la ruta no desactiva la verificación (hallazgo V602-06). Un
+    proyecto no web no arrastra una verificación que no tiene objeto; una ruta que no se puede
+    perfilar devuelve ``UNKNOWN`` y se trata como no exigible **solo** en esta función: el kernel
+    exige evidencia antes de cerrar (ver :func:`visual_applicability`).
     """
     if request.web_visual_required:
         return True
+    return visual_applicability(request) is VisualApplicability.REQUIRED
+
+
+def visual_applicability(request: WorkflowRequest) -> VisualApplicability:
+    """Aplicabilidad de la verificación visual, con la duda declarada como duda.
+
+    ``UNKNOWN`` cuando no hay ruta que perfilar o la ruta no se puede leer: en ese caso no se sabe
+    si el proyecto tiene interfaz, y PUNTO no convierte «no sé» en «no aplica».
+    """
     project = _project_path(request)
     if project is None:
-        return False
+        return VisualApplicability.UNKNOWN
+    if not project.is_dir():
+        return VisualApplicability.UNKNOWN
     try:
         profile = detect_web_project(project)
     except (OSError, ValueError):
-        # Un proyecto ilegible no convierte la verificación en obligatoria: no se sabe, y fingir que
-        # se sabe sería peor que declararlo no aplicable.
-        return False
-    return profile.is_web_project
+        # Un proyecto ilegible no se declara no-web: no se sabe, y fingir que se sabe sería peor que
+        # declarar la duda.
+        return VisualApplicability.UNKNOWN
+    return (
+        VisualApplicability.REQUIRED
+        if profile.is_web_project
+        else VisualApplicability.NOT_REQUIRED
+    )
 
 
 def _project_path(request: WorkflowRequest) -> Path | None:
-    """Ruta del proyecto a perfilar, si la petición declara dónde está."""
-    if not request.project_path:
-        return None
-    base = Path(request.workspace_path) if request.workspace_path else Path()
-    return base / request.project_path
+    """Ruta del proyecto a perfilar.
+
+    ``project_path`` es relativo a ``workspace_path``. Si no se declara, se perfila el propio
+    ``workspace_path``: la raíz del workspace ya identifica al proyecto cuando el trabajo se hace
+    sobre él, y exigir una segunda ruta para «activar» la verificación sería una puerta trasera.
+    """
+    base = Path(request.workspace_path) if request.workspace_path else None
+    if request.project_path:
+        return (base / request.project_path) if base is not None else Path(request.project_path)
+    return base
 
 
 def next_stage(stage: TaskStatus) -> TaskStatus | None:
@@ -137,9 +181,11 @@ __all__ = [
     "NEXT_STAGE",
     "REVIEW_VERIFICATIONS",
     "STAGE_ROLES",
+    "VisualApplicability",
     "next_stage",
     "required_roles",
     "stage_roles",
     "verification_required",
+    "visual_applicability",
     "visual_qa_required",
 ]

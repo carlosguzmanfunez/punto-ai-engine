@@ -35,7 +35,7 @@ from punto.schemas.workflow import (
     WorkflowRequest,
     WorkflowRun,
 )
-from punto.workflow.errors import WorkflowError
+from punto.workflow.errors import WorkflowApprovalProofInvalidError, WorkflowError
 from punto.workflow.policy import (
     ActionImpact,
     PolicyGate,
@@ -110,7 +110,11 @@ def _gate_request(
     resume_status: TaskStatus = TaskStatus.IN_PROGRESS,
     approval_id: UUID | None = None,
 ) -> HumanGateRequest:
-    """Solicitud de Human Gate del kernel, con la decisión de política indicada."""
+    """Solicitud de Human Gate del kernel, con la decisión de política indicada.
+
+    El destino propuesto y el declarado para autorizar son **el mismo** estado: la coherencia que
+    exige el hallazgo V602-01 empieza en la propia solicitud, no en la comprobación posterior.
+    """
     return HumanGateRequest(
         workflow_id=uuid4(),
         task_id=task_id,
@@ -118,8 +122,8 @@ def _gate_request(
         requested_action="deploy_production",
         risk=RiskLevel.CRITICAL,
         authority_required=AuthorityLevel.LEVEL_3_HUMAN,
-        current_state=TaskStatus.REVIEW,
-        proposed_next_state=TaskStatus.APPROVED,
+        current_state=resume_status,
+        proposed_next_state=resume_status,
         context_summary="desplegar la versión validada",
         policy_outcome=PolicyOutcome.REQUIRE_HUMAN.value,
         human_gate_resume_status=resume_status,
@@ -439,23 +443,15 @@ def test_request_human_gate_sin_decision_de_politica_no_registra_nada(
 
 
 @pytest.mark.parametrize(
-    ("declarado", "esperado"),
-    [
-        (TaskStatus.IN_PROGRESS, TaskStatus.IN_PROGRESS),
-        (TaskStatus.READY, TaskStatus.READY),
-        (TaskStatus.REVIEW, TaskStatus.REVIEW),
-        (TaskStatus.APPROVED, TaskStatus.APPROVED),
-        (TaskStatus.HUMAN_APPROVAL, TaskStatus.IN_PROGRESS),
-        (TaskStatus.COMPLETED, TaskStatus.IN_PROGRESS),
-    ],
+    "declarado",
+    [TaskStatus.IN_PROGRESS, TaskStatus.READY, TaskStatus.REVIEW, TaskStatus.APPROVED],
 )
-def test_request_human_gate_solo_registra_estados_reanudables(
+def test_request_human_gate_registra_el_estado_de_reanudacion_declarado(
     workflow_policy: WorkflowPolicy,
     human_gate: HumanGate,
     declarado: TaskStatus,
-    esperado: TaskStatus,
 ) -> None:
-    """Un estado de reanudación no autorizado se sustituye por ``IN_PROGRESS``, documentado."""
+    """El estado autorizado es el declarado, sin sustituciones (hallazgo V602-01)."""
     peticion = _peticion(action="deploy_production")
     veredicto = workflow_policy.evaluate_action(
         request=peticion, role=RoleName.REVIEWER, stage=TaskStatus.REVIEW
@@ -466,7 +462,64 @@ def test_request_human_gate_solo_registra_estados_reanudables(
         resume_status=declarado,
     )
     approval = workflow_policy.request_human_gate(request=peticion, gate_request=gate_request)
-    assert approval.resume_status == esperado.value
+    assert approval.resume_status == declarado.value
+
+
+@pytest.mark.parametrize(
+    "declarado",
+    [
+        TaskStatus.HUMAN_APPROVAL,
+        TaskStatus.COMPLETED,
+        TaskStatus.NEW,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ],
+)
+def test_request_human_gate_rechaza_un_destino_no_reanudable(
+    workflow_policy: WorkflowPolicy,
+    human_gate: HumanGate,
+    declarado: TaskStatus,
+) -> None:
+    """Un destino que no es reanudable no se sustituye por otro: no se registra el gate.
+
+    Antes se caía a ``IN_PROGRESS``, y esa sustitución permitía que la autorización describiera un
+    destino distinto del que el workflow aplicaría (hallazgo V602-01).
+    """
+    peticion = _peticion(action="deploy_production")
+    veredicto = workflow_policy.evaluate_action(
+        request=peticion, role=RoleName.REVIEWER, stage=TaskStatus.REVIEW
+    )
+    gate_request = _gate_request(
+        task_id=peticion.task_id,
+        policy_decision_id=veredicto.decision.id,
+        resume_status=declarado,
+    )
+    with pytest.raises(WorkflowApprovalProofInvalidError) as excinfo:
+        workflow_policy.request_human_gate(request=peticion, gate_request=gate_request)
+
+    assert "no es un destino de reanudación autorizado" in excinfo.value.detail
+    assert human_gate.list_all() == ()
+
+
+def test_request_human_gate_rechaza_un_destino_incoherente(
+    workflow_policy: WorkflowPolicy, human_gate: HumanGate
+) -> None:
+    """Si el gate propone un destino y declara autorizar otro, no se registra nada."""
+    peticion = _peticion(action="deploy_production")
+    veredicto = workflow_policy.evaluate_action(
+        request=peticion, role=RoleName.REVIEWER, stage=TaskStatus.REVIEW
+    )
+    gate_request = _gate_request(
+        task_id=peticion.task_id,
+        policy_decision_id=veredicto.decision.id,
+        resume_status=TaskStatus.REVIEW,
+    ).model_copy(update={"proposed_next_state": TaskStatus.IN_PROGRESS})
+
+    with pytest.raises(WorkflowApprovalProofInvalidError) as excinfo:
+        workflow_policy.request_human_gate(request=peticion, gate_request=gate_request)
+
+    assert "tienen que ser el mismo estado" in excinfo.value.detail
+    assert human_gate.list_all() == ()
 
 
 # ---------------------------------------------------------------------------
@@ -592,12 +645,32 @@ def test_verify_proof_rechaza_un_estado_de_reanudacion_distinto(
 ) -> None:
     """El destino autorizado es el que se aprobó: otro destino reanudable sigue siendo inválido."""
     run, proof, gate_request = _escenario_aprobado(workflow_policy, human_gate)
-    otro = gate_request.model_copy(update={"human_gate_resume_status": TaskStatus.APPROVED})
+    otro = gate_request.model_copy(
+        update={
+            "human_gate_resume_status": TaskStatus.APPROVED,
+            "proposed_next_state": TaskStatus.APPROVED,
+        }
+    )
     assert otro.human_gate_resume_status is not proof.resume_status
     with pytest.raises(WorkflowError) as excinfo:
         workflow_policy.verify_proof(proof, run=run.model_copy(update={"human_gate": otro}))
     assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_APPROVAL_PROOF_INVALID
     assert "reanudar" in excinfo.value.detail
+
+
+def test_verify_proof_rechaza_un_gate_con_destino_incoherente(
+    workflow_policy: WorkflowPolicy, human_gate: HumanGate
+) -> None:
+    """Un gate que declara autorizar un estado y propone otro no autoriza nada (V602-01)."""
+    run, proof, gate_request = _escenario_aprobado(workflow_policy, human_gate)
+    incoherente = gate_request.model_copy(
+        update={"proposed_next_state": TaskStatus.REVIEW}
+    )
+    assert incoherente.human_gate_resume_status is TaskStatus.IN_PROGRESS
+    with pytest.raises(WorkflowError) as excinfo:
+        workflow_policy.verify_proof(proof, run=run.model_copy(update={"human_gate": incoherente}))
+    assert excinfo.value.code is WorkflowFailureCode.WORKFLOW_APPROVAL_PROOF_INVALID
+    assert "no coinciden" in excinfo.value.detail
 
 
 def test_verify_proof_rechaza_un_workflow_que_no_esta_en_aprobacion_humana(

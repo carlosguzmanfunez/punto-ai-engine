@@ -132,6 +132,7 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.workflow.decisions",
     "punto.workflow.effects",
     "punto.workflow.errors",
+    "punto.workflow.handoff",
     "punto.workflow.kernel",
     "punto.workflow.pipeline",
     "punto.workflow.policy",

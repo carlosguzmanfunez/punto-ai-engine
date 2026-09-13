@@ -1,4 +1,4 @@
-"""Kernel de workflow autónomo (ENGINE-6.0 / 6.0.1).
+"""Kernel de workflow autónomo (ENGINE-6.0 / 6.0.1 / 6.0.2).
 
 CAMUS coordina; el kernel conduce. Este módulo recibe una intención y la lleva, paso a paso y de
 forma determinista, por los roles que ya existen.
@@ -10,14 +10,18 @@ Reglas que no se negocian, y dónde están:
 - **La autoridad la gobierna el Policy Engine**: la acción se declara explícitamente en la
   petición y se evalúa con la capa de política que ya existía. ``REJECT`` no crea workflow,
   ``REQUIRE_HUMAN`` detiene en un Human Gate real, y declarar ``LOW``/``L0`` no rebaja una acción
-  L3.
+  L3. La frontera de política es **obligatoria** y se vuelve a evaluar en cada paso y justo antes
+  de un efecto con efectos secundarios.
 - **Salir de ``HUMAN_APPROVAL`` exige una `HumanApprovalProof`**: la emite
-  ``HumanGate.authorize_resume`` y el kernel solo la verifica. No hay booleano que valga, y el
-  kernel no puede fabricarse una autorización.
-- **El presupuesto se comprueba antes de gastar**: cada intento técnico reserva su llamada de rol,
-  las llamadas al modelo son las reales, los fallos se cuentan y las transiciones se reservan.
-- **Los efectos no se repiten a ciegas**: antes de un efecto se apunta su intención; si el proceso
-  muere en medio, el registro queda en vuelo y la reanudación bloquea para reconciliar.
+  ``HumanGate.authorize_resume`` y el kernel solo la verifica. No hay booleano que valga, el kernel
+  no puede fabricarse una autorización, y la prueba solo provoca **exactamente** la transición que
+  autoriza: el destino propuesto, el declarado y el aplicado son el mismo estado.
+- **El presupuesto se comprueba antes de gastar**: cada intento técnico reserva y **consume** su
+  llamada de rol, el saldo de modelo y de tokens viaja al rol antes de invocarlo, los fallos se
+  cuentan y **toda** transición pasa por una única frontera que reserva antes de aplicar.
+- **Los efectos no se repiten a ciegas**: antes de un efecto se apunta su intención; si el rol falla
+  con el efecto en vuelo, el registro queda incierto, **no** se reintenta y la reanudación bloquea
+  para reconciliar.
 - **El handoff es durable**: lo que produce cada etapa queda como artefactos referenciados en el
   checkpoint, así que un proceso nuevo puede reconstruir la entrada del siguiente rol.
 - **El modelo no escribe el estado**: estado, autoridad, decisión, presupuesto y cierre los calcula
@@ -36,7 +40,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.policy.human_gate import HumanApprovalProof
-from punto.schemas.enums import AuthorityLevel, TaskStatus
+from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.policy import PolicyOutcome
 from punto.schemas.workflow import (
     MAX_ROLES_EXECUTED,
@@ -44,6 +48,7 @@ from punto.schemas.workflow import (
     MAX_WORKFLOW_FINDINGS,
     PAUSED_WORKFLOW_STATUSES,
     ArtifactReference,
+    BudgetAllowance,
     EffectStatus,
     HumanGateRequest,
     RoleExecutionRequest,
@@ -69,6 +74,8 @@ from punto.workflow.decisions import (
 )
 from punto.workflow.effects import EffectLedger, effect_key
 from punto.workflow.errors import (
+    WorkflowApprovalProofInvalidError,
+    WorkflowBudgetExceededError,
     WorkflowError,
     WorkflowHumanApprovalRequiredError,
     WorkflowIdempotencyConflictError,
@@ -76,7 +83,13 @@ from punto.workflow.errors import (
     WorkflowResumeFailedError,
     WorkflowTerminalError,
 )
-from punto.workflow.pipeline import next_stage, required_roles, stage_roles
+from punto.workflow.pipeline import (
+    VisualApplicability,
+    next_stage,
+    required_roles,
+    stage_roles,
+    visual_applicability,
+)
 from punto.workflow.policy import PolicyGate, WorkflowPolicy
 from punto.workflow.roles import RoleExecutor
 from punto.workflow.state_machine import WorkflowStateMachine
@@ -129,12 +142,27 @@ class WorkflowKernel:
         policy: WorkflowPolicy | None = None,
         effects: EffectLedger | None = None,
     ) -> None:
+        """Construye el kernel.
+
+        ``policy`` es **obligatoria**: es la frontera constitucional que decide qué puede hacer el
+        workflow (hallazgo V602-02). El parámetro admite ``None`` solo para poder fallar de forma
+        explícita y comprobable: un kernel sin política no se construye, en vez de ejecutar trabajo
+        autonómo sin que nadie evalúe la autoridad.
+
+        Raises:
+            WorkflowPolicyRejectedError: si no se inyecta una frontera de política válida.
+        """
+        if policy is None:
+            raise WorkflowPolicyRejectedError(
+                "el kernel exige una frontera de política: sin Policy Engine no hay evaluación de "
+                "autoridad, y ejecutar sin ella sería saltarse la constitución del motor"
+            )
         self._executors = dict(executors)
         self._store = store
         self._audit = audit
         self._machine = machine or WorkflowStateMachine()
         self._clock = clock or utc_now
-        self._policy = policy
+        self._policy: WorkflowPolicy = policy
         self._effects = effects or EffectLedger()
 
     # ------------------------------------------------------------------ estado
@@ -149,8 +177,8 @@ class WorkflowKernel:
         return self._machine
 
     @property
-    def policy(self) -> WorkflowPolicy | None:
-        """Frontera de política en uso, si la hay."""
+    def policy(self) -> WorkflowPolicy:
+        """Frontera de política en uso. Nunca es ``None``: el kernel no se construye sin ella."""
         return self._policy
 
     def workflow_id_for(self, request: WorkflowRequest) -> UUID:
@@ -178,7 +206,7 @@ class WorkflowKernel:
             return stored
 
         gate = self._evaluate_policy(request)
-        if gate is not None and gate.outcome is PolicyOutcome.REJECT:
+        if gate.outcome is PolicyOutcome.REJECT:
             # Rechazo duro del Policy Engine (acción no catalogada, archivo constitucionalmente
             # protegido): no se crea workflow y no se ejecuta nada. ``REJECT`` no se abre como gate:
             # aprobar a mano una acción que el motor rechaza sería eludir la política.
@@ -191,9 +219,9 @@ class WorkflowKernel:
             update={
                 "request_fingerprint": fingerprint,
                 "usage": run.usage.with_visit(TaskStatus.NEW),
-                "policy_decision_id": None if gate is None else gate.decision.id,
-                "effective_authority": None if gate is None else gate.authority,
-                "effective_risk": None if gate is None else gate.risk,
+                "policy_decision_id": gate.decision.id,
+                "effective_authority": gate.authority,
+                "effective_risk": gate.risk,
             }
         )
         self._store.save(run)
@@ -226,16 +254,57 @@ class WorkflowKernel:
             return self._block(run, exceeded, step_index=None)
 
         pending = self._pending_role(run)
-        if self._requires_human(run) and not run.human_gate_approved:
-            if run.human_gate is not None:
-                self._store.save(run)
-                return run
-            if pending is not None and run.status is not TaskStatus.NEW:
-                return self._open_human_gate(run)
+        # La autoridad se re-evalúa **en cada paso**, no solo al crear el workflow (hallazgo
+        # V602-02): un workflow puede persistirse y reanudarse con otra configuración de política, y
+        # la decisión que amparaba el trabajo anterior puede haber cambiado.
+        verdict = self._policy.evaluate_action(
+            request=run.request,
+            role=pending if pending is not None else RoleName.ARCHITECT,
+            stage=run.status,
+        )
+        if verdict.outcome is PolicyOutcome.REJECT:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_POLICY_REJECTED,
+                    f"la política actual rechaza la acción {run.request.action!r} en "
+                    f"{run.status.value}: {verdict.reason}",
+                ),
+                step_index=None,
+            )
+        run = self._refresh_authority(run, verdict)
+        if verdict.requires_human and not self._approval_covers(run, verdict):
+            if self._machine.can_transition(run.status, TaskStatus.HUMAN_APPROVAL):
+                return self._open_human_gate(run, verdict)
+            if pending is not None:
+                # Defensa: ningún rol se ejecuta amparado por una autoridad que la política de hoy
+                # no concede. ``NEW`` no tiene roles, así que el único efecto de no poder abrir aquí
+                # el gate es avanzar de etapa y abrirlo en la siguiente.
+                return self._block(
+                    run,
+                    BudgetCheck(
+                        False,
+                        WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
+                        f"la política exige aprobación humana en {run.status.value}, que no admite "
+                        "un Human Gate reanudable: no se ejecuta el rol pendiente",
+                    ),
+                    step_index=None,
+                )
 
         if pending is None:
             return self._advance(run)
         return self._run_role(run, pending, elapsed)
+
+    def _refresh_authority(self, run: WorkflowRun, verdict: PolicyGate) -> WorkflowRun:
+        """Deja constancia de la autoridad **vigente** en el checkpoint del run."""
+        return run.model_copy(
+            update={
+                "policy_decision_id": verdict.decision.id,
+                "effective_authority": verdict.authority,
+                "effective_risk": verdict.risk,
+            }
+        )
 
     def run_all(self, request: WorkflowRequest, *, max_steps: int | None = None) -> WorkflowRun:
         """Crea el workflow y lo conduce hasta que se cierre o se pause."""
@@ -275,12 +344,16 @@ class WorkflowKernel:
 
         if run.status is TaskStatus.HUMAN_APPROVAL:
             self._require_verified_proof(run, proof)
-            target = (
-                run.human_gate.proposed_next_state
-                if run.human_gate is not None
-                else TaskStatus.ANALYZING
-            )
-            run = self._machine.apply_transition(
+            gate = run.human_gate
+            if gate is None:  # pragma: no cover - ``verify_proof`` ya lo rechaza antes
+                raise WorkflowApprovalProofInvalidError(
+                    "el workflow está en HUMAN_APPROVAL sin Human Gate registrado"
+                )
+            # El destino es **exactamente** el que la prueba autoriza: es el mismo estado que el
+            # gate declaró y propuso al abrirse (hallazgo V602-01), no otro que venga de otra
+            # fuente. ``verify_proof`` ya comprobó que los tres coinciden.
+            target = gate.human_gate_resume_status
+            run, denied = self._transition(
                 run,
                 target,
                 decision=WorkflowDecisionKind.CONTINUE,
@@ -288,15 +361,23 @@ class WorkflowKernel:
                 authority=AuthorityLevel.LEVEL_3_HUMAN,
                 resumed=True,
             )
+            if denied is not None:
+                raise WorkflowBudgetExceededError(
+                    f"no cabe la transición de reanudación hacia {target.value}: {denied.detail}"
+                )
             run = run.model_copy(update={"human_gate_approved": True})
         elif run.status is TaskStatus.BLOCKED:
-            run = self._machine.apply_transition(
+            run, denied = self._transition(
                 run,
                 self._resume_target(run),
                 decision=WorkflowDecisionKind.CONTINUE,
                 reason="reanudación tras un bloqueo",
                 resumed=True,
             )
+            if denied is not None:
+                raise WorkflowBudgetExceededError(
+                    f"no cabe la transición de reanudación tras el bloqueo: {denied.detail}"
+                )
             run = run.model_copy(update={"failure": None})
 
         self._store.save(run)
@@ -313,13 +394,19 @@ class WorkflowKernel:
         Raises:
             WorkflowTerminalError: si ya está cerrado.
             WorkflowInvalidTransitionError: si la tabla no permite cancelar desde ese estado.
+            WorkflowBudgetExceededError: si la cancelación no cabe en el tope de transiciones.
         """
-        cancelled = self._machine.apply_transition(
+        cancelled, denied = self._transition(
             run,
             TaskStatus.CANCELLED,
             decision=WorkflowDecisionKind.FAIL,
             reason=reason or "cancelación explícita",
+            guard_loop=False,
         )
+        if denied is not None:
+            raise WorkflowBudgetExceededError(
+                f"la cancelación no cabe en el presupuesto de transiciones: {denied.detail}"
+            )
         self._store.save(cancelled)
         self._audit_cancelled(cancelled, reason)
         return cancelled
@@ -379,23 +466,9 @@ class WorkflowKernel:
         executor = self._executors.get(role)
         index = len(run.steps)
         key = step_idempotency_key(run.workflow_id, index, role, run.status)
-        request = RoleExecutionRequest(
-            workflow_id=run.workflow_id,
-            step_index=index,
-            role=role,
-            stage=run.status,
-            task_id=run.task_id,
-            project_id=run.project_id,
-            objective=run.request.objective,
-            acceptance_criteria=run.request.acceptance_criteria,
-            workspace_path=run.request.workspace_path,
-            changed_files=run.request.changed_files,
-            context_summary=self._context_for(run, role),
-            references=self._references(run),
-            idempotency_key=key,
-        )
 
         if executor is None:
+            request = self._role_request(run, role, index, key)
             unavailable = RoleExecutionResult(
                 role=role,
                 status=RoleStatus.PROVIDER_UNAVAILABLE,
@@ -403,10 +476,18 @@ class WorkflowKernel:
                 error_code=WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE,
                 error_detail="no hay ejecutor inyectado para el rol: no se sustituye por otro",
             )
-            return self._finish_step(run, role, unavailable, key, attempts=1)
+            return self._finish_step(
+                run, role, unavailable, key, attempts=1, request=request
+            )
 
-        # Efecto con efectos secundarios: se apunta la intención **antes** de ejecutarlo.
+        # Frontera de efectos (hallazgos V602-02 y V602-05): antes de un rol con efectos
+        # secundarios se vuelve a evaluar la autoridad con la política **actual** y se apunta la
+        # intención del efecto. Una aprobación antigua no autoriza un efecto que la política de hoy
+        # prohíbe, y una intención en vuelo no se reintenta a ciegas.
         if role in EFFECTFUL_ROLES:
+            guard = self._effect_boundary(run, role, index)
+            if guard is not None:
+                return guard
             intent_key = effect_key(run.workflow_id, index, role, run.request.action)
             run, effect = self._effects.begin_intent(
                 run,
@@ -414,7 +495,7 @@ class WorkflowKernel:
                 action=run.request.action,
                 role=role,
                 step_index=index,
-                reversible=not run.request.risk.requires_human_gate,
+                reversible=self._effect_reversible(run),
             )
             if not effect.allowed:
                 return self._block(
@@ -431,15 +512,30 @@ class WorkflowKernel:
         else:
             resolved_key = ""
 
+        # Saldo de gasto en modelo calculado **antes** de invocar al rol: con el saldo agotado no
+        # se llama al proveedor (hallazgo V602-04: no basta con contabilizar después).
+        allowance = self._allowance(run)
+        if allowance is None:
+            return self._block(run, self._model_budget_denied(run), step_index=index)
+
+        request = self._role_request(run, role, index, key, allowance=allowance)
         attempts = 0
         last_error: WorkflowError | None = None
         result: RoleExecutionResult | None = None
-        while attempts < MAX_TECHNICAL_ATTEMPTS:
+        # Un rol con efectos secundarios se ejecuta **una sola vez**: si el efecto pudo empezar y la
+        # llamada falla, su resultado es incierto y reintentar podría duplicarlo (hallazgo V602-05).
+        max_attempts = 1 if role in EFFECTFUL_ROLES else MAX_TECHNICAL_ATTEMPTS
+        while attempts < max_attempts:
             attempts += 1
+            request = request.model_copy(update={"attempt": attempts})
             # Cada intento real reserva su propia llamada de rol: dos llamadas al executor son dos.
             budget = reserve_budget(run, role_calls=1, elapsed_seconds=self._elapsed(run))
             if not budget.allowed:
                 return self._block(run, budget, step_index=index)
+            # La reserva se vuelve **durable** en el run antes de ejecutar: sin esto, el segundo
+            # intento volvía a ver el consumo intacto y `max_role_calls=1` permitía dos llamadas
+            # (hallazgo V602-04). Los intentos ya no se suman otra vez en el cierre del paso.
+            run = self._consume(run, role_calls=1)
             self._audit_step_started(run, index, role, attempts)
             try:
                 result = executor.execute(request)
@@ -447,7 +543,9 @@ class WorkflowKernel:
             except WorkflowError as exc:
                 last_error = exc
                 self._audit_step_failed(run, index, role, exc, attempts)
-                if attempts >= MAX_TECHNICAL_ATTEMPTS:
+                if role in EFFECTFUL_ROLES:
+                    return self._effect_uncertain(run, role, resolved_key, exc, index)
+                if attempts >= max_attempts:
                     break
 
         if result is None:
@@ -473,7 +571,185 @@ class WorkflowKernel:
             )
             run = self._effects.resolve(run, key=resolved_key, status=status)
 
-        return self._finish_step(run, role, result, key, attempts=attempts)
+        return self._finish_step(run, role, result, key, attempts=attempts, request=request)
+
+    def _role_request(
+        self,
+        run: WorkflowRun,
+        role: RoleName,
+        index: int,
+        key: str,
+        *,
+        allowance: BudgetAllowance | None = None,
+    ) -> RoleExecutionRequest:
+        """Petición de ejecución del rol, con sus referencias durables y su saldo de gasto."""
+        return RoleExecutionRequest(
+            workflow_id=run.workflow_id,
+            step_index=index,
+            role=role,
+            stage=run.status,
+            task_id=run.task_id,
+            project_id=run.project_id,
+            objective=run.request.objective,
+            acceptance_criteria=run.request.acceptance_criteria,
+            workspace_path=run.request.workspace_path,
+            changed_files=run.request.changed_files,
+            context_summary=self._context_for(run, role),
+            references=self._references(run),
+            budget_allowance=allowance,
+            idempotency_key=key,
+        )
+
+    def _allowance(self, run: WorkflowRun) -> BudgetAllowance | None:
+        """Saldo de modelo/tokens que el rol puede gastar, o ``None`` si ya no cabe una llamada.
+
+        Devolver ``None`` significa «no se invoca al rol»: con ``max_model_calls`` agotado o con los
+        tokens consumidos no se hace una llamada real al proveedor para enterarse después.
+        """
+        budget = run.request.budget
+        model_calls = budget.max_model_calls - run.usage.model_calls
+        tokens = budget.max_total_tokens - run.usage.total_tokens
+        remaining_time = budget.max_wall_time_seconds - self._elapsed(run)
+        if model_calls <= 0 or tokens <= 0 or remaining_time <= 0:
+            return None
+        return BudgetAllowance(
+            model_calls_remaining=model_calls,
+            tokens_remaining=tokens,
+            wall_time_seconds_remaining=max(0.0, remaining_time),
+        )
+
+    def _model_budget_denied(self, run: WorkflowRun) -> BudgetCheck:
+        """Veredicto explícito de «no hay saldo para llamar al modelo», con su cifra.
+
+        ``reserve_budget`` no sirve aquí: pedir ``model_calls=1`` contra un ``max_model_calls=0``
+        daría un «no» correcto, pero pedir tokens cuando lo agotado son las llamadas daría un
+        permiso. El motivo real se calcula nombrando el límite que decidió.
+        """
+        budget = run.request.budget
+        model_calls = budget.max_model_calls - run.usage.model_calls
+        tokens = budget.max_total_tokens - run.usage.total_tokens
+        remaining_time = budget.max_wall_time_seconds - self._elapsed(run)
+        if model_calls <= 0:
+            return BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
+                f"no queda ninguna llamada de modelo ({run.usage.model_calls} de "
+                f"{budget.max_model_calls}): no se invoca al rol",
+                limit="max_model_calls",
+                used=float(run.usage.model_calls),
+                maximum=float(budget.max_model_calls),
+            )
+        if tokens <= 0:
+            return BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
+                f"no quedan tokens ({run.usage.total_tokens} de {budget.max_total_tokens}): no se "
+                "invoca al rol",
+                limit="max_total_tokens",
+                used=float(run.usage.total_tokens),
+                maximum=float(budget.max_total_tokens),
+            )
+        return BudgetCheck(
+            False,
+            WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
+            f"se agotó el tiempo máximo ({remaining_time:.1f}s restantes): no se invoca al rol",
+            limit="max_wall_time_seconds",
+            used=self._elapsed(run),
+            maximum=budget.max_wall_time_seconds,
+        )
+
+    def _consume(self, run: WorkflowRun, **increments: int) -> WorkflowRun:
+        """Aplica al run el consumo ya reservado, sin volver a comprobarlo."""
+        usage = run.usage.model_copy(
+            update={field: getattr(run.usage, field) + value for field, value in increments.items()}
+        )
+        return run.model_copy(update={"usage": usage})
+
+    def _effect_boundary(
+        self, run: WorkflowRun, role: RoleName, index: int
+    ) -> WorkflowRun | None:
+        """Re-evalúa la autoridad justo antes de un efecto; devuelve el run si hay que parar.
+
+        ``None`` significa «adelante»: la política actual permite el efecto y no pide humano (o ya
+        hay una aprobación vigente para un veredicto igual o menos restrictivo).
+
+        Motivo (hallazgo V602-02): un workflow puede persistirse y reanudarse otro día, con otra
+        configuración de política. Evaluar la autoridad solo al crear el workflow dejaría el efecto
+        amparado por una decisión que ya no está en vigor.
+        """
+        gate = self._policy.evaluate_action(request=run.request, role=role, stage=run.status)
+        if gate.outcome is PolicyOutcome.REJECT:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_POLICY_REJECTED,
+                    f"la política actual rechaza la acción {run.request.action!r} antes de un "
+                    f"efecto con efectos secundarios: {gate.reason}",
+                ),
+                step_index=index,
+            )
+        if gate.requires_human and not self._approval_covers(run, gate):
+            return self._open_human_gate(run, gate, step_index=index)
+        refreshed = self._refresh_authority(run, gate)
+        self._store.save(refreshed)
+        return None
+
+    def _approval_covers(self, run: WorkflowRun, gate: PolicyGate) -> bool:
+        """True si la aprobación humana vigente ampara el veredicto actual de la política.
+
+        La aprobación ampara cuando el workflow ya tiene un gate aprobado y el riesgo efectivo y la
+        autoridad del veredicto **actual** no son más restrictivos que los que el humano aprobó: si
+        la política de hoy pide más de lo que se aprobó, hace falta una aprobación nueva.
+        """
+        if not run.human_gate_approved or run.human_gate is None:
+            return False
+        approved = run.human_gate
+        if _risk_rank(gate.risk) > _risk_rank(approved.risk):
+            return False
+        return _authority_rank(gate.authority) <= _authority_rank(approved.authority_required)
+
+    def _effect_reversible(self, run: WorkflowRun) -> bool:
+        """Reversibilidad del efecto según el riesgo **efectivo**, no el declarado.
+
+        Un llamante puede declarar ``LOW`` para una acción que el Policy Engine elevó a L3/HIGH; el
+        efecto se marca irreversible si el riesgo efectivo exige Human Gate (hallazgo V602-05).
+        """
+        effective = run.effective_risk or run.request.risk
+        return not effective.requires_human_gate
+
+    def _effect_uncertain(
+        self,
+        run: WorkflowRun,
+        role: RoleName,
+        resolved_key: str,
+        error: WorkflowError,
+        index: int,
+    ) -> WorkflowRun:
+        """Bloquea el workflow ante un efecto con resultado incierto, sin repetirlo.
+
+        Si el efecto ya tenía su intención apuntada y la ejecución falló, no se sabe si el efecto
+        ocurrió: la única salida segura es la reconciliación explícita.
+        """
+        if resolved_key:
+            run = self._effects.mark_unknown(
+                run,
+                key=resolved_key,
+                detail=f"la ejecución de {role.value} falló con el efecto en vuelo: {error.detail}",
+            )
+        return self._block(
+            run,
+            BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_EFFECT_RECONCILIATION_REQUIRED,
+                (
+                    f"el rol {role.value} declaró un efecto con efectos secundarios y falló "
+                    f"después ({error.code.value}): su resultado es incierto, así que no se "
+                    "reintenta. Hace falta reconciliar el efecto antes de continuar"
+                ),
+            ),
+            step_index=index,
+        )
 
     def _finish_step(
         self,
@@ -483,8 +759,10 @@ class WorkflowKernel:
         key: str,
         *,
         attempts: int,
+        request: RoleExecutionRequest,
     ) -> WorkflowRun:
         """Registra el paso y su handoff, decide y aplica la transición (o la pausa)."""
+        del request  # el intento ya quedó reflejado como reserva en el consumo del run
         index = len(run.steps)
         roles_now = stage_roles(run.status, run.request)
         last_in_stage = role == roles_now[-1] if roles_now else True
@@ -519,10 +797,11 @@ class WorkflowKernel:
             error_detail=result.error_detail,
         )
         failed = 1 if result.status is not RoleStatus.COMPLETED else 0
+        # ``role_calls`` **no** se suma aquí: cada intento ya reservó y consumió la suya antes de
+        # invocar al executor. Sumarla otra vez contaría dos veces la misma llamada.
         usage = run.usage.model_copy(
             update={
                 "steps": run.usage.steps + 1,
-                "role_calls": run.usage.role_calls + attempts,
                 "model_calls": run.usage.model_calls + result.model_calls,
                 "total_tokens": run.usage.total_tokens + result.usage.total_tokens,
                 "failures": run.usage.failures + failed,
@@ -552,18 +831,14 @@ class WorkflowKernel:
                         "; ".join(missing),
                     ),
                 )
-            if not self._reserve_transition(run, count=1).allowed:
-                return self._block(run, self._reserve_transition(run, count=1))
-            if not loop_check(run, TaskStatus.COMPLETED, run.request.budget).allowed:
-                return self._block(
-                    run, loop_check(run, TaskStatus.COMPLETED, run.request.budget)
-                )
-            completed = self._machine.apply_transition(
+            completed, denied = self._transition(
                 run,
                 TaskStatus.COMPLETED,
                 decision=WorkflowDecisionKind.COMPLETE,
                 reason="todas las etapas y verificaciones exigidas aprobaron",
             )
+            if denied is not None:
+                return self._denied(run, denied)
             completed = completed.model_copy(
                 update={"result": self._build_result(completed, TaskStatus.COMPLETED)}
             )
@@ -582,27 +857,74 @@ class WorkflowKernel:
                     f"{run.status.value} no tiene etapa siguiente en el camino limpio",
                 ),
             )
-        if target is TaskStatus.COMPLETED and self._requires_human(run):
+        if target is TaskStatus.COMPLETED and self._requires_human(run) and not (
+            run.human_gate_approved
+        ):
+            # Frontera de cierre: la aprobación humana se exige una sola vez. Con el gate ya
+            # aprobado, volver a abrirlo dejaría el workflow en un bucle de pausas.
             return self._open_human_gate(run)
-        reserved = self._reserve_transition(run, count=1)
-        if not reserved.allowed:
-            return self._block(run, reserved)
-        loop = loop_check(run, target, run.request.budget)
-        if not loop.allowed:
-            return self._block(run, loop)
 
-        advanced = self._machine.apply_transition(
+        advanced, denied = self._transition(
             run,
             target,
             decision=WorkflowDecisionKind.READY_FOR_NEXT_STAGE,
             reason=f"etapa {run.status.value} sin roles pendientes; pasa a {target.value}",
         )
+        if denied is not None:
+            return self._denied(run, denied)
         advanced = advanced.model_copy(
             update={"usage": advanced.usage.model_copy(update={"steps": advanced.usage.steps + 1})}
         )
         self._audit_transition(advanced)
         self._store.save(advanced)
         return advanced
+
+    def _transition(
+        self,
+        run: WorkflowRun,
+        target: TaskStatus,
+        *,
+        decision: WorkflowDecisionKind,
+        reason: str = "",
+        authority: AuthorityLevel | None = None,
+        step_index: int | None = None,
+        resumed: bool = False,
+        guard_loop: bool = True,
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """**Única** frontera de transición: reserva, comprueba bucle y aplica.
+
+        Toda transición contabilizable del kernel pasa por aquí (hallazgo V602-04): la reserva se
+        hace antes de aplicar, así que el contador nunca puede observar ``max_transitions + 1``.
+        Devuelve ``(run_aplicado, None)`` o ``(run_intacto, veredicto)`` cuando el presupuesto o la
+        protección de bucles lo impiden; quien llama decide cómo dejar constancia sin transicionar.
+        """
+        reserved = self._reserve_transition(run, count=1)
+        if not reserved.allowed:
+            return run, reserved
+        if guard_loop and not resumed:
+            loop = loop_check(run, target, run.request.budget)
+            if not loop.allowed:
+                return run, loop
+        applied = self._machine.apply_transition(
+            run,
+            target,
+            decision=decision,
+            reason=reason,
+            authority=authority if authority is not None else run.request.authority,
+            step_index=step_index,
+            resumed=resumed,
+        )
+        return applied, None
+
+    def _denied(self, run: WorkflowRun, check: BudgetCheck) -> WorkflowRun:
+        """Deja constancia de un «no» de la frontera de transición.
+
+        Pasa por :meth:`_block`, que intenta la transición a ``BLOCKED`` y, si el tope de
+        transiciones ya no la admite, registra el fallo en el estado actual sin transicionar. Ese
+        doble paso es lo que garantiza el invariante ``usage.transitions <= max_transitions`` sin
+        dejar el workflow sin constancia del fallo.
+        """
+        return self._block(run, check)
 
     def _apply_decision(
         self, run: WorkflowRun, decision: WorkflowDecision, *, step_index: int | None = None
@@ -630,20 +952,15 @@ class WorkflowKernel:
         if target is TaskStatus.HUMAN_APPROVAL:
             return self._open_human_gate(run)
 
-        reserved = self._reserve_transition(run, count=1)
-        if not reserved.allowed:
-            return self._block(run, reserved, step_index=step_index)
-        loop = loop_check(run, target, run.request.budget)
-        if not loop.allowed:
-            return self._block(run, loop, step_index=step_index)
-
-        updated = self._machine.apply_transition(
+        updated, denied = self._transition(
             run,
             target,
             decision=decision.kind,
             reason=decision.reason,
             step_index=step_index,
         )
+        if denied is not None:
+            return self._denied(run, denied)
         self._audit_transition(updated)
         self._store.save(updated)
         return updated
@@ -651,7 +968,11 @@ class WorkflowKernel:
     def _enter_repair(
         self, run: WorkflowRun, decision: WorkflowDecision, step_index: int | None
     ) -> WorkflowRun:
-        """Entra en ``REPAIRING`` y se detiene ahí: dos transiciones, reservadas antes."""
+        """Entra en ``REPAIRING`` y se detiene ahí: dos transiciones, reservadas antes.
+
+        La reserva es **compuesta** (``count=2``) porque reservar de una en una permitiría que la
+        segunda mitad rebasara el tope de transiciones.
+        """
         reserved = self._reserve_transition(run, count=2)
         if not reserved.allowed:
             return self._block(run, reserved, step_index=step_index)
@@ -693,13 +1014,15 @@ class WorkflowKernel:
         self, run: WorkflowRun, decision: WorkflowDecision, step_index: int | None
     ) -> WorkflowRun:
         """Cierra el workflow como fallido."""
-        failed = self._machine.apply_transition(
+        failed, denied = self._transition(
             run,
             TaskStatus.FAILED,
             decision=decision.kind,
             reason=decision.reason,
             step_index=step_index,
         )
+        if denied is not None:
+            return self._denied(run, denied)
         failed = failed.model_copy(
             update={
                 "failure": WorkflowFailure(
@@ -716,78 +1039,128 @@ class WorkflowKernel:
         return failed
 
     def _block(
-        self, run: WorkflowRun, check: BudgetCheck, *, step_index: int | None = None
+        self,
+        run: WorkflowRun,
+        check: BudgetCheck,
+        *,
+        step_index: int | None = None,
+        in_place: bool = False,
     ) -> WorkflowRun:
-        """Bloquea el workflow con el código indicado, auditándolo."""
+        """Bloquea el workflow con el código indicado, auditándolo.
+
+        ``in_place=True`` registra el fallo sin transicionar: se usa cuando la propia transición a
+        ``BLOCKED`` no cabe en el presupuesto (o la tabla no la permite, como desde ``NEW``), que es
+        lo que mantiene el invariante de ``max_transitions``.
+        """
         code = check.code or WorkflowFailureCode.WORKFLOW_INCOMPLETE_EVIDENCE
         failure = WorkflowFailure(code=code, detail=check.detail, step_index=step_index)
         if code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED:
             self._audit_budget(run, check)
-        if run.status in PAUSED_WORKFLOW_STATUSES or run.status is TaskStatus.NEW:
-            # ``NEW`` no puede ir a ``BLOCKED`` según la tabla: se deja constancia sin inventar una
-            # transición que el contrato no permite.
+        if in_place or run.status in PAUSED_WORKFLOW_STATUSES or run.status is TaskStatus.NEW:
             blocked = run.model_copy(update={"failure": failure, "updated_at": self._clock()})
             self._store.save(blocked)
             self._audit_blocked(blocked, failure)
             return blocked
 
-        blocked = self._machine.apply_transition(
+        blocked, denied = self._transition(
             run,
             TaskStatus.BLOCKED,
             decision=WorkflowDecisionKind.BLOCK,
             reason=check.detail,
             step_index=step_index,
+            guard_loop=False,
         )
+        if denied is not None:
+            # No cabe ni la transición de bloqueo: se registra el fallo donde está el workflow.
+            exhausted = denied if denied.code else check
+            return self._block(run, exhausted, step_index=step_index, in_place=True)
         blocked = blocked.model_copy(update={"failure": failure})
         self._audit_transition(blocked)
         self._store.save(blocked)
         self._audit_blocked(blocked, failure)
         return blocked
 
-    def _open_human_gate(self, run: WorkflowRun) -> WorkflowRun:
-        """Crea un Human Gate **real** y detiene el workflow. Nunca lo aprueba."""
-        if self._policy is None:
+    def _open_human_gate(
+        self,
+        run: WorkflowRun,
+        gate: PolicyGate | None = None,
+        *,
+        step_index: int | None = None,
+    ) -> WorkflowRun:
+        """Crea un Human Gate **real** y detiene el workflow. Nunca lo aprueba.
+
+        El destino es el estado actual del workflow (donde se interrumpió el trabajo), y se declara
+        **igual** en ``proposed_next_state`` y en ``human_gate_resume_status``: la autorización que
+        emita el humano describe exactamente la transición que la reanudación aplicará, sin
+        sustituciones (hallazgo V602-01). Si esa pareja no fuera legal en las dos tablas —la de
+        transiciones y la de reanudación—, el workflow no se pausa con una promesa falsa: se
+        bloquea.
+        """
+        verdict = gate or self._evaluate_policy(run.request)
+        target = run.status
+        if self._machine.is_terminal(target) or not self._machine.can_transition(
+            target, TaskStatus.HUMAN_APPROVAL
+        ):
             return self._block(
                 run,
                 BudgetCheck(
                     False,
                     WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
-                    "el workflow necesita aprobación humana y no hay frontera de política "
-                    "inyectada: no se abre un gate de mentira",
+                    f"la tabla de transiciones no permite abrir un Human Gate desde {target.value}",
                 ),
+                step_index=step_index,
             )
-        resume_status = (
-            run.status if run.status.name in _HUMAN_GATE_RESUMABLE else TaskStatus.IN_PROGRESS
-        )
+        if not self._machine.can_resume(TaskStatus.HUMAN_APPROVAL, target):
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
+                    f"{target.value} no es un destino de reanudación autorizado: un gate abierto "
+                    "aquí no podría reanudarse al mismo estado en el que se interrumpió",
+                ),
+                step_index=step_index,
+            )
         draft = HumanGateRequest(
             workflow_id=run.workflow_id,
             task_id=run.task_id,
             reason_code=WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
             requested_action=f"autorizar la ejecución autónoma de {run.request.objective[:120]}",
-            risk=run.effective_risk or run.request.risk,
+            risk=verdict.risk,
+            # Un gate existe porque hace falta un humano: la autoridad que se exige para seguir es
+            # humana. El nivel que la política concede a la acción viaja en ``effective_authority``
+            # y no sustituye a este campo, que describe lo que la solicitud necesita.
             authority_required=AuthorityLevel.LEVEL_3_HUMAN,
-            current_state=run.status,
-            proposed_next_state=run.status,
+            current_state=target,
+            proposed_next_state=target,
             context_summary=run.request.context_summary,
-            policy_decision_id=run.policy_decision_id,
-            policy_outcome="REQUIRE_HUMAN",
-            human_gate_resume_status=resume_status,
+            policy_decision_id=verdict.decision.id,
+            policy_outcome=verdict.outcome.value,
+            human_gate_resume_status=target,
         )
         approval = self._policy.request_human_gate(request=run.request, gate_request=draft)
-        gate = draft.model_copy(update={"approval_id": approval.id})
-        if run.status is TaskStatus.NEW:  # pragma: no cover - la tabla no permite NEW -> gate
-            paused = run
-        else:
-            paused = self._machine.apply_transition(
-                run,
-                TaskStatus.HUMAN_APPROVAL,
-                decision=WorkflowDecisionKind.REQUEST_HUMAN,
-                reason="la petición exige aprobación humana antes de continuar",
-                authority=AuthorityLevel.LEVEL_3_HUMAN,
-            )
-        paused = paused.model_copy(update={"human_gate": gate})
+        gate_request = draft.model_copy(update={"approval_id": approval.id})
+        paused, denied = self._transition(
+            run,
+            TaskStatus.HUMAN_APPROVAL,
+            decision=WorkflowDecisionKind.REQUEST_HUMAN,
+            reason="la petición exige aprobación humana antes de continuar",
+            authority=AuthorityLevel.LEVEL_3_HUMAN,
+            step_index=step_index,
+            guard_loop=False,
+        )
+        if denied is not None:
+            return self._denied(run, denied)
+        paused = paused.model_copy(
+            update={
+                "human_gate": gate_request,
+                "policy_decision_id": verdict.decision.id,
+                "effective_authority": verdict.authority,
+                "effective_risk": verdict.risk,
+            }
+        )
         self._audit_transition(paused)
-        self._audit_human_gate(paused, gate)
+        self._audit_human_gate(paused, gate_request)
         self._store.save(paused)
         return paused
 
@@ -796,15 +1169,14 @@ class WorkflowKernel:
     ) -> None:
         """Exige una autorización real del Human Gate para salir de ``HUMAN_APPROVAL``.
 
+        La frontera de política existe siempre (el kernel no se construye sin ella), así que lo que
+        se comprueba aquí es la prueba: que esté, y que autorice **esta** tarea, **esta** solicitud,
+        **esta** decisión y **este** destino.
+
         Raises:
             WorkflowHumanApprovalRequiredError: si no se presenta ninguna.
             WorkflowError: con ``WORKFLOW_APPROVAL_PROOF_INVALID`` si no es de este workflow.
         """
-        if self._policy is None:
-            raise WorkflowHumanApprovalRequiredError(
-                "sin frontera de política inyectada no hay Human Gate real que autorice la "
-                "reanudación"
-            )
         if proof is None:
             raise WorkflowHumanApprovalRequiredError(
                 "el workflow está en HUMAN_APPROVAL y no se ha presentado ninguna autorización: "
@@ -820,13 +1192,17 @@ class WorkflowKernel:
         return TaskStatus.ANALYZING
 
     def _reserve_transition(self, run: WorkflowRun, *, count: int) -> BudgetCheck:
-        """Reserva transiciones antes de aplicarlas: el tope no se puede rebasar."""
-        return reserve_budget(run, transitions=count, elapsed_seconds=self._elapsed(run))
+        """Reserva transiciones antes de aplicarlas: el tope no se puede rebasar.
 
-    def _evaluate_policy(self, request: WorkflowRequest) -> PolicyGate | None:
-        """Evalúa la acción con el Policy Engine, si hay frontera de política."""
-        if self._policy is None:
-            return None
+        El tiempo transcurrido se pasa como ``0`` a propósito: una transición es instantánea, así
+        que no consume tiempo de pared. Si se comparara aquí, un workflow que agotó su tiempo no
+        podría ni siquiera registrarse como ``BLOCKED`` o ``CANCELLED``, y el cierre quedaría sin
+        constancia; el tiempo se mide al reservar **pasos** y **llamadas**, que sí lo consumen.
+        """
+        return reserve_budget(run, transitions=count, elapsed_seconds=0.0)
+
+    def _evaluate_policy(self, request: WorkflowRequest) -> PolicyGate:
+        """Evalúa la acción con el Policy Engine. La frontera de política nunca es opcional."""
         return self._policy.evaluate_action(
             request=request, role=RoleName.ARCHITECT, stage=TaskStatus.NEW
         )
@@ -861,6 +1237,16 @@ class WorkflowKernel:
                 missing.append(
                     f"{role.value} dejó {step.blocking_findings} hallazgo(s) bloqueante(s)"
                 )
+        # La duda sobre la aplicabilidad visual no se resuelve omitiendo la verificación (hallazgo
+        # V602-06): si no se pudo perfilar el proyecto, el workflow no cierra sin evidencia.
+        if (
+            not run.request.web_visual_required
+            and visual_applicability(run.request) is VisualApplicability.UNKNOWN
+        ):
+            missing.append(
+                "no se pudo decidir si el proyecto exige verificación visual: declara "
+                "workspace_path (y project_path si el proyecto no es la raíz del workspace)"
+            )
         if run.human_gate is not None and not run.human_gate_approved:
             missing.append("hay un Human Gate pendiente")
         return tuple(missing)
@@ -1052,10 +1438,17 @@ class WorkflowKernel:
         )
 
 
-#: Estados del workflow que el HumanGate real admite como destino de reanudación.
-_HUMAN_GATE_RESUMABLE: Final[frozenset[str]] = frozenset(
-    {"APPROVED", "IN_PROGRESS", "READY", "REVIEW"}
-)
+#: Los niveles de riesgo y de autoridad son ``IntEnum`` ordenados de menos a más restrictivo, así
+#: que su propia escala numérica es la comparación: no hace falta una tabla paralela que pudiera
+#: quedar desincronizada del contrato.
+def _risk_rank(risk: RiskLevel) -> int:
+    """Posición del riesgo en su escala (mayor = más restrictivo)."""
+    return int(risk)
+
+
+def _authority_rank(authority: AuthorityLevel) -> int:
+    """Posición de la autoridad en su escala (mayor = exige más control humano)."""
+    return int(authority)
 
 
 def _duration_ms(result: RoleExecutionResult) -> int:

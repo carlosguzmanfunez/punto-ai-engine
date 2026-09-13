@@ -25,6 +25,7 @@ from workflow_support import (
     all_stage_executors,
     make_finding,
     make_request,
+    offline_policy,
     role_sequence,
 )
 
@@ -70,6 +71,7 @@ def visual_kernel(
     kernel = WorkflowKernel(
         executors=dict(executors),
         store=FileCheckpointStore(store_root),
+        policy=offline_policy(),
     )
     return kernel, executors
 
@@ -98,6 +100,7 @@ def test_a_non_visual_task_does_not_run_visual_qa(tmp_path: Path) -> None:
     kernel = WorkflowKernel(
         executors=dict(all_stage_executors(cross_audit_required=False)),
         store=FileCheckpointStore(tmp_path),
+        policy=offline_policy(),
     )
 
     run = kernel.run_all(make_request(web_visual_required=False, cross_audit_required=False))
@@ -168,6 +171,7 @@ def test_a_web_profile_makes_visual_qa_mandatory_even_with_the_flag_false(
     kernel = WorkflowKernel(
         executors=dict(executors),
         store=FileCheckpointStore(tmp_path / "cp"),
+        policy=offline_policy(),
     )
 
     run = kernel.run_all(request)
@@ -193,6 +197,7 @@ def test_a_project_without_a_web_profile_does_not_run_visual_qa(tmp_path: Path) 
     kernel = WorkflowKernel(
         executors=dict(executors),
         store=FileCheckpointStore(tmp_path / "cp"),
+        policy=offline_policy(),
     )
 
     run = kernel.run_all(request)

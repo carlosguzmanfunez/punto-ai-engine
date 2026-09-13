@@ -86,16 +86,29 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.COMPLETED, Tas
 #: una tarea que está en ``HUMAN_APPROVAL``.
 #:
 #: Fuente única de verdad, declarada aquí —y no en el orquestador ni en la
-#: política— porque ambos la necesitan: la máquina de estados construye con ella
-#: su tabla de reanudación y el Human Gate valida con ella el ``resume_status``
-#: que autoriza. ``punto.schemas.enums`` no importa nada de ``punto.policy`` ni
-#: de ``punto.orchestrator``, así que es el único lugar común libre de ciclos.
+#: política— porque los tres la necesitan: la máquina de estados de tareas
+#: construye con ella su tabla de reanudación, la máquina del workflow deriva de
+#: ella sus destinos de reanudación desde ``HUMAN_APPROVAL``, y el Human Gate
+#: valida con ella el ``resume_status`` que autoriza. ``punto.schemas.enums`` no
+#: importa nada de ``punto.policy``, de ``punto.orchestrator`` ni de
+#: ``punto.workflow``, así que es el único lugar común libre de ciclos.
+#:
+#: Contiene **todos** los estados en los que un workflow puede estar cuando se
+#: abre un Human Gate: si faltara alguno, el gate tendría que declarar un destino
+#: distinto del real y la autorización dejaría de significar lo que dice (hallazgo
+#: V602-01). Un estado que no pueda ser destino real de reanudación
+#: (``HUMAN_APPROVAL``, los terminales y ``NEW``) queda fuera a propósito: una
+#: autorización para reanudar hacia ahí no reanudaría nada.
 HUMAN_GATE_RESUME_STATUSES: frozenset[TaskStatus] = frozenset(
     {
+        TaskStatus.ANALYZING,
         TaskStatus.APPROVED,
         TaskStatus.IN_PROGRESS,
+        TaskStatus.PLANNING,
+        TaskStatus.QA,
         TaskStatus.READY,
         TaskStatus.REVIEW,
+        TaskStatus.SECURITY,
     }
 )
 

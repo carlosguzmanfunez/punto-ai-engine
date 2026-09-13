@@ -19,7 +19,9 @@ Lo que se fija aquí, y por qué:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -54,6 +56,7 @@ from punto.schemas.workflow import (
     MAX_WORKFLOW_SUMMARY_CHARS,
     MAX_WORKFLOW_TEXT_CHARS,
     ArtifactReference,
+    BudgetAllowance,
     CredentialState,
     ProviderCapability,
     RoleExecutionRequest,
@@ -68,7 +71,14 @@ from punto.tools.errors import (
     PlanningValidationError,
     QARunnerNotConfiguredError,
 )
+from punto.workflow.artifacts import FileArtifactStore
 from punto.workflow.errors import WorkflowProviderUnavailableError
+from punto.workflow.handoff import (
+    ARCHITECTURE_KIND,
+    PLAN_KIND,
+    resolve_architecture,
+    resolve_plan,
+)
 from punto.workflow.roles import (
     CallableRoleExecutor,
     CamusRoleExecutor,
@@ -492,7 +502,7 @@ def test_normalize_security_con_hallazgo_high_produce_bloqueantes() -> None:
 
 
 def test_normalize_architecture_usa_el_resumen_real_del_proveedor() -> None:
-    """``provider``, ``model``, ``usage`` y ``attempts`` salen del informe cuando existe."""
+    """``provider``, ``model``, ``usage``, ``model_calls`` y ``attempts`` salen del informe real."""
     outcome = SimpleNamespace(
         status=ProjectPlanStatus.PASS,
         summary=ModelExecutionSummary(
@@ -512,6 +522,7 @@ def test_normalize_architecture_usa_el_resumen_real_del_proveedor() -> None:
     assert resultado.provider == "deepseek"
     assert resultado.model == "deepseek-chat"
     assert resultado.usage.total_tokens == 15
+    assert resultado.model_calls == 2, "el contador del resumen manda sobre los intentos"
     assert resultado.attempts == 3
     assert resultado.summary == "ARCHITECT: COMPLETED"
 
@@ -755,9 +766,10 @@ _INTENT = ProjectIntent(name="StockFlow", description="Intención sintética de 
 class _CountingArchitectRunner(ArchitectRunner):
     """Doble del Architect: cuenta llamadas y devuelve un diseño válido, siempre el mismo."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, model_calls: int = 0) -> None:
         self.calls = 0
         self.outcome: ArchitectureOutcome | None = None
+        self._model_calls = model_calls
 
     @property
     def provider(self) -> str:
@@ -776,7 +788,11 @@ class _CountingArchitectRunner(ArchitectRunner):
         self.outcome = ArchitectureOutcome(
             status=ProjectPlanStatus.PASS,
             proposal=_ARCHITECTURE_PROPOSAL,
-            summary=ModelExecutionSummary(runner="CountingArchitectRunner", attempts_used=1),
+            summary=ModelExecutionSummary(
+                runner="CountingArchitectRunner",
+                model_calls=self._model_calls,
+                attempts_used=1,
+            ),
         )
         return self.outcome
 
@@ -1146,3 +1162,327 @@ def test_plan_project_from_architecture_rechaza_un_diseno_invalido(
     with pytest.raises(PlanningValidationError):
         camus.plan_project_from_architecture(_INTENT, sin_diseno)
     assert planner.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# V602-04-B: las llamadas reales al modelo llegan al resultado normalizado
+# ---------------------------------------------------------------------------
+#: Normalizador puro de cada rol, para comprobar que **todos** copian las llamadas declaradas.
+_RoleNormalizer = Callable[[object, RoleExecutionRequest], RoleExecutionResult]
+_NORMALIZADORES: tuple[tuple[RoleName, _RoleNormalizer], ...] = (
+    (RoleName.ARCHITECT, normalize_architecture),
+    (RoleName.PLANNER, normalize_planning),
+    (RoleName.DEVELOPER, normalize_developer),
+    (RoleName.QA, normalize_qa),
+    (RoleName.SECURITY, normalize_security),
+    (RoleName.REVIEWER, normalize_review),
+    (RoleName.CROSS_AUDIT, normalize_cross_audit),
+    (RoleName.VISUAL_QA, normalize_visual_qa),
+)
+
+
+@pytest.mark.parametrize(("rol", "normalizador"), _NORMALIZADORES)
+def test_los_normalizadores_copian_las_llamadas_al_modelo(
+    rol: RoleName, normalizador: _RoleNormalizer
+) -> None:
+    """Los ocho normalizadores copian el ``model_calls`` que declara el informe real."""
+    report = _report(rol, _EXITO[rol], model_calls=2)
+
+    resultado = normalizador(report, _request(rol))
+
+    assert resultado.model_calls == 2
+    assert resultado.role is rol
+
+
+def test_las_llamadas_al_modelo_no_se_deducen_de_los_tokens() -> None:
+    """Sin llamadas declaradas el contador es ``0``: los tokens no son un contador de llamadas."""
+    report = _report(
+        RoleName.QA,
+        QAStatus.PASS,
+        model_calls=0,
+        attempts=0,
+        model_usage=ModelUsage(prompt_tokens=500, completion_tokens=499, total_tokens=999),
+    )
+
+    resultado = normalize_qa(report, _request(RoleName.QA))
+
+    assert resultado.usage.total_tokens == 999
+    assert resultado.model_calls == 0
+
+
+def test_el_adaptador_real_reporta_las_llamadas_al_modelo_del_informe(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V602-04-B: un informe que declara 3 llamadas da ``RoleExecutionResult.model_calls == 3``.
+
+    Con ``CamusRoleExecutor`` **real** y CAMUS **real**: el defecto era que el adaptador devolvía
+    ``model_calls=0`` aunque el ``ModelExecutionSummary`` del informe declarara llamadas de verdad.
+    """
+    architect = _CountingArchitectRunner(model_calls=3)
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    executor = _camus_role(camus, RoleName.ARCHITECT, _EngineArtifactStore())
+
+    resultado = executor.execute(_request(RoleName.ARCHITECT))
+
+    assert resultado.status is RoleStatus.COMPLETED
+    assert architect.outcome is not None
+    assert architect.outcome.summary.model_calls == 3
+    assert resultado.model_calls == 3
+    assert planner.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# V602-03: el handoff durable lo produce el adaptador real, sin closure externa
+# ---------------------------------------------------------------------------
+def test_el_architect_publica_su_diseno_durable_sin_closure_externa(
+    tmp_path: Path, task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V602-03: con ``artifacts`` y sin ``build_input``, el adaptador publica el diseño él mismo."""
+    architect = _CountingArchitectRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=_CountingPlannerRunner(),
+    )
+    store = FileArtifactStore(tmp_path / "artifacts")
+    executor = CamusRoleExecutor(camus=camus, role=RoleName.ARCHITECT, artifacts=store)
+
+    resultado = executor.execute(_request(RoleName.ARCHITECT))
+
+    assert resultado.status is RoleStatus.COMPLETED
+    assert len(resultado.artifact_references) == 1
+    reference = resultado.artifact_references[0]
+    assert reference.kind == ARCHITECTURE_KIND
+    assert reference.digest and reference.bytes_written > 0
+    design = resolve_architecture(store, (reference,))
+    assert design is not None
+    assert design.proposal == _ARCHITECTURE_PROPOSAL
+    assert architect.calls == 1
+
+
+def test_el_planner_resuelve_el_diseno_del_almacen_y_publica_el_plan_durable(
+    tmp_path: Path, task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V602-03: sin ``build_input``, el Planner resuelve el diseño del almacén y publica el plan."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    store = FileArtifactStore(tmp_path / "artifacts")
+
+    diseno = CamusRoleExecutor(camus=camus, role=RoleName.ARCHITECT, artifacts=store).execute(
+        _request(RoleName.ARCHITECT)
+    )
+    assert diseno.status is RoleStatus.COMPLETED
+    referencia = diseno.artifact_references[0]
+
+    plan = CamusRoleExecutor(camus=camus, role=RoleName.PLANNER, artifacts=store).execute(
+        _request(RoleName.PLANNER, references=(referencia,))
+    )
+
+    assert plan.status is RoleStatus.COMPLETED
+    assert architect.calls == 1, "el Planner no vuelve a ejecutar al Architect"
+    assert planner.calls == 1
+    assert len(plan.artifact_references) == 1
+    assert plan.artifact_references[0].kind == PLAN_KIND
+    durable = resolve_plan(store, plan.artifact_references)
+    assert durable is not None
+    assert durable.roadmap == _PLANNER_ROADMAP
+    assert durable.task_graph == _PLANNER_TASK_GRAPH
+    assert durable.project_spec == _ARCHITECTURE_PROPOSAL.project_spec
+    assert durable.capability_profile == _ARCHITECTURE_PROPOSAL.capability_profile
+
+
+def test_el_planner_sin_almacen_ni_entrada_explicita_falla_de_forma_explicita(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Sin ``artifacts`` ni ``build_input`` el Planner no improvisa: no llama a nadie y lo dice."""
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=_CountingArchitectRunner(),
+        planner=planner,
+    )
+
+    resultado = CamusRoleExecutor(camus=camus, role=RoleName.PLANNER).execute(
+        _request(RoleName.PLANNER)
+    )
+
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "PLANNER" in resultado.error_detail
+    assert "artifacts" in resultado.error_detail
+    assert planner.calls == 0
+
+
+def test_el_planner_sin_referencia_durable_falla_sin_planificar_ni_disenar(
+    tmp_path: Path, task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Con almacén pero sin diseño referenciado, la etapa falla: no se vuelve a diseñar."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    executor = CamusRoleExecutor(
+        camus=camus, role=RoleName.PLANNER, artifacts=FileArtifactStore(tmp_path / "artifacts")
+    )
+
+    resultado = executor.execute(_request(RoleName.PLANNER))
+
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "references" in resultado.error_detail
+    assert planner.calls == 0
+    assert architect.calls == 0, "el Architect no se re-ejecuta para suplir el diseño ausente"
+
+
+def test_el_developer_sin_plan_durable_falla_de_forma_explicita(
+    tmp_path: Path, task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Sin plan durable el Developer no trabaja, y el detalle dice exactamente qué falta."""
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=_CountingArchitectRunner(),
+        planner=_CountingPlannerRunner(),
+    )
+    executor = CamusRoleExecutor(
+        camus=camus, role=RoleName.DEVELOPER, artifacts=FileArtifactStore(tmp_path / "artifacts")
+    )
+
+    resultado = executor.execute(_request(RoleName.DEVELOPER))
+
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "plan durable" in resultado.error_detail
+    assert "references" in resultado.error_detail
+
+
+def test_el_developer_sin_almacen_ni_entrada_explicita_falla_de_forma_explicita(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """Sin ``artifacts`` ni ``build_input`` el Developer tampoco improvisa su entrada."""
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=_CountingArchitectRunner(),
+        planner=_CountingPlannerRunner(),
+    )
+
+    resultado = CamusRoleExecutor(camus=camus, role=RoleName.DEVELOPER).execute(
+        _request(RoleName.DEVELOPER)
+    )
+
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert "DEVELOPER" in resultado.error_detail
+    assert "artifacts" in resultado.error_detail
+
+
+# ---------------------------------------------------------------------------
+# V602-04-C: sin saldo de modelo autorizado el adaptador real no gasta nada
+# ---------------------------------------------------------------------------
+def _allowance(*, model_calls: int, tokens: int) -> BudgetAllowance:
+    """Saldo autorizado por el kernel para un intento, con tiempo de sobra."""
+    return BudgetAllowance(
+        model_calls_remaining=model_calls,
+        tokens_remaining=tokens,
+        wall_time_seconds_remaining=10.0,
+    )
+
+
+def test_el_adaptador_real_no_llama_a_camus_sin_saldo_de_modelo() -> None:
+    """V602-04-C: con cero llamadas autorizadas, CAMUS no se invoca ni una vez."""
+    camus = _FakeCamus(_report(RoleName.QA, QAStatus.PASS))
+    executor = CamusRoleExecutor(camus=camus, role=RoleName.QA, build_input=lambda _request: "t")
+    request = _request(RoleName.QA).model_copy(
+        update={"budget_allowance": _allowance(model_calls=0, tokens=100)}
+    )
+
+    resultado = executor.execute(request)
+
+    assert camus.calls == [], "sin saldo no se toca el proveedor"
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED
+    assert "saldo" in resultado.error_detail
+    assert "Cero llamadas reales" in resultado.error_detail
+
+
+def test_el_adaptador_real_no_llama_a_camus_sin_saldo_de_tokens() -> None:
+    """V602-04-C: ceñir las llamadas no basta; sin tokens autorizados tampoco se invoca."""
+    camus = _FakeCamus(_report(RoleName.QA, QAStatus.PASS))
+    executor = CamusRoleExecutor(camus=camus, role=RoleName.QA, build_input=lambda _request: "t")
+    request = _request(RoleName.QA).model_copy(
+        update={"budget_allowance": _allowance(model_calls=5, tokens=0)}
+    )
+
+    resultado = executor.execute(request)
+
+    assert camus.calls == []
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED
+    assert "tokens_remaining=0" in resultado.error_detail
+
+
+def test_el_adaptador_real_ejecuta_cuando_hay_saldo_de_modelo() -> None:
+    """Con saldo autorizado la etapa se ejecuta: la cota no estorba al camino feliz."""
+    camus = _FakeCamus(_report(RoleName.QA, QAStatus.PASS))
+    executor = CamusRoleExecutor(camus=camus, role=RoleName.QA, build_input=lambda _request: "t")
+    request = _request(RoleName.QA).model_copy(
+        update={"budget_allowance": _allowance(model_calls=1, tokens=100)}
+    )
+
+    resultado = executor.execute(request)
+
+    assert [llamada[0] for llamada in camus.calls] == ["qa_task"]
+    assert resultado.status is RoleStatus.COMPLETED
+
+
+def test_el_adaptador_real_no_ejecuta_al_architect_sin_saldo_de_modelo(
+    task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
+) -> None:
+    """V602-04-C con el rol real: sin saldo, el runner del Architect recibe cero llamadas."""
+    architect = _CountingArchitectRunner()
+    planner = _CountingPlannerRunner()
+    camus = _planning_camus(
+        task_manager=task_manager,
+        policy_engine=policy_engine,
+        human_gate=human_gate,
+        architect=architect,
+        planner=planner,
+    )
+    executor = _camus_role(camus, RoleName.ARCHITECT, _EngineArtifactStore())
+    request = _request(RoleName.ARCHITECT).model_copy(
+        update={"budget_allowance": _allowance(model_calls=0, tokens=100)}
+    )
+
+    resultado = executor.execute(request)
+
+    assert architect.calls == 0, "el runner del modelo no se llama sin autorización de gasto"
+    assert planner.calls == 0
+    assert resultado.status is RoleStatus.FAILED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED
+    assert resultado.model_calls == 0

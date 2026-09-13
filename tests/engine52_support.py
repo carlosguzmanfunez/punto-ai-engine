@@ -43,8 +43,39 @@ from test_anthropic_client import (
     message_response,
 )
 
+#: Implementación del proyecto sintético de auditoría cruzada: una función **pura**.
+#:
+#: El fixture está deliberadamente limpio porque el gate vivo E exige ``PASS``: una función que
+#: solo transforma texto no tiene subprocess, ni escritura de archivos, ni red, ni eval/exec, ni
+#: import dinámico, ni shell, ni credenciales. Un auditor real no puede calificar de HIGH lo que
+#: no ejecuta nada, así que el veredicto del gate deja de depender de una discusión de
+#: seguridad ambigua.
+CLEAN_IMPLEMENTATION: str = (
+    '"""Normalización de etiquetas de texto."""\n'
+    "\n"
+    "\n"
+    "def normalize_label(value: str) -> str:\n"
+    '    """Devuelve la etiqueta en minúsculas y sin espacios sobrantes."""\n'
+    '    return " ".join(value.strip().lower().split())\n'
+)
+
+#: Prueba determinista del Developer sobre la función pura: sin subprocess ni efectos.
+CLEAN_DEVELOPER_TEST: str = (
+    "from runner import normalize_label\n"
+    "\n"
+    "\n"
+    "def test_recorta_y_baja_a_minusculas() -> None:\n"
+    "    assert normalize_label('  Hola   Mundo ') == 'hola mundo'\n"
+    "\n"
+    "\n"
+    "def test_no_cambia_una_etiqueta_ya_normalizada() -> None:\n"
+    "    assert normalize_label('hola') == 'hola'\n"
+)
+
 #: Criterio de aceptación del proyecto sintético de auditoría.
-CROSS_AUDIT_CRITERIA: tuple[str, ...] = ("ejecuta el comando indicado por el usuario",)
+CROSS_AUDIT_CRITERIA: tuple[str, ...] = (
+    "normalize_label devuelve la etiqueta en minúsculas y sin espacios sobrantes",
+)
 
 #: Summary y valoraciones por defecto de una propuesta limpia.
 CLEAN_ASSESSMENTS: dict[str, str] = {
@@ -141,22 +172,22 @@ def make_review_finding(
         description="La función no documenta qué recibe ni qué devuelve.",
         file=file,
         line=4,
-        evidence="def run_user_command(command: list[str]) -> str:",
+        evidence="def normalize_label(value: str) -> str:",
         recommendation="Añadir una docstring con el contrato.",
     )
 
 
 def cross_audit_workspace(tmp_path: Path) -> Path:
-    """Proyecto sintético con la implementación corregida y su prueba."""
+    """Proyecto sintético **inequívocamente limpio** y su prueba determinista.
+
+    Es el fixture que usa el gate vivo E: una función pura de normalización de texto, sin
+    subprocess ni efectos. El nombre de archivo se mantiene para no tocar el resto de pruebas.
+    """
     return build_security_project(
         tmp_path,
         {
-            "runner.py": CORRECTED_RUNNER,
-            "tests/test_runner_developer.py": (
-                "from runner import run_user_command\n\n\n"
-                "def test_runs_a_command() -> None:\n"
-                "    assert run_user_command(['echo', 'hola']).strip() == 'hola'\n"
-            ),
+            "runner.py": CLEAN_IMPLEMENTATION,
+            "tests/test_runner_developer.py": CLEAN_DEVELOPER_TEST,
         },
     )
 
@@ -175,7 +206,7 @@ def make_cross_audit_task(workspace: Path, **overrides: object) -> CrossAuditTas
         "task_id": task_id,
         "project_id": project_id,
         "objective": (
-            "Implementar run_user_command para ejecutar un comando y devolver su salida"
+            "Implementar normalize_label para normalizar etiquetas de texto"
         ),
         "acceptance_criteria": CROSS_AUDIT_CRITERIA,
         "changed_files": ("runner.py",),
@@ -211,6 +242,8 @@ def audit_runner_with(
 __all__ = [
     "ACCEPTANCE_CRITERIA",
     "CLEAN_ASSESSMENTS",
+    "CLEAN_DEVELOPER_TEST",
+    "CLEAN_IMPLEMENTATION",
     "CORRECTED_RUNNER",
     "CROSS_AUDIT_CRITERIA",
     "FAKE_KEY",

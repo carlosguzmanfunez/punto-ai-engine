@@ -47,6 +47,11 @@ FORBIDDEN_PATH_FRAGMENTS: Final[tuple[str, ...]] = (
     "credentials",
 )
 
+#: Caracteres de control (C0 y DEL). Un NUL incrustado no es una ruta: es una ambigüedad que
+#: la frontera no debe resolver a ciegas, porque el sistema de archivos y el texto podrían
+#: interpretarla de forma distinta.
+CONTROL_CHARACTER_PATTERN: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
 
 class PathKind(StrEnum):
     """Clasificación determinista de una ruta propuesta por QA."""
@@ -65,12 +70,16 @@ def normalize_relative_path(path: str) -> str:
     """Normaliza una ruta relativa a formato posix, o lanza ``ValueError``.
 
     Raises:
-        ValueError: si la ruta es vacía, absoluta, de unidad Windows, contiene ``..``
-            o usa separadores mixtos de forma ambigua.
+        ValueError: si la ruta es vacía, absoluta, de unidad Windows, contiene ``..``, usa
+            separadores mixtos de forma ambigua o incluye caracteres de control (incluido NUL).
     """
     raw = path.strip().replace("\\", "/")
     if not raw:
         raise ValueError("ruta vacía")
+    if CONTROL_CHARACTER_PATTERN.search(raw):
+        # Un NUL o un salto de línea incrustado no es una ruta: es un intento de que la
+        # frontera vea una cosa y el sistema de archivos otra.
+        raise ValueError(f"ruta con caracteres de control no permitida: {path!r}")
     if raw.startswith("/") or raw.startswith("~"):
         raise ValueError(f"ruta absoluta no permitida: {path!r}")
     if re.match(r"^[A-Za-z]:", raw):
@@ -149,6 +158,7 @@ def is_test_only_path(path: str, *, test_only_paths: tuple[str, ...] = ()) -> bo
 
 
 __all__ = [
+    "CONTROL_CHARACTER_PATTERN",
     "FORBIDDEN_DIRECTORIES",
     "FORBIDDEN_PATH_FRAGMENTS",
     "TEST_DIRECTORIES",

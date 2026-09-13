@@ -203,7 +203,8 @@ def require_provider(
 
     Comprobar el modelo importa tanto como comprobar el proveedor: una ruta que dice
     ``claude-opus-5`` y un cliente configurado con otro modelo producirían un informe que
-    declara algo distinto de lo que se ejecutó.
+    declara algo distinto de lo que se ejecutó. Y un modelo **vacío** no se salta la
+    comprobación: un cliente que no declara modelo no puede acreditar la ruta.
 
     Raises:
         ProviderRouteError: si no hay cliente del proveedor, si el cliente declara otro
@@ -221,7 +222,7 @@ def require_provider(
             f"PROVIDER_UNAVAILABLE: el rol {route.role.value} pide {route.provider!r} y el "
             f"cliente entregado es {client.provider!r}: no se sustituye por otro proveedor."
         )
-    if client.model and client.model != route.model:
+    if not client.model or client.model != route.model:
         raise ProviderRouteError(
             f"PROVIDER_MODEL_MISMATCH: el rol {route.role.value} declara el modelo "
             f"{route.model!r} y el cliente entregado usa {client.model!r}: la ruta y lo que se "

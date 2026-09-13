@@ -147,7 +147,7 @@ def test_prompt_carries_the_production_system_prompt_and_context(tmp_path: Path)
     body = api.last_body
     assert body["system"] == CROSS_AUDIT_SYSTEM_PROMPT
     text = body["messages"][0]["content"][0]["text"]
-    assert "run_user_command" in text
+    assert "normalize_label" in text
     assert "PASS" in text
     assert "runner.py" in text
 
@@ -486,7 +486,7 @@ def test_audit_events_are_recorded(tmp_path: Path) -> None:
     assert tuple(metadata["upstream_providers"]) == ("deepseek",)
     assert metadata["cross_model"] is True
     assert "sk-ant" not in json.dumps(metadata)
-    assert "run_user_command" not in json.dumps(metadata)
+    assert "normalize_label" not in json.dumps(metadata)
 
 
 def test_blocked_audit_is_recorded_as_blocked(tmp_path: Path) -> None:

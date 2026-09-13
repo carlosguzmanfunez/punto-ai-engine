@@ -2220,7 +2220,7 @@ Nota documentada: `stop_reason` devuelve el valor **nativo** del proveedor. Deep
 `length` y Anthropic `max_tokens` para el mismo fenómeno; traducirlo exigiría verificar en vivo
 la semántica de cada uno, y una tabla inventada sería peor que la asimetría declarada.
 
-### Structured Outputs (ENGINE-5.2.1)
+### Structured Outputs y dialecto del proveedor (ENGINE-5.2.1 · 5.2.2)
 
 El formato no depende de que el prompt pida JSON por favor. `complete_json` y
 `complete_multimodal_json` aceptan `json_schema`, y cada proveedor lo cumple según su
@@ -2228,24 +2228,40 @@ primitiva real:
 
 | Proveedor | Cómo lo aplica |
 | --- | --- |
-| Anthropic | `output_config.format = {"type": "json_schema", "schema": <schema>}` en la petición; sin `output_format` antiguo y sin *assistant prefill* |
+| Anthropic | `output_config.format = {"type": "json_schema", "schema": <provider schema>}` en la petición; sin `output_format` antiguo y sin *assistant prefill* |
 | DeepSeek | Conserva `response_format: json_object` y recibe el esquema como contrato **textual** en el prompt de sistema: no se finge una garantía que su API no da |
 
-Antes de enviar nada, `prepare_json_schema` hace una transformación controlada del esquema que
-produce Pydantic:
+**Dos esquemas, dos responsabilidades.** El **original** (`Model.model_json_schema()`) es el
+contrato de PUNTO y no se toca: `Model.model_validate(...)` lo sigue aplicando entero. El
+**provider schema** es la versión compatible que viaja al proveedor, y la produce
+`provider_schema_for(Modelo)`:
 
 1. **inlinea** las referencias locales (`$ref` a `$defs`) y elimina `$defs`, para enviar un
    esquema autocontenido en vez de uno que el proveedor tenga que resolver;
-2. **rechaza** los ciclos de referencias en lugar de adivinar una estructura;
-3. exige que la raíz cumpla el contrato de PUNTO: `type: object`, `properties` no vacío,
-   `required` con campos reales y `additionalProperties: false`.
+2. los **siblings** de un `$ref` solo pueden anotar (`title`, `description`, `default`). Un
+   sibling estructural que contradiga o amplíe el destino es un **conflicto** y se rechaza: no
+   se elige uno de los dos en silencio;
+3. **retira** las restricciones que el dialecto del proveedor no admite y las cuenta en la
+   `description` del campo. La lista es explícita y solo toca lo no admitido:
+   `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+   `multipleOf`, `maxItems`, `uniqueItems`, `minProperties`, `maxProperties`. Lo que **sí** se
+   admite (`anyOf`, `allOf`, `enum`, `const`, `default`, `required`, `additionalProperties`,
+   `format`, `pattern`, `minItems`) se conserva intacto: una lista negra improvisada destruiría
+   features válidas;
+4. **rechaza** ciclos de referencias, referencias irresolubles y profundidades absurdas;
+5. valida **todos** los nodos, no solo la raíz: un `minLength` escondido en el `items` de un
+   array anidado rompería la petición igual que uno en la raíz. Cada objeto con `properties`
+   debe estar cerrado (`additionalProperties: false`), cada array debe declarar `items`, cada
+   unión debe ser una lista no vacía de esquemas y ningún keyword desconocido llega al
+   proveedor.
 
 Un esquema que no cumple falla en PUNTO con `SchemaValidationError` y **cero** peticiones HTTP.
 
-Structured Outputs **reduce** errores de formato; no sustituye a la frontera final: el
-resultado sigue pasando por `Pydantic.model_validate(...)`, y el bucle de reparación semántica
-se conserva para lo que un esquema no puede cubrir (evidencia, visibilidad de archivos,
-referencias a hallazgos y los invariantes propios de PUNTO).
+Retirar una restricción del provider schema **no** relaja nada: `Field(min_length=1)` se anota
+en la descripción para el modelo, pero `model_validate(...)` sigue rechazando la cadena vacía.
+Structured Outputs **reduce** errores de formato; Pydantic decide la validez final, y el bucle
+de reparación semántica se conserva para lo que un esquema no puede cubrir (evidencia,
+visibilidad de archivos, referencias a hallazgos y los invariantes propios de PUNTO).
 
 ### Cliente de Anthropic
 
@@ -2254,17 +2270,20 @@ referencias a hallazgos y los invariantes propios de PUNTO).
 
 | Aspecto | Comportamiento |
 | --- | --- |
-| Errores | `AnthropicAuthenticationError` (401/403), `AnthropicRateLimitError` (429), `AnthropicServerError` (5xx/529), `AnthropicProviderError` (resto 4xx), `AnthropicTransportError` / `AnthropicTimeoutError`, `AnthropicInvalidResponseError`, `AnthropicTruncatedResponseError` |
-| Reintentos | 401/403 **nunca** (una sola llamada); 429/5xx/529/timeout/red con backoff exponencial acotado |
-| Truncamiento | `stop_reason == "max_tokens"` se detecta **antes** de interpretar el JSON: nunca se reporta un error de sintaxis cuando la causa es el presupuesto |
-| Redacción | clave exacta, cualquier `sk-ant-...`, `x-api-key: ...` y `Bearer ...`; el detalle HTTP se redacta **antes** de recortarlo |
+| Errores | `AnthropicAuthenticationError` (401/403), `AnthropicRateLimitError` (429), `AnthropicServerError` (5xx/529), `AnthropicProviderError` (resto 4xx), `AnthropicTransportError` / `AnthropicTimeoutError`, `AnthropicInvalidResponseError`, `AnthropicTruncatedResponseError`, `AnthropicRefusalError` |
+| Reintentos | 401/403 **nunca** (una sola llamada); 429/5xx/529/timeout/red con espera acotada |
+| Espera | Un `retry-after` válido manda; ausente o ilegible usa backoff exponencial; por encima de 60 s se falla de forma explícita en vez de bloquear el proceso. Nunca se copian cabeceras a mensajes ni a registros |
+| Motivos de parada | `max_tokens` y `model_context_window_exceeded` ⇒ truncamiento (capacidad, nunca «JSON roto»); `refusal` ⇒ `AnthropicRefusalError`, detectado **antes** de interpretar el contenido |
+| Redacción | clave exacta, cualquier `sk-ant-...`, `x-api-key: ...` y `Bearer ...`; el detalle HTTP se redacta **antes** de recortarlo, y todo lo que se persiste o se reporta pasa por ella |
 | Credencial | solo en el proceso que llama: no entra al sandbox, ni al workspace, ni al prompt, ni al registro de auditoría |
 
 La jerarquía se diseñó para ser **equivalente**, no idéntica, a la de DeepSeek: añade
 `AnthropicTimeoutError` (subclase de transporte) y `AnthropicServerError` (subclase de
 proveedor) porque distinguir un 500 de un 400 es información útil. Además,
-`AnthropicAuthenticationError` hereda de `ProviderAuthenticationError`, así que el motor puede
-tratarla como «proveedor no disponible» sin conocer a Anthropic.
+`AnthropicAuthenticationError` hereda de `ProviderAuthenticationError` y
+`AnthropicRefusalError` de `ProviderRefusalError`, así que el motor puede tratarlas sin conocer
+a Anthropic. Una negativa **no** se reintenta con el mismo prompt ni se sustituye el proveedor:
+en la auditoría cruzada produce `BLOCKED` con causa propia, `PROVIDER_REFUSAL`.
 
 ### Fundación multimodal
 
@@ -2369,10 +2388,10 @@ Los gates vivos están endurecidos para no poder confundir un bloqueo con un éx
 | Gate | Exigencia |
 | --- | --- |
 | A. Autenticación | respuesta real con `provider=anthropic`, tokens > 0 |
-| B. JSON estructurado | **esquema real** en `output_config.format` y `json.loads` del contenido **sin** quitar vallas |
+| B. JSON estructurado | el **esquema de producción** (`provider_schema_for(CrossAuditProposal)`) en `output_config.format` y `json.loads` del contenido **sin** quitar vallas: un dialecto incompatible daría 400 y el gate falla. Un esquema simple complementario también se prueba |
 | C. Credencial inválida | `AnthropicAuthenticationError` con **cero** reintentos |
-| D. Multimodal | esquema `{"image_received": boolean}` y `image_received is True`: nada de juicios visuales subjetivos |
-| E. Auditoría cruzada | el fixture limpio debe dar **PASS**; `BLOCKED` y `CHANGES_REQUESTED` **no** se aceptan como éxito, y se exige `provider == "anthropic"`, `model == cliente.model`, `cross_model is True` y tokens > 0 |
+| D. Multimodal | texto + imagen + esquema, y un `image_received is True` que el esquema obliga a responder. Demuestra **transporte y estructura**, no reconocimiento visual ni estética |
+| E. Auditoría cruzada | el fixture limpio debe dar **PASS**; `BLOCKED` y `CHANGES_REQUESTED` **no** se aceptan como éxito, y se exige `provider == "anthropic"`, `model == cliente.model`, `cross_model is True` y tokens > 0. El fixture es una función **pura** de normalización de texto: sin subprocess, efectos, red, `eval`/`exec`, import dinámico, shell ni credenciales, para que el veredicto no dependa de una discusión de seguridad ambigua |
 
 ### Limitación declarada
 
@@ -2383,10 +2402,13 @@ Los gates vivos están endurecidos para no poder confundir un bloqueo con un éx
   `True`. Lo que sigue sin poder afirmarse es el **acceso de esta cuenta** a ellos
   (`LIVE_ACCOUNT_ACCESS_UNVERIFIED`), porque la fase se construyó sin credencial. No hay lista
   blanca: un identificador equivocado se verá como un 404 explícito del proveedor.
-- El esquema preparado usa `anyOf` para los campos opcionales (`line`, `confidence`), que es lo
-  que produce Pydantic para `int | None`. Ese detalle del dialecto solo lo puede confirmar la
-  API real: lo verificará el gate vivo E, que envía el esquema completo de
-  `CrossAuditProposal`.
+- El provider schema usa `anyOf` para los campos opcionales (`line`, `confidence`), que es lo
+  que produce Pydantic para `int | None`, y conserva `default`. Ese detalle del dialecto solo lo
+  puede confirmar la API real: lo verifica el gate vivo B con el **esquema de producción**
+  completo de `CrossAuditProposal`, no con uno trivial.
+- Los límites multimodales se miden en **bytes crudos** de la imagen, mientras el transporte la
+  envía en base64 (≈33 % más). No se deben «igualar» a los 10 MB que publica la API pensando que
+  son la misma unidad.
 - Los tres roles visuales están **preparados** (ruta declarada) pero **sin runner**: sus
   interfaces llegarán en ENGINE-5.3.
 - No hay routing autónomo ni bucle de reparación: eso es ENGINE-6.

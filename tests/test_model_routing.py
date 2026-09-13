@@ -357,6 +357,15 @@ def test_require_provider_rejects_a_client_with_another_model() -> None:
         require_provider(route, {PROVIDER_ANTHROPIC: other})
 
 
+def test_require_provider_rejects_a_client_without_a_model() -> None:
+    """Un cliente que no declara modelo no acredita la ruta: no se salta la comprobación."""
+    route = ModelRouter().route(ModelRole.CROSS_AUDITOR)
+    anonymous = _ClientDouble(PROVIDER_ANTHROPIC, "")
+
+    with pytest.raises(ProviderRouteError, match="PROVIDER_MODEL_MISMATCH"):
+        require_provider(route, {PROVIDER_ANTHROPIC: anonymous})
+
+
 def test_require_provider_rejects_a_client_from_another_provider() -> None:
     route = ModelRouter().route(ModelRole.CROSS_AUDITOR)
     impostor = _ClientDouble(PROVIDER_DEEPSEEK)

@@ -39,7 +39,8 @@ from punto.providers.anthropic import (
     config_from_environment,
 )
 from punto.providers.base import ImagePayload
-from punto.schemas.cross_audit import CrossAuditStatus
+from punto.providers.json_schema import provider_schema_for
+from punto.schemas.cross_audit import CrossAuditProposal, CrossAuditStatus
 
 pytestmark = pytest.mark.integration
 
@@ -119,12 +120,48 @@ def test_live_a_authentication_works(client: AnthropicClient) -> None:
 
 
 def test_live_b_structured_json_is_parseable(client: AnthropicClient) -> None:
-    """Gate B: con esquema real, la respuesta es JSON parseable **sin** limpiar fences.
+    """Gate B: con esquema real, la respuesta es JSON parseable **sin** limpiar vallas.
 
     El esquema viaja en ``output_config.format``: si el proveedor respeta structured outputs,
     el contenido es JSON válido tal cual. Quitarle las vallas al texto escondería que ese
     camino no funcionó, así que aquí no se limpia nada.
+
+    Este gate usa el **esquema real de producción** —el mismo que envía la auditoría cruzada,
+    ya transformado al dialecto del proveedor— porque uno trivial puede quedar verde mientras la
+    ruta de producción está rota. Si el dialecto no fuera compatible, la API respondería 400 y
+    la prueba falla.
     """
+    production_schema = provider_schema_for(CrossAuditProposal)
+    completion = client.complete_json(
+        system_prompt="Respondes con un objeto JSON que cumple el esquema entregado.",
+        user_prompt=(
+            "Audita un cambio hipotético de una función que normaliza etiquetas de texto. "
+            "No hay hallazgos: devuelve una lista vacía y valoraciones breves."
+        ),
+        json_schema=production_schema,
+    )
+    payload = json.loads(completion.content)
+
+    assert isinstance(payload, dict)
+    # El contrato de producción: mismas claves, sin extras (additionalProperties: false).
+    assert set(payload) == set(production_schema["properties"])
+    assert isinstance(payload["findings"], list)
+    for field in (
+        "architecture_assessment",
+        "qa_assessment",
+        "security_assessment",
+        "maintainability_assessment",
+        "scope_assessment",
+    ):
+        assert isinstance(payload[field], str)
+    print(
+        f"\nB. structured con schema de producción: claves={sorted(payload)} "
+        f"stop={completion.stop_reason!r} tokens={completion.usage.total_tokens}"
+    )
+
+
+def test_live_b2_structured_json_with_a_simple_schema(client: AnthropicClient) -> None:
+    """Gate B (complementario): un esquema mínimo también funciona."""
     completion = client.complete_json(
         system_prompt="Respondes con un objeto JSON que cumple el esquema entregado.",
         user_prompt="Resume el cambio y lista los hallazgos (puede ser una lista vacía).",
@@ -136,7 +173,7 @@ def test_live_b_structured_json_is_parseable(client: AnthropicClient) -> None:
     assert isinstance(payload.get("summary"), str)
     assert isinstance(payload.get("findings"), list)
     assert set(payload) == {"summary", "findings"}, "el esquema prohíbe claves extra"
-    print(f"\nB. structured: claves={sorted(payload)} stop={completion.stop_reason!r}")
+    print(f"\nB2. structured simple: claves={sorted(payload)}")
 
 
 def test_live_c_invalid_key_is_rejected_once() -> None:
@@ -164,8 +201,10 @@ def test_live_c_invalid_key_is_rejected_once() -> None:
 def test_live_d_multimodal_reaches_the_api(client: AnthropicClient) -> None:
     """Gate D: texto + imagen + esquema ⇒ objeto estructurado verificable.
 
-    No se juzga nada visualmente: se comprueba un campo booleano que el esquema obliga a
-    responder, de modo que el gate no dependa de una clasificación subjetiva.
+    **Alcance real de este gate**: demuestra que la petición con texto, una imagen y un
+    ``json_schema`` es aceptada y que la respuesta estructurada se parsea con su consumo. **No**
+    demuestra reconocimiento visual ni calidad estética, y ``image_received`` es un acuse de
+    recibo que el esquema obliga a responder, no una prueba de visión.
     """
     image = ImagePayload(data=PNG_1X1, media_type="image/png", logical_name="pixel.png")
     completion = client.complete_multimodal_json(
@@ -182,7 +221,8 @@ def test_live_d_multimodal_reaches_the_api(client: AnthropicClient) -> None:
     assert payload.get("image_received") is True
     assert completion.usage.total_tokens > 0
     print(
-        f"\nD. multimodal: image_received={payload.get('image_received')} "
+        f"\nD. multimodal (transporte + estructura, no visión): "
+        f"image_received={payload.get('image_received')} "
         f"tokens={completion.usage.total_tokens} bytes={image.size_bytes}"
     )
 

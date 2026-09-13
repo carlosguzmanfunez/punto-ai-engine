@@ -42,6 +42,7 @@ from punto.providers.base import (
     MultimodalModelClient,
     ProviderAuthenticationError,
     ProviderError,
+    ProviderRefusalError,
 )
 from punto.providers.json_schema import prepare_json_schema
 from punto.schemas.execution import ModelUsage
@@ -80,6 +81,21 @@ RETRYABLE_STATUS_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 5
 
 #: ``stop_reason`` con el que Anthropic declara que se agoto el presupuesto de salida.
 STOP_REASON_MAX_TOKENS: Final[str] = "max_tokens"
+
+#: ``stop_reason`` con el que el modelo declara que se niega a responder.
+STOP_REASON_REFUSAL: Final[str] = "refusal"
+
+#: ``stop_reason`` con el que el proveedor declara que se agotó la ventana de contexto.
+STOP_REASON_CONTEXT_WINDOW: Final[str] = "model_context_window_exceeded"
+
+#: Cabecera con la espera que pide el proveedor tras un límite de tasa.
+RETRY_AFTER_HEADER: Final[str] = "retry-after"
+
+#: Presupuesto máximo de espera que PUNTO acepta obedecer de un ``retry-after``.
+#:
+#: Un header arbitrariamente grande no puede bloquear el proceso: si el proveedor pide más que
+#: esto, se falla de forma explícita en lugar de dormir un tiempo ilimitado.
+MAX_RETRY_AFTER_SECONDS: Final[float] = 60.0
 
 #: Variable de entorno con la credencial.
 API_KEY_ENV: Final[str] = "ANTHROPIC_API_KEY"
@@ -159,6 +175,16 @@ class AnthropicTimeoutError(AnthropicTransportError):
 
 class AnthropicProviderError(AnthropicError):
     """Error HTTP del proveedor que no es reintentable (400, 404, 422, ...)."""
+
+
+class AnthropicRefusalError(AnthropicError, ProviderRefusalError):
+    """El modelo respondió 200 y se negó a producir la salida.
+
+    No es un fallo de formato: el contenido no se interpreta como JSON. Se registra solo
+    metadata segura (proveedor, modelo, motivo de parada, categoría de la negativa e
+    identificador de la petición) y **no** se reintenta con el mismo prompt ni se sustituye el
+    proveedor: repetir lo que provocó la negativa no es reparar.
+    """
 
 
 class AnthropicServerError(AnthropicProviderError):
@@ -509,6 +535,7 @@ class AnthropicClient(MultimodalModelClient):
         last_error: AnthropicError | None = None
 
         for attempt in range(attempts):
+            wait: float | None = None
             try:
                 response = self._client.post(
                     MESSAGES_PATH, json=payload, headers=headers
@@ -533,9 +560,22 @@ class AnthropicClient(MultimodalModelClient):
                 # solo gasta cuota y retrasa el diagnostico.
                 if response.status_code not in RETRYABLE_STATUS_CODES:
                     raise last_error
+                # El proveedor puede pedir una espera concreta. Obedecerla es mejor que
+                # adivinar, pero solo dentro de un presupuesto: un header enorme no puede
+                # bloquear el proceso.
+                wait = _retry_after_seconds(response)
+                if wait is not None and wait > MAX_RETRY_AFTER_SECONDS:
+                    raise type(last_error)(
+                        f"{last_error} · el proveedor pide esperar {wait:.1f}s, más que el "
+                        f"presupuesto de espera de PUNTO ({MAX_RETRY_AFTER_SECONDS:.0f}s): se "
+                        "falla en vez de bloquear el proceso"
+                    )
 
             if attempt + 1 < attempts:
-                self._sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+                # Política explícita: un ``retry-after`` válido manda; ausente o inválido usa el
+                # backoff exponencial; fuera de presupuesto ya se falló arriba.
+                delay = wait if wait is not None else RETRY_BACKOFF_SECONDS * (2**attempt)
+                self._sleep(delay)
 
         assert last_error is not None  # garantizado por el bucle
         raise last_error
@@ -583,9 +623,23 @@ class AnthropicClient(MultimodalModelClient):
         model = raw_model if isinstance(raw_model, str) and raw_model else self._config.model
         blocks = body.get("content")
 
+        # La negativa se detecta ANTES de leer el contenido: un 200 con refusal no es una
+        # respuesta que se pueda interpretar como JSON, y tratarla como tal sería inventar
+        # contenido a partir de una negativa.
+        if stop_reason == STOP_REASON_REFUSAL:
+            raise AnthropicRefusalError(
+                "el modelo se negó a responder "
+                f"(provider={PROVIDER_ANTHROPIC}, model={model}, "
+                f"stop_reason={stop_reason!r}, "
+                f"categoría={_refusal_category(body)!r}, "
+                f"request_id={_request_id(response, body) or '(sin id)'}, "
+                f"texto recibido de {len(_extract_text(blocks))} caracteres). "
+                "No se reintenta con el mismo prompt ni se sustituye el proveedor."
+            )
+
         # El truncamiento se detecta ANTES de interpretar el contenido: un JSON cortado
         # produce un error de sintaxis enganoso que oculta la causa real, que es el
-        # presupuesto de salida. Y no se repite la petición: se cortaria igual.
+        # presupuesto de salida. Y no se repite la petición: se cortaría igual.
         if stop_reason == STOP_REASON_MAX_TOKENS:
             raise AnthropicTruncatedResponseError(
                 "respuesta truncada por el límite de tokens de salida "
@@ -593,6 +647,17 @@ class AnthropicClient(MultimodalModelClient):
                 f"stop_reason={stop_reason!r}, max_tokens={self._config.max_tokens}, "
                 f"texto recibido de {len(_extract_text(blocks))} caracteres). "
                 "Aumenta max_tokens."
+            )
+
+        # Capacidad, no formato: la ventana de contexto se agotó y la salida no es utilizable
+        # completa. Se clasifica como truncamiento para no confundirlo con un JSON roto.
+        if stop_reason == STOP_REASON_CONTEXT_WINDOW:
+            raise AnthropicTruncatedResponseError(
+                "respuesta incompleta porque se agotó la ventana de contexto "
+                f"(provider={PROVIDER_ANTHROPIC}, model={model}, "
+                f"stop_reason={stop_reason!r}, texto recibido de "
+                f"{len(_extract_text(blocks))} caracteres). Reduce el contexto o el esquema; "
+                "no se reintenta con el mismo prompt."
             )
 
         content = _extract_text(blocks)
@@ -629,6 +694,35 @@ def _extract_text(blocks: object) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def _refusal_category(body: dict[str, Any]) -> str:
+    """Categoría de la negativa, si el proveedor la declara. Nunca la respuesta completa."""
+    details = body.get("stop_details")
+    if isinstance(details, dict):
+        category = details.get("category")
+        if isinstance(category, str):
+            return category
+    return ""
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Espera pedida por el proveedor, o ``None`` si falta o no es utilizable.
+
+    Solo se aceptan segundos enteros no negativos. Una fecha HTTP, un valor vacío o cualquier
+    cosa no numérica se ignoran: en ese caso se usa el backoff exponencial de PUNTO. Nunca se
+    copian headers a mensajes ni a registros: aquí solo se lee un número.
+    """
+    raw = response.headers.get(RETRY_AFTER_HEADER)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        return None
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):  # NaN o infinito
+        return None
+    return seconds
 
 
 def _request_id(response: httpx.Response, body: dict[str, Any]) -> str:
@@ -699,12 +793,16 @@ __all__ = [
     "DEFAULT_TRANSPORT_RETRIES",
     "DEFAULT_VISUAL_MODEL",
     "LIVE_ACCOUNT_ACCESS_UNVERIFIED",
+    "MAX_RETRY_AFTER_SECONDS",
     "MAX_TOKENS_ENV",
     "MESSAGES_PATH",
     "MODEL_ID_DOCUMENTED",
     "RETRYABLE_STATUS_CODES",
+    "RETRY_AFTER_HEADER",
     "RETRY_BACKOFF_SECONDS",
+    "STOP_REASON_CONTEXT_WINDOW",
     "STOP_REASON_MAX_TOKENS",
+    "STOP_REASON_REFUSAL",
     "VISUAL_MODEL_ENV",
     "AnthropicAuthenticationError",
     "AnthropicClient",
@@ -713,6 +811,7 @@ __all__ = [
     "AnthropicInvalidResponseError",
     "AnthropicProviderError",
     "AnthropicRateLimitError",
+    "AnthropicRefusalError",
     "AnthropicServerError",
     "AnthropicTimeoutError",
     "AnthropicTransportError",

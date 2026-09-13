@@ -263,7 +263,7 @@ def _resolved_root(root: Path) -> Path:
     """
     try:
         return root.resolve()
-    except OSError:  # pragma: no cover - depende del sistema de archivos
+    except (OSError, ValueError):  # pragma: no cover - depende del sistema de archivos
         return root
 
 
@@ -272,10 +272,14 @@ def _contained(root: Path, resolved_root: Path, relative: str) -> Path | None:
 
     Sigue symlinks y junctions antes de decidir. Nunca devuelve una ruta cuya lectura
     pudiera salir del proyecto, y nunca revela el destino que rechazó.
+
+    ``Path.resolve()`` puede fallar con ``OSError`` (enlace roto, error del sistema de archivos)
+    y con ``ValueError`` (una ruta con caracteres inválidos, como un NUL incrustado). Las dos
+    cosas significan «no contenida», no un crash: la frontera decide, no se cae.
     """
     try:
         resolved = (root / relative).resolve()
-    except OSError:  # pragma: no cover - depende del sistema de archivos
+    except (OSError, ValueError):
         return None
     if not resolved.is_relative_to(resolved_root):
         return None

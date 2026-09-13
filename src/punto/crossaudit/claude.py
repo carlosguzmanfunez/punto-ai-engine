@@ -25,6 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from punto.common import utc_now
 from punto.crossaudit.base import CrossAuditLimits, CrossAuditRunner
 from punto.crossaudit.gates import (
@@ -54,7 +56,9 @@ from punto.providers.base import (
     ModelCompletion,
     ProviderAuthenticationError,
     ProviderError,
+    ProviderRefusalError,
 )
+from punto.providers.json_schema import provider_schema_for
 from punto.schemas.cross_audit import (
     CrossAuditGate,
     CrossAuditProposal,
@@ -75,6 +79,7 @@ BLOCKED_CROSS_AUDIT_CALLS: str = "MAX_CROSS_AUDIT_MODEL_CALLS_EXCEEDED"
 BLOCKED_CROSS_AUDIT_TOKENS: str = "MAX_CROSS_AUDIT_TOKENS_EXCEEDED"
 BLOCKED_PROVIDER_UNAVAILABLE: str = "PROVIDER_UNAVAILABLE"
 BLOCKED_PROVIDER_ERROR: str = "PROVIDER_ERROR"
+BLOCKED_PROVIDER_REFUSAL: str = "PROVIDER_REFUSAL"
 
 
 def _bullets(items: tuple[str, ...]) -> str:
@@ -175,17 +180,21 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
                 )
             except PlanningLimitExceededError as exc:
                 proposal_missing = True
-                error = str(exc)
+                error = self._safe(str(exc))
             except ProviderAuthenticationError as exc:
                 proposal_missing = True
-                error = f"{BLOCKED_PROVIDER_UNAVAILABLE}: {self._client.redact(str(exc))}"
+                error = f"{BLOCKED_PROVIDER_UNAVAILABLE}: {self._safe(str(exc))}"
+            except ProviderRefusalError as exc:
+                # Causa diferenciada: negativa no es JSON roto ni error de formato.
+                proposal_missing = True
+                error = f"{BLOCKED_PROVIDER_REFUSAL}: {self._safe(str(exc))}"
             except ProviderError as exc:
                 proposal_missing = True
-                error = f"{BLOCKED_PROVIDER_ERROR}: {self._client.redact(str(exc))}"
+                error = f"{BLOCKED_PROVIDER_ERROR}: {self._safe(str(exc))}"
             except CrossAuditProposalError as exc:
                 proposal_missing = True
-                violations = exc.violations
-                error = str(exc)
+                violations = self._safe_violations(exc.violations)
+                error = self._safe(str(exc))
 
         findings = () if proposal is None else proposal.findings
         blocking = sum(1 for finding in findings if finding.blocks)
@@ -242,8 +251,10 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
             try:
                 payload = _parse_json(completion.content)
                 proposal = CrossAuditProposal.model_validate(payload)
-            except Exception as exc:  # se traduce a violaciones, nunca a excepción
-                violations = (f"contrato incumplido: {type(exc).__name__}: {exc}",)
+            except (ValueError, ValidationError) as exc:
+                violations = (
+                    f"contrato incumplido: {type(exc).__name__}: {self._safe(str(exc))}",
+                )
                 self._audit_proposal_rejected(task, attempt, violations)
                 prompt = self._repair_prompt(task, violations, _AFTER_REJECTION)
                 continue
@@ -260,7 +271,7 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
                 file_lines=context.line_map(),
             )
             if not validation.valid:
-                violations = validation.violations
+                violations = self._safe_violations(validation.violations)
                 self._audit_proposal_rejected(task, attempt, violations)
                 prompt = self._repair_prompt(
                     task,
@@ -273,6 +284,19 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
             return proposal, attempt, model_calls, usage
 
         raise CrossAuditProposalError(violations)
+
+    def _safe(self, text: str) -> str:
+        """Sanea un texto antes de persistirlo o reportarlo.
+
+        Las violaciones de Pydantic pueden arrastrar ``input_value`` con datos del modelo o del
+        workspace, así que todo lo que sale del ciclo pasa por la redacción del cliente. No se
+        afirma que hoy hubiera una fuga: es hardening preventivo sobre datos que no controlamos.
+        """
+        return self._client.redact(text)
+
+    def _safe_violations(self, violations: tuple[str, ...]) -> tuple[str, ...]:
+        """Sanea una lista de violaciones para el informe y la auditoría."""
+        return tuple(self._safe(item) for item in violations)
 
     @staticmethod
     def _finding_ids(task: CrossAuditTask, source: str) -> frozenset[str] | None:
@@ -307,7 +331,7 @@ class ClaudeCrossModelAuditRunner(CrossAuditRunner):
             completion = self._client.complete_json(
                 system_prompt=CROSS_AUDIT_SYSTEM_PROMPT,
                 user_prompt=prompt,
-                json_schema=CrossAuditProposal.model_json_schema(),
+                json_schema=provider_schema_for(CrossAuditProposal),
             )
         except ProviderError as exc:
             self._audit_model_failed(task, attempt, self._client.redact(str(exc)))
@@ -644,6 +668,7 @@ __all__ = [
     "BLOCKED_CROSS_AUDIT_CALLS",
     "BLOCKED_CROSS_AUDIT_TOKENS",
     "BLOCKED_PROVIDER_ERROR",
+    "BLOCKED_PROVIDER_REFUSAL",
     "BLOCKED_PROVIDER_UNAVAILABLE",
     "ClaudeCrossModelAuditRunner",
     "CrossAuditProposalError",

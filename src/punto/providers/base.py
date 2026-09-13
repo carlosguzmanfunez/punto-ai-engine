@@ -48,9 +48,14 @@ SUPPORTED_IMAGE_MEDIA_TYPES: Final[frozenset[str]] = frozenset(
 MAX_IMAGES: Final[int] = 8
 
 #: Máximo de bytes por imagen.
+#:
+#: Ojo con compararlo con los límites del proveedor: PUNTO mide **bytes crudos** de la imagen,
+#: y el transporte la envía en base64, que ocupa aproximadamente un 33 % más (4/3). Un límite
+#: de 5 MB crudos son ~6,7 MB en la petición. No se debe "igualar" a 10 MB crudos pensando que
+#: equivale al tope de 10 MB que publica la API.
 MAX_IMAGE_BYTES: Final[int] = 5_000_000
 
-#: Máximo de bytes sumando todas las imágenes.
+#: Máximo de bytes sumando todas las imágenes (también en crudo, no en base64).
 MAX_TOTAL_IMAGE_BYTES: Final[int] = 15_000_000
 
 #: Proveedores conocidos por el motor. Un proveedor nuevo se declara aquí **y** se
@@ -83,6 +88,16 @@ class ProviderAuthenticationError(ProviderUnavailableError):
 
 class ProviderModelUnsupportedError(ProviderError):
     """El modelo solicitado no está soportado por el proveedor."""
+
+
+class ProviderRefusalError(ProviderError):
+    """El proveedor respondió correctamente pero **se negó** a producir la salida.
+
+    No es un fallo de formato ni de contrato: el modelo decidió no responder. Interpretar esa
+    salida como JSON normal sería inventar contenido, así que se detecta antes de leerla, se
+    reporta con metadata segura y **no** se reintenta con el mismo prompt: repetir la misma
+    petición que provocó una negativa no es una reparación, es insistir.
+    """
 
 
 class ImageValidationError(ProviderError):
@@ -336,6 +351,7 @@ __all__ = [
     "ProviderAuthenticationError",
     "ProviderError",
     "ProviderModelUnsupportedError",
+    "ProviderRefusalError",
     "ProviderUnavailableError",
     "StructuredModelClient",
 ]

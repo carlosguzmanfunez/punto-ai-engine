@@ -36,7 +36,7 @@ from punto.providers.base import ImagePayload
 from punto.providers.json_schema import (
     SchemaValidationError,
     prepare_json_schema,
-    validate_root_schema,
+    validate_provider_schema,
 )
 from punto.providers.routing import ModelRole, ModelRouter
 from punto.schemas.cross_audit import CrossAuditProposal
@@ -229,13 +229,13 @@ def test_cross_audit_schema_satisfies_the_contract() -> None:
 def test_schema_validation_rejects_a_weak_root() -> None:
     """Un esquema flojo se rechaza en PUNTO, no en la API."""
     with pytest.raises(SchemaValidationError):
-        validate_root_schema({"type": "array"})
+        validate_provider_schema({"type": "array"})
     with pytest.raises(SchemaValidationError):
-        validate_root_schema(
+        validate_provider_schema(
             {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
         )
     with pytest.raises(SchemaValidationError):
-        validate_root_schema(
+        validate_provider_schema(
             {
                 "type": "object",
                 "properties": {"a": {"type": "string"}},
@@ -244,7 +244,7 @@ def test_schema_validation_rejects_a_weak_root() -> None:
             }
         )
     with pytest.raises(SchemaValidationError):
-        validate_root_schema(
+        validate_provider_schema(
             {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
         )
 

@@ -17,6 +17,7 @@ from typing import Final
 from punto.policy.permissions import is_protected_path
 from punto.qa.paths import normalize_relative_path
 from punto.schemas.cross_audit import (
+    MAX_CROSS_AUDIT_EVIDENCE_CHARS,
     MAX_CROSS_AUDIT_FINDINGS,
     CrossAuditProposal,
     CrossAuditTask,
@@ -121,6 +122,16 @@ def validate_cross_audit_proposal(
         if not finding.evidence.strip():
             violations.append(
                 f"cross_audit: el hallazgo {finding.id!r} no aporta evidencia"
+            )
+            continue
+        if len(finding.evidence) > MAX_CROSS_AUDIT_EVIDENCE_CHARS:
+            # El límite se aplica **aquí**, no en el esquema del proveedor: ``maxLength`` es
+            # una de las restricciones que su dialecto no admite, así que la garantía vive en
+            # PUNTO, de forma determinista, después de recibir la propuesta.
+            violations.append(
+                f"cross_audit: la evidencia del hallazgo {finding.id!r} ocupa "
+                f"{len(finding.evidence)} caracteres y el máximo es "
+                f"{MAX_CROSS_AUDIT_EVIDENCE_CHARS}"
             )
             continue
         if not finding.description.strip():

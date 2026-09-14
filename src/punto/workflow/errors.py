@@ -211,6 +211,18 @@ class WorkflowEffectReconciliationError(WorkflowError):
         super().__init__(WorkflowFailureCode.WORKFLOW_EFFECT_RECONCILIATION_REQUIRED, detail)
 
 
+class WorkflowReconciliationDeniedError(WorkflowError):
+    """La reconciliación de una brecha de presupuesto no se autorizó (hallazgo N6-01).
+
+    Cubre la prueba ausente, la fabricada, la de otra brecha, la de otro workflow, la de otra
+    tarea, la ya consumida y la emitida contra una decisión de política que ya no está vigente.
+    Antes bastaba con un ``resolved_by`` de texto libre: escribir un nombre no es una autoridad.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(WorkflowFailureCode.WORKFLOW_BUDGET_RECONCILIATION_DENIED, detail)
+
+
 __all__ = [
     "WorkflowApprovalProofInvalidError",
     "WorkflowBudgetExceededError",
@@ -224,6 +236,7 @@ __all__ = [
     "WorkflowLoopDetectedError",
     "WorkflowPolicyRejectedError",
     "WorkflowProviderUnavailableError",
+    "WorkflowReconciliationDeniedError",
     "WorkflowRepairDeferredError",
     "WorkflowResumeFailedError",
     "WorkflowRoleFailedError",

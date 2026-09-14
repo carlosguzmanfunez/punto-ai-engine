@@ -23,8 +23,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Final
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from punto.common import utc_now
 from punto.schemas.decision import HumanApprovalRequest
@@ -94,12 +95,73 @@ class HumanApprovalProof:
             raise HumanGateError(msg)
 
 
+@dataclass(frozen=True, slots=True)
+class BudgetReconciliationProof:
+    """Autorización de un solo uso para reconciliar **una** brecha de presupuesto (N6-01).
+
+    Claude Opus encontró que ``reconcile_budget_breach`` aceptaba un ``resolved_by`` de texto libre:
+    cualquiera que supiera escribir un nombre podía cerrar una brecha de presupuesto. Esta prueba
+    sustituye esa autoridad de papel por una **capacidad**: solo la emite
+    :meth:`HumanGate.authorize_budget_reconciliation`, sobre una solicitud ``APPROVED``, y su
+    constructor exige el mismo centinela privado que el resto de pruebas del gate, así que no puede
+    fabricarse desde código ordinario.
+
+    Va **ligada** a lo que autoriza —workflow, tarea, brecha, rol, paso, acción, política y alcance—
+    para que una prueba de otra brecha, de otro workflow o de otra tarea no sirva, y lleva ``nonce``
+    (identificador único) e ``issued_at`` para que una repetición se detecte: el run recuerda las
+    pruebas ya consumidas y rechaza la segunda vez.
+    """
+
+    proof_id: UUID
+    approval_id: UUID
+    workflow_id: UUID
+    task_id: UUID
+    breach_id: UUID
+    policy_decision_id: UUID
+    role: str
+    step_index: int
+    action: str
+    scope: str
+    nonce: UUID
+    issued_at: datetime
+    issuer: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.issuer is not _PROOF_ISSUER:
+            msg = (
+                "BudgetReconciliationProof solo puede ser emitido por "
+                "HumanGate.authorize_budget_reconciliation(); una autorización de "
+                "reconciliación no puede fabricarse a mano."
+            )
+            raise HumanGateError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationBinding:
+    """Lo que una solicitud de reconciliación autoriza, fijado al crearla.
+
+    Se guarda en el gate y no en la solicitud pública para no meter campos de presupuesto en el
+    contrato de aprobación humana: lo que el humano aprueba sigue siendo la solicitud, y el
+    ``HumanGate`` es quien sabe exactamente a qué brecha se refería.
+    """
+
+    workflow_id: UUID
+    task_id: UUID
+    breach_id: UUID
+    role: str
+    step_index: int
+    action: str
+    scope: str
+
+
 class HumanGate:
     """Registro en memoria de solicitudes de aprobación humana."""
 
     def __init__(self) -> None:
         self._requests: dict[UUID, HumanApprovalRequest] = {}
         self._by_task: dict[UUID, list[UUID]] = {}
+        #: Brecha exacta que autoriza cada solicitud de reconciliación (hallazgo N6-01).
+        self._reconciliations: dict[UUID, _ReconciliationBinding] = {}
 
     # ------------------------------------------------------------------ create
     def request(
@@ -316,6 +378,154 @@ class HumanGate:
             issuer=_PROOF_ISSUER,
         )
 
+    # ------------------------------------------------- reconciliación (N6-01)
+    def request_budget_reconciliation(
+        self,
+        *,
+        task_id: UUID,
+        workflow_id: UUID,
+        breach_id: UUID,
+        policy_decision_id: UUID,
+        role: str,
+        step_index: int,
+        action: str,
+        risk: RiskLevel,
+        reason: str,
+        scope: str = "reconcile_budget_breach",
+    ) -> HumanApprovalRequest:
+        """Pide aprobación humana para reconciliar **una** brecha de presupuesto concreta.
+
+        La brecha se fija aquí, al crear la solicitud: el humano aprueba exactamente eso, y una
+        autorización posterior para otra brecha, otro workflow o otra tarea no existirá nunca porque
+        el gate no la emite.
+
+        Args:
+            task_id: Tarea dueña del workflow.
+            workflow_id: Workflow cuya brecha se quiere reconciliar.
+            breach_id: Identificador del registro de brecha (``BudgetBreachRecord``).
+            policy_decision_id: Decisión de política vigente contra la que se aprueba.
+            role: Rol que se pasó de su cota.
+            step_index: Paso de la invocación que se pasó.
+            action: Acción del workflow sobre cuyo presupuesto se reconcilia.
+            risk: Riesgo efectivo de la reconciliación, calculado por la política.
+            reason: Motivo legible de la solicitud.
+            scope: Alcance autorizado de la reconciliación.
+
+        Returns:
+            La solicitud pendiente, lista para ``approve``/``reject``.
+        """
+        approval = self.request(
+            task_id=task_id,
+            action=action,
+            risk=risk,
+            reason=reason,
+            policy_outcome="RECONCILIATION",
+            policy_decision_id=policy_decision_id,
+        )
+        self._reconciliations[approval.id] = _ReconciliationBinding(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            breach_id=breach_id,
+            role=role,
+            step_index=step_index,
+            action=action,
+            scope=scope,
+        )
+        return approval
+
+    def authorize_budget_reconciliation(
+        self,
+        approval_id: UUID,
+        *,
+        workflow_id: UUID,
+        task_id: UUID,
+        breach_id: UUID,
+        role: str,
+        step_index: int,
+        policy_decision_id: UUID,
+        action: str = "",
+    ) -> BudgetReconciliationProof:
+        """Emite la prueba de reconciliación de una solicitud aprobada (hallazgo N6-01).
+
+        Es el **único** punto de emisión. Exige que lo que se pide reconciliar sea exactamente lo
+        que la solicitud aprobó: workflow, tarea, brecha, rol y paso tienen que coincidir, y la
+        decisión de política tiene que ser la de la solicitud. Una prueba «parecida» no sirve.
+
+        Args:
+            approval_id: Solicitud aprobada.
+            workflow_id: Workflow que se pretende reconciliar.
+            task_id: Tarea que se pretende reconciliar.
+            breach_id: Brecha que se pretende reconciliar.
+            role: Rol de la brecha.
+            step_index: Paso de la brecha.
+            policy_decision_id: Decisión de política vigente con la que se pide.
+            action: Acción del workflow, si se quiere comprobar también.
+
+        Returns:
+            La prueba, de un solo uso y ligada a esa brecha.
+
+        Raises:
+            HumanGateNotApprovedError: si la solicitud no existe o no está ``APPROVED``.
+            HumanGateError: si la solicitud no es de reconciliación, si no coincide con lo
+                aprobado o si no declara decisión de política.
+        """
+        approval = self.assert_executable(approval_id)
+        binding = self._reconciliations.get(approval_id)
+        if binding is None:
+            msg = (
+                f"La solicitud {approval_id} no autoriza ninguna reconciliación de presupuesto: "
+                "solo una solicitud creada con request_budget_reconciliation puede emitirla."
+            )
+            raise HumanGateError(msg)
+        if approval.policy_decision_id is None:
+            msg = (
+                f"La solicitud {approval_id} no está vinculada a ninguna PolicyDecision: no puede "
+                "autorizar una reconciliación."
+            )
+            raise HumanGateError(msg)
+        if approval.policy_decision_id != policy_decision_id:
+            msg = (
+                f"La solicitud {approval_id} se aprobó contra la decisión "
+                f"{approval.policy_decision_id} y se pide contra {policy_decision_id}: una "
+                "autorización de una decisión no ampara otra."
+            )
+            raise HumanGateError(msg)
+        if (
+            binding.workflow_id != workflow_id
+            or binding.task_id != task_id
+            or binding.breach_id != breach_id
+            or binding.role != role
+            or binding.step_index != step_index
+        ):
+            msg = (
+                f"La solicitud {approval_id} autoriza la brecha {binding.breach_id} del workflow "
+                f"{binding.workflow_id} (rol {binding.role}, paso {binding.step_index}) y se pide "
+                f"la brecha {breach_id} del workflow {workflow_id} (rol {role}, paso "
+                f"{step_index}): una autorización de una brecha no ampara otra."
+            )
+            raise HumanGateError(msg)
+        if action and binding.action != action:
+            msg = (
+                f"La solicitud {approval_id} autoriza la acción {binding.action!r} y se pide "
+                f"{action!r}: el alcance de la reconciliación no cambia al emitir la prueba."
+            )
+            raise HumanGateError(msg)
+        return BudgetReconciliationProof(
+            proof_id=uuid4(),
+            approval_id=approval.id,
+            workflow_id=binding.workflow_id,
+            task_id=binding.task_id,
+            breach_id=binding.breach_id,
+            policy_decision_id=approval.policy_decision_id,
+            role=binding.role,
+            step_index=binding.step_index,
+            action=binding.action,
+            scope=binding.scope,
+            nonce=uuid4(),
+            issued_at=utc_now(),
+            issuer=_PROOF_ISSUER,
+        )
+
     # ------------------------------------------------------------------ utils
     def audit_result_for(self, approval_id: UUID) -> AuditResult:
         """Resultado de auditoría correspondiente al estado de una solicitud."""
@@ -332,6 +542,7 @@ class HumanGate:
         """Vacía el registro (uso en pruebas)."""
         self._requests.clear()
         self._by_task.clear()
+        self._reconciliations.clear()
 
     def extend(self, requests: Iterable[HumanApprovalRequest]) -> None:
         """Reinserta solicitudes (uso en pruebas y restauración de estado)."""
@@ -342,6 +553,7 @@ class HumanGate:
 
 __all__ = [
     "RESUMABLE_STATUSES",
+    "BudgetReconciliationProof",
     "HumanApprovalProof",
     "HumanGate",
     "HumanGateError",

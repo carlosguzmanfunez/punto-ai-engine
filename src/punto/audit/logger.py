@@ -2818,6 +2818,377 @@ class AuditLogger:
             },
         )
 
+    # ------------------------------------------------------------------
+    # Bucle de reparación autónoma acotado (ENGINE-6.1)
+    # ------------------------------------------------------------------
+    def log_workflow_repair_decided(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        repairability: str,
+        finding_ids: Sequence[str],
+        requires_human: bool,
+        policy_decision_id: str = "",
+        reason: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la decisión de reparar y su veredicto de reparabilidad.
+
+        Queda en ``PENDING`` porque la decisión abre el ciclo, no lo cierra: el resultado real
+        se sabrá con la verificación posterior.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_DECIDED,
+            action="workflow_repair_decided",
+            resource_id=workflow_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "repairability": repairability,
+                "finding_ids": list(finding_ids),
+                "requires_human": requires_human,
+                "policy_decision_id": policy_decision_id,
+                "reason": reason[:300],
+            },
+        )
+
+    def log_workflow_repair_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        origin_stage: str,
+        restart_stage: str,
+        plan_fingerprint: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el arranque del ciclo de reparación desde la etapa fallida."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_STARTED,
+            action="workflow_repair_started",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "origin_stage": origin_stage,
+                "restart_stage": restart_stage,
+                "plan_fingerprint": plan_fingerprint,
+            },
+        )
+
+    def log_workflow_repair_snapshot_created(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        snapshot_id: UUID,
+        files: int,
+        workspace_fingerprint: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la instantánea previa a tocar el workspace, base del rollback."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_SNAPSHOT_CREATED,
+            action="workflow_repair_snapshot_created",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "snapshot_id": str(snapshot_id),
+                "files": files,
+                "workspace_fingerprint": workspace_fingerprint,
+            },
+        )
+
+    def log_workflow_repair_applied(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        changed_files: int,
+        status: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la aplicación del parche de reparación y cuántos ficheros tocó."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_APPLIED,
+            action="workflow_repair_applied",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "changed_files": changed_files,
+                "status": status,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_repair_verification_started(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        roles: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el inicio de la verificación posterior a la reparación.
+
+        Queda en ``PENDING``: la reparación solo cuenta como resuelta cuando la verificación
+        lo confirma, y eso se registra en su propio evento.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_VERIFICATION_STARTED,
+            action="workflow_repair_verification_started",
+            resource_id=workflow_id,
+            result=AuditResult.PENDING,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "roles": list(roles)[:12],
+            },
+        )
+
+    def log_workflow_repair_resolved(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        resolved_findings: Sequence[str],
+        unresolved_findings: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre del ciclo con los hallazgos que se resolvieron y los que no."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_RESOLVED,
+            action="workflow_repair_resolved",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "resolved_findings": list(resolved_findings),
+                "unresolved_findings": list(unresolved_findings),
+            },
+        )
+
+    def log_workflow_repair_failed(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        code: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el fallo del ciclo de reparación con su código estable."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_FAILED,
+            action="workflow_repair_failed",
+            resource_id=workflow_id,
+            result=AuditResult.FAILURE,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "code": code,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_repair_no_progress(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        fingerprint: str,
+        repeats: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la detección de un ciclo sin progreso real.
+
+        Se deniega porque la huella repetida es la prueba de que seguir iterando no cambiaría
+        nada: el bucle debe pararse aquí, no gastar otro intento.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_NO_PROGRESS,
+            action="workflow_repair_no_progress",
+            resource_id=workflow_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "fingerprint": fingerprint,
+                "repeats": repeats,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_repair_budget_exhausted(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repairs_used: int,
+        max_repairs: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el agotamiento del presupuesto de reparaciones del workflow.
+
+        Nombra las dos cifras (usadas y máximas) porque un tope sin contabilidad no es
+        auditable: sin ellas no se distingue un tope alcanzado de un error de cálculo.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_BUDGET_EXHAUSTED,
+            action="workflow_repair_budget_exhausted",
+            resource_id=workflow_id,
+            result=AuditResult.DENIED,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repairs_used": repairs_used,
+                "max_repairs": max_repairs,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_repair_rolled_back(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        repair_id: UUID,
+        cycle: int,
+        snapshot_id: UUID,
+        restored_files: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la restauración del workspace desde la instantánea del ciclo."""
+        return self.record(
+            AuditEventType.WORKFLOW_REPAIR_ROLLED_BACK,
+            action="workflow_repair_rolled_back",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "repair_id": str(repair_id),
+                "cycle": cycle,
+                "snapshot_id": str(snapshot_id),
+                "restored_files": restored_files,
+                "detail": detail[:300],
+            },
+        )
+
+    def log_workflow_budget_reconciliation_authorized(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        role: str,
+        step_index: int,
+        proof_id: UUID,
+        breach_id: UUID,
+        policy_decision_id: str = "",
+        known_overrun_model_calls: int = 0,
+        known_overrun_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la autorización de una reconciliación de presupuesto ya probada.
+
+        Es el evento que convierte la brecha en una decisión con dueño: sin él habría un
+        cambio de contabilidad sin autoridad identificable.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_BUDGET_RECONCILIATION_AUTHORIZED,
+            action="workflow_budget_reconciliation_authorized",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "role": role,
+                "step_index": step_index,
+                "proof_id": str(proof_id),
+                "breach_id": str(breach_id),
+                "policy_decision_id": policy_decision_id,
+                "known_overrun_model_calls": known_overrun_model_calls,
+                "known_overrun_tokens": known_overrun_tokens,
+            },
+        )
+
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""
         return tuple(self._events)

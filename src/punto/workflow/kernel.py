@@ -39,11 +39,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
-from punto.policy.human_gate import HumanApprovalProof
+from punto.policy.human_gate import BudgetReconciliationProof, HumanApprovalProof
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.policy import PolicyOutcome
 from punto.schemas.workflow import (
     MAX_BUDGET_BREACHES,
+    MAX_RECONCILIATION_PROOFS,
     MAX_ROLES_EXECUTED,
     MAX_WORKFLOW_EVIDENCE,
     MAX_WORKFLOW_FINDINGS,
@@ -85,6 +86,7 @@ from punto.workflow.errors import (
     WorkflowHumanApprovalRequiredError,
     WorkflowIdempotencyConflictError,
     WorkflowPolicyRejectedError,
+    WorkflowReconciliationDeniedError,
     WorkflowResumeFailedError,
     WorkflowTerminalError,
 )
@@ -792,51 +794,159 @@ class WorkflowKernel:
         )
 
     def reconcile_budget_breach(
-        self, run: WorkflowRun, *, resolution: str, resolved_by: str
+        self, run: WorkflowRun, *, proof: BudgetReconciliationProof
     ) -> WorkflowRun:
-        """Cierra las brechas de autorización sin reconciliar de un workflow (hallazgo V606-02).
+        """Cierra **una** brecha de autorización con la prueba que emite el Human Gate (N6-01).
 
-        Es la **única** forma de desbloquear un workflow cuya última invocación reportó más gasto
-        del autorizado; el kernel no lo hace solo, igual que no reconcilia un efecto incierto. La
-        decisión no la toma esta función: viene de una persona o de una comprobación externa que ya
-        sabe qué pasó.
+        Claude Opus encontró que esta operación aceptaba un ``resolved_by`` de texto libre:
+        cualquiera que supiera escribir un nombre podía cerrar una brecha de presupuesto. Ahora
+        exige una :class:`~punto.policy.human_gate.BudgetReconciliationProof`, que solo emite
+        ``HumanGate.authorize_budget_reconciliation`` sobre una solicitud aprobada y que va ligada
+        a workflow, tarea, brecha, rol, paso, acción y decisión de política.
 
-        Lo que **no** hace, a propósito: devolver presupuesto ni sumar el gasto declarado. La
-        reserva comprometida sigue comprometida y el contador no se reescribe, porque el contador
-        del workflow no puede quedar por encima de su propio máximo. La reconciliación decide que el
-        workflow puede seguir, no cuánto se gastó: eso ya no se puede saber con certeza.
+        La validación es determinista y en este orden (el primer «no» es el que se declara):
 
-        Si no hay nada sin reconciliar, el run se devuelve intacto: no se inventan registros.
+        1. la brecha existe y sigue sin reconciliar;
+        2. la prueba es de **este** workflow y de **esta** tarea;
+        3. es de **esta** brecha: rol, paso y acción coinciden;
+        4. no se ha usado antes (el run recuerda las pruebas consumidas, así que una repetición se
+           rechaza incluso si el proceso murió entre la emisión y el uso);
+        5. la decisión de política de la prueba sigue siendo la vigente del run y la política actual
+           no rechaza la acción de reconciliación.
+
+        Lo que **no** hace, a propósito:
+
+        - **no devuelve presupuesto**: la reserva comprometida sigue comprometida;
+        - **no oculta el sobregasto**: lo suma a ``known_budget_overrun_model_calls`` /
+          ``known_budget_overrun_tokens`` como ``max(0, reportado - autorizado)``, que es
+          contabilidad durable y forma parte del consumo comprometido. Reconciliar significa
+          «reconozco este evento y decido qué hacer», no «te regalo presupuesto nuevo»: con el gasto
+          real conocido por encima del máximo, el workflow no vuelve a llamar al modelo.
 
         Args:
             run: Ejecución en curso. No se muta.
-            resolution: Motivo acotado de la decisión, para la traza.
-            resolved_by: Quién reconcilia; viaja al registro y a la auditoría.
+            proof: Autorización emitida por el Human Gate para esa brecha exacta.
 
         Returns:
-            El run con las brechas reconciliadas, o el mismo run si no había ninguna.
+            El run con la brecha reconciliada, el sobregasto contabilizado y la prueba consumida.
+
+        Raises:
+            WorkflowReconciliationDeniedError: si la prueba no autoriza exactamente esa brecha
+                (ausente, de otra brecha/workflow/tarea, ya consumida o de política no vigente).
         """
-        breaches = run.budget_breaches
-        if not any(not record.reconciled for record in breaches):
-            return run
-        stamp = utc_now()
-        reconciled: list[BudgetBreachRecord] = []
-        for record in breaches:
-            if record.reconciled:
-                reconciled.append(record)
-                continue
-            closed = record.model_copy(
-                update={
-                    "reconciled_at": stamp,
-                    "reconciled_by": resolved_by[:80],
-                    "resolution": resolution[:MAX_WORKFLOW_SUMMARY_CHARS],
-                }
+        if not isinstance(proof, BudgetReconciliationProof):
+            raise WorkflowReconciliationDeniedError(
+                "la reconciliación exige la prueba que emite HumanGate."
+                "authorize_budget_reconciliation; un objeto que se le parezca no es una autoridad"
             )
-            reconciled.append(closed)
-            self._audit_budget_reconciled(run, closed)
-        updated = run.model_copy(update={"budget_breaches": tuple(reconciled)})
+        breach = self._breach_for(run, proof)
+        if breach.reconciled:
+            raise WorkflowReconciliationDeniedError(
+                f"la brecha {breach.step_index} de {breach.role.value} ya está reconciliada: una "
+                "reconciliación no se repite"
+            )
+        if proof.proof_id in run.consumed_reconciliation_proofs:
+            raise WorkflowReconciliationDeniedError(
+                f"la prueba {proof.proof_id} ya se consumió en este workflow: una autorización de "
+                "reconciliación es de un solo uso"
+            )
+        self._assert_policy_still_authorizes(run, proof)
+
+        stamp = utc_now()
+        closed = breach.model_copy(
+            update={
+                "reconciled_at": stamp,
+                "reconciled_by": f"HumanGate:{proof.approval_id}",
+                "resolution": proof.scope[:MAX_WORKFLOW_SUMMARY_CHARS],
+            }
+        )
+        breaches = tuple(
+            closed if record is breach else record for record in run.budget_breaches
+        )
+        usage = run.usage.model_copy(
+            update={
+                "known_budget_overrun_model_calls": (
+                    run.usage.known_budget_overrun_model_calls
+                    + max(0, breach.reported_model_calls - breach.authorized_model_calls)
+                ),
+                "known_budget_overrun_tokens": (
+                    run.usage.known_budget_overrun_tokens
+                    + max(0, breach.reported_total_tokens - breach.authorized_total_tokens)
+                ),
+            }
+        )
+        updated = run.model_copy(
+            update={
+                "budget_breaches": breaches,
+                "usage": usage,
+                "consumed_reconciliation_proofs": (
+                    *run.consumed_reconciliation_proofs[-MAX_RECONCILIATION_PROOFS + 1 :],
+                    proof.proof_id,
+                ),
+            }
+        )
+        self._audit_budget_reconciled(updated, closed)
+        self._audit_budget_reconciliation_authorized(updated, proof, closed)
         self._store.save(updated)
         return updated
+
+    def _breach_for(
+        self, run: WorkflowRun, proof: BudgetReconciliationProof
+    ) -> BudgetBreachRecord:
+        """Busca la brecha que la prueba autoriza, o rechaza la reconciliación.
+
+        Cada comprobación rechaza por un motivo distinto y lo dice: una autorización de otra brecha,
+        de otro workflow o de otra tarea no es «casi» la correcta.
+        """
+        if proof.workflow_id != run.workflow_id:
+            raise WorkflowReconciliationDeniedError(
+                f"la prueba pertenece al workflow {proof.workflow_id} y se intenta aplicar al "
+                f"{run.workflow_id}: una autorización no cruza de workflow"
+            )
+        if proof.task_id != run.task_id:
+            raise WorkflowReconciliationDeniedError(
+                f"la prueba pertenece a la tarea {proof.task_id} y se intenta aplicar a la "
+                f"{run.task_id}: una autorización no cruza de tarea"
+            )
+        for record in run.budget_breaches:
+            if record.breach_id != proof.breach_id:
+                continue
+            if record.role.value != proof.role or record.step_index != proof.step_index:
+                raise WorkflowReconciliationDeniedError(
+                    f"la brecha {proof.breach_id} es de {record.role.value} en el paso "
+                    f"{record.step_index} y la prueba la declara de {proof.role} en el paso "
+                    f"{proof.step_index}: la autorización no coincide con la brecha que nombra"
+                )
+            return record
+        raise WorkflowReconciliationDeniedError(
+            f"este workflow no tiene ninguna brecha con el identificador {proof.breach_id}: no se "
+            "inventa el registro que se reconcilia"
+        )
+
+    def _assert_policy_still_authorizes(
+        self, run: WorkflowRun, proof: BudgetReconciliationProof
+    ) -> None:
+        """Exige que la decisión de política de la prueba siga vigente y que la política no rechace.
+
+        Dos comprobaciones, y las dos importan: la prueba se aprobó contra una decisión concreta,
+        así que una decisión más reciente la deja sin valor; y la política de **hoy** tiene que
+        seguir permitiendo la reconciliación, porque una autorización vieja no ampara una política
+        nueva.
+        """
+        current = run.policy_decision_id
+        if current is not None and current != proof.policy_decision_id:
+            raise WorkflowReconciliationDeniedError(
+                f"la prueba se emitió contra la decisión de política "
+                f"{proof.policy_decision_id} y la vigente es {current}: hace falta una "
+                "autorización de la decisión actual"
+            )
+        verdict = self._policy.evaluate_action(
+            request=run.request, role=RoleName.ARCHITECT, stage=run.status
+        )
+        if verdict.outcome is PolicyOutcome.REJECT:
+            raise WorkflowReconciliationDeniedError(
+                f"la política actual rechaza la reconciliación de la brecha: {verdict.reason}"
+            )
 
 
     def _role_request(
@@ -874,11 +984,21 @@ class WorkflowKernel:
 
         El saldo descuenta lo **gastado y lo reservado** (hallazgo V604-01): una llamada iniciada
         antes de un crash sigue comprometida, así que el rol no puede recibir como disponible un
-        presupuesto que ya está comprometido.
+        presupuesto que ya está comprometido. Y descuenta el **sobregasto conocido** (hallazgo
+        N6-01): si una reconciliación dio por real más gasto del autorizado, ese gasto real cierra
+        la puerta a nuevas invocaciones aunque el contador autorizado no lo refleje.
         """
         budget = run.request.budget
-        model_calls = budget.max_model_calls - run.usage.model_calls_committed
-        tokens = budget.max_total_tokens - run.usage.tokens_committed
+        model_calls = (
+            budget.max_model_calls
+            - run.usage.model_calls_committed
+            - run.usage.known_budget_overrun_model_calls
+        )
+        tokens = (
+            budget.max_total_tokens
+            - run.usage.tokens_committed
+            - run.usage.known_budget_overrun_tokens
+        )
         remaining_time = budget.max_wall_time_seconds - self._elapsed(run)
         if model_calls <= 0 or tokens <= 0 or remaining_time <= 0:
             return None
@@ -966,8 +1086,14 @@ class WorkflowKernel:
         return run.model_copy(update={"usage": usage}), None
 
     def _authorized_calls(self, run: WorkflowRun, hint: ModelCallLimits | None) -> int:
-        """Llamadas de modelo que **esta** invocación tiene autorizadas."""
-        remaining = max(0, run.request.budget.max_model_calls - run.usage.model_calls_committed)
+        """Llamadas de modelo que **esta** invocación tiene autorizadas.
+
+        El **sobregasto conocido** (hallazgo N6-01) se descuenta aquí: reconciliar una brecha
+        reconoce el gasto real, no lo perdona, así que con 10 llamadas de máximo y 14 reales
+        conocidas esta cuenta da cero y no se autoriza ninguna invocación más.
+        """
+        committed = run.usage.model_calls_committed + run.usage.known_budget_overrun_model_calls
+        remaining = max(0, run.request.budget.max_model_calls - committed)
         if hint is not None and hint.max_model_calls is not None:
             return min(remaining, hint.max_model_calls)
         return remaining
@@ -982,9 +1108,11 @@ class WorkflowKernel:
 
         El máximo declarado por el runner (entrada más salida) es la cota superior de lo que puede
         gastar; si no la declara, el máximo posible es el saldo autorizado, y si tampoco hay
-        autorización declarada, lo que quede del presupuesto.
+        autorización declarada, lo que quede del presupuesto. El sobregasto conocido se descuenta
+        por el mismo motivo que en :meth:`_authorized_calls`.
         """
-        remaining = max(0, run.request.budget.max_total_tokens - run.usage.tokens_committed)
+        committed = run.usage.tokens_committed + run.usage.known_budget_overrun_tokens
+        remaining = max(0, run.request.budget.max_total_tokens - committed)
         if hint is not None and hint.max_input_tokens is not None and hint.max_output_tokens:
             declared = hint.max_input_tokens + hint.max_output_tokens
             return min(remaining, declared)
@@ -1038,27 +1166,41 @@ class WorkflowKernel:
         nada sería mentir sobre por qué no se invoca al rol (hallazgo V604-01).
         """
         budget = run.request.budget
-        model_calls = budget.max_model_calls - run.usage.model_calls_committed
-        tokens = budget.max_total_tokens - run.usage.tokens_committed
+        overrun_calls = run.usage.known_budget_overrun_model_calls
+        overrun_tokens = run.usage.known_budget_overrun_tokens
+        model_calls = (
+            budget.max_model_calls - run.usage.model_calls_committed - overrun_calls
+        )
+        tokens = budget.max_total_tokens - run.usage.tokens_committed - overrun_tokens
         remaining_time = budget.max_wall_time_seconds - self._elapsed(run)
         if model_calls <= 0:
+            detail = (
+                f"no queda ninguna llamada de modelo ({run.usage.model_calls_committed} de "
+                f"{budget.max_model_calls} comprometidas): no se invoca al rol"
+            )
+            if overrun_calls:
+                detail = (
+                    f"no queda ninguna llamada de modelo: hay {overrun_calls} llamada(s) de "
+                    "sobregasto real ya reconocidas por reconciliación, además de "
+                    f"{run.usage.model_calls_committed} de {budget.max_model_calls} "
+                    "comprometidas. Reconciliar no amplía el presupuesto: no se invoca al rol"
+                )
             return BudgetCheck(
                 False,
                 WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
-                f"no queda ninguna llamada de modelo ({run.usage.model_calls_committed} de "
-                f"{budget.max_model_calls} comprometidas): no se invoca al rol",
+                detail,
                 limit="max_model_calls",
-                used=float(run.usage.model_calls_committed),
+                used=float(run.usage.model_calls_committed + overrun_calls),
                 maximum=float(budget.max_model_calls),
             )
         if tokens <= 0:
             return BudgetCheck(
                 False,
                 WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
-                f"no quedan tokens ({run.usage.tokens_committed} de "
+                f"no quedan tokens ({run.usage.tokens_committed + overrun_tokens} de "
                 f"{budget.max_total_tokens} comprometidos): no se invoca al rol",
                 limit="max_total_tokens",
-                used=float(run.usage.tokens_committed),
+                used=float(run.usage.tokens_committed + overrun_tokens),
                 maximum=float(budget.max_total_tokens),
             )
         return BudgetCheck(
@@ -1846,6 +1988,32 @@ class WorkflowKernel:
             authorized_total_tokens=breach.authorized_total_tokens,
             resolution=breach.resolution,
             actor=breach.reconciled_by or None,
+        )
+
+    def _audit_budget_reconciliation_authorized(
+        self,
+        run: WorkflowRun,
+        proof: BudgetReconciliationProof,
+        breach: BudgetBreachRecord,
+    ) -> None:
+        """Audita que la reconciliación se hizo con una autorización del Human Gate (N6-01).
+
+        Va aparte del evento de brecha reconciliada porque son dos hechos distintos: uno dice que la
+        brecha se cerró, y este dice **con qué autoridad**.
+        """
+        if self._audit is None:
+            return
+        self._audit.log_workflow_budget_reconciliation_authorized(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            role=breach.role.value,
+            step_index=breach.step_index,
+            proof_id=proof.proof_id,
+            breach_id=breach.breach_id,
+            policy_decision_id=str(proof.policy_decision_id),
+            known_overrun_model_calls=run.usage.known_budget_overrun_model_calls,
+            known_overrun_tokens=run.usage.known_budget_overrun_tokens,
         )
 
     def _audit_completed(self, run: WorkflowRun) -> None:

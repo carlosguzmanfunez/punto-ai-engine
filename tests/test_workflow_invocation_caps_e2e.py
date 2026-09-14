@@ -19,7 +19,7 @@ defecto dejaba pasar— y se comprueban las tres fronteras del encargo:
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -27,7 +27,7 @@ from punto.audit.logger import AuditLogger
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.schemas.audit import AuditEventType
-from punto.schemas.enums import TaskStatus
+from punto.schemas.enums import RiskLevel, TaskStatus
 from punto.schemas.execution import ModelUsage
 from punto.schemas.workflow import (
     ModelCallLimits,
@@ -291,6 +291,7 @@ def test_a_breach_is_not_retried_on_resume_without_reconciliation(tmp_path: Path
     policy_engine = PolicyEngine.from_config(config_dir_of_repo())
     store_root = tmp_path / "cp"
     audit = AuditLogger()
+    gate = HumanGate()
     # Primera invocación: 2 llamadas declaradas con 1 autorizada. Después de reconciliar, el mismo
     # runner se comporta dentro de su cota: una llamada.
     architect = ScriptedRoleExecutor(
@@ -304,7 +305,7 @@ def test_a_breach_is_not_retried_on_resume_without_reconciliation(tmp_path: Path
             executors=executors,
             store=FileCheckpointStore(store_root),
             audit=audit,
-            policy=WorkflowPolicy(engine=policy_engine, gate=HumanGate()),
+            policy=WorkflowPolicy(engine=policy_engine, gate=gate),
         )
 
     request = budget_request(idempotency_key="brecha-y-reconciliacion")
@@ -324,11 +325,30 @@ def test_a_breach_is_not_retried_on_resume_without_reconciliation(tmp_path: Path
     assert blocked.failure.code is WorkflowFailureCode.WORKFLOW_BUDGET_RECONCILIATION_REQUIRED
     assert len(architect.calls) == 1, "la reanudación no reintenta la invocación en brecha"
 
-    # Reconciliación explícita: única forma de desbloquear, y queda auditada.
-    reconciled = kernel_b.reconcile_budget_breach(
-        blocked, resolution="se aceptó el gasto excedido tras revisar la facturación",
-        resolved_by="auditor-de-prueba",
+    # Reconciliación explícita: exige la prueba del Human Gate (hallazgo N6-01) y queda auditada.
+    breach = blocked.budget_breaches[-1]
+    approval = gate.request_budget_reconciliation(
+        task_id=blocked.task_id,
+        workflow_id=blocked.workflow_id,
+        breach_id=breach.breach_id,
+        policy_decision_id=blocked.policy_decision_id or uuid4(),
+        role=breach.role.value,
+        step_index=breach.step_index,
+        action=blocked.request.action,
+        risk=RiskLevel.LOW,
+        reason="se aceptó el gasto excedido tras revisar la facturación",
     )
+    gate.approve(approval.id, resolved_by="auditor-de-prueba")
+    proof = gate.authorize_budget_reconciliation(
+        approval.id,
+        workflow_id=blocked.workflow_id,
+        task_id=blocked.task_id,
+        breach_id=breach.breach_id,
+        role=breach.role.value,
+        step_index=breach.step_index,
+        policy_decision_id=blocked.policy_decision_id or uuid4(),
+    )
+    reconciled = kernel_b.reconcile_budget_breach(blocked, proof=proof)
     assert all(record.reconciled for record in reconciled.budget_breaches)
     assert AuditEventType.WORKFLOW_BUDGET_RECONCILED in audit.types_present()
 

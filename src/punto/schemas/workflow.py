@@ -49,6 +49,8 @@ MAX_CHANGED_FILES: Final[int] = 80
 MAX_CONTEXT_ENTRIES: Final[int] = 24
 MAX_EFFECT_RECORDS: Final[int] = 48
 MAX_BUDGET_BREACHES: Final[int] = 16
+#: Pruebas de reconciliación consumidas que el run recuerda para rechazar una repetición.
+MAX_RECONCILIATION_PROOFS: Final[int] = 16
 MAX_ROLES_EXECUTED: Final[int] = 12
 MAX_ROLE_SUPPORT: Final[int] = 12
 
@@ -127,6 +129,14 @@ class WorkflowFailureCode(StrEnum):
     #: reconciliado: no se vuelve a invocar a ese rol con una contabilidad inconsistente
     #: (hallazgo V606-02). Es la versión de presupuesto del bloqueo por efecto incierto.
     WORKFLOW_BUDGET_RECONCILIATION_REQUIRED = "WORKFLOW_BUDGET_RECONCILIATION_REQUIRED"
+    #: Se intentó reconciliar una brecha sin la prueba de autoridad que exige el hallazgo N6-01
+    #: (prueba ausente, fabricada, de otra brecha/workflow/tarea, ya usada o de una decisión de
+    #: política que ya no está vigente).
+    WORKFLOW_BUDGET_RECONCILIATION_DENIED = "WORKFLOW_BUDGET_RECONCILIATION_DENIED"
+    #: El gasto real de una invocación de IA quedó en outcome desconocido (fallo técnico después de
+    #: llamar al proveedor): no se reintenta a ciegas y hace falta reconciliar el gasto
+    #: (hallazgo N6-02).
+    WORKFLOW_MODEL_SPEND_RECONCILIATION_REQUIRED = "WORKFLOW_MODEL_SPEND_RECONCILIATION_REQUIRED"
     #: El workflow llegó a ``REPAIRING`` y se detiene ahí: el ciclo de reparación completo es
     #: ENGINE-6.1. Es un código propio para no disfrazar la pausa de otra cosa.
     WORKFLOW_REPAIR_DEFERRED = "WORKFLOW_REPAIR_DEFERRED"
@@ -186,6 +196,13 @@ class WorkflowUsage(BaseModel):
     muere en medio, la reserva sigue contando —``max_total_tokens`` es un tope de
     ``total_tokens + tokens_reserved``— de modo que una llamada perdida no reaparece como cero
     consumo y el workflow no puede rebasar su presupuesto por un crash.
+
+    Desde ENGINE-6.1 (hallazgo N6-01) lleva además el **sobregasto conocido**: lo que una invocación
+    reportó por encima de su autorización y una reconciliación explícita dio por real. Ese gasto no
+    se suma a ``model_calls``/``total_tokens`` —sumarlo dejaría el contador por encima de su propio
+    máximo y el workflow no podría ni cerrarse— pero **sí** cierra la puerta a nuevas llamadas de
+    modelo: el kernel lo descuenta del saldo antes de autorizar cualquier invocación, así que
+    reconciliar una discrepancia contable no regala presupuesto.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -199,6 +216,10 @@ class WorkflowUsage(BaseModel):
     total_tokens: int = Field(default=0, ge=0)
     #: Tokens de entrada y salida reservados y aún no convertidos en consumo real.
     tokens_reserved: int = Field(default=0, ge=0)
+    #: Sobregasto de modelo dado por real en brechas ya reconciliadas (``Σ max(0, reportado -
+    #: autorizado)``). Es contabilidad durable: viaja en el checkpoint y no se puede deshacer.
+    known_budget_overrun_model_calls: int = Field(default=0, ge=0)
+    known_budget_overrun_tokens: int = Field(default=0, ge=0)
     failures: int = Field(default=0, ge=0)
     transitions: int = Field(default=0, ge=0)
     wall_time_seconds: float = Field(default=0.0, ge=0.0)
@@ -207,7 +228,11 @@ class WorkflowUsage(BaseModel):
 
     @property
     def tokens_committed(self) -> int:
-        """Tokens comprometidos: los gastados más los reservados que aún no se han liquidado."""
+        """Tokens comprometidos: los gastados más los reservados sin liquidar.
+
+        El sobregasto conocido **no** entra aquí: se descuenta aparte, en la frontera que autoriza
+        llamadas de modelo, para que el workflow conserve la capacidad de transicionar y cerrarse.
+        """
         return self.total_tokens + self.tokens_reserved
 
     @property
@@ -567,6 +592,9 @@ class BudgetBreachRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    #: Identidad estable de la brecha: es a lo que se liga la autorización de reconciliación
+    #: (hallazgo N6-01), de modo que una prueba de otra brecha no sirva.
+    breach_id: UUID = Field(default_factory=uuid4)
     role: RoleName = Field(...)
     step_index: int = Field(..., ge=0)
     reported_model_calls: int = Field(default=0, ge=0)
@@ -721,6 +749,12 @@ class WorkflowRun(BaseModel):
     budget_breaches: tuple[BudgetBreachRecord, ...] = Field(
         default=(), max_length=MAX_BUDGET_BREACHES
     )
+    #: Pruebas de reconciliación ya consumidas (hallazgo N6-01): una prueba es de un solo uso, y el
+    #: run recuerda los identificadores usados para rechazar una repetición incluso si el proceso
+    #: murió entre la emisión y el uso.
+    consumed_reconciliation_proofs: tuple[UUID, ...] = Field(
+        default=(), max_length=MAX_RECONCILIATION_PROOFS
+    )
     #: Decisión de política vigente, si la hay: es la autoridad efectiva del workflow.
     policy_decision_id: UUID | None = Field(default=None)
     effective_authority: AuthorityLevel | None = Field(default=None)
@@ -795,6 +829,7 @@ __all__ = [
     "MAX_CHANGED_FILES",
     "MAX_CONTEXT_ENTRIES",
     "MAX_EFFECT_RECORDS",
+    "MAX_RECONCILIATION_PROOFS",
     "MAX_ROLES_EXECUTED",
     "MAX_ROLE_SUPPORT",
     "MAX_WORKFLOW_ARTIFACTS",

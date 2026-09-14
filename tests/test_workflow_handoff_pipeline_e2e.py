@@ -15,6 +15,7 @@ Piezas reales: ``WorkflowKernel``, ``Camus``, ``CamusRoleExecutor``, ``FileCheck
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from uuid import UUID
@@ -31,6 +32,7 @@ from punto.orchestrator.state_machine import StateMachine
 from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
+from punto.providers.base import ImagePayload
 from punto.qa.base import QARunner
 from punto.reviewer.base import ReviewerRunner
 from punto.schemas.cross_audit import CrossAuditReport, CrossAuditStatus, CrossAuditTask
@@ -52,7 +54,7 @@ from punto.schemas.visual import (
     VisualQATask,
     VisualSpec,
 )
-from punto.schemas.web import WebSessionReport, WebTechnicalStatus
+from punto.schemas.web import ScreenshotArtifact, ViewportName, WebSessionReport, WebTechnicalStatus
 from punto.schemas.workflow import (
     ArtifactReference,
     RoleExecutionRequest,
@@ -73,6 +75,7 @@ from punto.workflow.handoff import (
     REVIEW_KIND,
     SECURITY_KIND,
     VISUAL_QA_KIND,
+    publish_screenshots,
     publish_visual_evidence,
     resolve_cross_audit,
     resolve_developer,
@@ -341,6 +344,7 @@ class CountingVisualRunner(LedgerMixin, VisualQARunner):
     def __init__(self, ledger: CallLedger) -> None:
         super().__init__(ledger, RoleName.VISUAL_QA)
         self.tasks: list[VisualQATask] = []
+        self.screenshots: list[object] = []
 
     @property
     def provider(self) -> str:
@@ -373,10 +377,10 @@ class CountingVisualRunner(LedgerMixin, VisualQARunner):
         return VisualQALimits()
 
     def evaluate(self, task: VisualQATask, screenshots: object) -> VisualQAReport:
-        """Registra la llamada y devuelve una verificación visual superada."""
-        del screenshots
+        """Registra la llamada, guarda las capturas recibidas y aprueba la interfaz."""
         self._record()
         self.tasks.append(task)
+        self.screenshots.append(screenshots)
         return VisualQAReport(
             task_id=task.task_id,
             project_id=task.project_id,
@@ -413,13 +417,76 @@ def request_for(*, web: bool, evidence: tuple[ArtifactReference, ...] = ()) -> W
     )
 
 
-def publish_web_evidence(artifacts: Path) -> ArtifactReference:
-    """Publica la evidencia de la capa web —especificación y sesión medidas— en el almacén.
+def synthetic_png(seed: bytes) -> bytes:
+    """PNG sintético **válido y no vacío**: firma, IHDR mínimo e IEND con un bloque propio.
 
-    Es lo que haría el *composition root* antes de lanzar el workflow: la especificación visual y
-    el informe técnico de la sesión de navegador no los produce ningún rol del plan, así que viajan
-    como referencias durables declaradas en la petición (``evidence_references``) para que la etapa
-    visual las reconstruya en cualquier proceso (hallazgo V603-04).
+    No hace falta que sea una imagen renderizable: lo que el handoff durable tiene que transportar
+    son los bytes exactos que midió el navegador, y para probarlo basta con que sean bytes reales,
+    distintos entre sí y con la firma correcta.
+    """
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"tEXt", b"Comment\x00" + seed)
+        + chunk(b"IEND", b"")
+    )
+
+
+def screenshot_artifacts() -> tuple[ScreenshotArtifact, ...]:
+    """Dos capturas canónicas con sus bytes reales: la evidencia que declara la sesión web."""
+    return (
+        ScreenshotArtifact(
+            logical_name="home-desktop",
+            route="/",
+            rendered_route="/",
+            viewport=ViewportName.DESKTOP,
+            width=1,
+            height=1,
+            bytes=len(synthetic_png(b"home")),
+            sha256=hashlib.sha256(synthetic_png(b"home")).hexdigest(),
+        ),
+        ScreenshotArtifact(
+            logical_name="stock-mobile",
+            route="/stock",
+            rendered_route="/stock",
+            viewport=ViewportName.MOBILE,
+            width=1,
+            height=1,
+            bytes=len(synthetic_png(b"stock")),
+            sha256=hashlib.sha256(synthetic_png(b"stock")).hexdigest(),
+        ),
+    )
+
+
+def screenshot_payloads(artifacts: tuple[ScreenshotArtifact, ...]) -> dict[str, ImagePayload]:
+    """Payloads multimodales con los bytes **verificados** de cada captura declarada."""
+    payloads: dict[str, ImagePayload] = {}
+    for artifact in artifacts:
+        data = synthetic_png(artifact.logical_name.encode("utf-8").split(b"-")[0])
+        payloads[artifact.logical_name] = artifact.as_image_payload(data)
+    return payloads
+
+
+def publish_web_evidence(artifacts: Path) -> tuple[ArtifactReference, ...]:
+    """Publica la evidencia de la capa web —especificación, sesión y capturas— en el almacén.
+
+    Es lo que haría el *composition root* antes de lanzar el workflow: la especificación visual, el
+    informe técnico de la sesión de navegador y los **bytes de las capturas** no los produce ningún
+    rol del plan, así que viajan como referencias durables declaradas en la petición
+    (``evidence_references``) para que la etapa visual las reconstruya en cualquier proceso
+    (hallazgos V603-04 y V604-02).
     """
     store = FileArtifactStore(artifacts)
     request = RoleExecutionRequest(
@@ -432,14 +499,25 @@ def publish_web_evidence(artifacts: Path) -> ArtifactReference:
         objective="verificar la interfaz",
         idempotency_key="evidencia-visual",
     )
-    return publish_visual_evidence(
-        store,
-        request=request,
-        spec=VisualSpec(routes=("/", "/stock")),
-        session=WebSessionReport(
-            task_id=TASK_ID,
-            project_id=PROJECT_ID,
-            status=WebTechnicalStatus.PASS,
+    captures = screenshot_artifacts()
+    session = WebSessionReport(
+        task_id=TASK_ID,
+        project_id=PROJECT_ID,
+        status=WebTechnicalStatus.PASS,
+        screenshots=captures,
+    )
+    return (
+        publish_visual_evidence(
+            store,
+            request=request,
+            spec=VisualSpec(routes=("/", "/stock")),
+            session=session,
+        ),
+        publish_screenshots(
+            store,
+            request=request,
+            session=session,
+            images=screenshot_payloads(captures),
         ),
     )
 
@@ -497,7 +575,7 @@ def run_pipeline(
     ledger = CallLedger(tmp_path / "runner-calls.txt")
     # La evidencia de la capa web se publica **antes** del workflow y viaja como referencia durable
     # en la petición: ningún proceso la tiene en memoria (hallazgo V603-04).
-    evidence = (publish_web_evidence(artifacts),) if web else ()
+    evidence = publish_web_evidence(artifacts) if web else ()
     request = request_for(web=web, evidence=evidence)
 
     # Proceso A - Architect. ``max_steps=2``: entra en ANALYZING y ejecuta al Architect.
@@ -536,11 +614,26 @@ def run_pipeline(
         del kernel
 
     # Proceso H - Visual QA (si aplica) y cierre de la etapa de revisión.
-    kernel_h, _ = build_process(
+    kernel_h, runners_h = build_process(
         checkpoints=checkpoints, artifacts=artifacts, config_dir=config_dir, ledger=ledger
     )
     final = kernel_h.resume(workflow_id)
     del kernel_h
+    if web:
+        # V604-02: la etapa visual recibe los **bytes reales** de las dos capturas reconstruidas del
+        # almacén, no metadatos ni un mapa vacío.
+        assert len(runners_h.visual.screenshots) == 1
+        received = runners_h.visual.screenshots[0]
+        assert isinstance(received, dict) and len(received) == 2
+        for artifact in screenshot_artifacts():
+            payload = received[artifact.logical_name]
+            assert isinstance(payload, ImagePayload)
+            data = synthetic_png(artifact.logical_name.encode("utf-8").split(b"-")[0])
+            assert payload.data == data, "los bytes son los mismos que se publicaron"
+            assert hashlib.sha256(payload.data).hexdigest() == artifact.sha256
+            assert payload.media_type == artifact.media_type
+    else:
+        assert not runners_h.visual.screenshots
     return final, ledger, checkpoints, artifacts
 
 

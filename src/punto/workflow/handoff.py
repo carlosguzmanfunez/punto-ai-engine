@@ -41,6 +41,18 @@ y la sesión técnica medida en un navegador viajan juntas en el sobre ``VISUAL_
 (:func:`publish_visual_evidence` y :func:`resolve_visual_evidence`), y el adaptador resuelve esa
 pareja antes de llamar a :func:`visual_qa_input`.
 
+Bytes de las capturas (ENGINE-6.0.4, V604-02)
+---------------------------------------------
+La evidencia visual viajaba descrita pero no **medida**: el sobre ``VISUAL_EVIDENCE`` lleva la
+especificación y la sesión web —nombre lógico, ruta, viewport, tamaño y sha256 de cada captura—,
+nunca los bytes, así que una sesión con capturas verificadas en un navegador real no se podía
+reconstruir en un proceso nuevo. Este módulo lo cierra con dos tipos más: cada captura se publica
+como su propio artefacto (``SCREENSHOT``) con los bytes exactos, y el manifiesto
+(``SCREENSHOT_MANIFEST``) guarda, por captura, su evidencia canónica y la referencia de esos bytes.
+El JSON del manifiesto no lleva binarios —solo metadatos y referencias—, y cada captura declarada
+por la sesión tiene que estar entera y verificada, o el resolutor falla con
+``WORKFLOW_INCOMPLETE_EVIDENCE`` en vez de entregar un mapa a medias.
+
 Dos reglas gobiernan lo que viaja en esos sobres, y conviene leerlas antes de tocar el códec:
 
 - **nada de secretos**: el almacén es disco y un volcado de error puede traer la cabecera de
@@ -91,6 +103,7 @@ from pydantic import BaseModel, ValidationError
 from punto.architect.base import ArchitectureOutcome
 from punto.developer.context import ExecutionContext
 from punto.planner.base import PlanningOutcome
+from punto.providers.base import ImagePayload
 from punto.schemas.cross_audit import CrossAuditReport, CrossAuditTask
 from punto.schemas.enums import AuthorityLevel, RiskLevel
 from punto.schemas.execution import CommandSpec, DeveloperExecutionResult, DeveloperTask
@@ -109,10 +122,14 @@ from punto.schemas.qa import QAReport, QATask
 from punto.schemas.review import ReviewReport, ReviewTask
 from punto.schemas.security import SecurityReport, SecurityTask
 from punto.schemas.visual import VisualQAReport, VisualQATask, VisualSpec
-from punto.schemas.web import WebSessionReport
+from punto.schemas.web import ScreenshotArtifact, WebSessionReport
 from punto.schemas.workflow import ArtifactReference, RoleExecutionRequest, RoleName
 from punto.workflow.artifacts import ArtifactStore
-from punto.workflow.errors import WorkflowIncompleteEvidenceError, WorkflowResumeFailedError
+from punto.workflow.errors import (
+    WorkflowCheckpointInvalidError,
+    WorkflowIncompleteEvidenceError,
+    WorkflowResumeFailedError,
+)
 
 #: Versión del sobre que viaja en cada artefacto del handoff.
 #:
@@ -138,6 +155,15 @@ VISUAL_QA_KIND: Final[str] = "VISUAL_QA_REPORT"
 #: Tipo del artefacto con la evidencia **de entrada** de Visual QA: la especificación visual y el
 #: informe técnico de la sesión web, medido por PUNTO en un navegador real.
 VISUAL_EVIDENCE_KIND: Final[str] = "VISUAL_EVIDENCE"
+#: Tipo del artefacto que guarda los **bytes** de una captura de la sesión web.
+#:
+#: Es un artefacto propio y no un campo del manifiesto porque unos bytes de imagen dentro de un
+#: JSON que se lee, se redacta y se acota como texto dejarían de ser los bytes exactos que el
+#: navegador midió.
+SCREENSHOT_KIND: Final[str] = "SCREENSHOT"
+#: Tipo del artefacto con el **índice** de capturas: la evidencia canónica de cada una más la
+#: referencia de sus bytes. Ata cada captura a su contenido sin llevar binarios.
+SCREENSHOT_MANIFEST_KIND: Final[str] = "SCREENSHOT_MANIFEST"
 
 #: Nombres de los campos del sobre. Son constantes porque son contrato, no texto decorativo.
 _SCHEMA_FIELD: Final[str] = "schema_version"
@@ -147,6 +173,13 @@ _CONTENT_FIELD: Final[str] = "content"
 #: Campos del sobre de la evidencia visual. Son dos piezas que viajan juntas o no viajan.
 _SPEC_FIELD: Final[str] = "spec"
 _SESSION_FIELD: Final[str] = "session"
+#: Campos del sobre del manifiesto de capturas. Son contrato: los lee otro proceso.
+_SCREENSHOTS_FIELD: Final[str] = "screenshots"
+_REFERENCE_FIELD: Final[str] = "reference"
+_LOGICAL_NAME_FIELD: Final[str] = "logical_name"
+_TASK_ID_FIELD: Final[str] = "task_id"
+_PROJECT_ID_FIELD: Final[str] = "project_id"
+_SESSION_ID_FIELD: Final[str] = "session_id"
 #: Etiquetas legibles de cada artefacto. Describen el tipo, nunca el contenido.
 _ARCHITECTURE_LABEL: Final[str] = "diseño del Architect"
 _PLAN_LABEL: Final[str] = "plan durable del Planner"
@@ -157,6 +190,9 @@ _REVIEW_LABEL: Final[str] = "informe durable del Reviewer"
 _CROSS_AUDIT_LABEL: Final[str] = "informe durable de la auditoría cruzada"
 _VISUAL_QA_LABEL: Final[str] = "informe durable de Visual QA"
 _VISUAL_EVIDENCE_LABEL: Final[str] = "evidencia visual durable (especificación y sesión web)"
+#: Etiquetas de los artefactos de capturas. Describen el tipo, nunca el contenido de la imagen.
+_SCREENSHOT_LABEL: Final[str] = "bytes de una captura de la sesión web"
+_SCREENSHOT_MANIFEST_LABEL: Final[str] = "índice durable de capturas de la sesión web"
 #: Acción con la que se declara el trabajo del Developer.
 #:
 #: Ni ``RoleExecutionRequest`` ni ``PlannedTask`` declaran una acción, así que inventarla a partir
@@ -630,6 +666,142 @@ def resolve_visual_evidence(
             _model_field(WebSessionReport, payload, _SESSION_FIELD, reference),
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Códec de los bytes de las capturas de la sesión web (ENGINE-6.0.4, V604-02)
+# ---------------------------------------------------------------------------
+def publish_screenshots(
+    store: ArtifactStore,
+    *,
+    request: RoleExecutionRequest,
+    session: WebSessionReport,
+    images: Mapping[str, ImagePayload],
+) -> ArtifactReference:
+    """Publica los bytes de cada captura y el índice que los ata a su evidencia canónica.
+
+    Es la pieza que cierra el defecto V604-02: hasta 6.0.3 el handoff publicaba la especificación
+    visual y la sesión web —nombre lógico, ruta, viewport, tamaño y sha256 de cada captura—, pero
+    **no sus bytes**, así que una sesión con capturas verificadas en un navegador real no se podía
+    reconstruir en un proceso nuevo. Los bytes viajan en su propio artefacto (``SCREENSHOT``) y el
+    índice en otro (``SCREENSHOT_MANIFEST``): meterlos en el JSON del manifiesto obligaría a
+    codificarlos, y un binario codificado que se redacta y se acota como texto deja de ser el
+    binario que el navegador midió.
+
+    Cada captura declarada se revalida con la función **canónica** de la capa web
+    (:meth:`~punto.schemas.web.ScreenshotArtifact.as_image_payload`), que comprueba que los bytes
+    miden lo que el artefacto declara y que su sha256 coincide. No se añade una segunda validación
+    más débil al lado: la canónica es la única. Su ``ValueError`` se propaga tal cual, y aquí
+    significa defecto de quien llama —el adaptador midió esas imágenes y las pasó—, no un estado del
+    workflow. Toda la validación ocurre **antes** de escribir el primer byte, de modo que un mapa de
+    payloads que no encaja no deja capturas a medias en el almacén.
+
+    El manifiesto lleva la identidad de la sesión (``task_id``, ``project_id`` e ``id``) y la lista
+    **completa y ordenada por nombre lógico**, para que el mismo conjunto de capturas produzca
+    siempre los mismos bytes y su digest sea reproducible.
+
+    Raises:
+        ValueError: si la petición no es de ``VISUAL_QA``; si la sesión no declara ninguna captura
+            —el caso «sin capturas» no publica nada de esto y un índice vacío fingiría una
+            evidencia que la sesión no midió—; si falta el payload de una captura declarada; si
+            llega el payload de una captura que la sesión no declara, porque una de más no puede
+            colarse ni ocultar una requerida que falte; si la sesión declara dos veces el mismo
+            nombre lógico; o si los bytes de una captura no superan la validación canónica.
+    """
+    _assert_role(request, RoleName.VISUAL_QA, "publish_screenshots")
+    declared = _declared_captures(session)
+    payloads = _capture_payloads(declared, images)
+    validated: list[tuple[ScreenshotArtifact, ImagePayload]] = [
+        (artifact, artifact.as_image_payload(payloads[artifact.logical_name].data))
+        for artifact in sorted(declared, key=lambda item: item.logical_name)
+    ]
+    entries: list[dict[str, object]] = []
+    for artifact, payload in validated:
+        reference = store.put(
+            workflow_id=request.workflow_id,
+            role=RoleName.VISUAL_QA,
+            step_index=request.step_index,
+            kind=SCREENSHOT_KIND,
+            label=f"{_SCREENSHOT_LABEL}: {artifact.logical_name}",
+            data=payload.data,
+        )
+        entries.append({**_json_dump(artifact), _REFERENCE_FIELD: _json_dump(reference)})
+    manifest: dict[str, object] = {
+        _KIND_FIELD: SCREENSHOT_MANIFEST_KIND,
+        _TASK_ID_FIELD: str(session.task_id),
+        _PROJECT_ID_FIELD: str(session.project_id),
+        _SESSION_ID_FIELD: str(session.id),
+        _SCREENSHOTS_FIELD: entries,
+    }
+    return store.put(
+        workflow_id=request.workflow_id,
+        role=RoleName.VISUAL_QA,
+        step_index=request.step_index,
+        kind=SCREENSHOT_MANIFEST_KIND,
+        label=_SCREENSHOT_MANIFEST_LABEL,
+        data=_encode(_bounded_payload(manifest)),
+    )
+
+
+def resolve_screenshots(
+    store: ArtifactStore,
+    references: tuple[ArtifactReference, ...],
+    session: WebSessionReport | None,
+) -> Mapping[str, ImagePayload]:
+    """Reconstruye los bytes **verificados** de cada captura que declara la sesión web.
+
+    Es la otra mitad de V604-02: un proceso nuevo resuelve el manifiesto (``SCREENSHOT_MANIFEST``)
+    de la **primera** referencia de ese tipo, localiza por nombre lógico la entrada de cada captura
+    declarada, recupera sus bytes del almacén con la referencia del propio manifiesto y los revalida
+    con la misma función canónica con la que se publicaron. Así la verificación visual no depende de
+    ninguna variable del proceso que midió la sesión.
+
+    Nada se entrega a medias: o están **todas** las capturas declaradas y verificadas, o hay
+    ``WORKFLOW_INCOMPLETE_EVIDENCE``. Una captura que falte, unos bytes ausentes, unos bytes del
+    tamaño declarado cuyo hash no cuadra, un sha256 que no corresponde, una entrada bajo otro nombre
+    lógico, una entrada de más en el manifiesto o una referencia de bytes que el almacén no puede
+    verificar son, todos, huecos de evidencia recuperables: el adaptador los convierte en
+    ``BLOCKED`` en vez de cerrar el workflow. Traducirlos aquí es deliberado, porque en esta función
+    «la captura durable no es de fiar» significa exactamente eso.
+
+    Un ``session`` ausente o sin capturas devuelve un mapa vacío y no toca el almacén: es el caso
+    «sin capturas» del adaptador, donde no hay nada que analizar y el informe dirá cero, que es un
+    hecho y no una invención.
+
+    Returns:
+        Mapa ``logical_name -> ImagePayload`` con los bytes exactos y verificados de cada captura
+        declarada, en el orden en que la sesión las declara.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si la sesión declara capturas y falta el manifiesto, o si
+            cualquier comprobación de integridad de las capturas falla.
+    """
+    declared = () if session is None else tuple(session.screenshots)
+    if not declared:
+        return {}
+    manifest = _first_reference(references, SCREENSHOT_MANIFEST_KIND)
+    if manifest is None:
+        raise WorkflowIncompleteEvidenceError(
+            f"la sesión web declara {len(declared)} captura(s) y las referencias del paso no traen "
+            f"ningún manifiesto {SCREENSHOT_MANIFEST_KIND}: sin él los bytes no se pueden "
+            "reconstruir en un proceso nuevo y la verificación visual se haría a ciegas"
+        )
+    entries = _read_capture_manifest(store, manifest)
+    images: dict[str, ImagePayload] = {}
+    for artifact in declared:
+        name = _bounded_text(artifact.logical_name)
+        entry = _capture_entry(entries, artifact, name, manifest)
+        stored, reference = _manifest_capture(entry, manifest, name)
+        _assert_same_capture(artifact, stored, name)
+        images[name] = _verified_payload(store, reference, stored, name)
+    extra = sorted(set(entries) - {_bounded_text(item.logical_name) for item in declared})
+    if extra:
+        raise WorkflowIncompleteEvidenceError(
+            f"el manifiesto {manifest.reference!r} lleva {len(extra)} entrada(s) que la sesión no "
+            f"declara ({extra}): el índice y la sesión no son el mismo conjunto de capturas y no "
+            "se puede saber qué evidencia corresponde a qué imagen"
+        )
+    return images
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1658,288 @@ def _require_web_evidence[EvidenceT: BaseModel](
     return evidence
 
 
+def _declared_captures(session: WebSessionReport) -> tuple[ScreenshotArtifact, ...]:
+    """Capturas declaradas por la sesión, o ``ValueError`` si no hay ninguna o se repiten.
+
+    Una sesión sin capturas no publica nada de este códec: el caso «sin capturas» sigue siendo el
+    que era —lo mantiene el adaptador— y un manifiesto vacío fingiría una evidencia que la sesión
+    nunca midió. Dos capturas con el mismo nombre lógico tampoco se aceptan: el manifiesto se
+    indexa por ese nombre y una de las dos quedaría sin entrada, que es justo el hueco silencioso
+    que este códec existe para impedir.
+    """
+    declared = tuple(session.screenshots)
+    if not declared:
+        raise ValueError(
+            "no se publican capturas de una sesión que no declara ninguna: el caso «sin capturas» "
+            "no deja bytes ni manifiesto, y un índice vacío fingiría una evidencia que la sesión "
+            "no midió"
+        )
+    names = [artifact.logical_name for artifact in declared]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(
+            f"la sesión declara más de una captura con el mismo nombre lógico {duplicates}: dos "
+            "imágenes distintas no se pueden atar a la misma entrada del manifiesto"
+        )
+    return declared
+
+
+def _capture_payloads(
+    declared: tuple[ScreenshotArtifact, ...], images: Mapping[str, ImagePayload]
+) -> Mapping[str, ImagePayload]:
+    """Payloads indexados por nombre lógico declarado, o ``ValueError`` si el mapa no encaja.
+
+    Se exige el conjunto **exacto**: que falte una declarada y que sobre una que la sesión no
+    declara son los dos rechazos, y ambos ocurren antes de escribir un solo byte. Una captura de más
+    no puede colarse en el manifiesto ni, sobre todo, ocultar una requerida que falte.
+    """
+    names = {artifact.logical_name for artifact in declared}
+    missing = sorted(names - set(images))
+    if missing:
+        raise ValueError(
+            f"la sesión declara {len(names)} captura(s) y no llegó el payload de {missing}: el "
+            "manifiesto ataría la evidencia a una imagen que no existe"
+        )
+    extra = sorted(set(images) - names)
+    if extra:
+        raise ValueError(
+            f"llegaron payloads de capturas que la sesión no declara ({extra}): una captura de más "
+            "no puede colarse en el manifiesto ni ocultar una requerida que falte"
+        )
+    return {name: images[name] for name in names}
+
+
+def _first_reference(
+    references: tuple[ArtifactReference, ...], kind: str
+) -> ArtifactReference | None:
+    """Primera referencia del tipo indicado, en el orden en que el run las declaró."""
+    for reference in references:
+        if reference.kind == kind:
+            return reference
+    return None
+
+
+def _read_capture_manifest(
+    store: ArtifactStore, reference: ArtifactReference
+) -> Mapping[str, dict[str, object]]:
+    """Lee el manifiesto de capturas y lo indexa por nombre lógico, o fallo de evidencia.
+
+    Un manifiesto ausente, ilegible, de otro esquema, sin lista de capturas, con una entrada que no
+    es un objeto o con dos entradas para el mismo nombre lógico no se interpreta «lo mejor posible»:
+    es evidencia incompleta, porque el índice que ata cada captura a sus bytes no es de fiar y sin
+    él no se puede saber qué imagen se midió.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si el manifiesto no se puede leer o no tiene la forma que
+            este códec escribió.
+    """
+    try:
+        data = store.get(reference)
+    except (WorkflowResumeFailedError, WorkflowCheckpointInvalidError) as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"no se pudo leer el manifiesto durable de capturas ({reference.reference!r}): "
+            f"{error.detail or error}"
+        ) from error
+    try:
+        payload = _decode(data, expected_kind=SCREENSHOT_MANIFEST_KIND, reference=reference)
+    except WorkflowResumeFailedError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"el manifiesto durable de capturas ({reference.reference!r}) no es un sobre legible "
+            f"de esta versión: {error.detail or error}"
+        ) from error
+    raw = payload.get(_SCREENSHOTS_FIELD)
+    if not isinstance(raw, list):
+        raise WorkflowIncompleteEvidenceError(
+            f"el manifiesto {reference.reference!r} no lleva una lista en "
+            f"{_SCREENSHOTS_FIELD!r} sino {type(raw).__name__}: no hay índice que resolver"
+        )
+    entries: dict[str, dict[str, object]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise WorkflowIncompleteEvidenceError(
+                f"el manifiesto {reference.reference!r} lleva una entrada que no es un objeto JSON "
+                f"sino {type(item).__name__}"
+            )
+        entry = cast("dict[str, object]", item)
+        name = entry.get(_LOGICAL_NAME_FIELD)
+        if not isinstance(name, str) or not name:
+            raise WorkflowIncompleteEvidenceError(
+                f"una entrada del manifiesto {reference.reference!r} no declara un nombre lógico "
+                "utilizable: sin él la captura no se puede atar a su evidencia"
+            )
+        if name in entries:
+            raise WorkflowIncompleteEvidenceError(
+                f"el manifiesto {reference.reference!r} lleva dos entradas para el nombre lógico "
+                f"{name!r}: no se puede saber cuál de las dos es la captura medida"
+            )
+        entries[name] = entry
+    return entries
+
+
+def _capture_entry(
+    entries: Mapping[str, dict[str, object]],
+    declared: ScreenshotArtifact,
+    name: str,
+    manifest: ArtifactReference,
+) -> dict[str, object]:
+    """Entrada del manifiesto de una captura declarada, o ``WORKFLOW_INCOMPLETE_EVIDENCE``.
+
+    Distingue dos hechos que no son lo mismo: que la captura **no esté** en el índice —un hueco de
+    evidencia— y que sus bytes estén bajo **otro** nombre lógico, que es una manipulación del
+    emparejamiento entre la captura y su contenido y se dice como tal.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si el manifiesto no ata esa captura a ningún contenido.
+    """
+    entry = entries.get(name)
+    if entry is not None:
+        return entry
+    impostors = sorted(
+        other for other, candidate in entries.items() if candidate.get("sha256") == declared.sha256
+    )
+    if impostors:
+        raise WorkflowIncompleteEvidenceError(
+            f"la sesión declara la captura {name!r} y el manifiesto {manifest.reference!r} ata "
+            f"esos mismos bytes al nombre lógico {impostors!r}: el emparejamiento entre la captura "
+            "y su evidencia fue manipulado"
+        )
+    raise WorkflowIncompleteEvidenceError(
+        f"la sesión declara la captura {name!r} y el manifiesto {manifest.reference!r} no lleva "
+        "ninguna entrada para ella: sin entrada no hay bytes que verificar"
+    )
+
+
+def _manifest_capture(
+    entry: Mapping[str, object], manifest: ArtifactReference, name: str
+) -> tuple[ScreenshotArtifact, ArtifactReference]:
+    """Reconstruye la evidencia canónica y la referencia de bytes de una entrada del manifiesto.
+
+    La evidencia se reconstruye contra el contrato de :class:`ScreenshotArtifact` y la referencia
+    contra :class:`ArtifactReference`: una entrada que no valida contra ellos es un índice
+    manipulado, no una captura a la que le falte un campo.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si la entrada o su referencia no validan contra el
+            contrato.
+    """
+    raw = {key: value for key, value in entry.items() if key != _REFERENCE_FIELD}
+    try:
+        artifact = ScreenshotArtifact.model_validate(raw)
+    except ValidationError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"la entrada {name!r} del manifiesto {manifest.reference!r} no valida contra "
+            f"ScreenshotArtifact: {error}"
+        ) from error
+    try:
+        reference = ArtifactReference.model_validate(entry.get(_REFERENCE_FIELD))
+    except ValidationError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"la entrada {name!r} del manifiesto {manifest.reference!r} no lleva una referencia de "
+            f"bytes válida: {error}"
+        ) from error
+    return artifact, reference
+
+
+def _assert_same_capture(
+    declared: ScreenshotArtifact, stored: ScreenshotArtifact, name: str
+) -> None:
+    """Comprueba que la evidencia del manifiesto es la que la sesión declara.
+
+    Se comparan los campos que atan la captura a su contenido y a su contexto —nombre lógico, ruta,
+    viewport, media type, tamaño y sha256— y se falla con el detalle del primero que no cuadra. Los
+    textos se comparan en su forma acotada, que es la que el manifiesto guarda: la misma que ya
+    viajó en el sobre de la sesión.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si algún campo no coincide. Dos evidencias distintas para
+            la misma captura significan que el índice durable no es de fiar.
+    """
+    if stored.logical_name != _bounded_text(declared.logical_name):
+        raise WorkflowIncompleteEvidenceError(
+            f"la entrada del manifiesto ata la captura {name!r} al nombre lógico "
+            f"{stored.logical_name!r}: el índice no corresponde a la captura que la sesión declara"
+        )
+    if stored.route != _bounded_text(declared.route):
+        raise WorkflowIncompleteEvidenceError(
+            f"la ruta canónica de la captura {name!r} es {stored.route!r} y la sesión declara "
+            f"{declared.route!r}: no es la misma captura"
+        )
+    if stored.viewport != declared.viewport:
+        raise WorkflowIncompleteEvidenceError(
+            f"el viewport canónico de la captura {name!r} es {stored.viewport.value!r} y la sesión "
+            f"declara {declared.viewport.value!r}: no es la misma captura"
+        )
+    if stored.media_type != _bounded_text(declared.media_type):
+        raise WorkflowIncompleteEvidenceError(
+            f"el media type canónico de la captura {name!r} es {stored.media_type!r} y la sesión "
+            f"declara {declared.media_type!r}: no es la misma captura"
+        )
+    if stored.bytes != declared.bytes:
+        raise WorkflowIncompleteEvidenceError(
+            f"la evidencia canónica de la captura {name!r} declara {stored.bytes} bytes y la "
+            f"sesión declara {declared.bytes}: el índice y la sesión no miden lo mismo"
+        )
+    if stored.sha256 != declared.sha256:
+        raise WorkflowIncompleteEvidenceError(
+            f"el sha256 canónico de la captura {name!r} no coincide con el que declara la sesión: "
+            "el índice y la sesión no atan la misma imagen"
+        )
+
+
+def _verified_payload(
+    store: ArtifactStore,
+    reference: ArtifactReference,
+    stored: ScreenshotArtifact,
+    name: str,
+) -> ImagePayload:
+    """Bytes del almacén revalidados contra la evidencia canónica del manifiesto.
+
+    Traduce **todos** los fallos de integridad a ``WORKFLOW_INCOMPLETE_EVIDENCE`` con un detalle
+    distinto por caso: unos bytes que no están, una referencia que el almacén no puede verificar,
+    unos bytes de otro tamaño y unos bytes del tamaño declarado cuyo hash no cuadra. En esta función
+    cualquiera de los cuatro significa «la captura durable no es de fiar», que es un hueco de
+    evidencia recuperable y no una corrupción del workflow.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si los bytes no están, no se pueden leer, no superan la
+            verificación del almacén o no superan la validación canónica.
+    """
+    try:
+        data = store.get(reference)
+    except WorkflowResumeFailedError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"los bytes durables de la captura {name!r} no están en el almacén "
+            f"({reference.reference!r}): {error.detail or error}"
+        ) from error
+    except WorkflowCheckpointInvalidError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"la referencia de bytes de la captura {name!r} no supera la verificación de "
+            f"integridad del almacén ({reference.reference!r}): {error.detail or error}"
+        ) from error
+    if len(data) != stored.bytes:
+        raise WorkflowIncompleteEvidenceError(
+            f"los bytes durables de la captura {name!r} ocupan {len(data)} y su evidencia canónica "
+            f"declara {stored.bytes}: la imagen no es la que se midió"
+        )
+    try:
+        return stored.as_image_payload(data)
+    except ValueError as error:
+        raise WorkflowIncompleteEvidenceError(
+            f"los bytes durables de la captura {name!r} tienen el tamaño declarado pero su hash no "
+            f"cuadra con el sha256 canónico: {error}"
+        ) from error
+
+
+def _bounded_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Sanea y acota un sobre construido a mano, campo a campo, antes de serializarlo.
+
+    Es la variante de :func:`_bounded_json` para sobres que no son un modelo pydantic —el manifiesto
+    de capturas lo es— y aplica la misma redacción de credenciales y la misma cota de texto al JSON
+    que se va a escribir. Nunca toca los bytes: los binarios no viven en este sobre.
+    """
+    return cast("dict[str, object]", _bound_value(dict(payload)))
+
+
 def _branch_name(request: RoleExecutionRequest, slug: str) -> str:
     """Rama de tarea determinista: ``ai/<slug>-<8 primeros del task_id>``.
 
@@ -1561,6 +2015,8 @@ __all__ = [
     "PLAN_KIND",
     "QA_KIND",
     "REVIEW_KIND",
+    "SCREENSHOT_KIND",
+    "SCREENSHOT_MANIFEST_KIND",
     "SECURITY_KIND",
     "VISUAL_EVIDENCE_KIND",
     "VISUAL_QA_KIND",
@@ -1573,6 +2029,7 @@ __all__ = [
     "publish_plan",
     "publish_qa",
     "publish_review",
+    "publish_screenshots",
     "publish_security",
     "publish_visual_evidence",
     "publish_visual_qa",
@@ -1583,6 +2040,7 @@ __all__ = [
     "resolve_plan",
     "resolve_qa",
     "resolve_review",
+    "resolve_screenshots",
     "resolve_security",
     "resolve_visual_evidence",
     "resolve_visual_qa",

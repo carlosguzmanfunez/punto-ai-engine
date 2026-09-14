@@ -51,6 +51,7 @@ from punto.schemas.workflow import (
     BudgetAllowance,
     EffectStatus,
     HumanGateRequest,
+    ModelCallLimits,
     RoleExecutionRequest,
     RoleExecutionResult,
     RoleName,
@@ -103,6 +104,13 @@ WORKFLOW_ID_NAMESPACE: Final[UUID] = uuid5(
 #: (``RoleStatus.FAILED``) no: eso es un resultado, no un tropiezo. Los reintentos de transporte ya
 #: viven dentro de cada cliente de proveedor.
 MAX_TECHNICAL_ATTEMPTS: Final[int] = 2
+
+#: Colchón de tokens que se reserva antes de invocar a un rol que puede usar modelo (V604-01).
+#:
+#: Es una **reserva** que se liquida con el consumo real en cuanto el resultado se conoce, y su
+#: única razón de ser es que un proceso que muere a mitad de una llamada no pueda reaparecer con el
+#: presupuesto intacto. No es un tope del rol: el tope lo ponen los límites efectivos y el saldo.
+DEFAULT_TOKEN_RESERVATION: Final[int] = 8_000
 
 #: Roles que producen efectos sobre el proyecto (escritura de código, archivos). Son los que pasan
 #: por el libro de efectos antes de ejecutarse.
@@ -562,10 +570,19 @@ class WorkflowKernel:
             # intento volvía a ver el consumo intacto y `max_role_calls=1` permitía dos llamadas
             # (hallazgo V602-04). Los intentos ya no se suman otra vez en el cierre del paso.
             run = self._consume(run, role_calls=1)
-            # Y se **persiste** antes de invocar (hallazgo V603-02): una llamada iniciada cuenta
-            # contra el presupuesto aunque el proceso muera antes de recibir o guardar la
-            # respuesta. Conservador antes que doble gasto: si el checkpoint no se puede escribir,
-            # no se llama al rol.
+            # Y con ella la del gasto de modelo (hallazgo V604-01): una llamada de modelo y un
+            # colchón de tokens quedan comprometidos antes de salir, para que una llamada iniciada
+            # y perdida no reaparezca como cero consumo.
+            reserved_calls = run.usage.model_calls_reserved
+            reserved_tokens = run.usage.tokens_reserved
+            run, reserved = self._reserve_model_budget(run, role, step_index=index)
+            if reserved is not None:
+                return self._block(run, reserved, step_index=index)
+            attempted_calls = run.usage.model_calls_reserved - reserved_calls
+            attempted_tokens = run.usage.tokens_reserved - reserved_tokens
+            # Se **persiste** antes de invocar (hallazgos V603-02 y V604-01): una llamada iniciada
+            # cuenta contra el presupuesto aunque el proceso muera antes de recibir o guardar la
+            # respuesta.
             self._store.save(run)
             self._audit_step_started(run, index, role, attempts)
             try:
@@ -576,6 +593,12 @@ class WorkflowKernel:
                 self._audit_step_failed(run, index, role, exc, attempts)
                 if role in EFFECTFUL_ROLES:
                     return self._effect_uncertain(run, role, resolved_key, exc, index)
+                run = self._settle_model_budget(
+                    run,
+                    reserved_calls=attempted_calls,
+                    reserved_tokens=attempted_tokens,
+                    result=None,
+                )
                 if attempts >= max_attempts:
                     break
 
@@ -592,6 +615,15 @@ class WorkflowKernel:
                 summary=f"{role.value} no pudo ejecutarse",
                 error_code=code,
                 error_detail=detail,
+            )
+        else:
+            # El executor devolvió un resultado: se sabe qué se gastó de verdad, así que la reserva
+            # se convierte en consumo y se libera entera.
+            run = self._settle_model_budget(
+                run,
+                reserved_calls=attempted_calls,
+                reserved_tokens=attempted_tokens,
+                result=result,
             )
 
         if resolved_key:
@@ -636,10 +668,14 @@ class WorkflowKernel:
 
         Devolver ``None`` significa «no se invoca al rol»: con ``max_model_calls`` agotado o con los
         tokens consumidos no se hace una llamada real al proveedor para enterarse después.
+
+        El saldo descuenta lo **gastado y lo reservado** (hallazgo V604-01): una llamada iniciada
+        antes de un crash sigue comprometida, así que el rol no puede recibir como disponible un
+        presupuesto que ya está comprometido.
         """
         budget = run.request.budget
-        model_calls = budget.max_model_calls - run.usage.model_calls
-        tokens = budget.max_total_tokens - run.usage.total_tokens
+        model_calls = budget.max_model_calls - run.usage.model_calls_committed
+        tokens = budget.max_total_tokens - run.usage.tokens_committed
         remaining_time = budget.max_wall_time_seconds - self._elapsed(run)
         if model_calls <= 0 or tokens <= 0 or remaining_time <= 0:
             return None
@@ -648,6 +684,89 @@ class WorkflowKernel:
             tokens_remaining=tokens,
             wall_time_seconds_remaining=max(0.0, remaining_time),
         )
+
+    def _model_budget_hint(self, role: RoleName) -> ModelCallLimits | None:
+        """Cota declarada por el runner del rol, si el ejecutor sabe declararla.
+
+        ``CamusRoleExecutor`` la delega en CAMUS, que es quien conoce los runners reales. Un
+        ejecutor que no la implemente (dobles de prueba) devuelve ``None``: significa «no declaro
+        cota», y el kernel reserva de forma conservadora en vez de suponer que no se gastará nada.
+        """
+        executor = self._executors.get(role)
+        provider = getattr(executor, "model_limits", None)
+        if not callable(provider):
+            return None
+        hint = provider(role)
+        return hint if isinstance(hint, ModelCallLimits) else None
+
+    def _reserve_model_budget(
+        self, run: WorkflowRun, role: RoleName, *, step_index: int
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """Reserva de forma **durable** el gasto de modelo que el intento puede producir.
+
+        Hallazgos V603-02 y V604-01: la reserva no cubre solo la llamada de rol. Antes de invocar a
+        un rol que puede usar modelo se reservan una llamada de modelo y un colchón de tokens, y el
+        checkpoint se escribe **antes** de la llamada. Si el proceso muere en medio, la reserva
+        sigue comprometida: una llamada iniciada y perdida no puede reaparecer como cero consumo.
+
+        Un runner que declara ``uses_ai=False`` no reserva nada: no gasta presupuesto de modelo.
+        """
+        hint = self._model_budget_hint(role)
+        if hint is not None and not hint.uses_ai:
+            return run, None
+        tokens = self._token_reservation(run)
+        check = reserve_budget(
+            run, model_calls=1, tokens=tokens, elapsed_seconds=self._elapsed(run)
+        )
+        if not check.allowed:
+            return run, check
+        usage = run.usage.model_copy(
+            update={
+                "model_calls_reserved": run.usage.model_calls_reserved + 1,
+                "tokens_reserved": run.usage.tokens_reserved + tokens,
+            }
+        )
+        return run.model_copy(update={"usage": usage}), None
+
+    def _token_reservation(self, run: WorkflowRun) -> int:
+        """Colchón de tokens de una reserva pre-gasto, acotado por lo que queda.
+
+        Es una **reserva**, no un tope: se liquida con el consumo real en cuanto el resultado se
+        conoce. El valor por defecto es deliberadamente pequeño frente al presupuesto típico y se
+        documenta aquí porque es la única cifra del presupuesto que no la declara un contrato.
+        """
+        remaining = max(0, run.request.budget.max_total_tokens - run.usage.tokens_committed)
+        return min(DEFAULT_TOKEN_RESERVATION, remaining)
+
+    def _settle_model_budget(
+        self,
+        run: WorkflowRun,
+        *,
+        reserved_calls: int,
+        reserved_tokens: int,
+        result: RoleExecutionResult | None,
+    ) -> WorkflowRun:
+        """Liquida la reserva: consumo real conocido ⇒ libera; resultado desconocido ⇒ no libera.
+
+        Con resultado (aunque sea un fallo del rol) se sabe qué se gastó de verdad: se suma
+        **entero** a los contadores de consumo —la reserva era una cota inferior, no un techo— y se
+        libera la reserva. Que el consumo no rebase el máximo lo garantiza el pre-gasto: el rol
+        recibió como saldo lo que cabía. Sin resultado —excepción, caída— la reserva se queda
+        comprometida, que es la política conservadora del hallazgo V604-01.
+        """
+        if result is None:
+            return run
+        usage = run.usage
+        # El consumo real se cuenta **entero**: la reserva era una cota inferior de lo que el rol
+        # podía gastar, no un techo. Que el total no rebase el máximo lo garantiza el pre-gasto: el
+        # rol recibió como saldo lo que cabía, así que no puede gastar más que eso.
+        update = {
+            "model_calls": usage.model_calls + result.model_calls,
+            "total_tokens": usage.total_tokens + result.usage.total_tokens,
+            "model_calls_reserved": max(0, usage.model_calls_reserved - reserved_calls),
+            "tokens_reserved": max(0, usage.tokens_reserved - reserved_tokens),
+        }
+        return run.model_copy(update={"usage": usage.model_copy(update=update)})
 
     def _model_budget_denied(self, run: WorkflowRun) -> BudgetCheck:
         """Veredicto explícito de «no hay saldo para llamar al modelo», con su cifra.
@@ -828,13 +947,12 @@ class WorkflowKernel:
             error_detail=result.error_detail,
         )
         failed = 1 if result.status is not RoleStatus.COMPLETED else 0
-        # ``role_calls`` **no** se suma aquí: cada intento ya reservó y consumió la suya antes de
-        # invocar al executor. Sumarla otra vez contaría dos veces la misma llamada.
+        # ``role_calls`` **no** se suma aquí (cada intento ya reservó y consumió la suya) y
+        # ``model_calls``/``total_tokens`` tampoco: los liquidó la reserva pre-gasto con el consumo
+        # real del resultado (hallazgos V602-04 y V604-01).
         usage = run.usage.model_copy(
             update={
                 "steps": run.usage.steps + 1,
-                "model_calls": run.usage.model_calls + result.model_calls,
-                "total_tokens": run.usage.total_tokens + result.usage.total_tokens,
                 "failures": run.usage.failures + failed,
             }
         )

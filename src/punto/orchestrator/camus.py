@@ -807,7 +807,7 @@ class Camus:
         )
 
     def declared_model_limits(self, role: RoleName) -> ModelCallLimits | None:
-        """Cota de modelo **declarada** por el runner inyectado de un rol, o ``None``.
+        """Cota **declarada** por el runner inyectado de un rol, o ``None`` si no hay runner.
 
         El presupuesto del workflow es una cota pre-gasto: para los roles cuyo contrato lleva los
         límites dentro de la petición (Architect y Planner) se aplican directamente; para los demás,
@@ -815,22 +815,32 @@ class Camus:
         podría gastar más de lo permitido. De ahí esta consulta: es el único punto donde el workflow
         puede leer la cota real del proveedor sin conocer su implementación.
 
+        Dos matices que importan (hallazgo V604-01):
+
+        - ``uses_ai`` viaja con la cota, porque un runner que **no** usa modelo no debe reservar
+          presupuesto de modelo;
+        - una cota ausente se devuelve como ``None`` en ese campo, que significa **desconocida**, no
+          «sin límite»: para un runner con IA, una cota desconocida es motivo de bloqueo.
+
         Args:
             role: Rol del workflow cuya cota se consulta.
 
         Returns:
-            ``(max_model_calls, max_output_tokens)`` del runner, o ``None`` si el rol no tiene
-            runner, no está configurado o su implementación no declara límites.
+            La cota declarada, o ``None`` si el rol no tiene runner inyectado.
         """
         runner = self._runner_for(role)
+        if runner is None:
+            return None
+        uses_ai = bool(getattr(runner, "uses_ai", False))
         limits = getattr(runner, "limits", None)
         if limits is None:
-            return None
-        calls = getattr(limits, "max_model_calls", None)
-        tokens = getattr(limits, "max_output_tokens", None)
-        if not isinstance(calls, int) or not isinstance(tokens, int):
-            return None
-        return ModelCallLimits(max_model_calls=calls, max_output_tokens=tokens)
+            return ModelCallLimits(uses_ai=uses_ai)
+        return ModelCallLimits(
+            uses_ai=uses_ai,
+            max_model_calls=_declared_int(limits, "max_model_calls"),
+            max_input_tokens=_declared_int(limits, "max_input_tokens"),
+            max_output_tokens=_declared_int(limits, "max_output_tokens"),
+        )
 
     def _runner_for(self, role: RoleName) -> object | None:
         """Runner inyectado del rol, o ``None`` si ese rol no tiene uno.
@@ -1601,6 +1611,17 @@ class Camus:
             elapsed_minutes=0.0,
             verified=True,
         )
+
+
+def _declared_int(limits: object, field: str) -> int | None:
+    """Cota declarada por el runner, o ``None`` si no la declara.
+
+    Un runner que no expone ese campo (o lo expone con un tipo que no es entero) **no declara** la
+    cota: devolver ``None`` es lo que hace que el presupuesto la trate como desconocida y no
+    autorice gasto autónomo con IA (hallazgo V604-01).
+    """
+    value = getattr(limits, field, None)
+    return value if isinstance(value, int) else None
 
 
 __all__ = [

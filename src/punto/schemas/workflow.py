@@ -174,20 +174,41 @@ class WorkflowBudget(BaseModel):
 
 
 class WorkflowUsage(BaseModel):
-    """Presupuesto consumido. Lo actualiza PUNTO, nunca el modelo."""
+    """Presupuesto consumido. Lo actualiza PUNTO, nunca el modelo.
+
+    Separa lo **gastado** de lo **reservado** (hallazgo V604-01): una llamada ya iniciada se reserva
+    antes de salir y solo se convierte en consumo real cuando el resultado se conoce. Si el proceso
+    muere en medio, la reserva sigue contando —``max_total_tokens`` es un tope de
+    ``total_tokens + tokens_reserved``— de modo que una llamada perdida no reaparece como cero
+    consumo y el workflow no puede rebasar su presupuesto por un crash.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     steps: int = Field(default=0, ge=0)
     role_calls: int = Field(default=0, ge=0)
     model_calls: int = Field(default=0, ge=0)
+    #: Llamadas de modelo reservadas y aún no convertidas en consumo real.
+    model_calls_reserved: int = Field(default=0, ge=0)
     repairs: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
+    #: Tokens de entrada y salida reservados y aún no convertidos en consumo real.
+    tokens_reserved: int = Field(default=0, ge=0)
     failures: int = Field(default=0, ge=0)
     transitions: int = Field(default=0, ge=0)
     wall_time_seconds: float = Field(default=0.0, ge=0.0)
     #: Veces que se ha entrado en cada estado, para detectar bucles.
     state_visits: tuple[tuple[str, int], ...] = Field(default=())
+
+    @property
+    def tokens_committed(self) -> int:
+        """Tokens comprometidos: los gastados más los reservados que aún no se han liquidado."""
+        return self.total_tokens + self.tokens_reserved
+
+    @property
+    def model_calls_committed(self) -> int:
+        """Llamadas de modelo comprometidas: las gastadas más las reservadas sin liquidar."""
+        return self.model_calls + self.model_calls_reserved
 
     def visit_count(self, status: TaskStatus) -> int:
         """Veces que se ha entrado en un estado."""
@@ -250,17 +271,36 @@ class ProviderCapability(BaseModel):
 
 
 class ModelCallLimits(BaseModel):
-    """Cota de llamadas y de tokens de salida **declarada** por el runner de un rol.
+    """Cota de llamadas y de tokens **declarada** por el runner de un rol.
 
     La consulta el presupuesto del workflow para no autorizar una ejecución que podría gastar más de
     lo permitido: es la única forma de conocer el máximo real del proveedor sin depender de su
-    implementación (hallazgo V603-01).
+    implementación (hallazgos V603-01 y V604-01).
+
+    ``uses_ai`` distingue un runner con modelo de uno determinista, y una cota en ``None`` significa
+    **desconocida**, no «sin límite»: para un runner con IA, una cota desconocida es motivo de
+    bloqueo, porque PUNTO no puede garantizar que no se rebase el presupuesto.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    max_model_calls: int = Field(..., ge=1)
-    max_output_tokens: int = Field(..., ge=1)
+    #: True si el runner puede llamar a un modelo (y por tanto consume presupuesto de modelo).
+    uses_ai: bool = Field(default=False)
+    #: ``None`` = el runner no declara cota de llamadas.
+    max_model_calls: int | None = Field(default=None, ge=1)
+    #: ``None`` = el runner no declara cota de tokens de entrada.
+    max_input_tokens: int | None = Field(default=None, ge=1)
+    #: ``None`` = el runner no declara cota de tokens de salida.
+    max_output_tokens: int | None = Field(default=None, ge=1)
+
+    @property
+    def known(self) -> bool:
+        """True si el runner declara las tres cotas: sin ellas no hay gasto autónomo seguro."""
+        return (
+            self.max_model_calls is not None
+            and self.max_input_tokens is not None
+            and self.max_output_tokens is not None
+        )
 
 
 class BudgetAllowance(BaseModel):

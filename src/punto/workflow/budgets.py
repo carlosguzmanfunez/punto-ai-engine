@@ -125,11 +125,25 @@ def reserve_budget(
     budget = run.request.budget
     usage = run.usage
     # (límite, usado, solicitado, máximo) en orden fijo: el primer límite que no cabe gana.
+    #
+    # En modelo y tokens lo «usado» incluye lo **reservado** y aún no liquidado (hallazgo V604-01):
+    # una llamada iniciada antes de un crash sigue contando, así que el tope es de compromiso total
+    # (gastado + reservado) y no puede rebasarse por perder un resultado por el camino.
     reservations: tuple[tuple[str, float, float, float], ...] = (
         ("max_steps", usage.steps, max(0, steps), budget.max_steps),
         ("max_role_calls", usage.role_calls, max(0, role_calls), budget.max_role_calls),
-        ("max_model_calls", usage.model_calls, max(0, model_calls), budget.max_model_calls),
-        ("max_total_tokens", usage.total_tokens, max(0, tokens), budget.max_total_tokens),
+        (
+            "max_model_calls",
+            usage.model_calls_committed,
+            max(0, model_calls),
+            budget.max_model_calls,
+        ),
+        (
+            "max_total_tokens",
+            usage.tokens_committed,
+            max(0, tokens),
+            budget.max_total_tokens,
+        ),
         ("max_wall_time_seconds", elapsed_seconds, 0.0, budget.max_wall_time_seconds),
         ("max_failures", usage.failures, max(0, failures), budget.max_failures),
         ("max_transitions", usage.transitions, max(0, transitions), budget.max_transitions),
@@ -267,8 +281,8 @@ def budget_report(
     return (
         ("max_steps", f"{usage.steps}/{budget.max_steps}"),
         ("max_role_calls", f"{usage.role_calls}/{budget.max_role_calls}"),
-        ("max_model_calls", f"{usage.model_calls}/{budget.max_model_calls}"),
-        ("max_total_tokens", f"{usage.total_tokens}/{budget.max_total_tokens}"),
+        ("max_model_calls", f"{usage.model_calls_committed}/{budget.max_model_calls}"),
+        ("max_total_tokens", f"{usage.tokens_committed}/{budget.max_total_tokens}"),
         (
             "max_wall_time_seconds",
             f"{_short(elapsed_seconds)}/{_short(budget.max_wall_time_seconds)}",

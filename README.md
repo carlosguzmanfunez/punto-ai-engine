@@ -32,7 +32,8 @@
 | **ENGINE-6.0** | **Autonomous Workflow Kernel.** CAMUS conduce una intención por etapas y roles con máquina de estados explícita, autoridad, Human Gates no autoaprobables, presupuesto, protección de bucles, checkpoints, reanudación idempotente y routing provider-neutral sin fallback. | ✅ Implementada (live `PENDING_API_KEY`; ciclo de reparación en 6.1) |
 | **ENGINE-6.0.1** | **Authority, Real Handoff & Budget Hardening.** Gobierno real de autoridad (default deny, L3 no rebajable), Human Gate con prueba verificable, etapas Architect/Planner sin duplicación, handoff durable por artefactos, presupuesto pre-gasto, checkpoints coherentes, conflicto de idempotencia, colecciones acotadas, aplicabilidad visual por perfil web y efectos que no se repiten a ciegas. | ✅ Implementada |
 | **ENGINE-6.0.2** | **Final Autonomy Boundary Hardening.** La prueba humana autoriza exactamente la transición que se aplica, la política es obligatoria y se re-evalúa en cada paso y antes del efecto, el handoff durable vive en los adaptadores reales, el presupuesto es pre-gasto también en modelo/tokens y en transiciones, un efecto incierto no se reintenta y la verificación visual no se desactiva omitiendo metadatos. | ✅ Implementada |
-| **ENGINE-6.0.3** | **Final Execution Continuity & Budget Enforcement.** El saldo de modelo/tokens es una cota que llega al runner, la reserva pre-gasto se persiste antes de la llamada, un rol solo queda satisfecho con un resultado aceptable —así que reanudar reabre el rol que no terminó— y el handoff durable cubre toda la pipeline, de Architect a VisualQA. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
+| **ENGINE-6.0.3** | **Final Execution Continuity & Budget Enforcement.** El saldo de modelo/tokens es una cota que llega al runner, la reserva pre-gasto se persiste antes de la llamada, un rol solo queda satisfecho con un resultado aceptable —así que reanudar reabre el rol que no terminó— y el handoff durable cubre toda la pipeline, de Architect a VisualQA. | ✅ Implementada |
+| **ENGINE-6.0.4** | **Token Accounting & Real Visual Handoff Closure.** `max_total_tokens` es un tope de **total** (entrada + salida) con reserva durable de llamada y tokens que un crash no devuelve, y el handoff visual transporta los **bytes reales** de las capturas con revalidación canónica: una captura manipulada, ausente o con hash que no cuadra bloquea el workflow sin ejecutar VisualQA. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -3120,12 +3121,24 @@ Tercera pasada, sobre las tres fronteras residuales que encontró la auditoría 
 El handoff completo se prueba con **un proceso por frontera** (ocho procesos, cada uno con su kernel,
 su CAMUS y sus almacenes reconstruidos desde disco) y una variante sin proyecto web.
 
+### ENGINE-6.0.4 — Contabilidad de tokens y capturas reales
+
+| Hallazgo | Cómo se cierra |
+| --- | --- |
+| V604-01 Saldo de tokens | `max_total_tokens` es un tope de **total** (entrada + salida): la cota efectiva reparte el saldo entre `max_input_tokens` y `max_output_tokens` (`entrada_autorizada + salida_autorizada <= total`), la entrada se estima de forma conservadora —o se cuenta con un tokenizador inyectado— y si ya consume el saldo no se llama al proveedor. El consumo distingue **gastado** de **reservado**: antes de invocar se reservan una llamada de modelo y un colchón de tokens, se persiste el checkpoint y solo entonces se llama; con resultado se convierte en consumo real y se libera, sin resultado (crash) queda comprometido. Un runner con IA sin cota declarada **no se ejecuta** (`UNKNOWN` no es «sin límite») y uno determinista no reserva nada |
+| V604-02 Capturas | `handoff.py` publica los **bytes exactos** de cada captura (`SCREENSHOT`) y un manifiesto que los ata a su evidencia canónica (`SCREENSHOT_MANIFEST`), reutilizando la validación de ENGINE-5.3 (`ScreenshotArtifact.as_image_payload`) sin una segunda más débil. Un proceso nuevo reconstruye el `Mapping[str, ImagePayload]` del almacén; una captura ausente, unos bytes modificados con el mismo tamaño, un hash o un nombre que no cuadran bloquean el workflow con `WORKFLOW_INCOMPLETE_EVIDENCE` y **cero** llamadas a VisualQA |
+
 ### Limitación declarada
 
 - **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
   `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
-- ENGINE-6.0.3 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
+- ENGINE-6.0.4 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
   programador en jefe.
+- La estimación de tokens de entrada es deliberadamente pesimista (dos caracteres por token más la
+  sobrecarga del prompt): con un tokenizador real disponible se inyecta un conteo exacto
+  (`input_estimator`), y sin él se prefiere no ejecutar antes que autorizar un gasto que no cabe.
+- La reserva de tokens por defecto (`8 000`) es una reserva que se liquida con el consumo real; si el
+  proceso muere en medio, queda comprometida hasta la reconciliación.
 - Política conservadora del presupuesto: un rol sin cota inyectable por petición (todo menos
   Architect y Planner) **no se ejecuta** si su máximo declarado no cabe en el saldo restante. Es
   deliberado —antes no gastar que gastar de más— y se declara con `WORKFLOW_BUDGET_EXCEEDED`.

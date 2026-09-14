@@ -168,6 +168,7 @@ from punto.workflow.handoff import (
     resolve_plan,
     resolve_qa,
     resolve_review,
+    resolve_screenshots,
     resolve_security,
     resolve_visual_evidence,
     review_input,
@@ -197,6 +198,14 @@ _MAX_MODEL_CHARS: Final[int] = 120
 _MAX_CATEGORY_CHARS: Final[int] = 80
 #: Espejo del máximo de ``RoleExecutionResult.model_calls``: el contrato lo acota a ``le=64``.
 _MAX_MODEL_CALLS: Final[int] = 64
+#: Caracteres por token que supone la estimación **conservadora** de entrada (hallazgo V604-01).
+#:
+#: Los tokenizadores reales rondan cuatro caracteres por token en texto latino; suponer dos
+#: sobreestima la entrada, que es la dirección segura: preferimos rechazar una ejecución que
+#: autorizarla con un presupuesto que quizá no alcance.
+_CHARS_PER_TOKEN: Final[int] = 2
+#: Sobrecarga fija del prompt (instrucciones, formato y ejemplos) que ningún rol declara.
+_PROMPT_OVERHEAD_TOKENS: Final[int] = 1_000
 #: Cota del nombre de la intención que se deriva del objetivo de la petición.
 _MAX_INTENT_NAME_CHARS: Final[int] = 120
 #: Nombre de la intención cuando el objetivo no deja ni un carácter utilizable.
@@ -236,47 +245,115 @@ _RoleNormalizer = Callable[[object, RoleExecutionRequest], RoleExecutionResult]
 
 @dataclass(frozen=True, slots=True)
 class _EffectiveCap:
-    """Cota de gasto que el kernel autorizó para **esta** ejecución.
+    """Cota de gasto autorizada para **esta** ejecución.
 
-    No es un booleano «hay saldo»: es el número de llamadas y de tokens de salida que la etapa
-    puede gastar como máximo (hallazgo V603-01). Se traduce a los límites reales del rol cuando su
-    contrato los admite por petición, y se usa para rechazar la ejecución cuando el máximo declarado
-    del runner no cabe en ella.
+    No es un booleano «hay saldo»: es el número de llamadas y de **tokens totales** (entrada más
+    salida) que la etapa puede gastar como máximo (hallazgos V603-01 y V604-01). Se traduce a los
+    límites reales del rol cuando su contrato los admite por petición, y se usa para rechazar la
+    ejecución cuando el gasto declarado del runner no cabe en ella.
     """
 
     model_calls: int
-    output_tokens: int
+    total_tokens: int
 
 
-def _architect_limits(cap: _EffectiveCap | None) -> ArchitectLimits | None:
-    """Límites del Architect acotados por el saldo, o ``None`` para usar los suyos.
+def estimate_input_tokens(payload: object, request: RoleExecutionRequest) -> int:
+    """Estimación **conservadora** de los tokens de entrada que enviará el rol al modelo.
 
-    ``max_attempts`` también se acota: un intento de reparación es otra llamada al modelo, así que
-    con saldo para una sola llamada no puede haber dos intentos.
+    Orden de preferencia del hallazgo V604-01: cuando el proveedor o el tokenizador permiten conocer
+    el conteo exacto, se usa el conteo exacto; cuando no, se usa esta estimación, que es deliberada
+    **pesimista** —supone dos caracteres por token, cuando los tokenizadores reales rondan cuatro en
+    texto latino— y añade la sobrecarga del prompt de sistema. Nunca optimista: si el presupuesto no
+    cabe con la estimación conservadora, no se llama al modelo.
+
+    La estimación se calcula sobre lo que el rol **ve**: el texto de su entrada declarada (objetivo,
+    criterios, ficheros, resumen de contexto) más el de la carga útil que PUNTO le entrega. Un
+    conteo exacto se inyecta con ``input_estimator`` en el constructor del adaptador.
+    """
+    parts = (
+        request.objective,
+        *request.acceptance_criteria,
+        *request.changed_files,
+        request.context_summary,
+        *(reference.label for reference in request.references),
+        _text_of(payload),
+    )
+    characters = sum(len(part) for part in parts if part)
+    return _PROMPT_OVERHEAD_TOKENS + -(-characters // _CHARS_PER_TOKEN)
+
+
+def _text_of(payload: object) -> str:
+    """Texto de la carga útil de un rol, para estimar su tamaño de entrada.
+
+    Se prefiere la serialización del contrato (pydantic) y, si no la hay, su representación: lo que
+    importa es el orden de magnitud, no el formato, porque la estimación es pesimista a propósito.
+    """
+    dump = getattr(payload, "model_dump_json", None)
+    if callable(dump):
+        return str(dump())
+    return repr(payload)
+
+
+def _effective_token_limits(
+    *, base_input: int, base_output: int, cap: _EffectiveCap, input_tokens: int
+) -> tuple[int, int]:
+    """Reparte el saldo total entre entrada y salida sin que la suma lo rebase.
+
+    Regla del hallazgo V604-01: ``entrada_autorizada + salida_autorizada <= total``. La entrada se
+    autoriza por lo que el rol **va a enviar** (la estimación, con un mínimo de un token para que
+    el contrato del rol siga siendo válido) y la salida se queda con el resto, sin pasar del máximo
+    propio del rol. Después se recalcula la entrada con lo que la salida dejó libre, para que la
+    suma sea exacta y no quede holgura sin asignar.
+    """
+    reserved_input = min(base_input, max(input_tokens, 1))
+    output = max(1, min(base_output, cap.total_tokens - reserved_input))
+    allowed_input = max(1, min(base_input, cap.total_tokens - output))
+    return allowed_input, output
+
+
+def _architect_limits(cap: _EffectiveCap | None, input_tokens: int) -> ArchitectLimits | None:
+    """Límites del Architect acotados por el saldo **total** de tokens, o ``None``.
+
+    La cota gobierna los dos lados (hallazgo V604-01): la salida autorizada es lo que queda después
+    de reservar la entrada estimada, y ``max_input_tokens`` tampoco se queda en el máximo base del
+    rol cuando el workflow tiene menos saldo. ``max_attempts`` se acota igual, porque un intento de
+    reparación es otra llamada al modelo.
     """
     if cap is None:
         return None
     base = ArchitectLimits()
     calls = max(1, min(base.max_model_calls, cap.model_calls))
+    allowed_input, allowed_output = _effective_token_limits(
+        base_input=base.max_input_tokens,
+        base_output=base.max_output_tokens,
+        cap=cap,
+        input_tokens=input_tokens,
+    )
     return ArchitectLimits(
         max_attempts=max(1, min(base.max_attempts, calls)),
         max_model_calls=calls,
-        max_input_tokens=base.max_input_tokens,
-        max_output_tokens=max(1, min(base.max_output_tokens, cap.output_tokens)),
+        max_input_tokens=allowed_input,
+        max_output_tokens=allowed_output,
     )
 
 
-def _planner_limits(cap: _EffectiveCap | None) -> PlannerLimits | None:
-    """Límites del Planner acotados por el saldo, con la misma regla que el Architect."""
+def _planner_limits(cap: _EffectiveCap | None, input_tokens: int) -> PlannerLimits | None:
+    """Límites del Planner acotados por el saldo total, con la misma regla que el Architect."""
     if cap is None:
         return None
     base = PlannerLimits()
     calls = max(1, min(base.max_model_calls, cap.model_calls))
+    allowed_input, allowed_output = _effective_token_limits(
+        base_input=base.max_input_tokens,
+        base_output=base.max_output_tokens,
+        cap=cap,
+        input_tokens=input_tokens,
+    )
     return PlannerLimits(
         max_attempts=max(1, min(base.max_attempts, calls)),
         max_model_calls=calls,
-        max_input_tokens=base.max_input_tokens,
-        max_output_tokens=max(1, min(base.max_output_tokens, cap.output_tokens)),
+        max_input_tokens=allowed_input,
+        max_output_tokens=allowed_output,
     )
 
 
@@ -301,27 +378,42 @@ def _resolve_durable[ResolvedT](
         raise WorkflowIncompleteEvidenceError(f"{detail}: {error.detail or error}") from error
 
 
-def _screenshots_of(session: WebSessionReport | None) -> Mapping[str, ImagePayload]:
-    """Capturas verificadas que acompañan a la verificación visual, o un mapa vacío.
+def _screenshots_of(
+    store: ArtifactStore,
+    references: tuple[ArtifactReference, ...],
+    session: WebSessionReport | None,
+) -> Mapping[str, ImagePayload]:
+    """Capturas **verificadas** que acompañan a la verificación visual, resueltas del almacén.
 
-    El handoff durable guarda la **sesión** (nombres lógicos, viewport, tamaño y hash de cada
-    captura), nunca los bytes de las imágenes. Por eso:
+    El handoff durable guarda la sesión (nombres lógicos, viewport, tamaño y hash de cada captura)
+    **y los bytes exactos** en artefactos propios (hallazgo V604-02). Aquí se reconstruyen los
+    ``ImagePayload`` desde esa evidencia durable, revalidando con la misma función canónica de
+    ENGINE-5.3 que se usó al publicarlos: nombre lógico, media type, tamaño y sha256.
 
     - si la sesión no declara ninguna captura, el mapa va vacío: no hay nada que analizar y el
       informe dirá cuántas se analizaron (cero), que es un hecho, no una invención;
-    - si declara capturas, la etapa **no se puede reconstruir** desde el checkpoint y el almacén, y
-      se declara evidencia incompleta en vez de analizar a ciegas.
+    - si declara capturas, se resuelven **todas** o la etapa se declara incompleta. Una captura
+      faltante, unos bytes modificados con el mismo tamaño, un hash que no cuadra o un nombre lógico
+      que no corresponde son huecos de evidencia: nunca se analiza a ciegas ni se entrega un mapa a
+      medias.
 
     Raises:
-        WorkflowIncompleteEvidenceError: si la sesión declara capturas que el handoff no guarda.
+        WorkflowIncompleteEvidenceError: si alguna captura declarada no se puede reconstruir y
+            verificar.
     """
-    if session is None or not session.screenshots:
-        return {}
-    raise WorkflowIncompleteEvidenceError(
-        f"la sesión web declara {len(session.screenshots)} captura(s) y el handoff durable solo "
-        "guarda su descripción, no sus bytes: la verificación visual no se puede reconstruir sin "
-        "las imágenes verificadas"
-    )
+    return resolve_screenshots(store, references, session)
+
+
+def _required_tokens(declared: ModelCallLimits, input_tokens: int) -> int:
+    """Tokens que la ejecución puede gastar: la entrada **estimada** más la salida declarada.
+
+    Es la cantidad que el presupuesto del workflow debe poder cubrir para autorizar la ejecución
+    (hallazgos V603-01 y V604-01). Se usa la entrada estimada —lo que el rol va a enviar de verdad—
+    y no el techo de entrada que declara el runner: ese techo es su autocomprobación, no una
+    expectativa de gasto, y exigir que quepa entero dejaría inutilizable cualquier workflow con el
+    presupuesto por defecto.
+    """
+    return input_tokens + (declared.max_output_tokens or 0)
 
 
 def _declared_limits(camus: object, role: RoleName) -> ModelCallLimits | None:
@@ -512,13 +604,21 @@ class CamusRoleExecutor:
         artifacts: ArtifactStore | None = None,
         registry: ProviderCapabilityRegistry | None = None,
         provider: str | None = None,
+        input_estimator: Callable[[object, RoleExecutionRequest], int] | None = None,
     ) -> None:
+        """Construye el adaptador.
+
+        ``input_estimator`` es el punto donde entra un **conteo exacto** de tokens de entrada cuando
+        el proveedor o el tokenizador lo permiten (hallazgo V604-01). Sin él se usa
+        :func:`estimate_input_tokens`, que es conservador y está documentado.
+        """
         self._camus = camus
         self._role = role
         self._build_input = build_input
         self._artifacts = artifacts
         self._registry = registry
         self._provider = provider
+        self._input_estimator = input_estimator
         self._handlers: Mapping[RoleName, Callable[..., object]] = MappingProxyType(
             {
                 RoleName.ARCHITECT: self._call_analyze_project,
@@ -555,10 +655,6 @@ class CamusRoleExecutor:
             return exhausted
 
         cap = self._effective_cap(request)
-        if cap is not None:
-            refused = self._cap_failure_if_declared_exceeds(request, cap)
-            if refused is not None:
-                return refused
 
         try:
             payload = self._request_input(request)
@@ -599,8 +695,16 @@ class CamusRoleExecutor:
                     f"declarado por la petición: {error}"
                 ),
             )
+
+        # La cota de tokens se decide **después** de construir la entrada, porque necesita saber
+        # cuántos tokens de entrada va a enviar el rol (hallazgo V604-01).
+        input_tokens = self._input_tokens(payload, request)
+        if cap is not None:
+            refused = self._cap_failure_if_budget_exceeds(request, cap, input_tokens)
+            if refused is not None:
+                return refused
         try:
-            produced = self._invoke(payload, cap)
+            produced = self._invoke(payload, cap, input_tokens)
         except _NOT_CONFIGURED_ERRORS as error:
             return _unavailable(
                 self._role,
@@ -647,6 +751,17 @@ class CamusRoleExecutor:
             return self._registry.require(self._role, self._provider)
         except WorkflowProviderUnavailableError:
             return None
+
+    def model_limits(self, role: RoleName) -> ModelCallLimits | None:
+        """Cota de modelo declarada por el runner del rol, para la reserva pre-gasto del kernel.
+
+        Es la parte del puerto ``RoleExecutor`` que permite al kernel saber si el rol puede usar
+        modelo (``uses_ai``) y cuánto declara poder gastar antes de invocarlo (hallazgo V604-01). Un
+        ejecutor que no la implemente deja al kernel reservando de forma conservadora.
+        """
+        if role is not self._role:
+            return None
+        return _declared_limits(self._camus, self._role)
 
     # ------------------------------------------------------------------ interno
     def _registry_failure(self, request: RoleExecutionRequest) -> RoleExecutionResult | None:
@@ -706,61 +821,93 @@ class CamusRoleExecutor:
     def _effective_cap(self, request: RoleExecutionRequest) -> _EffectiveCap | None:
         """Cota efectiva autorizada para esta ejecución, o ``None`` si no hay saldo declarado.
 
-        Hallazgo V603-01: el saldo positivo no bastaba como permiso, tenía que ser una **cota**. El
+        Hallazgos V603-01 y V604-01: el saldo positivo no bastaba como permiso, tenía que ser una
+        **cota**, y esa cota es de **tokens totales** (entrada más salida), no solo de salida. El
         adaptador la convierte en los límites reales de cada rol cuando su contrato admite límites
-        por petición y, cuando no, exige que el máximo declarado del runner quepa entero en el
-        saldo: antes de gastar una llamada que podría excederlo, se rechaza la ejecución.
+        por petición y, cuando no, exige que el gasto declarado del runner quepa entero en el saldo.
         """
         allowance = request.budget_allowance
         if allowance is None:
             return None
         return _EffectiveCap(
             model_calls=allowance.model_calls_remaining,
-            output_tokens=allowance.tokens_remaining,
+            total_tokens=allowance.tokens_remaining,
         )
 
-    def _cap_failure_if_declared_exceeds(
-        self, request: RoleExecutionRequest, cap: _EffectiveCap
-    ) -> RoleExecutionResult | None:
-        """Comprueba, antes de invocar, que el máximo declarado del runner cabe en el saldo.
+    def _input_tokens(self, payload: object, request: RoleExecutionRequest) -> int:
+        """Tokens de entrada del rol: conteo exacto si se inyectó, si no estimación conservadora."""
+        estimator = self._input_estimator or estimate_input_tokens
+        return max(0, estimator(payload, request))
 
-        Para el Architect y el Planner no se aplica: sus contratos llevan los límites dentro de la
-        petición, así que la cota se inyecta de verdad y el runner se detiene donde se le dice. Para
-        el resto de roles, el contrato no permite una cota por ejecución: si su máximo declarado no
-        cabe en el saldo, la ejecución se rechaza en vez de autorizar un gasto que podría excederlo.
+    def _cap_failure_if_budget_exceeds(
+        self, request: RoleExecutionRequest, cap: _EffectiveCap, input_tokens: int
+    ) -> RoleExecutionResult | None:
+        """Comprueba, antes de invocar, que el gasto del rol cabe en el saldo **total** de tokens.
+
+        Tres reglas, todas del hallazgo V604-01:
+
+        - **Architect y Planner**: la cota se inyecta en sus límites (entrada y salida); si la
+          entrada estimada ya consume o excede el saldo, no se llama al proveedor.
+        - **Runner con IA y cota declarada**: se exige que sus máximos de llamadas y de tokens
+          (entrada más salida) quepan en el saldo; si no, no se ejecuta.
+        - **Runner determinista** (``uses_ai=False``): no reserva ni gasta presupuesto de modelo,
+          así que la cota de tokens no lo frena.
         """
         if self._role in (RoleName.ARCHITECT, RoleName.PLANNER):
+            if input_tokens >= cap.total_tokens:
+                return self._cap_failure(request, cap, declared=None, input_tokens=input_tokens)
             return None
         declared = _declared_limits(self._camus, self._role)
-        if declared is None:
+        if declared is None or not declared.uses_ai:
             return None
-        if declared.max_model_calls <= cap.model_calls and (
-            declared.max_output_tokens <= cap.output_tokens
-        ):
-            return None
-        return self._cap_failure(request, cap, declared)
+        if not declared.known:
+            return self._cap_failure(request, cap, declared=declared, input_tokens=input_tokens)
+        need = _required_tokens(declared, input_tokens)
+        assert declared.max_model_calls is not None  # ``known`` lo garantiza
+        if declared.max_model_calls > cap.model_calls or need > cap.total_tokens:
+            return self._cap_failure(request, cap, declared=declared, input_tokens=input_tokens)
+        return None
 
     def _cap_failure(
-        self, request: RoleExecutionRequest, cap: _EffectiveCap, declared: ModelCallLimits
+        self,
+        request: RoleExecutionRequest,
+        cap: _EffectiveCap,
+        *,
+        declared: ModelCallLimits | None,
+        input_tokens: int,
     ) -> RoleExecutionResult:
-        """Rechaza la ejecución de un rol cuyo máximo declarado no cabe en el saldo autorizado.
+        """Rechaza la ejecución de un rol cuyo gasto no cabe en el saldo autorizado.
 
-        Política conservadora y documentada (hallazgo V603-01): si el contrato del rol no permite
-        inyectar una cota por ejecución, PUNTO no invoca al runner con un saldo menor que su máximo
-        declarado, porque no podría garantizar que se detuviera a tiempo. Conservador antes que
-        gastar de más.
+        Política conservadora y documentada (hallazgos V603-01 y V604-01): si el contrato del rol
+        no permite inyectar una cota por ejecución, PUNTO no invoca al runner con un saldo menor
+        que su máximo declarado; y si el runner usa IA sin declarar cota, la cota es
+        **desconocida**, que no es lo mismo que «sin límite»: no hay gasto autónomo. Nunca se llama
+        al proveedor.
         """
+        if declared is None:
+            detail = (
+                f"la entrada estimada de {self._role.value} ({input_tokens} token(s)) ya consume o "
+                f"excede el saldo total de tokens ({cap.total_tokens}): no se invoca al proveedor"
+            )
+        elif not declared.known:
+            detail = (
+                f"el runner de {self._role.value} usa IA y no declara cota de llamadas ni de "
+                "tokens: sin cota conocida no hay gasto autónomo, así que no se invoca al proveedor"
+            )
+        else:
+            detail = (
+                f"el saldo autorizado no cubre el gasto declarado por el runner de "
+                f"{self._role.value} (saldo: {cap.model_calls} llamada(s) y {cap.total_tokens} "
+                f"token(s); declarado: {declared.max_model_calls} llamada(s) y "
+                f"{_required_tokens(declared, input_tokens)} token(s) de entrada más salida): no "
+                "se invoca al proveedor"
+            )
         return _failure(
             self._role,
             request,
             status=RoleStatus.BLOCKED,
             code=WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
-            detail=(
-                f"el saldo autorizado no cubre el máximo declarado por el runner de "
-                f"{self._role.value} (saldo: {cap.model_calls} llamada(s) y {cap.output_tokens} "
-                f"token(s) de salida; declarado: {declared.max_model_calls} y "
-                f"{declared.max_output_tokens}): no se invoca al proveedor"
-            ),
+            detail=detail,
         )
 
     def _request_input(self, request: RoleExecutionRequest) -> object:
@@ -851,7 +998,7 @@ class CamusRoleExecutor:
         )
         spec, session = evidence if evidence is not None else (None, None)
         task = visual_qa_input(plan, developer, request, spec=spec, session=session)
-        return (task, _screenshots_of(session))
+        return (task, _screenshots_of(store, request.references, session))
 
     def _require_store(self) -> ArtifactStore:
         """Almacén de artefactos inyectado, o un error de cableado explícito.
@@ -986,37 +1133,45 @@ class CamusRoleExecutor:
             return publish_visual_qa(store, request=request, report=produced)
         return None
 
-    def _invoke(self, payload: object, cap: _EffectiveCap | None) -> object:
+    def _invoke(
+        self, payload: object, cap: _EffectiveCap | None, input_tokens: int
+    ) -> object:
         """Despacha al método público de CAMUS del rol, con la cota de gasto si la hay."""
         handler = self._handlers.get(self._role)
         if handler is None:
             msg = f"no hay método de CAMUS declarado para el rol {self._role.value}"
             raise _InvalidRoleInputError(msg)
         if self._role is RoleName.ARCHITECT:
-            return self._call_analyze_project(payload, cap)
+            return self._call_analyze_project(payload, cap, input_tokens)
         if self._role is RoleName.PLANNER:
-            return self._call_plan_from_architecture(payload, cap)
+            return self._call_plan_from_architecture(payload, cap, input_tokens)
         return handler(payload)
 
-    def _call_analyze_project(self, payload: object, cap: _EffectiveCap | None) -> object:
+    def _call_analyze_project(
+        self, payload: object, cap: _EffectiveCap | None, input_tokens: int
+    ) -> object:
         """``analyze_project`` ejecuta **solo** al Architect y devuelve su informe.
 
-        La cota efectiva entra en el ``ArchitectRequest`` como límites del rol: es lo que hace que
-        el saldo del workflow sea una restricción real sobre el bucle que hace cada llamada al
-        modelo (hallazgo V603-01) y no una comprobación posterior.
+        La cota efectiva entra en el ``ArchitectRequest`` como límites del rol, gobernando **entrada
+        y salida**: la salida autorizada es lo que queda del saldo después de la entrada estimada, y
+        el tope de entrada tampoco se queda en el máximo base del rol (hallazgo V604-01). Es lo que
+        hace que el saldo del workflow sea una restricción real sobre el bucle que hace cada llamada
+        al modelo y no una comprobación posterior.
         """
         return self._camus.analyze_project(
-            cast("ProjectIntent", payload), limits=_architect_limits(cap)
+            cast("ProjectIntent", payload), limits=_architect_limits(cap, input_tokens)
         )
 
-    def _call_plan_from_architecture(self, payload: object, cap: _EffectiveCap | None) -> object:
+    def _call_plan_from_architecture(
+        self, payload: object, cap: _EffectiveCap | None, input_tokens: int
+    ) -> object:
         """``plan_project_from_architecture`` ejecuta **solo** al Planner sobre el diseño.
 
         ``build_input`` debe devolver la pareja ``(ProjectIntent, ArchitectureOutcome)``, con el
         diseño del Architect reconstruido desde la referencia durable de la petición. Si el
         diseño no llega, se falla aquí: volver a ejecutar al Architect para rellenar el hueco
         sería exactamente la duplicación que este adaptador debe impedir. Los límites efectivos
-        viajan en el ``PlannerRequest``, igual que en el Architect.
+        viajan en el ``PlannerRequest``, con la misma regla de entrada y salida que en el Architect.
         """
         intent, architecture = _pair(
             payload, RoleName.PLANNER, "ProjectIntent y ArchitectureOutcome"
@@ -1031,7 +1186,7 @@ class CamusRoleExecutor:
         return self._camus.plan_project_from_architecture(
             cast("ProjectIntent", intent),
             cast("ArchitectureOutcome", architecture),
-            limits=_planner_limits(cap),
+            limits=_planner_limits(cap, input_tokens),
         )
 
     def _call_developer(self, payload: object) -> object:

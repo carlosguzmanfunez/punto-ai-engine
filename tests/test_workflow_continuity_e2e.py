@@ -578,7 +578,7 @@ def test_the_model_usage_never_exceeds_the_declared_budget(tmp_path: Path) -> No
 
 
 def test_a_reduced_token_balance_reduces_the_requested_output_limit(tmp_path: Path) -> None:
-    """V603-01: el saldo de tokens acota el máximo de salida que recibe el rol."""
+    """V604-01: el saldo de tokens acota **entrada y salida**, no solo la salida."""
     policy_engine = PolicyEngine.from_config(config_dir_of_repo())
     architect = ProviderLoopArchitect(wanted_calls=1)
     camus = build_camus(
@@ -600,7 +600,11 @@ def test_a_reduced_token_balance_reduces_the_requested_output_limit(tmp_path: Pa
     run = kernel.run_all(request)
 
     limits = architect.limits_seen[0]
-    assert limits.max_output_tokens == 50_000, "el saldo manda sobre el máximo del rol"
+    assert limits.max_output_tokens < 50_000, "la salida se acota por el saldo menos la entrada"
+    assert limits.max_output_tokens > 0
+    assert limits.max_input_tokens <= 50_000 - limits.max_output_tokens, (
+        "entrada y salida no pueden sumar más que el saldo total de tokens"
+    )
     assert limits.max_model_calls == 5, "el saldo de llamadas es amplio: manda el máximo del rol"
     assert run.usage.total_tokens <= budget.max_total_tokens
 
@@ -618,6 +622,11 @@ def test_the_adapter_refuses_a_role_whose_declared_maximum_does_not_fit(
         def provider(self) -> str:
             """Proveedor del doble."""
             return "doble"
+
+        @property
+        def uses_ai(self) -> bool:
+            """El doble usa modelo, como cualquier runner real de QA."""
+            return True
 
         @property
         def limits(self) -> QALimits:

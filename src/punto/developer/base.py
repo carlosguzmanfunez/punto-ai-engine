@@ -79,9 +79,11 @@ class DeveloperRunner(ABC):
 
         Por defecto ``False`` (fail-closed). CAMUS y el adaptador de rol exigen esta declaración
         antes de invocar una reparación, así que un runner que no la declare no recibe trabajo de
-        reparación y la etapa falla de forma explícita en vez de degradarse en silencio. El runner
-        real de DeepSeek todavía no lo declara: recibir y aplicar este contexto es trabajo de una
-        fase posterior, y hasta entonces esta propiedad es la frontera que lo dice.
+        reparación y la etapa falla de forma explícita en vez de degradarse en silencio. Cada
+        runner decide la suya: ``DeepSeekDeveloperRunner`` la declara ``True`` porque el encargo
+        gobierna de verdad su prompt y la validación de su propuesta (autorización y prohibiciones
+        del plan); un runner que solo leyera el contexto «para adorno» debe seguir declarando
+        ``False``.
         """
         return False
 

@@ -15,6 +15,8 @@ cierre, y el motivo queda declarado con su propio código (``WORKFLOW_REPAIR_DEF
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
 from types import MappingProxyType
 from typing import Final
 
@@ -171,8 +173,19 @@ class WorkflowStateMachine:
     def __init__(
         self,
         table: MappingProxyType[TaskStatus, frozenset[TaskStatus]] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """Máquina de estados con su tabla de transiciones y su reloj.
+
+        El reloj es inyectable por una razón concreta (hallazgo I61-21): la transición sellaba
+        ``updated_at`` y ``created_at`` con dos llamadas distintas a ``utc_now()``, así que dos
+        aplicaciones **idénticas** del mismo paso producían marcas de tiempo distintas por
+        microsegundos. En una máquina cuya propiedad declarada es el determinismo, el reloj no puede
+        ser una fuente de diferencia: con un reloj fijo —o con una sola lectura por transición— dos
+        aplicaciones del mismo estado dan exactamente el mismo resultado, en Windows y en Linux.
+        """
         self._table = table if table is not None else WORKFLOW_TRANSITIONS
+        self._clock: Callable[[], datetime] = clock if clock is not None else utc_now
 
     def allowed_from(self, status: TaskStatus) -> frozenset[TaskStatus]:
         """Estados alcanzables desde ``status``."""
@@ -257,6 +270,9 @@ class WorkflowStateMachine:
         else:
             self.assert_can_transition(run.status, target)
 
+        # Una sola lectura del reloj por transición (hallazgo I61-21): la traza y el ``updated_at``
+        # sello comparten marca, así que dos aplicaciones idénticas son idénticas de verdad.
+        now = self._clock()
         transition = WorkflowTransition(
             sequence=len(run.transitions),
             from_status=run.status,
@@ -265,11 +281,11 @@ class WorkflowStateMachine:
             reason=reason[:600],
             authority=authority,
             step_index=step_index,
+            created_at=now,
         )
         usage = run.usage.with_visit(target).model_copy(
             update={"transitions": run.usage.transitions + 1}
         )
-        now = utc_now()
         completed_at = now if target in TERMINAL_WORKFLOW_STATUSES else run.completed_at
         return run.model_copy(
             update={

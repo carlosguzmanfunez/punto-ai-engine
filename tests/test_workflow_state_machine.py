@@ -7,6 +7,8 @@ operación explícita de reanudación.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from punto.schemas.enums import AuthorityLevel, TaskStatus
@@ -229,14 +231,26 @@ def test_a_transition_error_carries_its_stable_code() -> None:
 
 
 def test_applying_the_same_transition_twice_is_deterministic() -> None:
-    """Dos aplicaciones sobre el mismo estado dan el mismo resultado."""
+    """Dos aplicaciones sobre el mismo estado dan el mismo resultado (hallazgo I61-21).
+
+    El invariante se comprueba con **todos** los campos, incluidas las marcas de tiempo: el reloj
+    de la máquina es inyectable, así que el determinismo no depende de la resolución del reloj
+    del sistema —en Linux, dos aplicaciones seguidas caían en microsegundos distintos y la prueba
+    fallaba aunque el motor fuera correcto—.
+    """
+    fixed = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    machine = WorkflowStateMachine(clock=lambda: fixed)
     run = make_run(status=TaskStatus.IN_PROGRESS)
 
-    first = MACHINE.apply_transition(
+    first = machine.apply_transition(
         run, TaskStatus.QA, decision=WorkflowDecisionKind.READY_FOR_NEXT_STAGE
     )
-    second = MACHINE.apply_transition(
+    second = machine.apply_transition(
         run, TaskStatus.QA, decision=WorkflowDecisionKind.READY_FOR_NEXT_STAGE
     )
 
     assert first.model_dump() == second.model_dump()
+    assert first.updated_at == fixed
+    assert first.transitions[-1].created_at == fixed, (
+        "la traza y el sello comparten una sola lectura del reloj"
+    )

@@ -611,6 +611,26 @@ class WorkflowKernel:
                 self._audit_step_failed(run, index, role, exc, attempts)
                 if role in EFFECTFUL_ROLES:
                     return self._effect_uncertain(run, role, resolved_key, exc, index)
+                # Hallazgo N6-02: una invocación que pudo gastar modelo no se reintenta a ciegas.
+                # Los reintentos de transporte viven en el cliente del proveedor, así que
+                # duplicarlos aquí gastaría dos veces dentro de una misma reserva. El reintento solo
+                # se permite cuando la propia frontera del proveedor demuestra que **no** salió
+                # ninguna petición facturable.
+                if authorization.uses_ai and self._billable_failure(exc):
+                    return self._block(
+                        run,
+                        BudgetCheck(
+                            False,
+                            WorkflowFailureCode.WORKFLOW_MODEL_SPEND_RECONCILIATION_REQUIRED,
+                            (
+                                f"la invocación de {role.value} falló después de poder gastar "
+                                f"modelo ({exc.code.value}): el gasto quedó en outcome "
+                                "desconocido, así que no se reintenta. La reserva sigue "
+                                "comprometida y hace falta reconciliar el gasto antes de seguir"
+                            ),
+                        ),
+                        step_index=index,
+                    )
                 # Sin resultado no se libera nada (hallazgo V604-01): lo que el intento fallido
                 # gastó es desconocido, así que la reserva del paso sigue comprometida. Si el kernel
                 # reintenta, el reintento corre dentro de esa reserva; si se agotan los intentos, se
@@ -662,6 +682,17 @@ class WorkflowKernel:
             run = self._effects.resolve(run, key=resolved_key, status=status)
 
         return self._finish_step(run, role, result, key, attempts=attempts, request=request)
+
+    def _billable_failure(self, error: WorkflowError) -> bool:
+        """True si el fallo pudo dejar una petición facturable en el proveedor (hallazgo N6-02).
+
+        La política conservadora es: una invocación con gasto posible **no** se reintenta. La única
+        excepción es el fallo que la propia frontera declara como no facturable —un proveedor no
+        disponible, que significa que la petición no llegó a salir—, porque entonces reintentar no
+        puede duplicar ningún gasto. Cualquier otro código (timeout, error del servidor, respuesta
+        ilegible) se trata como gasto incierto: puede haber salido y haberse facturado.
+        """
+        return error.code is not WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE
 
     def _authorization_breach(
         self,

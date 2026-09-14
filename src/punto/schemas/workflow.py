@@ -140,6 +140,24 @@ class WorkflowFailureCode(StrEnum):
     #: El workflow llegó a ``REPAIRING`` y se detiene ahí: el ciclo de reparación completo es
     #: ENGINE-6.1. Es un código propio para no disfrazar la pausa de otra cosa.
     WORKFLOW_REPAIR_DEFERRED = "WORKFLOW_REPAIR_DEFERRED"
+    #: El bucle de reparación no está autorizado para este defecto o para este workflow: no se
+    #: repara, y el motivo queda declarado (ENGINE-6.1).
+    WORKFLOW_REPAIR_NOT_ALLOWED = "WORKFLOW_REPAIR_NOT_ALLOWED"
+    #: Se agotaron los ciclos de reparación permitidos por ``max_repairs``. No se amplía solo.
+    WORKFLOW_REPAIR_BUDGET_EXHAUSTED = "WORKFLOW_REPAIR_BUDGET_EXHAUSTED"
+    #: El mismo intento se repitió sin progreso: el bucle se corta en vez de gastar reparaciones
+    #: haciendo lo mismo.
+    WORKFLOW_REPAIR_NO_PROGRESS = "WORKFLOW_REPAIR_NO_PROGRESS"
+    #: La reparación no tiene evidencia suficiente para un diagnóstico honesto: no se repara a
+    #: ciegas.
+    WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE = "WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE"
+    #: La reparación intentó tocar archivos fuera de su plan o debilitar un gate: se rechaza.
+    WORKFLOW_REPAIR_SCOPE_VIOLATION = "WORKFLOW_REPAIR_SCOPE_VIOLATION"
+    #: El snapshot previo a la reparación no permite deshacerla con garantías.
+    WORKFLOW_REPAIR_SNAPSHOT_INVALID = "WORKFLOW_REPAIR_SNAPSHOT_INVALID"
+    #: Una reparación quedó en outcome incierto (efecto sin resolver, mutación sin verificar): hace
+    #: falta reconciliación antes de continuar.
+    WORKFLOW_REPAIR_RECONCILIATION_REQUIRED = "WORKFLOW_REPAIR_RECONCILIATION_REQUIRED"
 
 
 class CredentialState(StrEnum):

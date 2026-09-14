@@ -367,7 +367,11 @@ def test_the_whole_repair_cycle_completes_with_the_real_developer_branch(
     assert repair.snapshot_id is not None
     assert repair.plan.forbidden_files, "el plan prohíbe lo que una reparación no toca"
     assert repair.plan.repair_id == cycle.repair_id
-    assert repair.plan.diagnosis_id is None, "sin diagnóstico publicado, el plan no lo declara"
+    # F611-02: toda reparación autónoma publica un diagnóstico estructurado **antes** del plan, y el
+    # plan lo cita por su identificador real (antes el plan viajaba con ``diagnosis_id=None``).
+    assert repair.plan.diagnosis_id is not None, "el ciclo publica el diagnóstico antes del plan"
+    assert repair.diagnosis is not None
+    assert repair.plan.diagnosis_id == repair.diagnosis.diagnosis_id
     assert repair.idempotency_key
     # El snapshot y el plan viajaron publicados: se pueden resolver del almacén con el run, que es
     # exactamente lo que hace el adaptador real del Developer.

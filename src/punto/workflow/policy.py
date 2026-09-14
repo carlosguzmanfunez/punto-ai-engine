@@ -29,6 +29,12 @@ Lo que añade este módulo son las tres garantías que el kernel necesita:
    **verifica** contra el workflow. Sin prueba, con prueba de otra tarea, de otra decisión de
    política, de otro gate, con otro estado de reanudación o ya consumida, la reanudación se rechaza
    con un código estable.
+4. **La reparación se evalúa contra su propia acción** (F611-03). El ciclo de reparación muta
+   archivos, así que no se juzga con ``run.request.action`` —que describe el trabajo original— sino
+   con la acción canónica de escritura y con los ``target_files`` reales del plan:
+   :meth:`WorkflowPolicy.evaluate_repair_action`. El riesgo se eleva por los archivos que el plan
+   toca (rutas protegidas y familias de mayor riesgo) y la reversibilidad se comprueba contra el
+   snapshot del ciclo, nunca se supone.
 
 Sobre ``swing`` en :meth:`WorkflowPolicy.request_human_gate`: es el descriptor del cambio de estado
 que motiva el gate (``from_status``/``to_status`` o ``current_state``/``proposed_next_state``). Se
@@ -47,11 +53,14 @@ Códigos de fallo usados:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 from uuid import UUID
 
+from punto.common import basename_of, normalize_path
 from punto.policy.human_gate import (
     RESUMABLE_STATUSES,
     HumanApprovalProof,
@@ -61,7 +70,9 @@ from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
+from punto.schemas.repair import RepairPlan
 from punto.schemas.workflow import (
+    MAX_WORKFLOW_SUMMARY_CHARS,
     HumanGateRequest,
     RoleName,
     WorkflowFailureCode,
@@ -105,6 +116,17 @@ class PolicyGate:
     requires_human: bool
     allowed: bool
     reason: str
+
+    @property
+    def policy_decision_id(self) -> UUID:
+        """Identificador de la decisión del motor que ampara este veredicto.
+
+        Es el valor que el kernel guarda en un artefacto derivado —``RepairPlan.policy_decision_id``
+        en el ciclo de reparación, el Human Gate en la parada humana— y la única vía admitida para
+        recuperar *esa* decisión del historial del motor (``PolicyEngine.decision_by_id``): la
+        posición en el historial mezclaría tareas concurrentes.
+        """
+        return self.decision.id
 
 
 #: Impacto base del trabajo autónomo: técnico, reversible y sin impacto externo declarado.
@@ -207,6 +229,71 @@ def known_actions() -> tuple[str, ...]:
     return tuple(sorted(_ACTION_IMPACTS))
 
 
+# ------------------------------------------------------------------ reparación
+#: Acciones del catálogo que expresan la **mutación** de una reparación, en orden de preferencia.
+#:
+#: ``fix_bug`` es la acción canónica de «corregir un defecto reproducido por pruebas», que es
+#: exactamente la reparación; ``modify_file`` es el respaldo para un catálogo que no la declare. Las
+#: dos existen ya en ``config/permissions.yaml``: esta frontera **no** añade entradas al catálogo ni
+#: inventa una acción de reparación propia, porque el nivel de autoridad de una reparación tiene que
+#: salir de la tabla que un humano revisó.
+REPAIR_ACTION_PREFERENCES: Final[tuple[str, ...]] = ("fix_bug", "modify_file")
+
+#: Rol y etapa que ejecutan la reparación. Se fijan aquí porque la mutación de reparación la lleva a
+#: cabo el Developer **dentro** de ``REPAIRING``: lo único que la reparación no hereda es la
+#: **acción** del trabajo original, no el contexto en el que se ejecuta.
+_REPAIR_ROLE: Final[RoleName] = RoleName.DEVELOPER
+_REPAIR_STAGE: Final[TaskStatus] = TaskStatus.REPAIRING
+
+#: Piso de riesgo de una reparación que toca una **ruta protegida** de la configuración
+#: (``PolicyEngine.protected_paths``: constitución, permisos, reglas de riesgo, presupuestos y
+#: entornos). Es el escalador ``files_changed_on_protected_path: CRITICAL`` que
+#: ``config/risk-rules.yaml`` declara y el Policy Engine no aplica —lo deja anotado como «se
+#: gestiona en el Policy Engine»—: aquí se aplica de verdad para la mutación de reparación.
+_PROTECTED_TARGET_RISK: Final[RiskLevel] = RiskLevel.CRITICAL
+
+#: Piso de riesgo de una reparación que toca una familia de **mayor riesgo** por su nombre o su
+#: ubicación: autenticación, seguridad, frontera de política, secretos y credenciales, gates de CI y
+#: configuración. No son rutas constitucionalmente protegidas, pero una reparación que las escribe
+#: cambia la superficie de confianza del producto y no se autoriza sola.
+_HIGH_RISK_TARGET_RISK: Final[RiskLevel] = RiskLevel.HIGH
+
+#: Prefijos de ruta que sitúan un archivo en una familia de mayor riesgo. Se comparan sobre la ruta
+#: normalizada (posix, sin ``./``, en minúsculas), de modo que ``.\\src\\auth.py`` y ``src/auth.py``
+#: son la misma ruta.
+_HIGH_RISK_PATH_PREFIXES: Final[tuple[str, ...]] = (
+    "src/punto/policy/",
+    "src/punto/tools/security",
+    ".github/",
+    ".env",
+    "config/",
+)
+
+#: Piezas de un nombre de archivo que lo sitúan en una familia de mayor riesgo. La comparación es
+#: por **pieza completa** (los segmentos de la ruta partidos por todo lo que no sea alfanumérico),
+#: no por subcadena: así ``src/auth.py`` y ``src/auth/session.py`` son de riesgo alto, y
+#: ``src/author.py`` o ``src/tokenizer.py`` no lo son por un parecido accidental.
+_HIGH_RISK_PATH_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "auth",
+        "authentication",
+        "authorization",
+        "constitution",
+        "credential",
+        "credentials",
+        "password",
+        "permission",
+        "permissions",
+        "policy",
+        "secret",
+        "secrets",
+        "security",
+        "token",
+        "tokens",
+    }
+)
+
+
 class WorkflowPolicy:
     """Frontera de autoridad del kernel: el Policy Engine decide y el Human Gate autoriza."""
 
@@ -239,16 +326,7 @@ class WorkflowPolicy:
         impact = action_impact(request.action)
         if impact is None:
             denied = _default_deny_decision(request.action)
-            return PolicyGate(
-                outcome=PolicyOutcome.REJECT,
-                decision=denied,
-                authority=denied.authority_level,
-                risk=denied.effective_risk,
-                requires_review=False,
-                requires_human=denied.requires_human,
-                allowed=False,
-                reason=_reason_for(denied.reason, role=role, stage=stage),
-            )
+            return _gate_from_decision(denied, role=role, stage=stage)
 
         action_request = ActionRequest(
             action=request.action,
@@ -265,20 +343,115 @@ class WorkflowPolicy:
         decision = self._engine.evaluate(
             action_request, PolicyEvaluationContext(actor=role.value)
         )
-        return PolicyGate(
-            outcome=decision.outcome,
-            decision=decision,
-            authority=decision.authority_level,
-            risk=decision.effective_risk,
-            requires_review=(
-                decision.requires_review or decision.outcome is PolicyOutcome.ALLOW_WITH_REVIEW
-            ),
-            requires_human=(
-                decision.requires_human or decision.outcome is PolicyOutcome.REQUIRE_HUMAN
-            ),
-            allowed=decision.outcome in _ALLOWED_OUTCOMES,
-            reason=_reason_for(decision.reason, role=role, stage=stage),
+        return _gate_from_decision(decision, role=role, stage=stage)
+
+    # --------------------------------------------------- evaluación de reparación
+    def evaluate_repair_action(self, *, run: WorkflowRun, plan: RepairPlan) -> PolicyGate:
+        """Evalúa la **mutación de reparación**, no la acción original del workflow.
+
+        Por qué la reparación puede pesar más que el trabajo original
+        ------------------------------------------------------------
+        Una reparación no es la continuación de la acción que pidió el humano: es **otra** acción.
+        ``run.request.action`` describe el trabajo original —``run_tests``, ``create_file``,
+        ``deploy_production``—, y la reparación casi siempre **escribe archivos**. Reutilizar aquel
+        nombre evaluaría una acción que no se va a ejecutar: dejaría sin juzgar los archivos que la
+        reparación va a tocar (una reparación dentro de un workflow de ``run_tests`` podría
+        modificar ``src/auth.py`` sin que el motor viera esa ruta) y, en el otro sentido, heredaría
+        el nivel de autoridad de una acción distinta. Además, la reparación muta un árbol que ya
+        estaba verificado, con un presupuesto de ciclos acotado, y puede tocar la frontera de
+        política, la seguridad o la configuración protegida: por eso su riesgo puede ser **mayor**
+        que el del trabajo original aunque el objetivo sea «más pequeño».
+
+        Por qué no se hereda la decisión previa
+        ---------------------------------------
+        Una :class:`PolicyDecision` autoriza **una** acción sobre **una** lista de archivos. La
+        aprobación de ``run_tests`` no dice nada sobre escribir ``src/auth.py``, y una decisión
+        anterior favorable no puede convertirse en un permiso permanente sobre cualquier mutación
+        posterior: la autoridad se pide por acción, no por workflow. Por eso aquí se construye una
+        petición nueva y se consulta al motor otra vez, en lugar de reutilizar el veredicto que ya
+        viaja en el checkpoint.
+
+        Qué se evalúa
+        -------------
+        - **Acción**: la canónica del catálogo apropiada a modificar archivos —
+          :data:`REPAIR_ACTION_PREFERENCES`—. No se añade ninguna entrada a ``permissions.yaml``: si
+          ninguna de esas acciones estuviera catalogada, la reparación no se evalúa y se resuelve
+          como *default deny*.
+        - **Recursos**: los ``target_files`` reales del plan, sin globs y sin nada que venga de un
+          diagnóstico: son los archivos que el plan autoriza a escribir.
+        - **Riesgo**: el del plan, elevado al piso que imponen los archivos que toca —
+          :data:`_PROTECTED_TARGET_RISK` para una ruta protegida de la configuración (y la
+          modificación de ``constitution.yaml``/``permissions.yaml`` la rechaza el propio motor
+          antes de llegar al riesgo), :data:`_HIGH_RISK_TARGET_RISK` para autenticación, seguridad,
+          frontera de política, secretos, CI y configuración—. Un riesgo ``HIGH`` o ``CRITICAL``
+          exige Human Gate por defecto, así que el veredicto sube de autoridad efectiva por la vía
+          del motor: aquí no se inventa un nivel de catálogo para la acción de reparación.
+        - **Reversibilidad**: real, no supuesta. La reparación es reversible solo si el snapshot del
+          ciclo la cubre: sin archivos declarados no hay nada que un snapshot pueda cubrir, y un
+          snapshot registrado que no cubra todos los objetivos deja la mutación sin deshacer. En
+          ambos casos ``reversible=False`` y el escalador de irreversibilidad del Risk Engine la
+          lleva como mínimo a ``HIGH``. Si todavía no hay snapshot, la cobertura la garantiza el
+          contrato del ciclo: el kernel captura exactamente ``plan.target_files`` **antes** de mutar
+          y bloquea el ciclo si no puede capturarlo.
+        - **Descripción**: acotada a los defectos del plan (código/categoría y resumen) y a los
+          cambios esperados. Nunca razonamiento del modelo ni el objetivo del workflow.
+        - **Tarea**: ``run.task_id``, para que la decisión quede ligada a este workflow.
+
+        Mapeo del veredicto, que decide el motor y aquí no se reinterpreta: ``ALLOW`` ⇒ se puede
+        reparar; ``ALLOW_WITH_REVIEW`` ⇒ se repara y la verificación completa vuelve a pasar;
+        ``REQUIRE_HUMAN`` ⇒ Human Gate; ``REJECT`` ⇒ no se muta nada.
+
+        El plan puede traer ``policy_decision_id=None`` durante esta evaluación: es el kernel quien
+        guarda después el identificador devuelto —:attr:`PolicyGate.policy_decision_id`— en
+        ``RepairPlan.policy_decision_id``. Un identificador que ya viniera en el plan **no** se
+        reutiliza: la decisión que se devuelve es siempre la de esta evaluación.
+
+        Returns:
+            El :class:`PolicyGate` **tal cual** lo emite el Policy Engine.
+        """
+        action = self._repair_action()
+        impact = action_impact(action) if action is not None else None
+        if action is None or impact is None:
+            denied = _default_deny_decision(action or REPAIR_ACTION_PREFERENCES[0])
+            return _gate_from_decision(denied, role=_REPAIR_ROLE, stage=_REPAIR_STAGE)
+
+        declared = _declared_paths(plan.target_files)
+        protected = _protected_targets(self._engine.protected_paths, declared)
+        high_risk = _high_risk_targets(declared)
+        risk_floor = _repair_risk_floor(plan.risk, protected=protected, high_risk=high_risk)
+        reversible = impact.reversible and _repair_is_reversible(
+            run, declared=_normalized_paths(declared)
         )
+        action_request = ActionRequest(
+            action=action,
+            technical=impact.technical,
+            # La reversibilidad de la reparación no la declara el plan: la decide el snapshot. Una
+            # acción irreversible no se vuelve reversible por un snapshot, de ahí el ``and``.
+            reversible=reversible,
+            production_impact=impact.production,
+            legal_impact=impact.legal,
+            business_impact=impact.business,
+            risk_level=risk_floor,
+            files_changed=list(declared),
+            description=_repair_description(run, plan),
+            task_id=str(run.task_id),
+        )
+        decision = self._engine.evaluate(
+            action_request, PolicyEvaluationContext(actor=_REPAIR_ROLE.value)
+        )
+        return _gate_from_decision(decision, role=_REPAIR_ROLE, stage=_REPAIR_STAGE)
+
+    def _repair_action(self) -> str | None:
+        """Acción catalogada que expresa la mutación de reparación, o ``None`` si no hay ninguna.
+
+        La preferencia es :data:`REPAIR_ACTION_PREFERENCES` y el catálogo real es el del motor: una
+        acción que no esté en él no se puede usar, porque el nivel de autoridad de la reparación
+        tiene que salir de la tabla que un humano revisó y no de una suposición de esta frontera.
+        """
+        for candidate in REPAIR_ACTION_PREFERENCES:
+            if self._engine.catalog.has(candidate):
+                return candidate
+        return None
 
     # ------------------------------------------------------------ human gate
     def request_human_gate(
@@ -418,6 +591,158 @@ class WorkflowPolicy:
 
 
 # --------------------------------------------------------------------- interno
+def _gate_from_decision(
+    decision: PolicyDecision, *, role: RoleName, stage: TaskStatus
+) -> PolicyGate:
+    """Vista del kernel sobre la decisión del motor, sin reinterpretar su veredicto.
+
+    La autoridad, el riesgo y el resultado salen del motor tal cual; el módulo solo deriva las dos
+    banderas que el kernel consulta (``requires_review``/``requires_human``) y añade la traza de
+    quién pidió la evaluación y en qué etapa.
+    """
+    return PolicyGate(
+        outcome=decision.outcome,
+        decision=decision,
+        authority=decision.authority_level,
+        risk=decision.effective_risk,
+        requires_review=(
+            decision.requires_review or decision.outcome is PolicyOutcome.ALLOW_WITH_REVIEW
+        ),
+        requires_human=(
+            decision.requires_human or decision.outcome is PolicyOutcome.REQUIRE_HUMAN
+        ),
+        allowed=decision.outcome in _ALLOWED_OUTCOMES,
+        reason=_reason_for(decision.reason, role=role, stage=stage),
+    )
+
+
+def _declared_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    """Rutas declaradas por el plan: sin vacíos, sin repetidos y en su orden original.
+
+    Se conserva la forma que declaró el plan (es lo que se envía al motor como recurso y lo que
+    queda en la traza); la normalización se reserva para las comparaciones.
+    """
+    seen: dict[str, str] = {}
+    for path in paths:
+        cleaned = path.strip()
+        if cleaned:
+            seen.setdefault(normalize_path(cleaned), cleaned)
+    return tuple(seen.values())
+
+
+def _normalized_paths(paths: Sequence[str]) -> frozenset[str]:
+    """Conjunto normalizado de rutas, para comparar coberturas y protecciones."""
+    return frozenset(normalize_path(path) for path in paths if path.strip())
+
+
+def _protected_targets(
+    protected: Sequence[str], declared: Sequence[str]
+) -> tuple[str, ...]:
+    """Rutas del plan que son **protegidas** para el motor, ordenadas y sin duplicados.
+
+    La lista de protegidas sale del propio Policy Engine (``protected_paths``: el piso en código más
+    la configuración explícita), no de una tabla paralela de esta frontera: si la protección crece
+    en la configuración, esta comprobación la ve sin cambios. La comparación es conservadora —ruta
+    exacta, sufijo de ruta y nombre base, igual que la protección constitucional— porque un falso
+    positivo solo eleva el riesgo, nunca lo rebaja.
+    """
+    known = tuple(normalize_path(path) for path in protected)
+    bases = frozenset(basename_of(path) for path in known if path)
+    found = {
+        target
+        for target in _normalized_paths(declared)
+        if target in known or target.endswith(known) or basename_of(target) in bases
+    }
+    return tuple(sorted(found))
+
+
+def _high_risk_targets(declared: Sequence[str]) -> tuple[str, ...]:
+    """Rutas del plan que pertenecen a una familia de **mayor riesgo**, ordenadas.
+
+    Ni la autenticación ni la seguridad ni la frontera de política son rutas protegidas de la
+    configuración, pero una reparación que las escribe cambia la superficie de confianza del
+    producto: se elevan a :data:`_HIGH_RISK_TARGET_RISK` para que no se autoricen en autonomía.
+    """
+    found = {
+        target
+        for target in _normalized_paths(declared)
+        if target.startswith(_HIGH_RISK_PATH_PREFIXES)
+        or bool(_path_tokens(target) & _HIGH_RISK_PATH_TOKENS)
+    }
+    return tuple(sorted(found))
+
+
+def _path_tokens(path: str) -> frozenset[str]:
+    """Piezas alfanuméricas de una ruta normalizada, para comparar familias de riesgo."""
+    return frozenset(part for part in re.split(r"[^a-z0-9]+", normalize_path(path)) if part)
+
+
+def _repair_risk_floor(
+    declared: RiskLevel, *, protected: Sequence[str], high_risk: Sequence[str]
+) -> RiskLevel:
+    """Riesgo declarado de la reparación, elevado por lo que el plan va a tocar.
+
+    El riesgo nunca baja: se parte del que declara el plan y solo se sube. Un archivo protegido pesa
+    más que uno de familia sensible, de modo que el orden de los pisos es
+    ``HIGH`` < ``CRITICAL``.
+    """
+    floor = declared
+    if high_risk:
+        floor = max(floor, _HIGH_RISK_TARGET_RISK)
+    if protected:
+        floor = max(floor, _PROTECTED_TARGET_RISK)
+    return floor
+
+
+def _repair_is_reversible(run: WorkflowRun, *, declared: frozenset[str]) -> bool:
+    """True si el snapshot del ciclo cubre la mutación que el plan autoriza.
+
+    Tres casos, y solo el primero permite reparar en autonomía:
+
+    1. **Sin snapshot registrado**: la cobertura la garantiza el contrato del ciclo —el kernel
+       captura exactamente ``plan.target_files`` antes de mutar y bloquea el ciclo si no puede
+       (``WORKFLOW_REPAIR_SNAPSHOT_INVALID``)—, así que la mutación es reversible siempre que el
+       plan declare archivos que capturar.
+    2. **Con snapshot registrado**: tiene que cubrir **todos** los objetivos. Si deja alguno fuera,
+       esa parte de la mutación no tiene estado previo con el que deshacerse y la reparación no es
+       reversible.
+    3. **Sin archivos declarados**: no hay nada que un snapshot pueda cubrir. Una reparación sin
+       alcance declarado no es acotada ni reversible, y por tanto no se autoriza sola.
+    """
+    if not declared:
+        return False
+    snapshot = run.active_repair_snapshot
+    if snapshot is None:
+        return True
+    covered = {normalize_path(entry.path) for entry in snapshot.entries if entry.path.strip()}
+    return declared <= covered
+
+
+def _repair_description(run: WorkflowRun, plan: RepairPlan) -> str:
+    """Descripción acotada de la reparación para el motivo auditable del motor.
+
+    Solo entra dato **estructurado**: los defectos que el plan declara reparar (código o categoría y
+    su resumen) y los cambios esperados del plan. Ni el objetivo del workflow ni el diagnóstico ni
+    razonamiento privado de un modelo: el motor tiene que poder auditar qué se autorizó sin leer
+    prosa que nadie puede verificar. El texto se recorta a la cota del contrato para que un llamante
+    verboso no haga crecer el checkpoint.
+    """
+    by_id = {finding.finding_id: finding for finding in run.repair_findings}
+    details: list[str] = []
+    for finding_id in plan.finding_ids:
+        finding = by_id.get(finding_id)
+        if finding is None:
+            continue
+        label = finding.code or finding.category or "defecto"
+        details.append(f"{label}: {finding.summary}" if finding.summary else label)
+    parts = [f"reparación del ciclo {plan.cycle}"]
+    if details:
+        parts.append("defectos: " + "; ".join(details))
+    if plan.expected_changes:
+        parts.append("cambios esperados: " + "; ".join(plan.expected_changes))
+    return " | ".join(parts)[:MAX_WORKFLOW_SUMMARY_CHARS]
+
+
 def _default_deny_decision(action: str) -> PolicyDecision:
     """Decisión de *default deny* para una acción ausente de la tabla de impacto.
 
@@ -515,6 +840,7 @@ def _state_of(swing: object, *attributes: str) -> TaskStatus | None:
 
 
 __all__ = [
+    "REPAIR_ACTION_PREFERENCES",
     "ActionImpact",
     "PolicyGate",
     "WorkflowPolicy",

@@ -50,12 +50,13 @@ from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.policy.human_gate import BudgetReconciliationProof, HumanApprovalProof
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
-from punto.schemas.policy import PolicyOutcome
+from punto.schemas.policy import PolicyDecision, PolicyOutcome
 from punto.schemas.repair import (
     Repairability,
     RepairCycle,
     RepairCycleStatus,
     RepairDecision,
+    RepairDiagnosis,
     RepairFinding,
     RepairFindingStatus,
     RepairPlan,
@@ -115,6 +116,7 @@ from punto.workflow.errors import (
     WorkflowTerminalError,
 )
 from punto.workflow.handoff import (
+    publish_repair_diagnosis,
     publish_repair_findings,
     publish_repair_plan,
     publish_repair_snapshot,
@@ -129,6 +131,7 @@ from punto.workflow.pipeline import (
 from punto.workflow.policy import PolicyGate, WorkflowPolicy
 from punto.workflow.repair import (
     build_repair_decision,
+    build_repair_diagnosis,
     build_repair_plan,
     classify_repairability,
     findings_from_result,
@@ -1908,13 +1911,22 @@ class WorkflowKernel:
         return self._execute_repair(run, plan=plan, snapshot=snapshot)
 
     def _begin_repair_cycle(self, run: WorkflowRun) -> WorkflowRun:
-        """Abre el ciclo: clasificación, política, plan, presupuesto, guard, snapshot e intención.
+        """Abre el ciclo: clasificación, política, diagnóstico, plan, presupuesto y snapshot.
 
-        El orden es el de la autorización: primero se decide **qué** se repara y con qué autoridad,
-        después se reserva el presupuesto de reparaciones (antes de cualquier mutación), se rechaza
-        el plan que tocaría un archivo protegido, se captura el estado previo, se publica el
-        contexto durable que el Developer resolverá y solo entonces se apunta la intención del
-        efecto. Cualquier «no» deja el árbol intacto.
+        El orden es el de la autorización y **no se puede invertir** (F611-02): primero se decide
+        **qué** se repara y con qué autoridad, después se materializa el **diagnóstico
+        estructurado** —que solo afirma lo que la evidencia del informe demuestra—, después el
+        **plan** que lo cita por su identificador real, después se reserva el presupuesto de
+        reparaciones (antes de cualquier mutación), se rechaza el plan que tocaría un archivo
+        protegido, se captura el estado previo, se publica el contexto durable que el Developer
+        resolverá y solo entonces se apunta la intención del efecto. Cualquier «no» deja el árbol
+        intacto.
+
+        Los tres artefactos del ciclo se escriben en el almacén en el orden del contrato
+        —diagnóstico primero, plan después, snapshot al final— y el checkpoint que los activa es
+        **una sola** escritura: no existe un estado durable en el que el plan exista sin el
+        diagnóstico al que
+        apunta.
         """
         findings = self._open_repair_findings(run)
         step_index = len(run.steps)
@@ -1991,9 +2003,48 @@ class WorkflowKernel:
                 reason_code=WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
             )
 
+        # (F611-02) El diagnóstico se materializa **antes** del plan y su ``None`` bloquea el ciclo
+        # sin gastar presupuesto, sin snapshot y sin mutación: sin evidencia que sitúe el defecto no
+        # se repara, se declara la falta de evidencia.
+        diagnosis = self._repair_diagnosis(run, findings=findings, origin=origin)
+        if diagnosis is None:
+            self._audit_repair_decided(run, decision, cycle=cycle)
+            return self._fail_repair_cycle(
+                run,
+                blocked=WorkflowFailureCode.WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE,
+                decision=decision,
+            )
         plan = self._repair_plan(
-            run, decision=decision, gate=gate, findings=findings, cycle=cycle, origin=origin
+            run,
+            decision=decision,
+            gate=gate,
+            findings=findings,
+            diagnosis=diagnosis,
+            cycle=cycle,
+            origin=origin,
         )
+        # (F611-03) La autorización del plan la puede dar la puerta específica de reparación, que
+        # conoce el ciclo; sin ella se conserva el veredicto general ya evaluado.
+        verdict, plan, decision = self._apply_repair_gate(
+            run, gate=gate, plan=plan, decision=decision
+        )
+        if verdict.outcome is PolicyOutcome.REJECT:
+            self._audit_repair_decided(run, decision, cycle=cycle, repair_id=plan.repair_id)
+            return self._fail_repair_cycle(
+                run,
+                blocked=WorkflowFailureCode.WORKFLOW_POLICY_REJECTED,
+                decision=decision,
+            )
+        if verdict.requires_human and not authorized_by_human:
+            self._audit_repair_decided(run, decision, cycle=cycle, repair_id=plan.repair_id)
+            return self._open_human_gate(
+                run,
+                verdict,
+                step_index=step_index,
+                resume_target=decision.restart_stage,
+                reason_code=WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+            )
+        run = self._refresh_authority(run, verdict)
         self._audit_repair_decided(run, decision, cycle=cycle, repair_id=plan.repair_id)
         if no_progress(
             history=run.repair_history, plan_fingerprint_value=plan.plan_fingerprint
@@ -2018,11 +2069,23 @@ class WorkflowKernel:
             return self._block_repair_budget_exhausted(run, reserved, step_index)
         run = self._consume(run, repairs=1)
         run = self._open_cycle_record(
-            run, plan=plan, decision=decision, cycle=cycle, findings=findings
+            run,
+            plan=plan,
+            decision=decision,
+            diagnosis=diagnosis,
+            cycle=cycle,
+            findings=findings,
         )
-        # El consumo de reparación se persiste **antes** de tocar el árbol: una caída después de
-        # mutar no puede devolver el intento como no gastado.
+        # El consumo de reparación, el ciclo, el plan y su diagnóstico se persisten **antes** de
+        # tocar el árbol: una caída después de mutar no puede devolver el intento como no gastado, y
+        # el plan nunca queda durable sin el diagnóstico que declara.
         self._store.save(run)
+        # El diagnóstico se hace durable como artefacto **antes** que el plan: es el orden del
+        # contrato (diagnóstico → plan → snapshot) y lo que impide que un plan autorice una
+        # escritura apoyándose en un diagnóstico que todavía no existe en el almacén.
+        run, failed = self._publish_repair_diagnosis(run, plan=plan, diagnosis=diagnosis)
+        if failed is not None:
+            return self._fail_repair_cycle(run, denied=failed, plan=plan, cycle=cycle)
         denied = self._pre_guard_verdict(plan)
         if denied is not None:
             return self._fail_repair_cycle(run, denied=denied, plan=plan, cycle=cycle)
@@ -2049,6 +2112,181 @@ class WorkflowKernel:
         self._store.save(run)
         return self._execute_repair(run, plan=plan, snapshot=snapshot)
 
+    def _apply_repair_gate(
+        self,
+        run: WorkflowRun,
+        *,
+        gate: PolicyGate,
+        plan: RepairPlan,
+        decision: RepairDecision,
+    ) -> tuple[PolicyGate, RepairPlan, RepairDecision]:
+        """Deja que la puerta específica de reparación autorice el ciclo, si existe (F611-03).
+
+        Hasta que el plan existe no hay contexto que una puerta de reparación pueda evaluar —su
+        contrato recibe ``run`` y ``plan``—, así que la evaluación **previa** al plan sigue siendo
+        la general (``evaluate_action`` con el rol ``DEVELOPER``). En cuanto el plan está
+        materializado, si la frontera de política declara ``evaluate_repair_action``, ese veredicto
+        es el vinculante: se guarda su ``policy_decision_id`` en la decisión y en el plan, y su
+        riesgo y su autoridad efectivos se reflejan en ambos. Cuando la puerta no existe, esta
+        función devuelve exactamente lo que recibió y el ciclo se comporta como antes.
+
+        El plan se refresca con ``model_copy``: su ``repair_id`` y su ``plan_fingerprint`` no
+        cambian —identifican el intento, no la autorización— y nada de lo ya auditado queda
+        desmentido.
+        """
+        evaluator = getattr(self._policy, "evaluate_repair_action", None)
+        if not callable(evaluator):
+            return gate, plan, decision
+        verdict = evaluator(run=run, plan=plan)
+        if not isinstance(verdict, PolicyGate):
+            # Fail-closed: un veredicto que el kernel no sabe interpretar no autoriza nada. Se
+            # construye el rechazo con el vocabulario del motor en vez de asumir un permiso.
+            return (
+                self._unreadable_repair_gate(run, verdict),
+                plan,
+                decision,
+            )
+        if verdict.outcome is PolicyOutcome.REJECT:
+            return verdict, plan, decision
+        refreshed_decision = decision.model_copy(
+            update={"policy_decision_id": verdict.decision.id}
+        )
+        refreshed_plan = plan.model_copy(
+            update={
+                "policy_decision_id": verdict.decision.id,
+                "risk": verdict.risk,
+                "authority": verdict.authority,
+            }
+        )
+        return verdict, refreshed_plan, refreshed_decision
+
+    @staticmethod
+    def _unreadable_repair_gate(run: WorkflowRun, verdict: object) -> PolicyGate:
+        """Rechazo explícito cuando la puerta de reparación devuelve algo que no es un veredicto.
+
+        Se nombra el tipo recibido: un contrato roto tiene que poder diagnosticarse desde el propio
+        bloqueo, y no se traduce a permiso bajo ninguna circunstancia.
+        """
+        decision = PolicyDecision(
+            allowed=False,
+            authority_level=run.effective_authority or run.request.authority,
+            requires_human=True,
+            reason=(
+                "REJECT: la puerta de reparación devolvió un veredicto que PUNTO no puede "
+                f"interpretar ({type(verdict).__name__})"
+            ),
+            outcome=PolicyOutcome.REJECT,
+            effective_risk=run.effective_risk or run.request.risk,
+            action=run.request.action,
+        )
+        return PolicyGate(
+            outcome=PolicyOutcome.REJECT,
+            decision=decision,
+            authority=decision.authority_level,
+            risk=decision.effective_risk,
+            requires_review=False,
+            requires_human=True,
+            allowed=False,
+            reason=(
+                "la puerta de reparación no devolvió un PolicyGate: no se repara con un veredicto "
+                "de forma desconocida"
+            ),
+        )
+
+    def _repair_diagnosis(
+        self,
+        run: WorkflowRun,
+        *,
+        findings: Sequence[RepairFinding],
+        origin: TaskStatus,
+    ) -> RepairDiagnosis | None:
+        """Diagnóstico estructurado del ciclo, o ``None`` si la evidencia no alcanza (F611-02).
+
+        El kernel no diagnostica: recoge lo que el ciclo ya tiene —los defectos, la autorización de
+        escritura de la petición y las referencias durables de los informes que detectaron el
+        defecto— y se lo pasa al diagnoser determinista de ``punto.workflow.repair``. Un ``None`` de
+        esa función **no se rellena con nada**: el ciclo se bloquea por falta de evidencia.
+        """
+        return build_repair_diagnosis(
+            findings=findings,
+            request=run.request,
+            target_files=self._repair_target_files(run),
+            origin_stage=origin,
+            detection_refs=self._detection_evidence(run, findings),
+        )
+
+    @staticmethod
+    def _detection_evidence(
+        run: WorkflowRun, findings: Sequence[RepairFinding]
+    ) -> tuple[ArtifactReference, ...]:
+        """Referencias durables de los informes que **detectaron** los defectos del ciclo.
+
+        Se buscan por la terna (rol, etapa, paso) del defecto, que es la misma con la que
+        ``record_stage`` registró el handoff de esa etapa: son los informes originales, no una
+        reconstrucción. Si la etapa no publicó nada, la tupla queda vacía —y el diagnóstico lo
+        declara en ``unknowns``— en vez de rellenarse con una referencia inventada.
+        """
+        wanted = {
+            (finding.source_role, finding.source_stage, finding.source_step_index)
+            for finding in findings
+        }
+        references: list[ArtifactReference] = []
+        for entry in run.stage_artifacts:
+            if (entry.role, entry.stage, entry.step_index) in wanted:
+                references.extend(entry.references)
+        return tuple(references[:MAX_WORKFLOW_EVIDENCE])
+
+    def _publish_repair_diagnosis(
+        self, run: WorkflowRun, *, plan: RepairPlan, diagnosis: RepairDiagnosis
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """Publica el diagnóstico en el almacén **antes** que el plan, y lo registra en el handoff.
+
+        Es la mitad durable de F611-02: el ``diagnosis_id`` que el plan declara tiene que apuntar a
+        un artefacto que existe. La referencia se registra con ``record_stage`` en el paso
+        ``DEVELOPER`` de ``REPAIRING``, que es por donde el adaptador del rol la resuelve; el
+        contenido no entra en el checkpoint, solo su referencia con digest y tamaño.
+        """
+        store = self._artifacts
+        if store is None:
+            return run, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+                (
+                    "el kernel no tiene almacén de artefactos: el diagnóstico de la reparación no "
+                    "puede viajar al Developer como referencia durable, así que no se repara a "
+                    "ciegas"
+                ),
+            )
+        request = self._role_request(
+            run,
+            RoleName.DEVELOPER,
+            len(run.steps),
+            step_idempotency_key(run.workflow_id, len(run.steps), RoleName.DEVELOPER, run.status),
+        )
+        try:
+            reference = publish_repair_diagnosis(store, request=request, diagnosis=diagnosis)
+        except (WorkflowError, ValueError, OSError) as exc:
+            return run, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE,
+                f"no se pudo publicar el diagnóstico de la reparación {plan.repair_id}: {exc}",
+            )
+        handoff = RoleExecutionResult(
+            role=RoleName.DEVELOPER,
+            status=RoleStatus.COMPLETED,
+            summary=f"diagnóstico de reparación del ciclo {plan.cycle} (por qué se repara)",
+            artifact_references=(reference,),
+        )
+        published = record_stage(
+            run,
+            role=RoleName.DEVELOPER,
+            stage=TaskStatus.REPAIRING,
+            step_index=len(run.steps),
+            result=handoff,
+        )
+        self._store.save(published)
+        return published, None
+
     def _repair_plan(
         self,
         run: WorkflowRun,
@@ -2056,25 +2294,27 @@ class WorkflowKernel:
         decision: RepairDecision,
         gate: PolicyGate,
         findings: Sequence[RepairFinding],
+        diagnosis: RepairDiagnosis,
         cycle: int,
         origin: TaskStatus,
     ) -> RepairPlan:
-        """Materializa el contrato de escritura del ciclo.
+        """Materializa el contrato de escritura del ciclo, citando su diagnóstico real.
 
         El plan declara como autorizados los archivos que la petición ya declaró
         (``changed_files``); el kernel **no** amplía esa lista con nada que venga de un rol: la
         autorización de escritura la fija la petición, y el guard comprueba después que lo escrito
         cabe en ella.
+
+        ``diagnosis_id`` es el identificador del diagnóstico que el kernel acaba de construir para
+        **este** ciclo (F611-02): es obligatorio y no un opcional. Un plan sin diagnóstico sería una
+        autorización de escritura sin conclusión técnica que la sostenga, y el adaptador del
+        Developer comprueba que el artefacto citado existe y es el mismo.
         """
         return build_repair_plan(
             workflow_id=run.workflow_id,
             cycle=cycle,
             findings=findings,
-            # El kernel no fabrica un diagnóstico: el plan apunta a uno **solo** si algo lo publicó
-            # para este mismo paso, y hoy nadie lo hace. Dejar aquí un identificador que no
-            # corresponde a un artefacto publicado haría que el Developer esperara una pieza que no
-            # existe.
-            diagnosis_id=None,
+            diagnosis_id=diagnosis.diagnosis_id,
             target_files=self._repair_target_files(run),
             expected_changes=tuple(finding.summary for finding in findings if finding.summary),
             acceptance_criteria=run.request.acceptance_criteria,
@@ -2094,14 +2334,22 @@ class WorkflowKernel:
         *,
         plan: RepairPlan,
         decision: RepairDecision,
+        diagnosis: RepairDiagnosis,
         cycle: int,
         findings: Sequence[RepairFinding],
     ) -> WorkflowRun:
-        """Deja el ciclo abierto y **durable**: plan vigente, decisión e historia.
+        """Deja el ciclo abierto y **durable**: plan, diagnóstico, decisión e historia.
 
         Se apunta antes de mutar nada porque el ciclo tiene que poder reconstruirse desde el
-        checkpoint: un proceso nuevo encuentra el plan, el snapshot y los defectos que cubre, y con
-        eso sabe qué se autorizó y qué falta por verificar.
+        checkpoint: un proceso nuevo encuentra el plan, su diagnóstico, el snapshot y los defectos
+        que cubre, y con eso sabe qué se autorizó, por qué y qué falta por verificar. El plan y el
+        diagnóstico viajan en la **misma** escritura: no existe un checkpoint en el que el plan esté
+        vigente sin el diagnóstico al que apunta.
+
+        La historia se conserva por los ciclos **más recientes**
+        (``[-MAX_REPAIR_HISTORY:]``): el ciclo vigente es siempre el último, así que la retención
+        nunca puede dejar al ciclo abierto sin su registro, y lo que se descarta es la traza más
+        antigua, que ya no decide nada.
         """
         record = RepairCycle(
             cycle=cycle,
@@ -2123,6 +2371,7 @@ class WorkflowKernel:
                 "active_repair_id": plan.repair_id,
                 "active_repair_cycle": cycle,
                 "active_repair_plan": plan,
+                "active_repair_diagnosis": diagnosis,
                 "repair_history": (*run.repair_history, record)[-MAX_REPAIR_HISTORY:],
                 # El ciclo arranca por el principio de la cadena de verificación: ninguna gate
                 # anterior a la mutación se puede reutilizar.

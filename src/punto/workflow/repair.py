@@ -20,6 +20,17 @@ Cuatro decisiones que conviene leer antes de tocar nada:
   bucle sería «prueba hasta que salga», que es justo lo que el presupuesto no puede permitirse.
 - **Ninguna verificación se salta.** Reparar es mutar código, así que la verificación vuelve a
   empezar por QA y solo la acorta lo que la petición no exige; no la acorta un modelo.
+- **Sin diagnóstico demostrable no hay reparación** (ENGINE-6.1.1, F611-02).
+  :func:`build_repair_diagnosis` traduce a ``RepairDiagnosis`` **solo** lo que el informe del rol ya
+  demuestra: un defecto bloqueante con evidencia y con archivos afectados que la petición autorizó.
+  Cuando eso falta —no hay evidencia, o el defecto no está situado en ningún archivo autorizado—
+  devuelve ``None``, y quien llama bloquea con ``BLOCKED_EVIDENCE`` /
+  ``WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE`` sin mutar nada. La frontera es honesta porque el
+  diagnóstico nunca afirma un **mecanismo**: copia la ubicación (archivos), el criterio incumplido
+  (código y categoría) y la evidencia que el propio informe aporta, y declara en ``unknowns`` lo que
+  PUNTO no puede demostrar. Un `root_cause_summary` del tipo «el finding falló» sería una tautología
+  que solo serviría para llenar el contrato, y por eso no se produce: lo que no está en el informe
+  no se escribe en el diagnóstico.
 """
 
 from __future__ import annotations
@@ -37,9 +48,11 @@ from punto.schemas.repair import (
     MAX_REPAIR_FILES,
     MAX_REPAIR_FINDINGS,
     Repairability,
+    RepairConfidence,
     RepairCycle,
     RepairCycleStatus,
     RepairDecision,
+    RepairDiagnosis,
     RepairFinding,
     RepairFindingStatus,
     RepairPlan,
@@ -47,6 +60,7 @@ from punto.schemas.repair import (
 from punto.schemas.workflow import (
     MAX_WORKFLOW_SUMMARY_CHARS,
     MAX_WORKFLOW_TEXT_CHARS,
+    ArtifactReference,
     RoleExecutionResult,
     RoleName,
     RoleStatus,
@@ -116,6 +130,22 @@ _STALLED_CYCLE_STATUSES: Final[tuple[RepairCycleStatus, ...]] = (
 #: Cota de roles de verificación del contrato (``RepairPlan.verification_roles``). Se nombra aquí
 #: para que el recorte del plan no dependa de un número suelto en medio del código.
 _MAX_VERIFICATION_ROLES: Final[int] = 8
+
+#: Cota de la evidencia que se copia de **cada** defecto al ``root_cause_summary`` del diagnóstico.
+#:
+#: El contrato ya acota ``RepairFinding.evidence``; esta cota es la del resumen, que reúne la de
+#: todos los defectos del ciclo. Se recorta en vez de fallar por el mismo motivo que el resto del
+#: módulo: un informe largo no puede impedir diagnosticar, pero tampoco puede hacer crecer el
+#: contrato por encima de su propio ``max_length``.
+_MAX_DIAGNOSIS_EVIDENCE_CHARS: Final[int] = 240
+
+#: Separador entre la evidencia de dos defectos distintos dentro del diagnóstico. Explícito para que
+#: el texto sea idéntico en cualquier proceso.
+_DIAGNOSIS_EVIDENCE_SEPARATOR: Final[str] = " | "
+
+#: Marca explícita de que un defecto no declaró ni código ni categoría. No es un valor inventado:
+#: falta de dato, declarada como tal.
+_UNCLASSIFIED_DEFECT: Final[str] = "SIN_CODIGO"
 
 
 def _normalize_text(value: str) -> str:
@@ -331,6 +361,215 @@ def findings_from_result(
             acceptance_criteria=acceptance_criteria,
         ),
     )
+
+
+def _authorized_files(target_files: Sequence[str]) -> tuple[str, ...]:
+    """Archivos autorizados por la petición, sin repetidos, sin vacíos y en su orden declarado.
+
+    Es el mismo conjunto que el plan declara como ``target_files``: la autorización de escritura la
+    fija la petición, y el diagnóstico solo puede situar el defecto donde esa autorización alcanza.
+    Normalizar aquí (recorte de extremos y deduplicación estable) evita que ``" src/a.py"`` y
+    ``"src/a.py"`` cuenten como dos archivos distintos según quién los declaró.
+    """
+    declared: dict[str, str] = {}
+    for path in target_files:
+        cleaned = path.strip()
+        if cleaned:
+            declared.setdefault(cleaned, cleaned)
+    return tuple(declared.values())
+
+
+def _located_files(finding: RepairFinding, authorized: Sequence[str]) -> tuple[str, ...]:
+    """Archivos del defecto que están **dentro** de la autorización, en su orden, sin repetidos.
+
+    Un archivo afectado que la petición no autorizó no se recorta ni se sustituye: queda fuera, y si
+    no queda ninguno el diagnóstico no se puede sostener (``()``). Situar el defecto en un archivo
+    que la reparación no puede tocar sería un diagnóstico que ninguna mutación autorizada podría
+    cumplir.
+    """
+    allowed = set(authorized)
+    seen: dict[str, str] = {}
+    for path in finding.affected_files:
+        cleaned = path.strip()
+        if cleaned and cleaned in allowed:
+            seen.setdefault(cleaned, cleaned)
+    return tuple(seen.values())
+
+
+def _evidence_names_file(finding: RepairFinding) -> bool:
+    """True si la **evidencia** del informe nombra alguno de los archivos afectados.
+
+    Es una comprobación literal —ruta completa o nombre de fichero, en minúsculas— sobre el texto
+    que el rol ya había declarado, no una interpretación: si aparece, el informe es autocontenido
+    para situar el defecto, y eso es lo que permite declarar confianza ``HIGH`` en vez de
+    ``MEDIUM``.
+    """
+    text = finding.evidence.strip().lower()
+    if not text:
+        return False
+    for path in finding.affected_files:
+        cleaned = path.strip().lower()
+        if not cleaned:
+            continue
+        basename = cleaned.rsplit("/", 1)[-1]
+        if cleaned in text or basename in text:
+            return True
+    return False
+
+
+def build_repair_diagnosis(
+    *,
+    findings: Sequence[RepairFinding],
+    request: WorkflowRequest,
+    target_files: Sequence[str],
+    origin_stage: TaskStatus,
+    detection_refs: Sequence[ArtifactReference] = (),
+) -> RepairDiagnosis | None:
+    """Traduce a ``RepairDiagnosis`` lo que los informes **demuestran**; ``None`` si no alcanza.
+
+    Esta función es la frontera de honestidad del diagnóstico (F611-02) y por eso su contrato es
+    estrecho a propósito. Lo que hace, exactamente:
+
+    - **No infiere mecanismos.** No lee código, no reproduce el fallo, no llama a ningún modelo y no
+      adivina una causa. Copia del defecto ya registrado: el código y la categoría (qué criterio
+      falló), los archivos autorizados en los que el propio informe lo sitúa y la evidencia textual
+      que el informe aportó. El ``root_cause_summary`` es esa ubicación con esa evidencia, no una
+      narración de por qué ocurre.
+    - **Devuelve ``None`` sin evidencia suficiente.** Si algún defecto del ciclo no trae evidencia,
+      si no sitúa el defecto en ningún archivo autorizado, o si no hay defectos, no hay diagnóstico:
+      quien llama bloquea con ``BLOCKED_EVIDENCE`` y con
+      ``WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE``, sin mutar nada. Ese ``None`` es la respuesta
+      correcta, no un fallo: preferir un bloqueo declarado a una reparación especulativa es
+      exactamente lo que esta frontera existe para hacer.
+    - **No llena el contrato con una tautología.** Un diagnóstico cuyo ``root_cause_summary`` dijera
+      «el defecto falló» o «hay que arreglar el defecto» no aportaría nada y aun así autorizaría una
+      mutación; aquí no se produce ninguno así, porque el texto se construye con hechos del informe
+      (rol, código, categoría, archivos) y con su evidencia.
+    - **Declara lo que no sabe.** ``unknowns`` dice, en texto fijo y verificable, que la causa
+      mecánica (línea, símbolo, expresión) no consta, que el fallo no se ha reproducido en este
+      proceso y, cuando corresponde, que el paso que detectó el defecto no dejó ninguna referencia
+      durable de su informe. Un ``unknowns`` vacío se leería como certeza total, que no es el caso.
+    - **Es de PUNTO, no de un modelo.** ``model_proposed=False``: la conclusión la produjo este
+      diagnoser determinista, y un lector del artefacto puede distinguirlo de una propuesta de
+      modelo sin inspeccionar nada más.
+
+    Sin razonamiento privado: el contrato ``RepairDiagnosis`` no tiene ningún campo de
+    *chain-of-thought* y esta función no inventa uno. Lo único textual que copia es la evidencia que
+    el informe del rol ya declaró como dato estructurado (``RepairFinding.evidence``), que es
+    evidencia observable y no razonamiento del modelo.
+
+    Args:
+        findings: Defectos que el ciclo va a reparar, en el orden en que se conocieron.
+        request: Petición del workflow. Aporta los criterios de aceptación vigentes.
+        target_files: Archivos que la petición autoriza. Es la autorización de escritura, y solo
+            dentro de ella se puede situar el defecto.
+        origin_stage: Etapa de la que salió el ciclo; se conserva como dato del ciclo.
+        detection_refs: Referencias durables de los informes que detectaron los defectos, si los
+            publicaron. Se copian tal cual —nunca se fabrican— y son lo que permite a un proceso
+            nuevo leer el informe original.
+
+    Returns:
+        El diagnóstico demostrable, o ``None`` si la evidencia no alcanza para afirmar nada.
+    """
+    if not findings:
+        return None
+    authorized = _authorized_files(target_files)
+    located: list[tuple[RepairFinding, tuple[str, ...]]] = []
+    for finding in findings:
+        if not finding.evidence.strip():
+            # Sin evidencia observada no se diagnostica: el resumen dice qué falla, pero afirmar una
+            # causa con él sería inferir. Es el mismo criterio que ``classify_repairability``.
+            return None
+        files = _located_files(finding, authorized)
+        if not files:
+            # El informe no sitúa el defecto en ningún archivo que la reparación pueda tocar: no hay
+            # diagnóstico honesto que hacer, solo uno inventado.
+            return None
+        located.append((finding, files))
+    suspected: dict[str, str] = {}
+    for _finding, files in located:
+        for path in files:
+            suspected.setdefault(path, path)
+    codes = sorted(
+        {finding.code or finding.category or _UNCLASSIFIED_DEFECT for finding, _ in located}
+    )
+    roles = sorted({finding.source_role.value for finding, _ in located})
+    evidence = _DIAGNOSIS_EVIDENCE_SEPARATOR.join(
+        finding.evidence.strip()[:_MAX_DIAGNOSIS_EVIDENCE_CHARS]
+        for finding, _ in located
+        if finding.evidence.strip()
+    )
+    return RepairDiagnosis(
+        finding_ids=tuple(finding.finding_id for finding, _ in located)[:MAX_REPAIR_FINDINGS],
+        # El texto afirma **dónde** y **qué criterio** falla, con la evidencia que lo sostiene. No
+        # afirma por qué: eso no lo demuestra ningún dato del motor.
+        root_cause_summary=(
+            f"el informe de {', '.join(roles)} sitúa el defecto ({', '.join(codes)}) en "
+            f"{', '.join(suspected)} con la evidencia: {evidence}"
+        )[:MAX_WORKFLOW_SUMMARY_CHARS],
+        evidence_refs=tuple(detection_refs)[:MAX_REPAIR_EVIDENCE],
+        suspected_files=tuple(suspected)[:MAX_REPAIR_FILES],
+        constraints=_diagnosis_constraints(suspected, request),
+        proposed_strategy=(
+            f"corregir {', '.join(codes)} en {', '.join(suspected)} con la mínima modificación y "
+            f"volver a verificar desde {restart_stage(origin_stage).value}"
+        )[:MAX_WORKFLOW_SUMMARY_CHARS],
+        # ``MEDIUM`` es el mínimo de un diagnóstico que sí se emite: la evidencia existe y la
+        # ubicación está declarada. ``HIGH`` solo cuando la propia evidencia nombra el archivo, que
+        # es lo único que hace al informe autocontenido.
+        confidence=(
+            RepairConfidence.HIGH
+            if all(_evidence_names_file(finding) for finding, _ in located)
+            else RepairConfidence.MEDIUM
+        ),
+        unknowns=_diagnosis_unknowns(located, detection_refs),
+        model_proposed=False,
+    )
+
+
+def _diagnosis_constraints(
+    suspected: Mapping[str, str], request: WorkflowRequest
+) -> tuple[str, ...]:
+    """Restricciones del diagnóstico: hechos del contrato, no consejos del diagnoser.
+
+    Las dos primeras son la autorización —qué se puede tocar y qué no— y la tercera son los
+    criterios vigentes, que son contra los que después se verifica. Se nombran porque un diagnóstico
+    que no dijera su alcance dejaría al Developer adivinando hasta dónde puede llegar.
+    """
+    items = [
+        f"tocar solo los archivos autorizados: {', '.join(suspected)}",
+        f"prohibido escribir en: {', '.join(PROTECTED_PATHS)}",
+    ]
+    criteria = tuple(
+        criterion.strip() for criterion in request.acceptance_criteria if criterion.strip()
+    )
+    if criteria:
+        items.append(f"criterios vigentes: {', '.join(criteria)[:MAX_WORKFLOW_SUMMARY_CHARS]}")
+    return tuple(items)
+
+
+def _diagnosis_unknowns(
+    located: Sequence[tuple[RepairFinding, tuple[str, ...]]],
+    detection_refs: Sequence[ArtifactReference],
+) -> tuple[str, ...]:
+    """Lo que el diagnóstico **no** puede demostrar, dicho de forma explícita y verificable.
+
+    No es relleno: cada frase es un hecho comprobable sobre el propio diagnóstico, y su ausencia
+    convertiría el artefacto en una afirmación de certeza que nadie ha demostrado.
+    """
+    unknowns = [
+        "la causa mecánica (línea, símbolo o expresión concreta) no consta en el informe del rol",
+        "el fallo no se ha reproducido en este proceso: el diagnóstico se apoya en el informe",
+    ]
+    if not detection_refs:
+        unknowns.append(
+            "el paso que detectó el defecto no publicó ninguna referencia durable de su informe"
+        )
+    if not all(_evidence_names_file(finding) for finding, _ in located):
+        unknowns.append(
+            "la evidencia no nombra el archivo: la ubicación es la que el defecto declara"
+        )
+    return tuple(unknowns)
 
 
 def classify_repairability(
@@ -610,6 +849,7 @@ __all__ = [
     "NON_REPARABLE_CATEGORIES",
     "PROTECTED_PATHS",
     "build_repair_decision",
+    "build_repair_diagnosis",
     "build_repair_plan",
     "classify_repairability",
     "finding_fingerprint",

@@ -25,13 +25,18 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
-from punto.architect.base import ArchitectRequest, ArchitectRunner, ArchitectureOutcome
+from punto.architect.base import (
+    ArchitectLimits,
+    ArchitectRequest,
+    ArchitectRunner,
+    ArchitectureOutcome,
+)
 from punto.common import utc_now
 from punto.crossaudit.base import CrossAuditRunner
 from punto.developer.base import DeveloperRunner
 from punto.orchestrator.planner import Planner, TaskPlan
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
-from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
+from punto.planner.base import PlannerLimits, PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.planning.capabilities import detect_capability_gaps
 from punto.planning.graph import (
     PlanningValidation,
@@ -78,6 +83,7 @@ from punto.schemas.review import ReviewReport, ReviewTask
 from punto.schemas.security import SecurityReport, SecurityTask
 from punto.schemas.task import Task
 from punto.schemas.visual import VisualQAReport, VisualQATask
+from punto.schemas.workflow import ModelCallLimits, RoleName
 from punto.security.base import SecurityRunner
 from punto.tasks.manager import TaskManager
 from punto.tools.errors import (
@@ -705,7 +711,9 @@ class Camus:
             completed_at=utc_now(),
         )
 
-    def analyze_project(self, intent: ProjectIntent) -> ArchitectureOutcome:
+    def analyze_project(
+        self, intent: ProjectIntent, *, limits: ArchitectLimits | None = None
+    ) -> ArchitectureOutcome:
         """Ejecuta **solo** al Architect y devuelve su diseño ya validado.
 
         Es la primera mitad de :meth:`plan_project`, expuesta por separado porque hay quien
@@ -719,6 +727,11 @@ class Camus:
         :data:`ARCHITECT_PLAN_INVALID_REASON` en ``error``. Un runner que no produjo propuesta
         devuelve su propio fallo sin reinterpretarlo.
 
+        ``limits`` es la **cota efectiva** que el llamante autoriza para esta ejecución (el saldo
+        del presupuesto del workflow, por ejemplo): se aplica tal cual al ``ArchitectRequest``, de
+        modo que la restricción llega hasta el bucle que hace cada llamada al modelo y no se queda
+        en una comprobación posterior. Sin ``limits`` se usan los del propio Architect.
+
         Nunca ejecuta al Planner.
 
         Raises:
@@ -727,7 +740,12 @@ class Camus:
         if self._architect is None:
             raise ArchitectRunnerNotConfiguredError()
 
-        outcome = self._architect.design(ArchitectRequest(project_id=intent.id, intent=intent))
+        request = ArchitectRequest(
+            project_id=intent.id,
+            intent=intent,
+            limits=limits if limits is not None else ArchitectLimits(),
+        )
+        outcome = self._architect.design(request)
         if outcome.proposal is None:
             return outcome
 
@@ -743,7 +761,11 @@ class Camus:
         )
 
     def plan_project_from_architecture(
-        self, intent: ProjectIntent, architecture: ArchitectureOutcome
+        self,
+        intent: ProjectIntent,
+        architecture: ArchitectureOutcome,
+        *,
+        limits: PlannerLimits | None = None,
     ) -> PlanningOutcome:
         """Ejecuta **solo** al Planner sobre un diseño ya validado.
 
@@ -756,6 +778,9 @@ class Camus:
         Architect: un diseño ausente o inválido se rechaza con el error tipado de la capa de
         planificación (:class:`~punto.tools.errors.PlanningValidationError`) en vez de pedirle
         al Architect que lo repita. Esta función **nunca** ejecuta al Architect.
+
+        ``limits`` es la cota efectiva autorizada para esta ejecución (el saldo del presupuesto del
+        workflow): viaja en el ``PlannerRequest`` hasta el bucle de llamadas del Planner.
 
         Raises:
             PlannerRunnerNotConfiguredError: si no hay Planner inyectado.
@@ -777,8 +802,58 @@ class Camus:
                 project_spec=proposal.project_spec,
                 architecture=proposal.architecture,
                 capability_profile=proposal.capability_profile,
+                limits=limits if limits is not None else PlannerLimits(),
             )
         )
+
+    def declared_model_limits(self, role: RoleName) -> ModelCallLimits | None:
+        """Cota de modelo **declarada** por el runner inyectado de un rol, o ``None``.
+
+        El presupuesto del workflow es una cota pre-gasto: para los roles cuyo contrato lleva los
+        límites dentro de la petición (Architect y Planner) se aplican directamente; para los demás,
+        el adaptador necesita saber qué máximo declara el runner para no autorizar una ejecución que
+        podría gastar más de lo permitido. De ahí esta consulta: es el único punto donde el workflow
+        puede leer la cota real del proveedor sin conocer su implementación.
+
+        Args:
+            role: Rol del workflow cuya cota se consulta.
+
+        Returns:
+            ``(max_model_calls, max_output_tokens)`` del runner, o ``None`` si el rol no tiene
+            runner, no está configurado o su implementación no declara límites.
+        """
+        runner = self._runner_for(role)
+        limits = getattr(runner, "limits", None)
+        if limits is None:
+            return None
+        calls = getattr(limits, "max_model_calls", None)
+        tokens = getattr(limits, "max_output_tokens", None)
+        if not isinstance(calls, int) or not isinstance(tokens, int):
+            return None
+        return ModelCallLimits(max_model_calls=calls, max_output_tokens=tokens)
+
+    def _runner_for(self, role: RoleName) -> object | None:
+        """Runner inyectado del rol, o ``None`` si ese rol no tiene uno.
+
+        Los ocho roles del contrato están cubiertos: el ``else`` final no existe porque el
+        comprobador de tipos demuestra la exhaustividad, y añadir un rol nuevo sin runner haría
+        fallar el tipado antes que la ejecución.
+        """
+        if role is RoleName.ARCHITECT:
+            return self._architect
+        if role is RoleName.PLANNER:
+            return self._planner_runner
+        if role is RoleName.DEVELOPER:
+            return self._developer
+        if role is RoleName.QA:
+            return self._qa
+        if role is RoleName.SECURITY:
+            return self._security
+        if role is RoleName.REVIEWER:
+            return self._reviewer
+        if role is RoleName.CROSS_AUDIT:
+            return self._cross_audit
+        return self._visual_qa
 
     def _require_planning_runners(self) -> None:
         """Comprueba los dos runners de planificación, en el orden de siempre.

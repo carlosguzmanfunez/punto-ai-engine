@@ -437,17 +437,43 @@ class WorkflowKernel:
         return run
 
     def _pending_role(self, run: WorkflowRun) -> RoleName | None:
-        """Primer rol de la etapa actual que aún no tiene un paso registrado.
+        """Primer rol de la etapa actual que **no está satisfecho** todavía.
 
-        La comprobación es por **rol dentro de la etapa**, no por índice de paso: el índice avanza
-        con cada paso, así que usarlo para decidir volvería a marcar como pendiente un rol ya
-        ejecutado.
+        Dos decisiones, y las dos importan (hallazgo V603-03):
+
+        - la comprobación es por **rol dentro de la etapa**, no por índice de paso: el índice avanza
+          con cada paso, así que usarlo para decidir volvería a marcar como pendiente un rol ya
+          ejecutado;
+        - un paso **no satisface** su rol por el mero hecho de existir. Solo lo satisface un
+          ``COMPLETED`` sin hallazgos bloqueantes (o un ``NOT_APPLICABLE``, que es una decisión
+          legítima del rol). Un ``PROVIDER_UNAVAILABLE``, un ``BLOCKED``, un ``NEEDS_REPAIR`` o un
+          ``FAILED`` dejan el rol pendiente: al reanudar el workflow tras el bloqueo, ese mismo rol
+          vuelve a ejecutarse y ninguna etapa posterior avanza sin que la anterior esté satisfecha.
         """
-        executed = {step.role for step in run.steps if step.stage is run.status}
+        satisfied = self._satisfied_roles(run)
         for role in stage_roles(run.status, run.request):
-            if role not in executed:
+            if role not in satisfied:
                 return role
         return None
+
+    def _satisfied_roles(self, run: WorkflowRun) -> frozenset[RoleName]:
+        """Roles que la etapa actual da por **cumplidos**, con su último resultado.
+
+        Se mira el **último** paso de cada rol en la etapa (un reintento posterior manda sobre el
+        intento fallido anterior) y solo se acepta un resultado que no deje trabajo pendiente.
+        """
+        satisfied: set[RoleName] = set()
+        for step in run.steps:
+            if step.stage is not run.status:
+                continue
+            done = step.status is RoleStatus.NOT_APPLICABLE or (
+                step.status is RoleStatus.COMPLETED and not step.blocking_findings
+            )
+            if done:
+                satisfied.add(step.role)
+            else:
+                satisfied.discard(step.role)
+        return frozenset(satisfied)
 
     def _requires_human(self, run: WorkflowRun) -> bool:
         """True si el workflow debe detenerse en un Human Gate.
@@ -536,6 +562,11 @@ class WorkflowKernel:
             # intento volvía a ver el consumo intacto y `max_role_calls=1` permitía dos llamadas
             # (hallazgo V602-04). Los intentos ya no se suman otra vez en el cierre del paso.
             run = self._consume(run, role_calls=1)
+            # Y se **persiste** antes de invocar (hallazgo V603-02): una llamada iniciada cuenta
+            # contra el presupuesto aunque el proceso muera antes de recibir o guardar la
+            # respuesta. Conservador antes que doble gasto: si el checkpoint no se puede escribir,
+            # no se llama al rol.
+            self._store.save(run)
             self._audit_step_started(run, index, role, attempts)
             try:
                 result = executor.execute(request)
@@ -1208,8 +1239,14 @@ class WorkflowKernel:
         )
 
     def _references(self, run: WorkflowRun) -> tuple[ArtifactReference, ...]:
-        """Referencias de las etapas anteriores, para que el rol reconstruya su entrada."""
-        references: list[ArtifactReference] = []
+        """Referencias durables que recibe un rol: las declaradas y las de las etapas anteriores.
+
+        Las que el *composition root* declaró en la petición van **primero**: son evidencia que ya
+        existía antes de la primera etapa (el informe de la sesión web, por ejemplo) y la etapa que
+        las necesita las busca por tipo, así que su presencia no depende del orden. Las de las
+        etapas anteriores se añaden después, en orden cronológico.
+        """
+        references: list[ArtifactReference] = list(run.request.evidence_references)
         for entry in WorkflowContext(run).entries():
             references.extend(entry.references)
         return tuple(references[:40])

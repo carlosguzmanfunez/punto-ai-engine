@@ -105,18 +105,24 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 
-from punto.architect.base import ArchitectureOutcome
+from punto.architect.base import ArchitectLimits, ArchitectureOutcome
 from punto.common import utc_now
-from punto.planner.base import PlanningOutcome
+from punto.planner.base import PlannerLimits, PlanningOutcome
+from punto.schemas.cross_audit import CrossAuditReport
 from punto.schemas.enums import FindingSeverity
-from punto.schemas.execution import ModelUsage
+from punto.schemas.execution import DeveloperExecutionResult, ModelUsage
 from punto.schemas.planning import ModelExecutionSummary, ProjectIntent
+from punto.schemas.qa import QAReport
+from punto.schemas.review import ReviewReport
+from punto.schemas.security import SecurityReport
+from punto.schemas.visual import VisualQAReport
 from punto.schemas.workflow import (
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_FINDINGS,
     MAX_WORKFLOW_SUMMARY_CHARS,
     MAX_WORKFLOW_TEXT_CHARS,
     ArtifactReference,
+    ModelCallLimits,
     ProviderCapability,
     RoleExecutionRequest,
     RoleExecutionResult,
@@ -138,13 +144,35 @@ from punto.tools.errors import (
     VisualQARunnerNotConfiguredError,
 )
 from punto.workflow.artifacts import ArtifactStore
-from punto.workflow.errors import WorkflowError, WorkflowProviderUnavailableError
+from punto.workflow.errors import (
+    WorkflowCheckpointInvalidError,
+    WorkflowError,
+    WorkflowIncompleteEvidenceError,
+    WorkflowProviderUnavailableError,
+    WorkflowResumeFailedError,
+)
 from punto.workflow.handoff import (
+    cross_audit_input,
     developer_input,
     publish_architecture,
+    publish_cross_audit,
+    publish_developer,
     publish_plan,
+    publish_qa,
+    publish_review,
+    publish_security,
+    publish_visual_qa,
+    qa_input,
     resolve_architecture,
+    resolve_developer,
     resolve_plan,
+    resolve_qa,
+    resolve_review,
+    resolve_security,
+    resolve_visual_evidence,
+    review_input,
+    security_input,
+    visual_qa_input,
 )
 
 if TYPE_CHECKING:
@@ -159,6 +187,7 @@ if TYPE_CHECKING:
     from punto.schemas.review import ReviewTask
     from punto.schemas.security import SecurityTask
     from punto.schemas.visual import VisualQATask
+    from punto.schemas.web import WebSessionReport
     from punto.workflow.providers import ProviderCapabilityRegistry
 
 #: Espejos de los máximos de ``RoleExecutionResult`` que no se exportan como constante propia.
@@ -203,6 +232,111 @@ _NOT_CONFIGURED_ERRORS: Final[tuple[type[Exception], ...]] = (
 
 #: Firma común de los normalizadores puros de rol.
 _RoleNormalizer = Callable[[object, RoleExecutionRequest], RoleExecutionResult]
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveCap:
+    """Cota de gasto que el kernel autorizó para **esta** ejecución.
+
+    No es un booleano «hay saldo»: es el número de llamadas y de tokens de salida que la etapa
+    puede gastar como máximo (hallazgo V603-01). Se traduce a los límites reales del rol cuando su
+    contrato los admite por petición, y se usa para rechazar la ejecución cuando el máximo declarado
+    del runner no cabe en ella.
+    """
+
+    model_calls: int
+    output_tokens: int
+
+
+def _architect_limits(cap: _EffectiveCap | None) -> ArchitectLimits | None:
+    """Límites del Architect acotados por el saldo, o ``None`` para usar los suyos.
+
+    ``max_attempts`` también se acota: un intento de reparación es otra llamada al modelo, así que
+    con saldo para una sola llamada no puede haber dos intentos.
+    """
+    if cap is None:
+        return None
+    base = ArchitectLimits()
+    calls = max(1, min(base.max_model_calls, cap.model_calls))
+    return ArchitectLimits(
+        max_attempts=max(1, min(base.max_attempts, calls)),
+        max_model_calls=calls,
+        max_input_tokens=base.max_input_tokens,
+        max_output_tokens=max(1, min(base.max_output_tokens, cap.output_tokens)),
+    )
+
+
+def _planner_limits(cap: _EffectiveCap | None) -> PlannerLimits | None:
+    """Límites del Planner acotados por el saldo, con la misma regla que el Architect."""
+    if cap is None:
+        return None
+    base = PlannerLimits()
+    calls = max(1, min(base.max_model_calls, cap.model_calls))
+    return PlannerLimits(
+        max_attempts=max(1, min(base.max_attempts, calls)),
+        max_model_calls=calls,
+        max_input_tokens=base.max_input_tokens,
+        max_output_tokens=max(1, min(base.max_output_tokens, cap.output_tokens)),
+    )
+
+
+def _resolve_durable[ResolvedT](
+    resolver: Callable[[ArtifactStore, tuple[ArtifactReference, ...]], ResolvedT | None],
+    store: ArtifactStore,
+    references: tuple[ArtifactReference, ...],
+    *,
+    detail: str,
+) -> ResolvedT | None:
+    """Resuelve un artefacto durable traduciendo «no se pudo leer» a evidencia incompleta.
+
+    Un artefacto que falta o que no supera su verificación de integridad es **evidencia
+    incompleta**, no un fallo del rol: el adaptador lo convierte en ``BLOCKED`` con
+    ``WORKFLOW_INCOMPLETE_EVIDENCE``, que es recuperable, en vez de cerrar el workflow con un
+    ``FAILED``. La taxonomía del almacén se conserva intacta; la traducción ocurre aquí, en la
+    frontera del rol, que es quien sabe que ese artefacto era su entrada (hallazgo V603-04).
+    """
+    try:
+        return resolver(store, references)
+    except (WorkflowResumeFailedError, WorkflowCheckpointInvalidError) as error:
+        raise WorkflowIncompleteEvidenceError(f"{detail}: {error.detail or error}") from error
+
+
+def _screenshots_of(session: WebSessionReport | None) -> Mapping[str, ImagePayload]:
+    """Capturas verificadas que acompañan a la verificación visual, o un mapa vacío.
+
+    El handoff durable guarda la **sesión** (nombres lógicos, viewport, tamaño y hash de cada
+    captura), nunca los bytes de las imágenes. Por eso:
+
+    - si la sesión no declara ninguna captura, el mapa va vacío: no hay nada que analizar y el
+      informe dirá cuántas se analizaron (cero), que es un hecho, no una invención;
+    - si declara capturas, la etapa **no se puede reconstruir** desde el checkpoint y el almacén, y
+      se declara evidencia incompleta en vez de analizar a ciegas.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si la sesión declara capturas que el handoff no guarda.
+    """
+    if session is None or not session.screenshots:
+        return {}
+    raise WorkflowIncompleteEvidenceError(
+        f"la sesión web declara {len(session.screenshots)} captura(s) y el handoff durable solo "
+        "guarda su descripción, no sus bytes: la verificación visual no se puede reconstruir sin "
+        "las imágenes verificadas"
+    )
+
+
+def _declared_limits(camus: object, role: RoleName) -> ModelCallLimits | None:
+    """Cota declarada por el runner del rol, consultando a CAMUS si sabe declararla.
+
+    El ``Camus`` real implementa :meth:`punto.orchestrator.camus.Camus.declared_model_limits`, así
+    que en producción la consulta siempre se hace. Un doble de prueba que no la implemente devuelve
+    ``None``: significa «no declaro cota», y el adaptador se apoya entonces en el pre-gasto del
+    kernel —que ya impide invocar con el saldo agotado— en vez de inventarse un máximo.
+    """
+    provider = getattr(camus, "declared_model_limits", None)
+    if not callable(provider):
+        return None
+    declared = provider(role)
+    return declared if isinstance(declared, ModelCallLimits) else None
 
 
 @runtime_checkable
@@ -385,7 +519,7 @@ class CamusRoleExecutor:
         self._artifacts = artifacts
         self._registry = registry
         self._provider = provider
-        self._handlers: Mapping[RoleName, Callable[[object], object]] = MappingProxyType(
+        self._handlers: Mapping[RoleName, Callable[..., object]] = MappingProxyType(
             {
                 RoleName.ARCHITECT: self._call_analyze_project,
                 RoleName.PLANNER: self._call_plan_from_architecture,
@@ -420,6 +554,12 @@ class CamusRoleExecutor:
         if exhausted is not None:
             return exhausted
 
+        cap = self._effective_cap(request)
+        if cap is not None:
+            refused = self._cap_failure_if_declared_exceeds(request, cap)
+            if refused is not None:
+                return refused
+
         try:
             payload = self._request_input(request)
         except _InvalidRoleInputError as error:
@@ -429,6 +569,16 @@ class CamusRoleExecutor:
                 status=RoleStatus.FAILED,
                 code=WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
                 detail=f"entrada inválida para {self._role.value}: {error}",
+            )
+        except WorkflowIncompleteEvidenceError as error:
+            # Evidencia incompleta, no fallo del rol: el kernel lo convierte en BLOCKED. Va antes
+            # que el manejador genérico de ``WorkflowError`` porque es su subclase.
+            return _failure(
+                self._role,
+                request,
+                status=RoleStatus.BLOCKED,
+                code=error.code,
+                detail=error.detail or str(error),
             )
         except WorkflowError as error:
             return _failure(
@@ -450,7 +600,7 @@ class CamusRoleExecutor:
                 ),
             )
         try:
-            produced = self._invoke(payload)
+            produced = self._invoke(payload, cap)
         except _NOT_CONFIGURED_ERRORS as error:
             return _unavailable(
                 self._role,
@@ -553,6 +703,66 @@ class CamusRoleExecutor:
             ),
         )
 
+    def _effective_cap(self, request: RoleExecutionRequest) -> _EffectiveCap | None:
+        """Cota efectiva autorizada para esta ejecución, o ``None`` si no hay saldo declarado.
+
+        Hallazgo V603-01: el saldo positivo no bastaba como permiso, tenía que ser una **cota**. El
+        adaptador la convierte en los límites reales de cada rol cuando su contrato admite límites
+        por petición y, cuando no, exige que el máximo declarado del runner quepa entero en el
+        saldo: antes de gastar una llamada que podría excederlo, se rechaza la ejecución.
+        """
+        allowance = request.budget_allowance
+        if allowance is None:
+            return None
+        return _EffectiveCap(
+            model_calls=allowance.model_calls_remaining,
+            output_tokens=allowance.tokens_remaining,
+        )
+
+    def _cap_failure_if_declared_exceeds(
+        self, request: RoleExecutionRequest, cap: _EffectiveCap
+    ) -> RoleExecutionResult | None:
+        """Comprueba, antes de invocar, que el máximo declarado del runner cabe en el saldo.
+
+        Para el Architect y el Planner no se aplica: sus contratos llevan los límites dentro de la
+        petición, así que la cota se inyecta de verdad y el runner se detiene donde se le dice. Para
+        el resto de roles, el contrato no permite una cota por ejecución: si su máximo declarado no
+        cabe en el saldo, la ejecución se rechaza en vez de autorizar un gasto que podría excederlo.
+        """
+        if self._role in (RoleName.ARCHITECT, RoleName.PLANNER):
+            return None
+        declared = _declared_limits(self._camus, self._role)
+        if declared is None:
+            return None
+        if declared.max_model_calls <= cap.model_calls and (
+            declared.max_output_tokens <= cap.output_tokens
+        ):
+            return None
+        return self._cap_failure(request, cap, declared)
+
+    def _cap_failure(
+        self, request: RoleExecutionRequest, cap: _EffectiveCap, declared: ModelCallLimits
+    ) -> RoleExecutionResult:
+        """Rechaza la ejecución de un rol cuyo máximo declarado no cabe en el saldo autorizado.
+
+        Política conservadora y documentada (hallazgo V603-01): si el contrato del rol no permite
+        inyectar una cota por ejecución, PUNTO no invoca al runner con un saldo menor que su máximo
+        declarado, porque no podría garantizar que se detuviera a tiempo. Conservador antes que
+        gastar de más.
+        """
+        return _failure(
+            self._role,
+            request,
+            status=RoleStatus.BLOCKED,
+            code=WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
+            detail=(
+                f"el saldo autorizado no cubre el máximo declarado por el runner de "
+                f"{self._role.value} (saldo: {cap.model_calls} llamada(s) y {cap.output_tokens} "
+                f"token(s) de salida; declarado: {declared.max_model_calls} y "
+                f"{declared.max_output_tokens}): no se invoca al proveedor"
+            ),
+        )
+
     def _request_input(self, request: RoleExecutionRequest) -> object:
         """Entrada del rol: la inyectada si la hay y, si no, la que PUNTO deriva de la petición.
 
@@ -567,13 +777,20 @@ class CamusRoleExecutor:
     def _durable_input(self, request: RoleExecutionRequest) -> object:
         """Entrada reconstruida desde el almacén de artefactos, sin ninguna *closure* externa.
 
-        - ``ARCHITECT``: la intención derivada de la petición (es la primera etapa);
-        - ``PLANNER``: la pareja ``(intención, diseño resuelto del almacén)``;
-        - ``DEVELOPER``: la pareja ``(DeveloperTask, ExecutionContext)`` del plan durable.
+        Cubre **toda** la pipeline (defecto V603-04): el Architect deriva su intención de la
+        petición, el Planner resuelve el diseño del almacén, el Developer reconstruye su tarea del
+        plan, y QA, Security, Reviewer, CrossAudit y VisualQA reconstruyen la suya desde el plan y
+        los informes durables de las etapas anteriores.
+
+        Nada de esto usa memoria de otro proceso: las referencias vienen del checkpoint
+        (``RoleExecutionRequest.references``) y el contenido, del almacén estable.
 
         Raises:
-            _InvalidRoleInputError: si la etapa no tiene constructor oficial o si falta el
-                artefacto del que depende. El detalle viaja al resultado ``FAILED``.
+            WorkflowIncompleteEvidenceError: si falta un artefacto del que depende la entrada. El
+                adaptador lo convierte en ``BLOCKED`` con ``WORKFLOW_INCOMPLETE_EVIDENCE``: no se
+                inventa la entrada ni se vuelve a ejecutar una etapa anterior en silencio.
+            _InvalidRoleInputError: si no hay almacén inyectado y el rol no puede construir su
+                entrada. El detalle viaja al resultado.
         """
         if self._role is RoleName.ARCHITECT:
             return _intent_from_request(request)
@@ -581,19 +798,84 @@ class CamusRoleExecutor:
             return (_intent_from_request(request), self._resolve_design(request))
         if self._role is RoleName.DEVELOPER:
             return self._developer_input(request)
-        msg = (
-            f"el rol {self._role.value} exige un build_input explícito: PUNTO no improvisa la "
-            "entrada de un rol que no tiene constructor oficial en el handoff durable"
+        store = self._require_store()
+        plan = _resolve_durable(
+            resolve_plan, store, request.references, detail="falta el plan durable"
         )
-        raise _InvalidRoleInputError(msg)
+        developer = _resolve_durable(
+            resolve_developer,
+            store,
+            request.references,
+            detail="falta el resultado durable del Developer",
+        )
+        if self._role is RoleName.QA:
+            return qa_input(plan, developer, request)
+        if self._role is RoleName.SECURITY:
+            qa = _resolve_durable(
+                resolve_qa, store, request.references, detail="falta el informe durable de QA"
+            )
+            return security_input(plan, developer, qa, request)
+        if self._role is RoleName.REVIEWER:
+            qa = _resolve_durable(
+                resolve_qa, store, request.references, detail="falta el informe durable de QA"
+            )
+            security = _resolve_durable(
+                resolve_security,
+                store,
+                request.references,
+                detail="falta el informe durable de Security",
+            )
+            return review_input(plan, developer, qa, security, request)
+        if self._role is RoleName.CROSS_AUDIT:
+            qa = _resolve_durable(
+                resolve_qa, store, request.references, detail="falta el informe durable de QA"
+            )
+            security = _resolve_durable(
+                resolve_security,
+                store,
+                request.references,
+                detail="falta el informe durable de Security",
+            )
+            review = _resolve_durable(
+                resolve_review,
+                store,
+                request.references,
+                detail="falta el informe durable del Reviewer",
+            )
+            return cross_audit_input(plan, developer, qa, security, review, request)
+        evidence = _resolve_durable(
+            resolve_visual_evidence,
+            store,
+            request.references,
+            detail="falta la evidencia visual durable",
+        )
+        spec, session = evidence if evidence is not None else (None, None)
+        task = visual_qa_input(plan, developer, request, spec=spec, session=session)
+        return (task, _screenshots_of(session))
+
+    def _require_store(self) -> ArtifactStore:
+        """Almacén de artefactos inyectado, o un error de cableado explícito.
+
+        Raises:
+            _InvalidRoleInputError: si el adaptador no tiene almacén. Sin él no hay handoff durable
+                que reconstruir, y PUNTO no improvisa la entrada de una etapa.
+        """
+        if self._artifacts is None:
+            msg = (
+                f"el rol {self._role.value} necesita artefactos durables y no hay almacén "
+                "inyectado: sin 'artifacts' ni 'build_input', el handoff no se puede reconstruir"
+            )
+            raise _InvalidRoleInputError(msg)
+        return self._artifacts
 
     def _resolve_design(self, request: RoleExecutionRequest) -> ArchitectureOutcome:
         """Diseño del Architect resuelto desde las referencias durables de la petición.
 
         Raises:
-            _InvalidRoleInputError: si no hay almacén inyectado o si no hay referencia
-                ``ARCHITECTURE`` resoluble. Un artefacto corrupto no cae aquí: sube como
-                ``WorkflowError`` con su código propio, que es lo que el kernel sabe interpretar.
+            _InvalidRoleInputError: si no hay almacén inyectado (defecto de cableado).
+            WorkflowIncompleteEvidenceError: si no hay referencia ``ARCHITECTURE`` resoluble. Es
+                evidencia incompleta, no un fallo del rol: el kernel lo convierte en ``BLOCKED``. Un
+                artefacto corrupto sube con su propio código, que el kernel también interpreta.
         """
         if self._artifacts is None:
             msg = (
@@ -601,14 +883,18 @@ class CamusRoleExecutor:
                 "inyectado: sin 'artifacts' ni 'build_input', el handoff no se puede reconstruir"
             )
             raise _InvalidRoleInputError(msg)
-        design = resolve_architecture(self._artifacts, request.references)
+        design = _resolve_durable(
+            resolve_architecture,
+            self._artifacts,
+            request.references,
+            detail="falta el diseño del Architect",
+        )
         if design is None:
-            msg = (
+            raise WorkflowIncompleteEvidenceError(
                 "falta el diseño del Architect en las referencias durables de la petición "
                 "(RoleExecutionRequest.references): el Planner no planifica sin él y PUNTO no "
                 "vuelve a ejecutar al Architect para suplirlo"
             )
-            raise _InvalidRoleInputError(msg)
         return design
 
     def _developer_input(
@@ -617,9 +903,10 @@ class CamusRoleExecutor:
         """Pareja ``(DeveloperTask, ExecutionContext)`` construida desde el plan durable.
 
         Raises:
-            _InvalidRoleInputError: si no hay almacén inyectado o si la petición no trae una
-                referencia ``PLANNING`` resoluble. PUNTO no vuelve a ejecutar al Planner para
-                rellenar el hueco.
+            _InvalidRoleInputError: si no hay almacén inyectado (defecto de cableado).
+            WorkflowIncompleteEvidenceError: si la petición no trae una referencia ``PLANNING``
+                resoluble: es evidencia incompleta y el kernel la convierte en ``BLOCKED``. PUNTO no
+                vuelve a ejecutar al Planner para rellenar el hueco.
         """
         if self._artifacts is None:
             msg = (
@@ -629,12 +916,11 @@ class CamusRoleExecutor:
             raise _InvalidRoleInputError(msg)
         plan = resolve_plan(self._artifacts, request.references)
         if plan is None:
-            msg = (
+            raise WorkflowIncompleteEvidenceError(
                 "falta el plan durable en las referencias de la petición "
                 "(RoleExecutionRequest.references): el Developer no trabaja sin plan y PUNTO no "
                 "vuelve a ejecutar al Planner para suplirlo"
             )
-            raise _InvalidRoleInputError(msg)
         return developer_input(plan, request)
 
     def _publish(
@@ -667,9 +953,11 @@ class CamusRoleExecutor:
     ) -> ArtifactReference | None:
         """Referencia del artefacto durable de esta etapa, o ``None`` si la etapa no publica.
 
-        El ``ARCHITECT`` publica su outcome completo; el ``PLANNER`` publica el bundle del plan
-        junto al diseño que acaba de usar, que es lo que hace al plan resoluble sin volver a
-        planificar. Los demás roles no producen handoff durable en esta fase.
+        Publica **toda** la pipeline (defecto V603-04): el Architect su diseño, el Planner el bundle
+        del plan, el Developer su resultado de ejecución, y QA, Security, Reviewer, CrossAudit y
+        VisualQA sus informes. Lo que se publica es el informe estructurado del contrato, nunca
+        contenido de ficheros ni cadenas de razonamiento, y solo cuando el resultado de la etapa es
+        aceptable —eso lo decide :meth:`_publish` antes de llamar aquí—.
         """
         if self._role is RoleName.ARCHITECT and isinstance(produced, ArchitectureOutcome):
             if produced.proposal is None:
@@ -684,27 +972,51 @@ class CamusRoleExecutor:
                 outcome=produced,
                 architecture=_design_of(payload),
             )
+        if self._role is RoleName.DEVELOPER and isinstance(produced, DeveloperExecutionResult):
+            return publish_developer(store, request=request, result=produced)
+        if self._role is RoleName.QA and isinstance(produced, QAReport):
+            return publish_qa(store, request=request, report=produced)
+        if self._role is RoleName.SECURITY and isinstance(produced, SecurityReport):
+            return publish_security(store, request=request, report=produced)
+        if self._role is RoleName.REVIEWER and isinstance(produced, ReviewReport):
+            return publish_review(store, request=request, report=produced)
+        if self._role is RoleName.CROSS_AUDIT and isinstance(produced, CrossAuditReport):
+            return publish_cross_audit(store, request=request, report=produced)
+        if self._role is RoleName.VISUAL_QA and isinstance(produced, VisualQAReport):
+            return publish_visual_qa(store, request=request, report=produced)
         return None
 
-    def _invoke(self, payload: object) -> object:
-        """Despacha al método público de CAMUS del rol; ninguno se improvisa."""
+    def _invoke(self, payload: object, cap: _EffectiveCap | None) -> object:
+        """Despacha al método público de CAMUS del rol, con la cota de gasto si la hay."""
         handler = self._handlers.get(self._role)
         if handler is None:
             msg = f"no hay método de CAMUS declarado para el rol {self._role.value}"
             raise _InvalidRoleInputError(msg)
+        if self._role is RoleName.ARCHITECT:
+            return self._call_analyze_project(payload, cap)
+        if self._role is RoleName.PLANNER:
+            return self._call_plan_from_architecture(payload, cap)
         return handler(payload)
 
-    def _call_analyze_project(self, payload: object) -> object:
-        """``analyze_project`` ejecuta **solo** al Architect y devuelve su informe."""
-        return self._camus.analyze_project(cast("ProjectIntent", payload))
+    def _call_analyze_project(self, payload: object, cap: _EffectiveCap | None) -> object:
+        """``analyze_project`` ejecuta **solo** al Architect y devuelve su informe.
 
-    def _call_plan_from_architecture(self, payload: object) -> object:
+        La cota efectiva entra en el ``ArchitectRequest`` como límites del rol: es lo que hace que
+        el saldo del workflow sea una restricción real sobre el bucle que hace cada llamada al
+        modelo (hallazgo V603-01) y no una comprobación posterior.
+        """
+        return self._camus.analyze_project(
+            cast("ProjectIntent", payload), limits=_architect_limits(cap)
+        )
+
+    def _call_plan_from_architecture(self, payload: object, cap: _EffectiveCap | None) -> object:
         """``plan_project_from_architecture`` ejecuta **solo** al Planner sobre el diseño.
 
         ``build_input`` debe devolver la pareja ``(ProjectIntent, ArchitectureOutcome)``, con el
         diseño del Architect reconstruido desde la referencia durable de la petición. Si el
         diseño no llega, se falla aquí: volver a ejecutar al Architect para rellenar el hueco
-        sería exactamente la duplicación que este adaptador debe impedir.
+        sería exactamente la duplicación que este adaptador debe impedir. Los límites efectivos
+        viajan en el ``PlannerRequest``, igual que en el Architect.
         """
         intent, architecture = _pair(
             payload, RoleName.PLANNER, "ProjectIntent y ArchitectureOutcome"
@@ -717,7 +1029,9 @@ class CamusRoleExecutor:
             )
             raise _InvalidRoleInputError(msg)
         return self._camus.plan_project_from_architecture(
-            cast("ProjectIntent", intent), cast("ArchitectureOutcome", architecture)
+            cast("ProjectIntent", intent),
+            cast("ArchitectureOutcome", architecture),
+            limits=_planner_limits(cap),
         )
 
     def _call_developer(self, payload: object) -> object:

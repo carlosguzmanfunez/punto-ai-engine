@@ -246,13 +246,20 @@ class _FakeCamus:
             "Planner en una sola etapa"
         )
 
-    def analyze_project(self, intent: object) -> object:
-        """Método público de CAMUS que ejecuta solo al Architect."""
-        return self._respond("analyze_project", (intent,))
+    def analyze_project(self, intent: object, *, limits: object = None) -> object:
+        """Método público de CAMUS que ejecuta solo al Architect, con su cota de gasto."""
+        return self._respond("analyze_project", (intent, limits))
 
-    def plan_project_from_architecture(self, intent: object, architecture: object) -> object:
+    def plan_project_from_architecture(
+        self, intent: object, architecture: object, *, limits: object = None
+    ) -> object:
         """Método público de CAMUS que ejecuta solo al Planner sobre el diseño recibido."""
-        return self._respond("plan_project_from_architecture", (intent, architecture))
+        return self._respond("plan_project_from_architecture", (intent, architecture, limits))
+
+    def declared_model_limits(self, role: object) -> object:
+        """El doble no declara cota de runner: devuelve ``None``, como un runner sin límites."""
+        del role
+        return None
 
     def execute_developer_task(self, task: object, context: object) -> object:
         """Método público de CAMUS para el Developer."""
@@ -1334,7 +1341,11 @@ def test_el_planner_sin_almacen_ni_entrada_explicita_falla_de_forma_explicita(
 def test_el_planner_sin_referencia_durable_falla_sin_planificar_ni_disenar(
     tmp_path: Path, task_manager: TaskManager, policy_engine: PolicyEngine, human_gate: HumanGate
 ) -> None:
-    """Con almacén pero sin diseño referenciado, la etapa falla: no se vuelve a diseñar."""
+    """Con almacén pero sin diseño referenciado, la etapa se bloquea: no se vuelve a diseñar.
+
+    Es evidencia incompleta, no un fallo del rol (ENGINE-6.0.3): el kernel lo convierte en
+    ``BLOCKED`` con ``WORKFLOW_INCOMPLETE_EVIDENCE``, que es recuperable añadiendo el artefacto.
+    """
     architect = _CountingArchitectRunner()
     planner = _CountingPlannerRunner()
     camus = _planning_camus(
@@ -1350,8 +1361,8 @@ def test_el_planner_sin_referencia_durable_falla_sin_planificar_ni_disenar(
 
     resultado = executor.execute(_request(RoleName.PLANNER))
 
-    assert resultado.status is RoleStatus.FAILED
-    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert resultado.status is RoleStatus.BLOCKED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_INCOMPLETE_EVIDENCE
     assert "references" in resultado.error_detail
     assert planner.calls == 0
     assert architect.calls == 0, "el Architect no se re-ejecuta para suplir el diseño ausente"
@@ -1374,8 +1385,8 @@ def test_el_developer_sin_plan_durable_falla_de_forma_explicita(
 
     resultado = executor.execute(_request(RoleName.DEVELOPER))
 
-    assert resultado.status is RoleStatus.FAILED
-    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+    assert resultado.status is RoleStatus.BLOCKED
+    assert resultado.error_code is WorkflowFailureCode.WORKFLOW_INCOMPLETE_EVIDENCE
     assert "plan durable" in resultado.error_detail
     assert "references" in resultado.error_detail
 

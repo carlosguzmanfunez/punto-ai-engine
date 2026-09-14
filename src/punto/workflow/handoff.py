@@ -27,13 +27,45 @@ payload que declare otro esquema o que se referencie con el tipo equivocado se r
 Dios. El JSON se escribe con claves ordenadas y sin espacios decorativos, de modo que el mismo
 contenido produce siempre los mismos bytes y el digest del almacén es reproducible.
 
+Cobertura de toda la pipeline (ENGINE-6.0.3)
+--------------------------------------------
+Hasta 6.0.2 el handoff durable solo cubría Architect, Planner y Developer: QA, Security, Reviewer,
+la auditoría cruzada y Visual QA seguían exigiendo un ``build_input`` externo —una *closure* que
+captura objetos del proceso anterior—, así que un proceso nuevo no podía reconstruir esas etapas
+(defecto V603-04). Aquí se cierran con dos piezas por rol: el **códec** de su informe (``publish_*``
+y ``resolve_*``) y el **constructor oficial de su entrada** (``qa_input``, ``security_input``,
+``review_input``, ``cross_audit_input`` y ``visual_qa_input``), que se apoyan en el plan durable y
+en los informes ya publicados en vez de en la memoria del proceso que ejecutó la etapa anterior.
+Visual QA añade una pieza más, porque su entrada no la produce ningún rol: la especificación visual
+y la sesión técnica medida en un navegador viajan juntas en el sobre ``VISUAL_EVIDENCE``
+(:func:`publish_visual_evidence` y :func:`resolve_visual_evidence`), y el adaptador resuelve esa
+pareja antes de llamar a :func:`visual_qa_input`.
+
+Dos reglas gobiernan lo que viaja en esos sobres, y conviene leerlas antes de tocar el códec:
+
+- **nada de secretos**: el almacén es disco y un volcado de error puede traer la cabecera de
+  autenticación de un proveedor, así que todo texto del sobre pasa por una redacción de valores con
+  forma de credencial antes de escribirse;
+- **nada ilimitado**: ningún texto del sobre supera la cota local del payload. El contrato de cada
+  informe ya acota muchos campos; los que no acota —salidas de comando, evidencias, valoraciones— se
+  recortan con la marca explícita de recorte, de modo que ni un contenido de fichero completo ni un
+  volcado de consola engordan un artefacto.
+
+Un informe previo (``qa``, ``security``, ``review``) viaja en la entrada de la etapa siguiente como
+**evidencia**, nunca como aprobación: que QA declare PASS significa que el producto funciona, no que
+sea seguro, y el veredicto de la etapa actual lo calcula su runner, no el códec. Lo que sí hace el
+códec es negarse a construir una entrada a la que le falta un artefacto del que depende: eso es
+``WORKFLOW_INCOMPLETE_EVIDENCE``, que el adaptador convierte en ``BLOCKED`` en vez de improvisar.
+
 Qué NO hace este módulo
 -----------------------
 No llama a ningún modelo, no abre red, no ejecuta subprocesos y no decide autoridad. Solo serializa
 lo que una etapa ya produjo, lo deja en el almacén y lo reconstruye cuando la etapa siguiente lo
 necesita. Tampoco re-ejecuta etapas: si un diseño o un plan no está en las referencias, la etapa que
 lo necesitaba falla con un detalle explícito; volver a ejecutar al Architect o al Planner para
-rellenar el hueco sería exactamente la duplicación que el kernel elimina.
+rellenar el hueco sería exactamente la duplicación que el kernel elimina. Tampoco publica el
+artefacto de un rol cuyo resultado no es aceptable: eso lo decide quien llama, que es quien conoce
+la decisión del kernel, no este módulo.
 
 Integridad
 ----------
@@ -59,8 +91,9 @@ from pydantic import BaseModel, ValidationError
 from punto.architect.base import ArchitectureOutcome
 from punto.developer.context import ExecutionContext
 from punto.planner.base import PlanningOutcome
-from punto.schemas.enums import RiskLevel
-from punto.schemas.execution import CommandSpec, DeveloperTask
+from punto.schemas.cross_audit import CrossAuditReport, CrossAuditTask
+from punto.schemas.enums import AuthorityLevel, RiskLevel
+from punto.schemas.execution import CommandSpec, DeveloperExecutionResult, DeveloperTask
 from punto.schemas.planning import (
     ArchitecturePlan,
     ArchitectureProposal,
@@ -72,9 +105,14 @@ from punto.schemas.planning import (
     Roadmap,
     TaskGraph,
 )
+from punto.schemas.qa import QAReport, QATask
+from punto.schemas.review import ReviewReport, ReviewTask
+from punto.schemas.security import SecurityReport, SecurityTask
+from punto.schemas.visual import VisualQAReport, VisualQATask, VisualSpec
+from punto.schemas.web import WebSessionReport
 from punto.schemas.workflow import ArtifactReference, RoleExecutionRequest, RoleName
 from punto.workflow.artifacts import ArtifactStore
-from punto.workflow.errors import WorkflowResumeFailedError
+from punto.workflow.errors import WorkflowIncompleteEvidenceError, WorkflowResumeFailedError
 
 #: Versión del sobre que viaja en cada artefacto del handoff.
 #:
@@ -85,13 +123,40 @@ HANDOFF_SCHEMA_VERSION: Final[str] = "1.0.0"
 ARCHITECTURE_KIND: Final[str] = "ARCHITECTURE"
 #: Tipo del artefacto que publica la etapa ``PLANNER``: el bundle durable del plan.
 PLAN_KIND: Final[str] = "PLANNING"
+#: Tipo del artefacto que publica la etapa ``DEVELOPER``: el ``DeveloperExecutionResult`` completo.
+DEVELOPER_KIND: Final[str] = "DEVELOPER_RESULT"
+#: Tipo del artefacto que publica la etapa ``QA``: el ``QAReport`` completo.
+QA_KIND: Final[str] = "QA_REPORT"
+#: Tipo del artefacto que publica la etapa ``SECURITY``: el ``SecurityReport`` completo.
+SECURITY_KIND: Final[str] = "SECURITY_REPORT"
+#: Tipo del artefacto que publica la etapa ``REVIEWER``: el ``ReviewReport`` completo.
+REVIEW_KIND: Final[str] = "REVIEW_REPORT"
+#: Tipo del artefacto que publica la etapa ``CROSS_AUDIT``: el ``CrossAuditReport`` completo.
+CROSS_AUDIT_KIND: Final[str] = "CROSS_AUDIT_REPORT"
+#: Tipo del artefacto que publica la etapa ``VISUAL_QA``: el ``VisualQAReport`` completo.
+VISUAL_QA_KIND: Final[str] = "VISUAL_QA_REPORT"
+#: Tipo del artefacto con la evidencia **de entrada** de Visual QA: la especificación visual y el
+#: informe técnico de la sesión web, medido por PUNTO en un navegador real.
+VISUAL_EVIDENCE_KIND: Final[str] = "VISUAL_EVIDENCE"
 
 #: Nombres de los campos del sobre. Son constantes porque son contrato, no texto decorativo.
 _SCHEMA_FIELD: Final[str] = "schema_version"
 _KIND_FIELD: Final[str] = "kind"
+#: Campo del sobre que lleva el informe serializado. El nombre es contrato: lo lee otro proceso.
+_CONTENT_FIELD: Final[str] = "content"
+#: Campos del sobre de la evidencia visual. Son dos piezas que viajan juntas o no viajan.
+_SPEC_FIELD: Final[str] = "spec"
+_SESSION_FIELD: Final[str] = "session"
 #: Etiquetas legibles de cada artefacto. Describen el tipo, nunca el contenido.
 _ARCHITECTURE_LABEL: Final[str] = "diseño del Architect"
 _PLAN_LABEL: Final[str] = "plan durable del Planner"
+_DEVELOPER_LABEL: Final[str] = "resultado durable del Developer"
+_QA_LABEL: Final[str] = "informe durable de QA"
+_SECURITY_LABEL: Final[str] = "informe durable de Security"
+_REVIEW_LABEL: Final[str] = "informe durable del Reviewer"
+_CROSS_AUDIT_LABEL: Final[str] = "informe durable de la auditoría cruzada"
+_VISUAL_QA_LABEL: Final[str] = "informe durable de Visual QA"
+_VISUAL_EVIDENCE_LABEL: Final[str] = "evidencia visual durable (especificación y sesión web)"
 #: Acción con la que se declara el trabajo del Developer.
 #:
 #: Ni ``RoleExecutionRequest`` ni ``PlannedTask`` declaran una acción, así que inventarla a partir
@@ -107,6 +172,32 @@ _DEFAULT_SLUG: Final[str] = "task"
 _MAX_SLUG_CHARS: Final[int] = 60
 _MAX_COMMIT_SUBJECT_CHARS: Final[int] = 120
 _MAX_ID_CHARS: Final[int] = 8
+#: Cota local de **todo** texto del sobre de un informe.
+#:
+#: El contrato de cada informe ya acota buena parte de sus campos, pero no todos: una salida de
+#: comando, una evidencia o una valoración pueden llegar sin límite. Esta cota es la que impide que
+#: un volcado de consola o el contenido completo de un fichero engorden el artefacto.
+_MAX_PAYLOAD_TEXT_CHARS: Final[int] = 4_000
+#: Cota de los textos de contexto derivados del plan y máximo de elementos que se copian de él.
+_MAX_CONTEXT_CHARS: Final[int] = 2_000
+_MAX_CONTEXT_ITEMS: Final[int] = 20
+#: Marca con la que se sustituye un valor con forma de credencial.
+_REDACTION_MARKER: Final[str] = "[credencial omitida]"
+#: Formas de credencial que se redactan antes de escribir bytes en el almacén.
+#:
+#: La lista es corta y conservadora a propósito: solo formas que casi nunca aparecen en texto
+#: legítimo. El almacén es disco, y un informe de seguridad que copie la cabecera de autenticación
+#: de una petición no puede convertir el artefacto en el sitio donde vive la credencial.
+_SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{10,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{8,}"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\b"
+        r"\s*[:=]\s*\S+"
+    ),
+)
 #: Marca de recorte explícita: un texto recortado en silencio se leería como completo.
 _TRUNCATION_MARKER: Final[str] = "…"
 #: Todo lo que no sea ``[a-z0-9]`` separa palabras en un slug.
@@ -263,6 +354,285 @@ def resolve_plan(
 
 
 # ---------------------------------------------------------------------------
+# Códecs de los informes posteriores al plan (ENGINE-6.0.3)
+# ---------------------------------------------------------------------------
+def publish_developer(
+    store: ArtifactStore, *, request: RoleExecutionRequest, result: DeveloperExecutionResult
+) -> ArtifactReference:
+    """Publica el ``DeveloperExecutionResult`` completo y devuelve su referencia durable.
+
+    Se guarda el resultado entero —estado, archivos cambiados, comandos, validación y consumo—
+    porque es la evidencia sobre la que QA, Security, Reviewer, auditoría cruzada y Visual QA
+    construyen su entrada: sin él, esas etapas solo podrían trabajar sobre una suposición. El
+    artefacto se publica cuando el resultado es aceptable (``COMPLETED``), y eso lo decide **quien
+    llama**, que es quien conoce la decisión del kernel: el códec solo serializa lo que ya ocurrió.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``. Etiquetar un artefacto con el
+            rol equivocado corrompería el handoff, así que se rechaza antes de escribir nada.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.DEVELOPER,
+        kind=DEVELOPER_KIND,
+        label=_DEVELOPER_LABEL,
+        report=result,
+        function="publish_developer",
+    )
+
+
+def resolve_developer(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> DeveloperExecutionResult | None:
+    """Reconstruye el resultado durable del Developer desde la **primera** referencia del tipo.
+
+    ``None`` significa «no hay artefacto de este tipo en las referencias», que la etapa debe
+    declarar como hueco. Un artefacto presente pero ilegible, de otro esquema o manipulado **no** se
+    degrada a ``None``: falla con ``WORKFLOW_RESUME_FAILED`` o lo detecta el propio almacén, porque
+    confundir corrupción con ausencia haría ejecutar la etapa siguiente sobre datos descartados en
+    silencio.
+    """
+    return _resolve_report(store, references, DEVELOPER_KIND, DeveloperExecutionResult)
+
+
+def publish_qa(
+    store: ArtifactStore, *, request: RoleExecutionRequest, report: QAReport
+) -> ArtifactReference:
+    """Publica el ``QAReport`` completo y devuelve su referencia durable.
+
+    Se guarda el informe entero —estado calculado por PUNTO, cobertura de cada criterio, checks
+    ejecutados, hallazgos y capacidades ausentes— porque es lo que Security, Reviewer, auditoría
+    cruzada y la reparación necesitan leer en un proceso nuevo. Igual que el resto de publicadores,
+    quien llama decide si el resultado es aceptable (``COMPLETED``): este códec no juzga el informe.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``QA``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.QA,
+        kind=QA_KIND,
+        label=_QA_LABEL,
+        report=report,
+        function="publish_qa",
+    )
+
+
+def resolve_qa(store: ArtifactStore, references: tuple[ArtifactReference, ...]) -> QAReport | None:
+    """Reconstruye el informe de QA desde la **primera** referencia ``QA_REPORT``, o ``None``.
+
+    Solo devuelve ``None`` cuando no hay ninguna referencia de ese tipo. Un informe de QA en estado
+    ``FAIL`` sí se resuelve: un veredicto negativo es evidencia de pleno derecho y descartarlo
+    borraría el motivo por el que el workflow pidió reparar.
+    """
+    return _resolve_report(store, references, QA_KIND, QAReport)
+
+
+def publish_security(
+    store: ArtifactStore, *, request: RoleExecutionRequest, report: SecurityReport
+) -> ArtifactReference:
+    """Publica el ``SecurityReport`` completo y devuelve su referencia durable.
+
+    Viaja el informe entero —estado, hallazgos con su gravedad real, checks ejecutados, archivos
+    revisados y omitidos— porque el Reviewer y la auditoría cruzada lo consumen como gate: un gate
+    reconstruido a medias no es un gate. Quien llama decide si el resultado es aceptable.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``SECURITY``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.SECURITY,
+        kind=SECURITY_KIND,
+        label=_SECURITY_LABEL,
+        report=report,
+        function="publish_security",
+    )
+
+
+def resolve_security(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> SecurityReport | None:
+    """Reconstruye el informe de Security desde la **primera** referencia del tipo, o ``None``.
+
+    Un informe ``FAIL`` se resuelve igual que uno ``PASS``: la gravedad de cada hallazgo viaja tal
+    como la calculó PUNTO, y ninguna reconstrucción la rebaja.
+    """
+    return _resolve_report(store, references, SECURITY_KIND, SecurityReport)
+
+
+def publish_review(
+    store: ArtifactStore, *, request: RoleExecutionRequest, report: ReviewReport
+) -> ArtifactReference:
+    """Publica el ``ReviewReport`` completo y devuelve su referencia durable.
+
+    Se guarda con sus gates y su veredicto porque la auditoría cruzada los lee como evidencia
+    previa: sin ellos, la etapa de auditoría no podría saber si el cambio llegó aprobado o con
+    cambios pedidos. Quien llama decide si el resultado es aceptable.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``REVIEWER``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.REVIEWER,
+        kind=REVIEW_KIND,
+        label=_REVIEW_LABEL,
+        report=report,
+        function="publish_review",
+    )
+
+
+def resolve_review(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> ReviewReport | None:
+    """Reconstruye el informe del Reviewer desde la **primera** referencia del tipo, o ``None``.
+
+    ``CHANGES_REQUESTED`` y ``BLOCKED`` se resuelven igual que ``APPROVED``: el veredicto es un
+    hecho del run y quien lo lee decide qué hacer con él, no este códec.
+    """
+    return _resolve_report(store, references, REVIEW_KIND, ReviewReport)
+
+
+def publish_cross_audit(
+    store: ArtifactStore, *, request: RoleExecutionRequest, report: CrossAuditReport
+) -> ArtifactReference:
+    """Publica el ``CrossAuditReport`` completo y devuelve su referencia durable.
+
+    Se conserva entero —veredicto, gates, hallazgos, proveedores previos y ``cross_model``— porque
+    es la prueba de que la auditoría fue de verdad entre proveedores distintos y no una relectura
+    del mismo modelo. Quien llama decide si el resultado es aceptable.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``CROSS_AUDIT``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.CROSS_AUDIT,
+        kind=CROSS_AUDIT_KIND,
+        label=_CROSS_AUDIT_LABEL,
+        report=report,
+        function="publish_cross_audit",
+    )
+
+
+def resolve_cross_audit(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> CrossAuditReport | None:
+    """Reconstruye la auditoría cruzada desde la **primera** referencia del tipo, o ``None``.
+
+    ``provider``, ``upstream_providers`` y ``cross_model`` viajan en el informe y se reconstruyen
+    con él: la reconstrucción no recalcula si la auditoría fue cruzada, porque eso la dejaría en
+    manos de una suposición en vez de en las del informe que ya lo declaró.
+    """
+    return _resolve_report(store, references, CROSS_AUDIT_KIND, CrossAuditReport)
+
+
+def publish_visual_qa(
+    store: ArtifactStore, *, request: RoleExecutionRequest, report: VisualQAReport
+) -> ArtifactReference:
+    """Publica el ``VisualQAReport`` completo y devuelve su referencia durable.
+
+    Se guarda entero —veredicto, gates, hallazgos, rutas, viewports y capturas analizadas— para que
+    el cierre del workflow pueda auditar qué se miró y con qué resultado sin volver a abrir un
+    navegador. Los bytes de las imágenes **no** viajan aquí: el contrato del informe nunca los
+    lleva. Quien llama decide si el resultado es aceptable.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``VISUAL_QA``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.VISUAL_QA,
+        kind=VISUAL_QA_KIND,
+        label=_VISUAL_QA_LABEL,
+        report=report,
+        function="publish_visual_qa",
+    )
+
+
+def resolve_visual_qa(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> VisualQAReport | None:
+    """Reconstruye el informe de Visual QA desde la **primera** referencia del tipo, o ``None``.
+
+    El informe se resuelve sin abrir un navegador y sin las imágenes: lo que viaja es el veredicto
+    con su evidencia declarada, que es lo que el cierre del workflow necesita comprobar.
+    """
+    return _resolve_report(store, references, VISUAL_QA_KIND, VisualQAReport)
+
+
+def publish_visual_evidence(
+    store: ArtifactStore,
+    *,
+    request: RoleExecutionRequest,
+    spec: VisualSpec,
+    session: WebSessionReport,
+) -> ArtifactReference:
+    """Publica la **entrada** de Visual QA —especificación y sesión web— en un solo sobre durable.
+
+    La etapa visual no opina en el vacío: opina contra una especificación y sobre unos hechos
+    medidos por PUNTO en un navegador real. Esas dos piezas no las produce ningún rol del plan, así
+    que sin publicarlas el proceso nuevo no puede reconstruir la entrada de Visual QA desde el
+    checkpoint y los almacenes (defecto V603-04, variante web) y la etapa quedaría siempre
+    incompleta. Viajan **juntas** y con un solo digest a propósito: una especificación sin la sesión
+    que la mide, o al revés, no permitiría evaluar nada, y un par descuadrado es peor que un hueco.
+
+    No se guardan binarios: el contrato de la sesión declara los screenshots por nombre lógico,
+    viewport, tamaño y hash, nunca por sus bytes, y el sobre pasa por la misma redacción y la misma
+    cota de texto que el resto de informes.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``VISUAL_QA``, que es la etapa que consume
+            esta evidencia y la que identifica el workflow y el paso en el almacén.
+    """
+    _assert_role(request, RoleName.VISUAL_QA, "publish_visual_evidence")
+    payload: dict[str, object] = {
+        _KIND_FIELD: VISUAL_EVIDENCE_KIND,
+        _SPEC_FIELD: _bounded_json(spec),
+        _SESSION_FIELD: _bounded_json(session),
+    }
+    return store.put(
+        workflow_id=request.workflow_id,
+        role=RoleName.VISUAL_QA,
+        step_index=request.step_index,
+        kind=VISUAL_EVIDENCE_KIND,
+        label=_VISUAL_EVIDENCE_LABEL,
+        data=_encode(payload),
+    )
+
+
+def resolve_visual_evidence(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> tuple[VisualSpec, WebSessionReport] | None:
+    """Reconstruye la pareja ``(especificación, sesión web)`` de la **primera** referencia del tipo.
+
+    ``None`` significa «no hay evidencia visual publicada», que la etapa debe declarar como hueco.
+    Un sobre presente pero ilegible, de otro esquema o con una de las dos piezas inválida **no** se
+    degrada a ``None``: la pareja no se entrega a medias y el fallo sube como
+    ``WORKFLOW_RESUME_FAILED`` con el motivo, porque evaluar con media evidencia es exactamente
+    aprobar sin haber mirado.
+    """
+    for reference in references:
+        if reference.kind != VISUAL_EVIDENCE_KIND:
+            continue
+        payload = _decode(
+            store.get(reference), expected_kind=VISUAL_EVIDENCE_KIND, reference=reference
+        )
+        return (
+            _model_field(VisualSpec, payload, _SPEC_FIELD, reference),
+            _model_field(WebSessionReport, payload, _SESSION_FIELD, reference),
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Entrada oficial del rol DEVELOPER
 # ---------------------------------------------------------------------------
 def developer_input(
@@ -321,8 +691,7 @@ def developer_input(
             tipado de la capa de ejecución y se propaga tal cual: el handoff no lo disfraza.
     """
     task = _next_task(plan)
-    objective = _coalesce(_one_line(_task_text(task, "objective")), _one_line(request.objective))
-    objective = objective or _DEFAULT_SLUG
+    objective = _objective(task, request)
     slug = _slug(objective)
     context_files = _context_files(task, request)
     developer_task = DeveloperTask(
@@ -343,6 +712,256 @@ def developer_input(
         branch_name=_branch_name(request, slug),
     )
     return developer_task, context
+
+
+# ---------------------------------------------------------------------------
+# Entradas oficiales de los roles posteriores al Developer (ENGINE-6.0.3)
+# ---------------------------------------------------------------------------
+def qa_input(
+    plan: DurablePlan | None,
+    developer: DeveloperExecutionResult | None,
+    request: RoleExecutionRequest,
+) -> QATask:
+    """Construye la entrada oficial del rol ``QA`` desde artefactos durables.
+
+    Es el constructor **oficial** de la entrada de QA: el adaptador real lo usa sin ninguna
+    *closure*, así que la evaluación se puede reconstruir en un proceso nuevo a partir de las
+    referencias del checkpoint y del almacén (defecto V603-04).
+
+    Precedencia, explícita porque es el contrato de esta función:
+
+    - el **plan** manda en el contrato de la tarea: objetivo y criterios de aceptación de la primera
+      tarea lista, capacidades que exige, vocabulario de capacidades del Architect y contexto de la
+      especificación y la arquitectura;
+    - el **resultado del Developer** manda en los hechos: qué archivos cambió y qué checks declaró,
+      que es lo que QA audita de verdad. Viaja como **evidencia, nunca como aprobación**: un informe
+      del Developer dice qué se hizo, no que esté bien, y ``QATask.developer_claimed_pass`` existe
+      justo para poder demostrar que QA no lo usa como prueba;
+    - la **petición** es el respaldo declarado cuando el plan o el resultado no traen el dato
+      (objetivo, criterios, archivos cambiados) y la única fuente de la identidad y del workspace.
+
+    Lo que ningún artefacto durable declara viaja **vacío** en lugar de inventado:
+    ``test_only_paths`` no lleva elementos porque ni el plan ni la petición declaran rutas
+    solo-de-pruebas, y la allowlist determinista de QA decide después con lo que sí sabe.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta el plan durable o el resultado del Developer. Sin
+            ellos la entrada se construiría sobre datos inventados, y PUNTO no ejecuta una etapa
+            sobre una suposición: es el hueco que el adaptador convierte en ``BLOCKED``.
+    """
+    durable = _require_plan(plan, "QA")
+    result = _require_developer(developer, "QA")
+    task = _next_task(durable)
+    return QATask(
+        task_id=request.task_id,
+        project_id=request.project_id,
+        objective=_objective(task, request),
+        acceptance_criteria=_acceptance_criteria(task, request),
+        changed_files=_changed_files(result, request),
+        context_files=_context_files(task, request),
+        validation_checks=_validation_checks(result, task),
+        required_capabilities=_declared(task, "required_capabilities"),
+        capability_profile=_capability_profile(durable),
+        test_only_paths=(),
+        workspace_path=str(_workspace(request)),
+        architecture_context=_architecture_context(durable),
+        project_spec_context=_project_spec_context(durable),
+        developer_result=result,
+    )
+
+
+def security_input(
+    plan: DurablePlan | None,
+    developer: DeveloperExecutionResult | None,
+    qa: QAReport | None,
+    request: RoleExecutionRequest,
+) -> SecurityTask:
+    """Construye la entrada oficial del rol ``SECURITY`` desde artefactos durables.
+
+    Prioridad de las fuentes, la misma que en :func:`qa_input`: el **plan** aporta el contrato de la
+    tarea y el vocabulario de capacidades, el **resultado del Developer** aporta los hechos —qué se
+    cambió— y la **petición** aporta identidad y workspace.
+
+    El informe de QA es **opcional a propósito**: la seguridad del cambio no depende de que QA haya
+    pasado, y un QA que no publicó informe (porque su resultado no fue aceptable) no puede impedir
+    una auditoría de seguridad que sí tiene sentido. Cuando viaja, lo hace como **evidencia, nunca
+    como aprobación**: que QA declare PASS significa que el producto funciona, no que sea seguro, y
+    ``SecurityTask.qa_claimed_pass`` lo expone solo para poder demostrarlo.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta el plan durable o el resultado del Developer.
+    """
+    durable = _require_plan(plan, "SECURITY")
+    result = _require_developer(developer, "SECURITY")
+    task = _next_task(durable)
+    return SecurityTask(
+        task_id=request.task_id,
+        project_id=request.project_id,
+        objective=_objective(task, request),
+        acceptance_criteria=_acceptance_criteria(task, request),
+        changed_files=_changed_files(result, request),
+        context_files=_context_files(task, request),
+        workspace_path=str(_workspace(request)),
+        architecture_context=_architecture_context(durable),
+        project_spec_context=_project_spec_context(durable),
+        capability_profile=_capability_profile(durable),
+        required_capabilities=_declared(task, "required_capabilities"),
+        developer_result=result,
+        qa_report=qa,
+    )
+
+
+def review_input(
+    plan: DurablePlan | None,
+    developer: DeveloperExecutionResult | None,
+    qa: QAReport | None,
+    security: SecurityReport | None,
+    request: RoleExecutionRequest,
+) -> ReviewTask:
+    """Construye la entrada oficial del rol ``REVIEWER`` desde artefactos durables.
+
+    El plan aporta el contrato de la tarea, las restricciones de la especificación y el riesgo y la
+    autoridad **declarados** para la tarea lista; el resultado del Developer aporta los hechos y un
+    resumen controlado del cambio; la petición aporta identidad y workspace. El riesgo y la
+    autoridad que viajan no se rebajan ni se elevan aquí: el handoff copia lo que el plan declaró y
+    la autoridad efectiva la calcula el Policy Engine fuera de esta capa.
+
+    Los informes de QA y de Security son **gates preceptivos** de esta etapa: se exigen los dos
+    porque sin ellos no hay aprobación posible y el Reviewer no puede evaluar nada. Viajan como
+    **evidencia, nunca como aprobación**: un gate en ``FAIL`` o ``CHANGES_REQUESTED`` se resuelve
+    igual que uno en verde y el veredicto lo calcula el runner, no este constructor.
+    ``deleted_files`` viaja vacío porque ni el plan durable ni el resultado declaran eliminaciones
+    explícitas y PUNTO no deduce una eliminación de la ausencia de un archivo.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta el plan, el resultado del Developer, el informe de
+            QA o el de Security. Faltar un gate no se suple con una aprobación inventada.
+    """
+    durable = _require_plan(plan, "REVIEWER")
+    result = _require_developer(developer, "REVIEWER")
+    qa_report = _require_report(qa, QA_KIND, "REVIEWER", "de QA")
+    security_report = _require_report(security, SECURITY_KIND, "REVIEWER", "de Security")
+    task = _next_task(durable)
+    return ReviewTask(
+        task_id=request.task_id,
+        project_id=request.project_id,
+        objective=_objective(task, request),
+        acceptance_criteria=_acceptance_criteria(task, request),
+        changed_files=_changed_files(result, request),
+        context_files=_context_files(task, request),
+        deleted_files=(),
+        workspace_path=str(_workspace(request)),
+        architecture_constraints=_architecture_constraints(durable),
+        risk_level=RiskLevel.LOW if task is None else task.risk_level,
+        authority_level=(
+            AuthorityLevel.LEVEL_0_AUTONOMOUS if task is None else task.authority_level
+        ),
+        project_spec_context=_project_spec_context(durable),
+        architecture_context=_architecture_context(durable),
+        diff_summary=_diff_summary(result),
+        developer_result=result,
+        qa_report=qa_report,
+        security_report=security_report,
+    )
+
+
+def cross_audit_input(
+    plan: DurablePlan | None,
+    developer: DeveloperExecutionResult | None,
+    qa: QAReport | None,
+    security: SecurityReport | None,
+    review: ReviewReport | None,
+    request: RoleExecutionRequest,
+) -> CrossAuditTask:
+    """Construye la entrada oficial de la auditoría cruzada desde artefactos durables.
+
+    Misma precedencia que en :func:`review_input`: el plan aporta el contrato y el riesgo y la
+    autoridad declarados, el resultado del Developer los hechos y el resumen del cambio, y la
+    petición la identidad y el workspace.
+
+    Los tres informes previos —QA, Security y Reviewer— son **gates preceptivos** y se exigen los
+    tres: la auditoría cruzada existe para mirar con otros ojos lo que ya se verificó, así que sin
+    ellos no hay nada que auditar. Viajan como **evidencia, nunca como aprobación**: sus estados se
+    copian tal cual y la decisión de la auditoría la toma su runner, que además deriva de ellos los
+    proveedores previos y si la auditoría es de verdad cruzada.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta el plan, el resultado del Developer o cualquiera
+            de los tres informes previos.
+    """
+    durable = _require_plan(plan, "CROSS_AUDIT")
+    result = _require_developer(developer, "CROSS_AUDIT")
+    qa_report = _require_report(qa, QA_KIND, "CROSS_AUDIT", "de QA")
+    security_report = _require_report(security, SECURITY_KIND, "CROSS_AUDIT", "de Security")
+    review_report = _require_report(review, REVIEW_KIND, "CROSS_AUDIT", "del Reviewer")
+    task = _next_task(durable)
+    return CrossAuditTask(
+        task_id=request.task_id,
+        project_id=request.project_id,
+        objective=_objective(task, request),
+        acceptance_criteria=_acceptance_criteria(task, request),
+        changed_files=_changed_files(result, request),
+        context_files=_context_files(task, request),
+        deleted_files=(),
+        workspace_path=str(_workspace(request)),
+        project_spec_context=_project_spec_context(durable),
+        architecture_context=_architecture_context(durable),
+        diff_summary=_diff_summary(result),
+        risk_level=RiskLevel.LOW if task is None else task.risk_level,
+        authority_level=(
+            AuthorityLevel.LEVEL_0_AUTONOMOUS if task is None else task.authority_level
+        ),
+        developer_result=result,
+        qa_report=qa_report,
+        security_report=security_report,
+        review_report=review_report,
+    )
+
+
+def visual_qa_input(
+    plan: DurablePlan | None,
+    developer: DeveloperExecutionResult | None,
+    request: RoleExecutionRequest,
+    *,
+    spec: VisualSpec | None = None,
+    session: WebSessionReport | None = None,
+) -> VisualQATask:
+    """Construye la entrada oficial de ``VISUAL_QA`` desde artefactos durables y la capa web.
+
+    El plan aporta el contrato de la tarea y el contexto de la arquitectura; el resultado del
+    Developer aporta los hechos —qué archivos cambiaron—; la petición aporta identidad y workspace.
+
+    ``spec`` y ``session`` se piden **explícitamente** porque las mide un navegador real, no este
+    módulo: el adaptador las obtiene de :func:`resolve_visual_evidence`, que devuelve la pareja
+    publicada con :func:`publish_visual_evidence` desde el almacén del motor (``VISUAL_EVIDENCE``),
+    así que la entrada se reconstruye en un proceso nuevo y no desde una variable del anterior.
+    Cuando esa pareja no está, el resolutor devuelve ``None`` y esta función se niega a inventar una
+    especificación sin rutas o una sesión con estado técnico ``PASS``: eso sería fabricar la
+    evidencia contra la que se opina. ``source_context`` viaja vacío por el mismo motivo: el plan
+    durable no contiene contexto de código, y rellenarlo con una lista de rutas sería disfrazar otra
+    cosa de contexto.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta el plan, el resultado del Developer, la
+            especificación visual o el informe de la sesión web.
+    """
+    durable = _require_plan(plan, "VISUAL_QA")
+    result = _require_developer(developer, "VISUAL_QA")
+    visual_spec = _require_web_evidence(spec, "la especificación visual (VisualSpec)")
+    web_session = _require_web_evidence(session, "el informe técnico de la sesión web")
+    task = _next_task(durable)
+    return VisualQATask(
+        task_id=request.task_id,
+        project_id=request.project_id,
+        objective=_objective(task, request),
+        acceptance_criteria=_acceptance_criteria(task, request),
+        spec=visual_spec,
+        session=web_session,
+        changed_files=_changed_files(result, request),
+        context_files=_context_files(task, request),
+        source_context="",
+        architecture_context=_architecture_context(durable),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +1029,60 @@ def _decode_architecture(data: bytes, reference: ArtifactReference) -> Architect
         violations=_texts_field(payload, "violations", reference),
         error=_text_field(payload, "error", reference),
     )
+
+
+def _publish_report(
+    store: ArtifactStore,
+    *,
+    request: RoleExecutionRequest,
+    role: RoleName,
+    kind: str,
+    label: str,
+    report: BaseModel,
+    function: str,
+) -> ArtifactReference:
+    """Publica el sobre de un informe de rol con el rol comprobado y el contenido saneado.
+
+    Lo comparten los seis publicadores de informes porque la mecánica es la misma y solo cambia qué
+    se serializa: comprobar que la petición es de la etapa que publica, envolver el informe con su
+    ``kind`` y escribirlo con la versión del esquema y el JSON canónico. La comprobación va
+    **antes** de tocar el disco: un artefacto etiquetado con el rol equivocado corrompería el
+    handoff.
+
+    Raises:
+        ValueError: si la petición no es de ``role``.
+    """
+    _assert_role(request, role, function)
+    payload: dict[str, object] = {_KIND_FIELD: kind, _CONTENT_FIELD: _bounded_json(report)}
+    return store.put(
+        workflow_id=request.workflow_id,
+        role=role,
+        step_index=request.step_index,
+        kind=kind,
+        label=label,
+        data=_encode(payload),
+    )
+
+
+def _resolve_report[ModelT: BaseModel](
+    store: ArtifactStore,
+    references: tuple[ArtifactReference, ...],
+    kind: str,
+    model_type: type[ModelT],
+) -> ModelT | None:
+    """Reconstruye el informe de la **primera** referencia de ese tipo, o ``None`` si no hay.
+
+    Se usa la primera en orden cronológico, que es la que el run declaró antes. Un sobre presente
+    pero ilegible, de otro esquema o de otro ``kind`` no se degrada a ``None``: ``_decode`` y
+    ``_validate`` lo convierten en ``WORKFLOW_RESUME_FAILED``, porque confundir corrupción con
+    ausencia haría que la etapa siguiente trabajara sobre datos descartados en silencio.
+    """
+    for reference in references:
+        if reference.kind != kind:
+            continue
+        payload = _decode(store.get(reference), expected_kind=kind, reference=reference)
+        return _model_field(model_type, payload, _CONTENT_FIELD, reference)
+    return None
 
 
 def _status_field(payload: Mapping[str, object], reference: ArtifactReference) -> ProjectPlanStatus:
@@ -507,6 +1180,42 @@ def _json_dump(model: BaseModel) -> dict[str, object]:
     return cast("dict[str, object]", model.model_dump(mode="json"))
 
 
+def _bounded_json(model: BaseModel) -> dict[str, object]:
+    """Serializa un informe listo para el almacén: sin credenciales y con todos sus textos acotados.
+
+    Es la puerta por la que pasa **todo** informe de rol antes de convertirse en bytes. Se recorre
+    el JSON ya serializado, así que la regla vale también para los textos anidados —la salida de un
+    comando, la evidencia de un hallazgo, la valoración de una propuesta— que ningún contrato acota.
+    Recorrer el JSON y no el modelo es deliberado: el modelo no se muta, y lo que se acota es
+    exactamente lo que se va a escribir.
+    """
+    return cast("dict[str, object]", _bound_value(_json_dump(model)))
+
+
+def _bound_value(value: object) -> object:
+    """Recorre un valor JSON saneando y acotando todos los textos que contenga."""
+    if isinstance(value, str):
+        return _bounded_text(value)
+    if isinstance(value, list):
+        return [_bound_value(item) for item in cast("list[object]", value)]
+    if isinstance(value, dict):
+        mapping = cast("dict[str, object]", value)
+        return {key: _bound_value(item) for key, item in mapping.items()}
+    return value
+
+
+def _bounded_text(value: str) -> str:
+    """Redacta credenciales y recorta a la cota local, dejando marca explícita de lo hecho.
+
+    El orden importa: primero se redacta y después se recorta, de modo que la marca de recorte nunca
+    pueda partir una credencial por la mitad y dejar un fragmento reconocible en el artefacto.
+    """
+    redacted = value
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(_REDACTION_MARKER, redacted)
+    return _excerpt(redacted, _MAX_PAYLOAD_TEXT_CHARS)
+
+
 def _json_or_none(model: BaseModel | None) -> dict[str, object] | None:
     """Serializa un modelo pydantic, o ``None`` si no hay modelo que serializar."""
     return None if model is None else _json_dump(model)
@@ -596,6 +1305,187 @@ def _workspace(request: RoleExecutionRequest) -> Path:
     return Path(request.workspace_path) if request.workspace_path.strip() else Path()
 
 
+def _objective(task: PlannedTask | None, request: RoleExecutionRequest) -> str:
+    """Objetivo de la etapa: el de la tarea lista del plan y, si no lo declara, el de la petición.
+
+    La tarea lista se elige por orden del plan (``ready_tasks`` conserva ese orden), así que el
+    mismo plan produce siempre el mismo objetivo. El valor por defecto solo aparece si ni el plan ni
+    la petición dejan un carácter utilizable, porque los contratos de las tareas exigen un objetivo
+    no vacío.
+    """
+    declared = _one_line(_task_text(task, "objective"))
+    return _coalesce(declared, _one_line(request.objective), _DEFAULT_SLUG)
+
+
+def _changed_files(
+    developer: DeveloperExecutionResult, request: RoleExecutionRequest
+) -> tuple[str, ...]:
+    """Archivos que el Developer cambió **de verdad** y, si no declaró ninguno, los de la petición.
+
+    El resultado durable del Developer es el registro real del cambio; los ``changed_files`` de la
+    petición son lo que el llamante declaró antes de ejecutar. Cuando hay hechos, mandan los hechos.
+    """
+    declared = tuple(change.path for change in developer.files_changed if change.path)
+    if declared:
+        return declared
+    return tuple(request.changed_files)
+
+
+def _validation_checks(
+    developer: DeveloperExecutionResult, task: PlannedTask | None
+) -> tuple[str, ...]:
+    """Checks que el Developer declaró en su resultado y, si no declaró ninguno, los del plan.
+
+    El contrato de ``QATask`` dice que estos checks son **contexto, no prueba**: QA los recibe para
+    saber qué se ejecutó, y su veredicto lo calcula PUNTO a partir de su propia ejecución.
+    """
+    validation = developer.validation
+    if validation is not None:
+        names = tuple(check.name for check in validation.checks if check.name)
+        if names:
+            return names
+    return _declared(task, "validation_checks")
+
+
+def _capability_profile(plan: DurablePlan) -> tuple[str, ...]:
+    """Vocabulario de capacidades declarado por el Architect, en el orden del perfil y sin repetir.
+
+    Se copian los **nombres** —``python312``, ``pytest``, ``node20``— porque es el vocabulario con
+    el que el plan escribe ``required_capabilities``; añadir la familia convertiría cada nombre en
+    algo que ningún contrato de capacidades reconoce.
+    """
+    profile = plan.capability_profile
+    if profile is None:
+        return ()
+    return tuple(dict.fromkeys(name for _kind, name in profile.entries() if name))
+
+
+def _architecture_context(plan: DurablePlan) -> str:
+    """Resumen acotado de la arquitectura del plan, o cadena vacía si el bundle no la trae.
+
+    Se compone con datos del contrato —estilo y componentes— y nunca con contenido de ficheros: el
+    bundle durable no lleva código, y fabricarlo aquí sería inventar contexto.
+    """
+    architecture = plan.architecture
+    if architecture is None:
+        return ""
+    components = ", ".join(component.id for component in architecture.components)
+    summary = f"estilo: {architecture.architecture_style}"
+    if components:
+        summary = f"{summary}; componentes: {components}"
+    return _excerpt(_one_line(summary), _MAX_CONTEXT_CHARS)
+
+
+def _project_spec_context(plan: DurablePlan) -> str:
+    """Resumen acotado de la especificación del plan, o cadena vacía si el bundle no la trae."""
+    spec = plan.project_spec
+    if spec is None:
+        return ""
+    return _excerpt(_one_line(f"{spec.project_name}: {spec.problem_statement}"), _MAX_CONTEXT_CHARS)
+
+
+def _architecture_constraints(plan: DurablePlan) -> tuple[str, ...]:
+    """Restricciones que la especificación del plan declara, acotadas y sin repetir.
+
+    Son las únicas restricciones durables que existen: la arquitectura declara estilo, componentes y
+    fronteras, no restricciones verificables de un cambio. Inventar restricciones a partir de la
+    arquitectura haría que el Reviewer exigiera cosas que nadie escribió.
+    """
+    spec = plan.project_spec
+    if spec is None:
+        return ()
+    bounded = (_excerpt(_one_line(item), _MAX_CONTEXT_CHARS) for item in spec.constraints)
+    return tuple(dict.fromkeys(item for item in bounded if item))[:_MAX_CONTEXT_ITEMS]
+
+
+def _diff_summary(developer: DeveloperExecutionResult) -> str:
+    """Resumen controlado del cambio, compuesto solo con los hechos del resultado durable.
+
+    Se declara qué archivo cambió, con qué operación y cuántos bytes: es lo que el contrato del
+    resultado registra. No se copia contenido y no se inventa ningún diff, porque el handoff no lee
+    el workspace ni tiene el contenido anterior.
+    """
+    lines = [
+        f"- {change.path}: {change.operation.value.lower()}, {change.bytes_written} bytes"
+        for change in developer.files_changed[:_MAX_CONTEXT_ITEMS]
+        if change.path
+    ]
+    return _excerpt("\n".join(lines), _MAX_CONTEXT_CHARS)
+
+
+def _require_plan(plan: DurablePlan | None, stage: str) -> DurablePlan:
+    """Plan durable de la etapa, o ``WORKFLOW_INCOMPLETE_EVIDENCE`` diciendo qué falta y por qué.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si el resolutor no encontró plan durable. No se sustituye
+            por el objetivo de la petición disfrazado de plan: el contrato de la tarea —criterios,
+            capacidades, contexto— saldría inventado y la etapa evaluaría algo que nadie planificó.
+    """
+    if plan is None:
+        raise WorkflowIncompleteEvidenceError(
+            f"falta el plan durable ({PLAN_KIND}) del que {stage} toma el contrato de su tarea: "
+            "sin él, el objetivo, los criterios y las capacidades se inventarían, y PUNTO no "
+            "ejecuta una etapa sobre una suposición"
+        )
+    return plan
+
+
+def _require_developer(
+    developer: DeveloperExecutionResult | None, stage: str
+) -> DeveloperExecutionResult:
+    """Resultado durable del Developer, o ``WORKFLOW_INCOMPLETE_EVIDENCE`` diciendo qué falta.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si no hay resultado durable. Sin el trabajo real no hay
+            nada que verificar, y fabricar una evidencia vacía haría que la etapa aprobara un cambio
+            que quizá nunca ocurrió.
+    """
+    if developer is None:
+        raise WorkflowIncompleteEvidenceError(
+            f"falta el resultado durable del Developer ({DEVELOPER_KIND}) que {stage} debe "
+            "evaluar: sin el trabajo real no hay nada que verificar y PUNTO no fabrica su evidencia"
+        )
+    return developer
+
+
+def _require_report[ReportT: BaseModel](
+    report: ReportT | None, kind: str, stage: str, requirement: str
+) -> ReportT:
+    """Informe previo del que la etapa depende, o ``WORKFLOW_INCOMPLETE_EVIDENCE``.
+
+    Un informe previo es un **gate preceptivo**: falta o no, y no hay término medio. Rellenarlo con
+    un informe inventado en estado favorable sería exactamente la aprobación falsa que los gates
+    existen para impedir.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si el informe no está.
+    """
+    if report is None:
+        raise WorkflowIncompleteEvidenceError(
+            f"falta el informe durable {requirement} ({kind}) que {stage} necesita: es un gate "
+            "preceptivo y PUNTO no lo sustituye por una aprobación inventada"
+        )
+    return report
+
+
+def _require_web_evidence[EvidenceT: BaseModel](
+    evidence: EvidenceT | None, description: str
+) -> EvidenceT:
+    """Evidencia de la capa web que la etapa visual exige, o ``WORKFLOW_INCOMPLETE_EVIDENCE``.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si falta. La especificación visual y la sesión técnica las
+            mide PUNTO en un navegador real; no las produce ningún códec durable de esta fase, así
+            que la única alternativa a faltar sería inventarlas.
+    """
+    if evidence is None:
+        raise WorkflowIncompleteEvidenceError(
+            f"falta {description} de la etapa VISUAL_QA: no tiene códec durable en esta fase "
+            "—la produce la capa web— y PUNTO no inventa la evidencia contra la que se opina"
+        )
+    return evidence
+
+
 def _branch_name(request: RoleExecutionRequest, slug: str) -> str:
     """Rama de tarea determinista: ``ai/<slug>-<8 primeros del task_id>``.
 
@@ -665,12 +1555,38 @@ def _assert_role(request: RoleExecutionRequest, expected: RoleName, function: st
 
 __all__ = [
     "ARCHITECTURE_KIND",
+    "CROSS_AUDIT_KIND",
+    "DEVELOPER_KIND",
     "HANDOFF_SCHEMA_VERSION",
     "PLAN_KIND",
+    "QA_KIND",
+    "REVIEW_KIND",
+    "SECURITY_KIND",
+    "VISUAL_EVIDENCE_KIND",
+    "VISUAL_QA_KIND",
     "DurablePlan",
+    "cross_audit_input",
     "developer_input",
     "publish_architecture",
+    "publish_cross_audit",
+    "publish_developer",
     "publish_plan",
+    "publish_qa",
+    "publish_review",
+    "publish_security",
+    "publish_visual_evidence",
+    "publish_visual_qa",
+    "qa_input",
     "resolve_architecture",
+    "resolve_cross_audit",
+    "resolve_developer",
     "resolve_plan",
+    "resolve_qa",
+    "resolve_review",
+    "resolve_security",
+    "resolve_visual_evidence",
+    "resolve_visual_qa",
+    "review_input",
+    "security_input",
+    "visual_qa_input",
 ]

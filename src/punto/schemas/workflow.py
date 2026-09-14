@@ -249,6 +249,20 @@ class ProviderCapability(BaseModel):
         return role in self.role_support
 
 
+class ModelCallLimits(BaseModel):
+    """Cota de llamadas y de tokens de salida **declarada** por el runner de un rol.
+
+    La consulta el presupuesto del workflow para no autorizar una ejecución que podría gastar más de
+    lo permitido: es la única forma de conocer el máximo real del proveedor sin depender de su
+    implementación (hallazgo V603-01).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_model_calls: int = Field(..., ge=1)
+    max_output_tokens: int = Field(..., ge=1)
+
+
 class BudgetAllowance(BaseModel):
     """Lo que el rol **puede** gastar en modelo, calculado por el kernel antes de ejecutarlo.
 
@@ -536,6 +550,14 @@ class WorkflowRequest(BaseModel):
     workspace_path: str = Field(default="", max_length=MAX_WORKFLOW_TEXT_CHARS)
     changed_files: tuple[str, ...] = Field(default=(), max_length=MAX_CHANGED_FILES)
     context_summary: str = Field(default="", max_length=MAX_WORKFLOW_CONTEXT_CHARS)
+    #: Referencias durables que el *composition root* declara para el workflow: evidencia que ya
+    #: existe en un almacén estable antes de la primera etapa (por ejemplo, el informe técnico de la
+    #: sesión web medido en un navegador real). Viajan al checkpoint y se entregan a cada rol junto
+    #: con las de las etapas anteriores, de modo que ninguna etapa depende de memoria efímera
+    #: (hallazgo V603-04).
+    evidence_references: tuple[ArtifactReference, ...] = Field(
+        default=(), max_length=MAX_WORKFLOW_ARTIFACTS
+    )
     #: Verificación visual declarada por el llamante. Es una **señal a favor**: si el perfil web del
     #: proyecto la exige, se ejecuta aunque esto venga en ``False``.
     web_visual_required: bool = Field(default=False)

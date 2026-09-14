@@ -33,8 +33,8 @@ from punto.orchestrator.state_machine import StateMachine
 from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
-from punto.qa.base import QARunner
-from punto.reviewer.base import ReviewerRunner
+from punto.qa.base import QALimits, QARunner
+from punto.reviewer.base import ReviewerLimits, ReviewerRunner
 from punto.schemas.cross_audit import CrossAuditReport, CrossAuditStatus, CrossAuditTask
 from punto.schemas.enums import TaskStatus
 from punto.schemas.execution import DeveloperExecutionResult, DeveloperRunStatus, DeveloperTask
@@ -63,7 +63,7 @@ from punto.schemas.workflow import (
     WorkflowRequest,
     WorkflowRun,
 )
-from punto.security.base import SecurityRunner
+from punto.security.base import SecurityLimits, SecurityRunner
 from punto.tasks.manager import TaskManager
 from punto.visualqa.base import VisualQALimits, VisualQARunner
 from punto.workflow.artifacts import FileArtifactStore
@@ -253,12 +253,27 @@ class SilentDeveloper(DeveloperRunner):
 
 
 class PassingQA(QARunner):
-    """QA doble que aprueba."""
+    """QA doble que aprueba y declara su uso de modelo, porque su informe cuenta llamadas."""
 
     @property
     def provider(self) -> str:
         """Proveedor del doble."""
         return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble consume modelo, como el runner real."""
+        return True
+
+    @property
+    def limits(self) -> QALimits:
+        """Cota declarada por el doble: una llamada y un prompt corto."""
+        return QALimits(
+            max_attempts=1,
+            max_model_calls=1,
+            max_input_tokens=4_000,
+            max_output_tokens=4_000,
+        )
 
     def evaluate(self, task: QATask) -> QAReport:
         """Devuelve un informe aceptable."""
@@ -272,12 +287,27 @@ class PassingQA(QARunner):
 
 
 class PassingSecurity(SecurityRunner):
-    """Security doble que aprueba."""
+    """Security doble que aprueba y declara su uso de modelo, porque su informe cuenta llamadas."""
 
     @property
     def provider(self) -> str:
         """Proveedor del doble."""
         return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble consume modelo, como el runner real."""
+        return True
+
+    @property
+    def limits(self) -> SecurityLimits:
+        """Cota declarada por el doble: una llamada y un prompt corto."""
+        return SecurityLimits(
+            max_attempts=1,
+            max_model_calls=1,
+            max_input_tokens=4_000,
+            max_output_tokens=4_000,
+        )
 
     def evaluate(self, task: SecurityTask) -> SecurityReport:
         """Devuelve un informe sin hallazgos."""
@@ -291,12 +321,27 @@ class PassingSecurity(SecurityRunner):
 
 
 class PassingReviewer(ReviewerRunner):
-    """Reviewer doble que aprueba."""
+    """Reviewer doble que aprueba y declara su uso de modelo, porque su informe cuenta llamadas."""
 
     @property
     def provider(self) -> str:
         """Proveedor del doble."""
         return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble consume modelo, como el runner real."""
+        return True
+
+    @property
+    def limits(self) -> ReviewerLimits:
+        """Cota declarada por el doble: una llamada y un prompt corto."""
+        return ReviewerLimits(
+            max_attempts=1,
+            max_model_calls=1,
+            max_input_tokens=4_000,
+            max_output_tokens=4_000,
+        )
 
     def review(self, task: ReviewTask) -> ReviewReport:
         """Devuelve una revisión aprobada."""

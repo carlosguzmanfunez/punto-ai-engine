@@ -2722,6 +2722,46 @@ class AuditLogger:
             },
         )
 
+    def log_workflow_budget_reconciled(
+        self,
+        *,
+        project_id: UUID,
+        task_id: UUID,
+        workflow_id: UUID,
+        role: str,
+        step_index: int,
+        reported_model_calls: int,
+        reported_total_tokens: int,
+        authorized_model_calls: int,
+        authorized_total_tokens: int,
+        resolution: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la reconciliación explícita de una brecha de autorización (hallazgo V606-02).
+
+        Es la constancia de que alguien decidió que el workflow puede seguir con una contabilidad
+        que ya no cuadra; sin este evento, la reconciliación sería un cambio de estado sin rastro.
+        """
+        return self.record(
+            AuditEventType.WORKFLOW_BUDGET_RECONCILED,
+            action="workflow_budget_reconciled",
+            resource_id=workflow_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "project_id": str(project_id),
+                "task_id": str(task_id),
+                "workflow_id": str(workflow_id),
+                "role": role,
+                "step_index": step_index,
+                "reported_model_calls": reported_model_calls,
+                "reported_total_tokens": reported_total_tokens,
+                "authorized_model_calls": authorized_model_calls,
+                "authorized_total_tokens": authorized_total_tokens,
+                "resolution": resolution[:300],
+            },
+        )
+
     def log_workflow_completed(
         self,
         *,

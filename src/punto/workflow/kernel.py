@@ -43,14 +43,18 @@ from punto.policy.human_gate import HumanApprovalProof
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.policy import PolicyOutcome
 from punto.schemas.workflow import (
+    MAX_BUDGET_BREACHES,
     MAX_ROLES_EXECUTED,
     MAX_WORKFLOW_EVIDENCE,
     MAX_WORKFLOW_FINDINGS,
+    MAX_WORKFLOW_SUMMARY_CHARS,
     PAUSED_WORKFLOW_STATUSES,
     ArtifactReference,
     BudgetAllowance,
+    BudgetBreachRecord,
     EffectStatus,
     HumanGateRequest,
+    InvocationBudgetAuthorization,
     ModelCallLimits,
     RoleExecutionRequest,
     RoleExecutionResult,
@@ -539,32 +543,28 @@ class WorkflowKernel:
         else:
             resolved_key = ""
 
-        # Saldo de gasto en modelo calculado **antes** de invocar al rol: con el saldo agotado no
-        # se llama al proveedor (hallazgo V602-04: no basta con contabilizar después). Un rol que
-        # declara **no usar IA** no necesita saldo de modelo en absoluto (hallazgo V605-05): con
-        # ``max_model_calls=0`` y ``max_total_tokens=0`` un ejecutor determinista sigue pudiendo
-        # trabajar, así que la exigencia de saldo se decide después de preguntar por el rol.
+        # Brecha de autorización sin reconciliar (hallazgo V606-02): con la contabilidad de una
+        # invocación anterior inconsistente no se vuelve a llamar al proveedor. Es la versión de
+        # presupuesto del bloqueo por efecto incierto, y solo una reconciliación explícita la
+        # cierra.
+        pending_breach = self._unreconciled_breach(run, role)
+        if pending_breach is not None:
+            return self._block(
+                run, self._reconciliation_check(pending_breach), step_index=index
+            )
+
+        # Autorización de **esta** invocación (hallazgo V606-01): una sola cifra, calculada antes
+        # de invocar, que es a la vez la reserva durable, la cota que acota los límites efectivos
+        # del runner y la postcondición de después. Un rol que declara **no usar IA** no necesita
+        # saldo de modelo (hallazgo V605-05): con ``max_model_calls=0`` y ``max_total_tokens=0``
+        # un ejecutor determinista sigue trabajando, y su autorización es cero en las dos
+        # dimensiones, de modo que un gasto reportado después es una brecha de contrato.
         hint = self._model_budget_hint(role)
         deterministic = hint is not None and not hint.uses_ai
         allowance = None if deterministic else self._allowance(run)
         if not deterministic and allowance is None:
             return self._block(run, self._model_budget_denied(run), step_index=index)
-        # Cota contra la que se validará lo que el rol **diga** haber gastado (hallazgo V605-04): el
-        # saldo disponible antes de reservar, que es lo que de verdad se le autorizó. Se calcula
-        # antes de la reserva porque la reserva compromete ese saldo sin que el rol haya gastado
-        # aún; para un rol determinista —sin saldo de modelo— la cota es lo que quede del
-        # presupuesto, de modo que un ejecutor que se diga determinista y reporte gasto no lo
-        # esconda.
-        workflow_budget = run.request.budget
-        authorized_calls = max(
-            0, workflow_budget.max_model_calls - run.usage.model_calls_committed
-        )
-        authorized_tokens = max(
-            0, workflow_budget.max_total_tokens - run.usage.tokens_committed
-        )
-        if allowance is not None:
-            authorized_calls = min(authorized_calls, allowance.model_calls_remaining)
-            authorized_tokens = min(authorized_tokens, allowance.tokens_remaining)
+        authorization = self._invocation_authorization(run, hint=hint, allowance=allowance)
 
         request = self._role_request(run, role, index, key, allowance=allowance)
         attempts = 0
@@ -573,13 +573,9 @@ class WorkflowKernel:
         # Un rol con efectos secundarios se ejecuta **una sola vez**: si el efecto pudo empezar y la
         # llamada falla, su resultado es incierto y reintentar podría duplicarlo (hallazgo V602-05).
         max_attempts = 1 if role in EFFECTFUL_ROLES else MAX_TECHNICAL_ATTEMPTS
-        # La reserva de modelo es del **paso**, no del intento: se compromete una sola vez el máximo
-        # que la invocación puede gastar, y los reintentos técnicos del kernel —que repiten la misma
-        # invocación, no abren una nueva— corren dentro de esa misma reserva (hallazgos V603-02 y
-        # V605-03). Reservar otra vez por intento pedía el doble del máximo y dejaba el reintento
-        # sin saldo, que es justo lo contrario de lo que la reserva tiene que proteger.
-        step_calls = 0
-        step_tokens = 0
+        # La reserva de modelo es del **paso**, no del intento: se compromete una sola vez el
+        # máximo que la invocación puede gastar —la autorización—, y los reintentos técnicos del
+        # kernel, que repiten la misma invocación, corren dentro de ella (V603-02 y V605-03).
         while attempts < max_attempts:
             attempts += 1
             request = request.model_copy(update={"attempt": attempts})
@@ -592,20 +588,14 @@ class WorkflowKernel:
             # (hallazgo V602-04). Los intentos ya no se suman otra vez en el cierre del paso.
             run = self._consume(run, role_calls=1)
             if attempts == 1:
-                # Y con ella la del gasto de modelo (hallazgos V604-01 y V605-03): se compromete el
-                # **máximo** que esta invocación puede consumir bajo los límites efectivos —llamadas
-                # y tokens totales—, no una cifra arbitraria. Si el proceso cae después de gastar
-                # parte de ese máximo pero antes de devolver el resultado, el gasto sigue
-                # comprometido y un proceso nuevo no puede reutilizarlo.
-                reserved_calls = run.usage.model_calls_reserved
-                reserved_tokens = run.usage.tokens_reserved
-                run, reserved = self._reserve_model_budget(
-                    run, hint=hint, allowance=allowance
-                )
+                # Y con ella la del gasto de modelo: se compromete **exactamente** la autorización
+                # de la invocación (hallazgos V604-01, V605-03 y V606-01), así que lo reservado, lo
+                # autorizado y lo que se valida después son la misma cifra. Si el proceso cae
+                # después de gastar parte de ese máximo pero antes de devolver el resultado, el
+                # gasto sigue comprometido y un proceso nuevo no puede reutilizarlo.
+                run, reserved = self._reserve_model_budget(run, authorization=authorization)
                 if reserved is not None:
                     return self._block(run, reserved, step_index=index)
-                step_calls = run.usage.model_calls_reserved - reserved_calls
-                step_tokens = run.usage.tokens_reserved - reserved_tokens
             # Se **persiste** antes de invocar (hallazgos V603-02 y V604-01): una llamada iniciada
             # cuenta contra el presupuesto aunque el proceso muera antes de recibir o guardar la
             # respuesta.
@@ -641,22 +631,23 @@ class WorkflowKernel:
                 error_detail=detail,
             )
         else:
-            # Hallazgo V605-04: el resultado lo produce el runner, así que el kernel **valida** la
-            # postcondición antes de aceptarla. El consumo declarado por encima de lo autorizado no
-            # se liquida —se deja la reserva del paso, que sí cabe en el presupuesto—: sumarlo al
-            # contador dejaría el consumo del workflow por encima de su máximo y la transición de
-            # bloqueo, que también pasa por el presupuesto, ya no cabría: el workflow quedaría
-            # atascado en la etapa en vez de bloquearse. Lo que se conserva es la constancia del
-            # consumo declarado, que viaja en el veredicto con sus dos cifras.
-            breach = self._authorization_breach(result, authorized_calls, authorized_tokens)
+            # Hallazgos V605-04 y V606-01: el resultado lo produce el runner, así que el kernel
+            # **valida** la postcondición contra la cota de **esta** invocación —no contra el saldo
+            # global del workflow, que puede ser mucho mayor— antes de aceptarla. El consumo
+            # declarado por encima no se liquida: se deja la reserva del paso, que sí cabe en el
+            # presupuesto, se apunta la brecha para que no se reintente a ciegas (V606-02) y se
+            # bloquea. Sumarlo al contador dejaría el consumo del workflow por encima de su máximo
+            # y la propia transición de bloqueo, que también pasa por el presupuesto, no cabría.
+            breach = self._authorization_breach(result, authorization)
             if breach is not None:
+                run = self._record_breach(run, role, result, authorization, breach.detail)
                 return self._block(run, breach, step_index=len(run.steps))
-            # El resultado es coherente con lo autorizado: se sabe qué se gastó de verdad, así que
-            # la reserva del paso se convierte en consumo y se libera entera.
+            # El resultado cabe en lo autorizado: se sabe qué se gastó de verdad, así que la
+            # reserva del paso —que es la autorización— se convierte en consumo y se libera entera.
             run = self._settle_model_budget(
                 run,
-                reserved_calls=step_calls,
-                reserved_tokens=step_tokens,
+                reserved_calls=authorization.authorized_model_calls,
+                reserved_tokens=authorization.authorized_total_tokens,
                 result=result,
             )
 
@@ -673,28 +664,39 @@ class WorkflowKernel:
     def _authorization_breach(
         self,
         result: RoleExecutionResult,
-        authorized_calls: int,
-        authorized_tokens: int,
+        authorization: InvocationBudgetAuthorization,
     ) -> BudgetCheck | None:
-        """Comprueba que el rol no gastó más de lo autorizado, sin fiarse de su palabra.
+        """Comprueba que el rol no gastó más de lo que **esta** invocación tenía autorizado.
 
-        Hallazgo V605-04: el resultado lo produce el runner, así que el kernel **valida** la
-        postcondición en vez de aceptarla. Un consumo reportado por encima de la autorización es un
-        fallo de frontera con código estable: el workflow no continúa a la etapa siguiente y no
-        puede declararse ``COMPLETED``.
+        Hallazgos V605-04 y V606-01: el resultado lo produce el runner, así que el kernel **valida**
+        la postcondición en vez de aceptarla, y la valida contra la cota de la invocación —la misma
+        que se reservó antes de llamar—, no contra el saldo global del workflow. Comparar con el
+        saldo global dejaba pasar el caso peligroso: con 10 llamadas de presupuesto y una
+        autorizada, un runner que reportaba 2 cumplía ``2 <= 10`` y el workflow seguía como si nada.
 
-        La cota son las llamadas y tokens autorizados **antes** de reservar, que es el saldo que el
-        rol recibió. Un ejecutor determinista no recibe saldo de modelo, así que su cota es lo que
-        quede del presupuesto: si aun así reporta gasto, tampoco pasa.
+        Un rol que declara no usar IA tiene autorización cero: cualquier gasto reportado es una
+        brecha de **contrato**, porque no se le cree la declaración después de observar consumo.
 
-        El veredicto nombra la dimensión que se rebasó y lleva sus dos cifras —lo declarado por el
-        runner y lo autorizado—, que es lo que deja constancia del consumo real sin sumarlo al
-        contador del workflow.
+        El veredicto nombra la dimensión que se rebasó y lleva las dos cifras de cada una
+        —``actual`` y ``authorized_for_invocation``—, que es lo que deja constancia del consumo
+        declarado sin sumarlo al contador del workflow.
         """
+        authorized_calls = authorization.authorized_model_calls
+        authorized_tokens = authorization.authorized_total_tokens
         if result.model_calls <= authorized_calls and (
             result.usage.total_tokens <= authorized_tokens
         ):
             return None
+        if not authorization.uses_ai:
+            head = (
+                f"el rol {result.role.value} declaró no usar modelo y reportó gasto: "
+                "la declaración no se sostiene después de observar consumo"
+            )
+        else:
+            head = (
+                f"el rol {result.role.value} reportó más gasto del autorizado para esta "
+                "invocación"
+            )
         if result.model_calls > authorized_calls:
             limit = "max_model_calls"
             used = float(result.model_calls)
@@ -707,15 +709,135 @@ class WorkflowKernel:
             False,
             WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED,
             (
-                f"el rol {result.role.value} reportó un consumo mayor que el autorizado "
-                f"(llamadas {result.model_calls}/{authorized_calls}, tokens "
-                f"{result.usage.total_tokens}/{authorized_tokens}): la ejecución no continúa y el "
-                "consumo declarado queda escrito en este veredicto"
+                f"{head} (llamadas: actual = {result.model_calls}, "
+                f"authorized_for_invocation = {authorized_calls}; tokens: actual = "
+                f"{result.usage.total_tokens}, authorized_for_invocation = {authorized_tokens}). "
+                "El workflow se bloquea sin pasar de etapa, la brecha queda pendiente de "
+                "reconciliación y el gasto declarado no se suma al contador: sumarlo lo dejaría "
+                "por encima de su propio máximo"
             ),
             limit=limit,
             used=used,
             maximum=maximum,
         )
+
+    def _record_breach(
+        self,
+        run: WorkflowRun,
+        role: RoleName,
+        result: RoleExecutionResult,
+        authorization: InvocationBudgetAuthorization,
+        detail: str,
+    ) -> WorkflowRun:
+        """Apunta la brecha de forma **durable**, para que no se reintente a ciegas (V606-02).
+
+        El registro vive en el run —como los efectos sin resolver— así que viaja en el checkpoint y
+        lo ve un proceso nuevo. Sin él, una reanudación volvería a invocar al mismo proveedor con
+        una contabilidad que ya no cuadra.
+        """
+        record = BudgetBreachRecord(
+            role=role,
+            step_index=len(run.steps),
+            reported_model_calls=result.model_calls,
+            reported_total_tokens=result.usage.total_tokens,
+            authorized_model_calls=authorization.authorized_model_calls,
+            authorized_total_tokens=authorization.authorized_total_tokens,
+            deterministic=not authorization.uses_ai,
+            detail=detail,
+        )
+        return run.model_copy(
+            update={"budget_breaches": (*self._room_for_breach(run.budget_breaches), record)}
+        )
+
+    @staticmethod
+    def _room_for_breach(
+        breaches: tuple[BudgetBreachRecord, ...],
+    ) -> tuple[BudgetBreachRecord, ...]:
+        """Hace sitio en el libro de brechas sin rebasar la cota del contrato.
+
+        ``model_copy`` no valida, así que pasarse de ``MAX_BUDGET_BREACHES`` escribiría un
+        checkpoint que ya no se podría volver a validar al cargarlo. Solo se suelta una brecha **ya
+        reconciliada** —una cerrada, cuya traza puede descartarse—; una sin reconciliar no se borra
+        nunca, y no pueden acumularse más que los roles del workflow (ocho) sin pasar por una
+        reconciliación, porque una brecha sin reconciliar impide volver a invocar a ese rol.
+        """
+        if len(breaches) < MAX_BUDGET_BREACHES:
+            return breaches
+        for index, record in enumerate(breaches):
+            if record.reconciled:
+                return (*breaches[:index], *breaches[index + 1 :])
+        return breaches
+
+    def _unreconciled_breach(self, run: WorkflowRun, role: RoleName) -> BudgetBreachRecord | None:
+        """Brecha sin reconciliar que afecta a ese rol, si la hay (hallazgo V606-02)."""
+        for record in run.budget_breaches:
+            if record.role is role and not record.reconciled:
+                return record
+        return None
+
+    def _reconciliation_check(self, breach: BudgetBreachRecord) -> BudgetCheck:
+        """Veredicto estable de «brecha sin reconciliar»: no se vuelve a invocar a ese rol."""
+        return BudgetCheck(
+            False,
+            WorkflowFailureCode.WORKFLOW_BUDGET_RECONCILIATION_REQUIRED,
+            (
+                f"el rol {breach.role.value} reportó en su invocación anterior más gasto del "
+                f"autorizado (llamadas: actual = {breach.reported_model_calls}, "
+                f"authorized_for_invocation = {breach.authorized_model_calls}; tokens: actual = "
+                f"{breach.reported_total_tokens}, authorized_for_invocation = "
+                f"{breach.authorized_total_tokens}) y la brecha no está reconciliada: no se "
+                "vuelve a invocar al proveedor con una contabilidad inconsistente. Hace falta "
+                "una reconciliación explícita (reconcile_budget_breach)"
+            ),
+        )
+
+    def reconcile_budget_breach(
+        self, run: WorkflowRun, *, resolution: str, resolved_by: str
+    ) -> WorkflowRun:
+        """Cierra las brechas de autorización sin reconciliar de un workflow (hallazgo V606-02).
+
+        Es la **única** forma de desbloquear un workflow cuya última invocación reportó más gasto
+        del autorizado; el kernel no lo hace solo, igual que no reconcilia un efecto incierto. La
+        decisión no la toma esta función: viene de una persona o de una comprobación externa que ya
+        sabe qué pasó.
+
+        Lo que **no** hace, a propósito: devolver presupuesto ni sumar el gasto declarado. La
+        reserva comprometida sigue comprometida y el contador no se reescribe, porque el contador
+        del workflow no puede quedar por encima de su propio máximo. La reconciliación decide que el
+        workflow puede seguir, no cuánto se gastó: eso ya no se puede saber con certeza.
+
+        Si no hay nada sin reconciliar, el run se devuelve intacto: no se inventan registros.
+
+        Args:
+            run: Ejecución en curso. No se muta.
+            resolution: Motivo acotado de la decisión, para la traza.
+            resolved_by: Quién reconcilia; viaja al registro y a la auditoría.
+
+        Returns:
+            El run con las brechas reconciliadas, o el mismo run si no había ninguna.
+        """
+        breaches = run.budget_breaches
+        if not any(not record.reconciled for record in breaches):
+            return run
+        stamp = utc_now()
+        reconciled: list[BudgetBreachRecord] = []
+        for record in breaches:
+            if record.reconciled:
+                reconciled.append(record)
+                continue
+            closed = record.model_copy(
+                update={
+                    "reconciled_at": stamp,
+                    "reconciled_by": resolved_by[:80],
+                    "resolution": resolution[:MAX_WORKFLOW_SUMMARY_CHARS],
+                }
+            )
+            reconciled.append(closed)
+            self._audit_budget_reconciled(run, closed)
+        updated = run.model_copy(update={"budget_breaches": tuple(reconciled)})
+        self._store.save(updated)
+        return updated
+
 
     def _role_request(
         self,
@@ -780,55 +902,83 @@ class WorkflowKernel:
         hint = provider(role)
         return hint if isinstance(hint, ModelCallLimits) else None
 
-    def _reserve_model_budget(
+    def _invocation_authorization(
         self,
         run: WorkflowRun,
         *,
         hint: ModelCallLimits | None,
         allowance: BudgetAllowance | None,
-    ) -> tuple[WorkflowRun, BudgetCheck | None]:
-        """Reserva de forma **durable** el gasto **máximo** que la invocación puede producir.
+    ) -> InvocationBudgetAuthorization:
+        """Cota que **esta** invocación puede gastar: la fuente única del gasto (hallazgo V606-01).
 
-        Hallazgos V603-02, V604-01 y V605-03: la reserva tiene que representar el máximo que esta
-        invocación puede consumir bajo los límites efectivos, no una cifra fija. Si el rol declara
-        sus cotas, el máximo es ``min(cota declarada, saldo autorizado)``; si no las declara, no hay
-        forma de acotarlo por debajo del saldo, así que se compromete el saldo entero. El checkpoint
-        se escribe antes de la llamada, y una caída deja ese máximo comprometido hasta la
-        reconciliación: nunca se devuelve presupuesto automáticamente.
+        Es ``min(saldo del workflow, máximo declarado por el rol)`` campo a campo: si el rol declara
+        sus cotas, el máximo es el menor de los dos; si no las declara, no hay forma honesta de
+        acotarlo por debajo del saldo, así que la autorización es el saldo entero (política
+        conservadora de siempre). Un rol que declara ``uses_ai=False`` no tiene autorización de
+        modelo: cero en las dos dimensiones.
+
+        La misma cifra se reserva antes de invocar, acota los límites efectivos del runner —que
+        recibe ``min(su máximo, esta autorización)`` y por tanto nunca puede gastar más— y se usa
+        como postcondición después.
+        """
+        if hint is not None and not hint.uses_ai:
+            return InvocationBudgetAuthorization(uses_ai=False)
+        return InvocationBudgetAuthorization(
+            authorized_model_calls=self._authorized_calls(run, hint),
+            authorized_total_tokens=self._authorized_tokens(run, hint, allowance),
+            uses_ai=True,
+        )
+
+    def _reserve_model_budget(
+        self,
+        run: WorkflowRun,
+        *,
+        authorization: InvocationBudgetAuthorization,
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """Compromete de forma **durable** la autorización de la invocación, entera.
+
+        Hallazgos V603-02, V604-01, V605-03 y V606-01: la reserva no es una cifra propia —una
+        llamada y un colchón— sino la autorización misma. Con una sola cifra deja de haber dos
+        verdades que puedan discrepar: lo reservado es lo autorizado es lo que se valida después.
+        El checkpoint se escribe antes de la llamada, y una caída deja ese máximo comprometido hasta
+        la reconciliación: nunca se devuelve presupuesto automáticamente.
 
         Un rol que declara ``uses_ai=False`` no reserva nada: no gasta presupuesto de modelo.
         """
-        if hint is not None and not hint.uses_ai:
+        if not authorization.uses_ai:
             return run, None
-        calls = self._reservation_calls(run, hint)
-        tokens = self._reservation_tokens(run, hint, allowance)
         check = reserve_budget(
-            run, model_calls=calls, tokens=tokens, elapsed_seconds=self._elapsed(run)
+            run,
+            model_calls=authorization.authorized_model_calls,
+            tokens=authorization.authorized_total_tokens,
+            elapsed_seconds=self._elapsed(run),
         )
         if not check.allowed:
             return run, check
         usage = run.usage.model_copy(
             update={
-                "model_calls_reserved": run.usage.model_calls_reserved + calls,
-                "tokens_reserved": run.usage.tokens_reserved + tokens,
+                "model_calls_reserved": run.usage.model_calls_reserved
+                + authorization.authorized_model_calls,
+                "tokens_reserved": run.usage.tokens_reserved
+                + authorization.authorized_total_tokens,
             }
         )
         return run.model_copy(update={"usage": usage}), None
 
-    def _reservation_calls(self, run: WorkflowRun, hint: ModelCallLimits | None) -> int:
-        """Llamadas de modelo que hay que comprometer antes de invocar al rol."""
+    def _authorized_calls(self, run: WorkflowRun, hint: ModelCallLimits | None) -> int:
+        """Llamadas de modelo que **esta** invocación tiene autorizadas."""
         remaining = max(0, run.request.budget.max_model_calls - run.usage.model_calls_committed)
         if hint is not None and hint.max_model_calls is not None:
             return min(remaining, hint.max_model_calls)
         return remaining
 
-    def _reservation_tokens(
+    def _authorized_tokens(
         self,
         run: WorkflowRun,
         hint: ModelCallLimits | None,
         allowance: BudgetAllowance | None,
     ) -> int:
-        """Tokens totales que hay que comprometer antes de invocar al rol.
+        """Tokens totales que **esta** invocación tiene autorizados.
 
         El máximo declarado por el runner (entrada más salida) es la cota superior de lo que puede
         gastar; si no la declara, el máximo posible es el saldo autorizado, y si tampoco hay
@@ -1678,6 +1828,24 @@ class WorkflowKernel:
             limit=check.limit or check.detail,
             used=check.used,
             maximum=check.maximum,
+        )
+
+    def _audit_budget_reconciled(self, run: WorkflowRun, breach: BudgetBreachRecord) -> None:
+        """Audita la reconciliación explícita de una brecha de autorización (hallazgo V606-02)."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_budget_reconciled(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            role=breach.role.value,
+            step_index=breach.step_index,
+            reported_model_calls=breach.reported_model_calls,
+            reported_total_tokens=breach.reported_total_tokens,
+            authorized_model_calls=breach.authorized_model_calls,
+            authorized_total_tokens=breach.authorized_total_tokens,
+            resolution=breach.resolution,
+            actor=breach.reconciled_by or None,
         )
 
     def _audit_completed(self, run: WorkflowRun) -> None:

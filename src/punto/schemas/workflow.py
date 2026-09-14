@@ -48,6 +48,7 @@ MAX_ACCEPTANCE_CRITERIA: Final[int] = 20
 MAX_CHANGED_FILES: Final[int] = 80
 MAX_CONTEXT_ENTRIES: Final[int] = 24
 MAX_EFFECT_RECORDS: Final[int] = 48
+MAX_BUDGET_BREACHES: Final[int] = 16
 MAX_ROLES_EXECUTED: Final[int] = 12
 MAX_ROLE_SUPPORT: Final[int] = 12
 
@@ -122,6 +123,10 @@ class WorkflowFailureCode(StrEnum):
     #: Hay un efecto en vuelo cuyo resultado se desconoce: se bloquea para reconciliar, no se
     #: repite.
     WORKFLOW_EFFECT_RECONCILIATION_REQUIRED = "WORKFLOW_EFFECT_RECONCILIATION_REQUIRED"
+    #: Una invocación anterior reportó más gasto del que tenía autorizado y la brecha no se ha
+    #: reconciliado: no se vuelve a invocar a ese rol con una contabilidad inconsistente
+    #: (hallazgo V606-02). Es la versión de presupuesto del bloqueo por efecto incierto.
+    WORKFLOW_BUDGET_RECONCILIATION_REQUIRED = "WORKFLOW_BUDGET_RECONCILIATION_REQUIRED"
     #: El workflow llegó a ``REPAIRING`` y se detiene ahí: el ciclo de reparación completo es
     #: ENGINE-6.1. Es un código propio para no disfrazar la pausa de otra cosa.
     WORKFLOW_REPAIR_DEFERRED = "WORKFLOW_REPAIR_DEFERRED"
@@ -517,6 +522,73 @@ class StageArtifacts(BaseModel):
     recorded_at: datetime = Field(default_factory=utc_now)
 
 
+class InvocationBudgetAuthorization(BaseModel):
+    """Cota que **esta** invocación tiene autorizada: la única cifra que gobierna su gasto.
+
+    Hallazgo V606-01. El kernel calculaba tres números con semánticas distintas —el saldo global del
+    workflow, la reserva del paso y la cota con la que validaba después— y la postcondición acababa
+    comparando contra el saldo global: con un workflow de 10 llamadas y un rol que declara 1, un
+    runner que reportaba 2 pasaba la comprobación porque 2 ≤ 10, aunque esa invocación solo tuviera
+    permiso para una.
+
+    Esta es la **fuente única**: nace antes de invocar y es la misma cifra que se reserva de forma
+    durable, la que acota los límites efectivos del runner (``min(límite declarado, autorización)``,
+    que nunca puede ser mayor) y la que se usa como postcondición. Un rol que declara
+    ``uses_ai=False`` tiene autorización cero en las dos dimensiones: no se le cree si luego reporta
+    gasto (hallazgo V606-01, caso determinista).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: Llamadas de modelo que esta invocación puede gastar como máximo.
+    authorized_model_calls: int = Field(default=0, ge=0)
+    #: Tokens totales (entrada más salida) que esta invocación puede gastar como máximo.
+    authorized_total_tokens: int = Field(default=0, ge=0)
+    #: ``False`` si el rol declara no usar modelo: entonces la autorización es cero y cualquier
+    #: gasto reportado es una brecha de contrato, no un consumo dentro de presupuesto.
+    uses_ai: bool = Field(default=True)
+
+    @property
+    def allows_spending(self) -> bool:
+        """True si la invocación tiene permiso para gastar algo de modelo."""
+        return self.uses_ai and (
+            self.authorized_model_calls > 0 and self.authorized_total_tokens > 0
+        )
+
+
+class BudgetBreachRecord(BaseModel):
+    """Invocación que reportó más gasto del que tenía autorizado, pendiente de reconciliación.
+
+    Hallazgo V606-02. Una brecha de autorización deja la contabilidad inconsistente: el runner dice
+    que gastó más de lo que el kernel le dejó, así que reintentarlo automáticamente al reanudar
+    volvería a gastar sobre un presupuesto que ya no cuadra. El registro vive en el run —igual que
+    los efectos sin resolver— y solo ``reconcile_budget_breach`` lo cierra.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: RoleName = Field(...)
+    step_index: int = Field(..., ge=0)
+    reported_model_calls: int = Field(default=0, ge=0)
+    reported_total_tokens: int = Field(default=0, ge=0)
+    authorized_model_calls: int = Field(default=0, ge=0)
+    authorized_total_tokens: int = Field(default=0, ge=0)
+    deterministic: bool = Field(
+        default=False,
+        description="True si el rol declaraba no usar IA: cualquier gasto es brecha de contrato.",
+    )
+    detail: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
+    created_at: datetime = Field(default_factory=utc_now)
+    reconciled_at: datetime | None = Field(default=None)
+    reconciled_by: str = Field(default="", max_length=80)
+    resolution: str = Field(default="", max_length=MAX_WORKFLOW_SUMMARY_CHARS)
+
+    @property
+    def reconciled(self) -> bool:
+        """True si una reconciliación explícita ya cerró esta brecha."""
+        return self.reconciled_at is not None
+
+
 class EffectRecord(BaseModel):
     """Efecto con efectos secundarios, con su intención durable y su estado.
 
@@ -644,6 +716,11 @@ class WorkflowRun(BaseModel):
     )
     #: Intenciones y resultados de efectos con efectos secundarios, para no repetirlos a ciegas.
     effects: tuple[EffectRecord, ...] = Field(default=(), max_length=MAX_EFFECT_RECORDS)
+    #: Brechas de autorización de invocación sin reconciliar (hallazgo V606-02). Mientras haya una
+    #: que afecte al rol pendiente, no se vuelve a invocar al proveedor.
+    budget_breaches: tuple[BudgetBreachRecord, ...] = Field(
+        default=(), max_length=MAX_BUDGET_BREACHES
+    )
     #: Decisión de política vigente, si la hay: es la autoridad efectiva del workflow.
     policy_decision_id: UUID | None = Field(default=None)
     effective_authority: AuthorityLevel | None = Field(default=None)
@@ -714,6 +791,7 @@ PAUSED_WORKFLOW_STATUSES: Final[frozenset[TaskStatus]] = frozenset(
 
 __all__ = [
     "MAX_ACCEPTANCE_CRITERIA",
+    "MAX_BUDGET_BREACHES",
     "MAX_CHANGED_FILES",
     "MAX_CONTEXT_ENTRIES",
     "MAX_EFFECT_RECORDS",
@@ -733,10 +811,12 @@ __all__ = [
     "PAUSED_WORKFLOW_STATUSES",
     "TERMINAL_WORKFLOW_STATUSES",
     "ArtifactReference",
+    "BudgetBreachRecord",
     "CredentialState",
     "EffectRecord",
     "EffectStatus",
     "HumanGateRequest",
+    "InvocationBudgetAuthorization",
     "ProviderCapability",
     "RoleExecutionRequest",
     "RoleExecutionResult",

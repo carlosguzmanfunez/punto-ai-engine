@@ -34,7 +34,8 @@
 | **ENGINE-6.0.2** | **Final Autonomy Boundary Hardening.** La prueba humana autoriza exactamente la transición que se aplica, la política es obligatoria y se re-evalúa en cada paso y antes del efecto, el handoff durable vive en los adaptadores reales, el presupuesto es pre-gasto también en modelo/tokens y en transiciones, un efecto incierto no se reintenta y la verificación visual no se desactiva omitiendo metadatos. | ✅ Implementada |
 | **ENGINE-6.0.3** | **Final Execution Continuity & Budget Enforcement.** El saldo de modelo/tokens es una cota que llega al runner, la reserva pre-gasto se persiste antes de la llamada, un rol solo queda satisfecho con un resultado aceptable —así que reanudar reabre el rol que no terminó— y el handoff durable cubre toda la pipeline, de Architect a VisualQA. | ✅ Implementada |
 | **ENGINE-6.0.4** | **Token Accounting & Real Visual Handoff Closure.** `max_total_tokens` es un tope de **total** (entrada + salida) con reserva durable de llamada y tokens que un crash no devuelve, y el handoff visual transporta los **bytes reales** de las capturas con revalidación canónica: una captura manipulada, ausente o con hash que no cuadra bloquea el workflow sin ejecutar VisualQA. | ✅ Implementada |
-| **ENGINE-6.0.5** | **Real Provider Budget Enforcement.** El presupuesto del workflow llega hasta el HTTP del proveedor: los runners reales de DeepSeek toman `request.limits` (nunca su propia configuración) y el `max_tokens` del cuerpo es el autorizado, gasto a gasto; la reserva durable cubre el máximo que la invocación puede gastar; el kernel valida el consumo que declara el runner y bloquea si lo supera; un rol que declara no usar IA corre con presupuesto de modelo cero; y el manifiesto de capturas ata la evidencia a la identidad de su sesión. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
+| **ENGINE-6.0.5** | **Real Provider Budget Enforcement.** El presupuesto del workflow llega hasta el HTTP del proveedor: los runners reales de DeepSeek toman `request.limits` (nunca su propia configuración) y el `max_tokens` del cuerpo es el autorizado, gasto a gasto; la reserva durable cubre el máximo que la invocación puede gastar; el kernel valida el consumo que declara el runner y bloquea si lo supera; un rol que declara no usar IA corre con presupuesto de modelo cero; y el manifiesto de capturas ata la evidencia a la identidad de su sesión. | ✅ Implementada |
+| **ENGINE-6.0.6** | **Invocation Budget Postcondition Closure.** La postcondición del presupuesto se ata a la **cota de la invocación** —una sola cifra, `InvocationBudgetAuthorization`, que es a la vez la reserva durable, la cota de los límites efectivos del runner y el veredicto posterior— y no al saldo global del workflow; una brecha de autorización queda apuntada y **no se reintenta** al reanudar sin reconciliación explícita; y el consumo declarado nunca supera lo reservado. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -3151,11 +3152,44 @@ qué `max_tokens` se envió. La suite `tests/test_workflow_provider_budget_e2e.p
 ENGINE-6.0.5 **no** declara cerrada la fase 6.0: el cierre final sigue pendiente de auditoría del
 programador en jefe, y ENGINE-6.1 (ciclo de reparación) no está autorizada.
 
+### ENGINE-6.0.6 — La postcondición del presupuesto se ata a la invocación
+
+Sexta pasada, sobre el defecto residual que dejó la auditoría de 6.0.5: el kernel calculaba tres
+números con semánticas distintas —el saldo global del workflow, la reserva del paso y la cota con la
+que validaba después— y acababa validando contra el saldo global.
+
+| Hallazgo | Cómo se cierra |
+| --- | --- |
+| V606-01 La postcondición usaba el saldo global | `InvocationBudgetAuthorization` (`authorized_model_calls`, `authorized_total_tokens`) es la **fuente única**: se calcula antes de invocar como `min(saldo del workflow, cota declarada por el rol)`, se reserva **entera** y de forma durable antes de la llamada, acota los límites efectivos del runner —que recibe `min(su máximo, esta autorización)` y por tanto nunca puede gastar más— y es la cota contra la que se valida el resultado. Con 10 llamadas de presupuesto y 1 autorizada, un runner que reporta 2 ya no pasa por `2 <= 10`: se bloquea. Un rol que declara `uses_ai=False` tiene autorización cero en las dos dimensiones y, si reporta gasto, la brecha es de **contrato**: no se le cree después de observar consumo |
+| V606-02 Una brecha se reintentaba al reanudar | La brecha se apunta de forma durable en el run (`BudgetBreachRecord`, como los efectos sin resolver) y, mientras siga sin reconciliar, el rol no vuelve a invocar al proveedor: el kernel se bloquea con `WORKFLOW_BUDGET_RECONCILIATION_REQUIRED`. La única salida es `reconcile_budget_breach(run, resolution=..., resolved_by=...)`, que cierra la brecha, la audita (`WORKFLOW_BUDGET_RECONCILED`) y **no** devuelve presupuesto ni reescribe el contador: decide que el workflow puede seguir, no cuánto se gastó |
+| V606-03 Reserva y consumo podían divergir | Como la reserva **es** la autorización, el invariante es estructural: `actual_calls <= authorized_calls` y `actual_tokens <= authorized_tokens`, y por tanto el consumo declarado nunca supera lo reservado. Tras una ejecución válida la reserva se liquida con el consumo real; tras una brecha **no se libera** —sigue comprometida— y el gasto declarado no se suma al contador, porque sumarlo lo dejaría por encima de su propio máximo |
+
+`tests/test_workflow_invocation_caps_e2e.py` recorre los tres casos adversariales del encargo con la
+cota del workflow **siempre mayor** que la de la invocación —workflow 10 llamadas / invocación 1 /
+actual 2; workflow 100 000 tokens / invocación 10 000 / actual 40 000; y un rol determinista que
+reporta gasto— más la reanudación sin reconciliación y los invariantes de reserva. Con el
+comportamiento anterior simulado, **siete de esos ocho casos fallan**: la suite discrimina el defecto.
+
+Dos límites declarados, sin ampliar el alcance de la fase (H1 y H2 del encargo):
+
+- **H1 — la estimación de entrada es una heurística.** `estimate_input_tokens` reparte por caracteres
+  (dos por token más la sobrecarga del prompt) y es **conservadora**, no exacta: no se puede afirmar
+  que lo sea para cualquier tokenizer ni para cualquier texto Unicode. Se mantiene así, documentada,
+  hasta que el tokenizer exacto del proveedor se inyecte por `input_estimator`.
+- **H2 — la puerta de compatibilidad del tope de salida.** `accepts_output_budget` existe para
+  clientes antiguos o de prueba; los clientes reales del repositorio (DeepSeek y Anthropic) ya
+  implementan la cota. Un proveedor real futuro **debe** implementarla antes de ser autorizado para
+  gasto autónomo: sin ella el tope autorizado no llega a la petición y el presupuesto solo se podría
+  comprobar a posteriori, con el gasto ya hecho.
+
+ENGINE-6.0.6 **no** declara cerrada la fase 6.0: el cierre final sigue pendiente de auditoría del
+programador en jefe, y ENGINE-6.1 (ciclo de reparación) no está autorizada.
+
 ### Limitación declarada
 
 - **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
   `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
-- Ni ENGINE-6.0.4 ni ENGINE-6.0.5 declaran cerrada la fase 6.0: el cierre final queda pendiente de
+- Ni ENGINE-6.0.4, ni 6.0.5, ni 6.0.6 declaran cerrada la fase 6.0: el cierre final queda pendiente de
   auditoría del programador en jefe.
 - La estimación de tokens de entrada es deliberadamente pesimista (dos caracteres por token más la
   sobrecarga del prompt): con un tokenizador real disponible se inyecta un conteo exacto

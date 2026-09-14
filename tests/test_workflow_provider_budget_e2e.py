@@ -597,9 +597,9 @@ def test_a_runner_that_reports_more_calls_than_authorized_is_blocked(tmp_path: P
     assert run.failure is not None
     assert run.failure.code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED
     assert RoleName.PLANNER.value not in role_sequence(run), "ninguna etapa siguiente avanzó"
-    assert "llamadas 2/1" in run.failure.detail, (
-        "el consumo declarado queda escrito en el veredicto, no se oculta"
-    )
+    assert "actual = 2" in run.failure.detail and "authorized_for_invocation = 1" in (
+        run.failure.detail
+    ), "el consumo declarado queda escrito en el veredicto, no se oculta"
     assert run.usage.model_calls <= run.request.budget.max_model_calls, (
         "el contador del workflow no se deja por encima de su propio máximo"
     )
@@ -641,9 +641,9 @@ def test_a_runner_that_reports_more_tokens_than_authorized_is_blocked(tmp_path: 
     assert run.failure is not None
     assert run.failure.code is WorkflowFailureCode.WORKFLOW_BUDGET_EXCEEDED
     assert RoleName.PLANNER.value not in role_sequence(run), "ninguna etapa siguiente avanzó"
-    assert "tokens 10001/10000" in run.failure.detail.replace(",", ""), (
-        "el gasto declarado queda escrito en el veredicto, no se oculta"
-    )
+    assert "actual = 10001" in run.failure.detail.replace(",", "") and (
+        "authorized_for_invocation = 10000" in run.failure.detail.replace(",", "")
+    ), "el gasto declarado queda escrito en el veredicto, no se oculta"
     assert run.usage.total_tokens <= run.request.budget.max_total_tokens
     planner = executors[RoleName.PLANNER]
     assert isinstance(planner, FakeRoleExecutor)

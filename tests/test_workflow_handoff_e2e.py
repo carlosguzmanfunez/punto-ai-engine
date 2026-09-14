@@ -37,7 +37,7 @@ from punto.developer.context import ExecutionContext
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
-from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
+from punto.planner.base import PlannerLimits, PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.schemas.enums import TaskStatus
@@ -147,7 +147,11 @@ class CountingArchitectRunner(ArchitectRunner):
 
 
 class CountingPlannerRunner(PlannerRunner):
-    """Doble del Planner: anota la llamada y devuelve el plan preparado."""
+    """Doble del Planner: anota la llamada y devuelve el plan preparado.
+
+    Declara ``uses_ai`` y su cota, como el Planner real: su informe cuenta llamadas de modelo, así
+    que no puede presentarse como determinista (hallazgo V606-01, caso determinista).
+    """
 
     def __init__(self, ledger: CallLedger) -> None:
         self._ledger = ledger
@@ -156,6 +160,21 @@ class CountingPlannerRunner(PlannerRunner):
     def provider(self) -> str:
         """Proveedor declarado por el doble."""
         return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble consume modelo, como el runner real."""
+        return True
+
+    @property
+    def limits(self) -> PlannerLimits:
+        """Cota declarada: las llamadas que el informe declara y un prompt corto."""
+        return PlannerLimits(
+            max_attempts=PLANNER_MODEL_CALLS,
+            max_model_calls=PLANNER_MODEL_CALLS,
+            max_input_tokens=4_000,
+            max_output_tokens=4_000,
+        )
 
     def plan(self, request: PlannerRequest) -> PlanningOutcome:
         """Anota la llamada y devuelve el roadmap y el grafo de tareas válidos."""

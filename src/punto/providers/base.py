@@ -271,6 +271,13 @@ def accepts_output_budget(client: object) -> bool:
     poder **preguntarlo** en vez de suponerlo. Se acepta tanto el parámetro con nombre como
     un ``**kwargs`` que lo absorba.
 
+    Límite declarado (H2 de ENGINE-6.0.6): esta puerta de compatibilidad es para clientes
+    **antiguos o de prueba**. Los clientes reales del repositorio —DeepSeek y Anthropic— ya
+    implementan la cota, y un proveedor real futuro **debe** implementarla antes de ser
+    autorizado para gasto autónomo: sin ella, el tope autorizado no llega a la petición y el
+    presupuesto solo se podría comprobar a posteriori, cuando el gasto ya ocurrió. La puerta no
+    convierte esa carencia en una capacidad.
+
     Args:
         client: Cliente candidato. No se exige que implemente el contrato: la pregunta es
             precisamente si lo implementa con este parámetro.

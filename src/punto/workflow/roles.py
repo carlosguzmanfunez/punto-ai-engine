@@ -269,6 +269,12 @@ def estimate_input_tokens(payload: object, request: RoleExecutionRequest) -> int
     La estimación se calcula sobre lo que el rol **ve**: el texto de su entrada declarada (objetivo,
     criterios, ficheros, resumen de contexto) más el de la carga útil que PUNTO le entrega. Un
     conteo exacto se inyecta con ``input_estimator`` en el constructor del adaptador.
+
+    Límite declarado (H1 de ENGINE-6.0.6): esto es una **heurística por caracteres**, no una medida
+    exacta. No se puede afirmar que sea exacta para cualquier tokenizer ni para cualquier texto
+    Unicode —los tokenizadores reales reparten los caracteres no latinos de otra forma—, así que se
+    mantiene como estimación conservadora y documentada hasta que el tokenizer exacto del proveedor
+    esté disponible; entonces se inyecta y esta función deja de usarse en ese camino.
     """
     parts = (
         request.objective,

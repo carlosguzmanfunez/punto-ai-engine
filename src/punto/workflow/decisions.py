@@ -1,4 +1,4 @@
-"""Motor de decisiones del kernel (ENGINE-6.0).
+"""Motor de decisiones del kernel (ENGINE-6.0 / 6.1).
 
 El modelo no decide. Después de cada resultado de rol, PUNTO calcula **una** decisión a partir de
 hechos: el estado normalizado del rol, la gravedad real de sus hallazgos, si quedan roles en la
@@ -10,8 +10,12 @@ La precedencia es deliberada y no negociable:
 2. rol fallido → **FAIL**;
 3. rol bloqueado → **BLOCK**;
 4. hallazgos bloqueantes (y, por tanto, un ``HIGH`` o ``CRITICAL`` de Security) → **ENTER_REPAIR**
-   si queda presupuesto de reparación, y **BLOCK** con ``WORKFLOW_REPAIR_DEFERRED`` si no; nunca
-   aprobar;
+   si queda presupuesto de reparación, y **BLOCK** si no; nunca aprobar. El código del bloqueo
+   distingue dos cosas que no son lo mismo (ENGINE-6.1): con ``max_repairs == 0`` el workflow no
+   tiene bucle de reparación y la pausa se declara ``WORKFLOW_REPAIR_DEFERRED`` —el comportamiento
+   de 6.0, intacto—, mientras que con reparaciones declaradas y agotadas el motivo es
+   ``WORKFLOW_REPAIR_BUDGET_EXHAUSTED``: el bucle existía y se le acabó el presupuesto, que no es
+   lo mismo que no existir;
 5. rol no aplicable → seguir sin penalizar;
 6. todo correcto y quedan roles en la etapa → **CONTINUE**;
 7. todo correcto y era el último rol de la etapa → **READY_FOR_NEXT_STAGE** (o **COMPLETE** si la
@@ -135,16 +139,7 @@ def decide_after_role(
                 TaskStatus.REPAIRING,
                 f"{role.value}: {detail}; se entra en reparación",
             )
-        return WorkflowDecision(
-            WorkflowDecisionKind.BLOCK,
-            TaskStatus.BLOCKED,
-            (
-                f"{role.value}: {detail} y el presupuesto de reparación está agotado "
-                f"({usage.repairs}/{budget.max_repairs}); el ciclo de reparación autónomo es "
-                "ENGINE-6.1"
-            ),
-            WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED,
-        )
+        return decide_after_repair(budget=budget, usage=usage, detail=detail, role=role)
 
     if result.status is RoleStatus.NOT_APPLICABLE:
         if last_in_stage:
@@ -189,18 +184,45 @@ def decide_after_role(
     )
 
 
-def decide_after_repair(run_status: TaskStatus) -> WorkflowDecision:
-    """Decide qué hacer al llegar a ``REPAIRING`` en ENGINE-6.0.
+def decide_after_repair(
+    *,
+    budget: WorkflowBudget,
+    usage: WorkflowUsage,
+    detail: str = "",
+    role: RoleName | None = None,
+) -> WorkflowDecision:
+    """Decide qué hacer cuando un defecto bloqueante no puede entrar en reparación.
 
-    El kernel entra en reparación (queda registrado y auditable) y se detiene ahí: reinvocar al
-    Developer en bucle, reparar y volver a verificar es ENGINE-6.1. La pausa se declara con su
-    propio código para que nadie la confunda con un fallo del producto.
+    Dos casos, y el código los distingue porque significan cosas distintas:
+
+    - ``max_repairs == 0``: la petición no declara bucle de reparación. Es el comportamiento de
+      ENGINE-6.0, que se conserva **intacto** (``WORKFLOW_REPAIR_DEFERRED``): el workflow no se
+      queda a medias, pero tampoco repara nada.
+    - ``max_repairs > 0`` y agotado: el bucle existía y gastó sus intentos, así que el motivo es
+      ``WORKFLOW_REPAIR_BUDGET_EXHAUSTED``. No se amplía solo ni se reintenta lo mismo.
+
+    El presupuesto es la única entrada que decide: ni el modelo ni el rol que reportó el defecto
+    pueden cambiar cuál de los dos casos aplica.
     """
+    prefix = f"{role.value}: {detail} y " if role is not None and detail else ""
+    if budget.max_repairs == 0:
+        return WorkflowDecision(
+            WorkflowDecisionKind.BLOCK,
+            TaskStatus.BLOCKED,
+            (
+                f"{prefix}la petición no declara reparaciones (max_repairs=0); el ciclo de "
+                "reparación autónomo no está habilitado para este workflow"
+            ),
+            WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED,
+        )
     return WorkflowDecision(
         WorkflowDecisionKind.BLOCK,
         TaskStatus.BLOCKED,
-        "el workflow entró en REPAIRING; el ciclo de reparación autónomo llega en ENGINE-6.1",
-        WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED,
+        (
+            f"{prefix}el presupuesto de reparación está agotado "
+            f"({usage.repairs}/{budget.max_repairs}); no se abre otro ciclo ni se repite el mismo"
+        ),
+        WorkflowFailureCode.WORKFLOW_REPAIR_BUDGET_EXHAUSTED,
     )
 
 

@@ -1,4 +1,4 @@
-"""Máquina de estados del workflow autónomo (ENGINE-6.0).
+"""Máquina de estados del workflow autónomo (ENGINE-6.0 / ENGINE-6.1).
 
 La tabla de transiciones es **explícita y cerrada**: no hay estados ni saltos por texto libre, y
 ``NEW -> COMPLETED`` no existe. Un workflow solo avanza por donde esta tabla lo permite.
@@ -8,9 +8,12 @@ trabajar sobre el mismo asunto hace falta un workflow nuevo. ``BLOCKED`` y ``HUM
 son reanudables, pero solo por la operación explícita de reanudación —nunca por un paso normal—,
 que es lo que impide que un bloqueo se disuelva solo.
 
-``REPAIRING`` está preparado contractualmente y el kernel puede **entrar** en él, pero el ciclo de
-reparación completo es ENGINE-6.1: desde ``REPAIRING`` solo se sale a un estado de pausa o de
-cierre, y el motivo queda declarado con su propio código (``WORKFLOW_REPAIR_DEFERRED``).
+``REPAIRING`` deja de ser un estado de paso único (ENGINE-6.1): desde ahí el workflow puede volver
+al trabajo (``IN_PROGRESS``, cuando lo que hay que repetir es la construcción), entrar en la
+verificación (``QA``, que es el destino real del ciclo de reparación: reparar muta código y lo
+verificado deja de estarlo) o pausarse y cerrarse por los mismos caminos que cualquier etapa
+activa. La aprobación sigue sin ser alcanzable desde aquí: una reparación no aprueba nada por sí
+misma, y ``REPAIRING -> APPROVED`` queda documentada como prohibida.
 """
 
 from __future__ import annotations
@@ -107,9 +110,13 @@ WORKFLOW_TRANSITIONS: Final[MappingProxyType[TaskStatus, frozenset[TaskStatus]]]
                 TaskStatus.FAILED,
             }
         ),
-        # Preparado para ENGINE-6.1: en 6.0 solo se sale hacia una pausa o un cierre.
+        # ENGINE-6.1: el ciclo de reparación vuelve al trabajo o a la verificación. ``QA`` es el
+        # destino real (reparar muta código y lo verificado deja de estarlo) e ``IN_PROGRESS``
+        # queda abierto para una reparación que tenga que rehacer la construcción.
         TaskStatus.REPAIRING: frozenset(
             {
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.QA,
                 TaskStatus.BLOCKED,
                 TaskStatus.HUMAN_APPROVAL,
                 TaskStatus.FAILED,
@@ -154,12 +161,16 @@ RESUME_TARGETS: Final[MappingProxyType[TaskStatus, frozenset[TaskStatus]]] = Map
 )
 
 #: Transiciones prohibidas que se documentan como ejemplos de lo que la tabla impide.
+#:
+#: ``REPAIRING -> APPROVED`` ocupa el sitio de la antigua ``REPAIRING -> IN_PROGRESS`` (que en
+#: ENGINE-6.1 sí está permitida): una reparación muta código, así que no puede saltar a la
+#: aprobación; tiene que volver a pasar por la verificación.
 FORBIDDEN_WORKFLOW_TRANSITIONS: Final[tuple[tuple[TaskStatus, TaskStatus], ...]] = (
     (TaskStatus.NEW, TaskStatus.COMPLETED),
     (TaskStatus.NEW, TaskStatus.APPROVED),
     (TaskStatus.ANALYZING, TaskStatus.IN_PROGRESS),
     (TaskStatus.QA, TaskStatus.APPROVED),
-    (TaskStatus.REPAIRING, TaskStatus.IN_PROGRESS),
+    (TaskStatus.REPAIRING, TaskStatus.APPROVED),
 )
 
 

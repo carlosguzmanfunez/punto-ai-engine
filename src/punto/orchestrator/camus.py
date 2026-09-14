@@ -78,6 +78,7 @@ from punto.schemas.planning import (
 )
 from punto.schemas.policy import PolicyDecision, PolicyOutcome
 from punto.schemas.qa import QAReport, QATask
+from punto.schemas.repair import RepairTask
 from punto.schemas.result import ExecutionResult
 from punto.schemas.review import ReviewReport, ReviewTask
 from punto.schemas.security import SecurityReport, SecurityTask
@@ -89,6 +90,7 @@ from punto.tasks.manager import TaskManager
 from punto.tools.errors import (
     ArchitectRunnerNotConfiguredError,
     CrossAuditRunnerNotConfiguredError,
+    DeveloperExecutionError,
     DeveloperRunnerNotConfiguredError,
     PlannerRunnerNotConfiguredError,
     PlanningValidationError,
@@ -287,6 +289,19 @@ class Camus:
     def developer_runner(self) -> DeveloperRunner | None:
         """Frontera de ejecución inyectada, si existe (ENGINE-1)."""
         return self._developer
+
+    @property
+    def developer_repair_supported(self) -> bool:
+        """True si el runner del Developer declara saber recibir contexto de reparación.
+
+        Es la consulta que el adaptador de rol hace **antes** de invocar una reparación: la
+        capacidad la declara el runner (``DeveloperRunner.supports_repair_context``), no la supone
+        CAMUS. Sin runner inyectado, o con un runner que no lo declare, la respuesta es ``False`` y
+        la reparación no se entrega como si fuera una tarea normal (fail-closed).
+        """
+        if self._developer is None:
+            return False
+        return self._developer.supports_repair_context
 
     @property
     def architect_runner(self) -> ArchitectRunner | None:
@@ -977,14 +992,90 @@ class Camus:
         que la protección constitucional y los presupuestos se aplican **antes**
         de tocar el disco (además de la protección propia del tool de archivos).
 
+        Una tarea con contexto de reparación (``task.repair``) **no** se ejecuta por aquí: la
+        reparación tiene su propio punto de entrada (:meth:`execute_repair_task`), que exige un
+        runner que declare saber recibirla. Aceptarla en silencio ejecutaría una reparación como una
+        tarea normal, sin reglas duras ni autorización acotada.
+
         Raises:
             DeveloperRunnerNotConfiguredError: si no hay runner inyectado.
+            DeveloperExecutionError: si la tarea trae contexto de reparación. Es un error de quien
+                llama, no un estado del workflow: la reparación va por su propio método.
+        """
+        if task.repair is not None:
+            raise DeveloperExecutionError(
+                "la tarea trae contexto de reparación y execute_developer_task ejecuta trabajo "
+                "normal: la reparación va por execute_repair_task, que comprueba que el runner "
+                "declara soportarla"
+            )
+        return self._run_developer_task(task, context, repair=None)
+
+    def execute_repair_task(
+        self, task: DeveloperTask, context: ExecutionContext
+    ) -> DeveloperExecutionResult:
+        """Ejecuta una **reparación** delegando en el MISMO ``DeveloperRunner`` de siempre.
+
+        No hay un segundo Developer ni un runner de reparación distinto: lo que cambia es el
+        contexto, que viaja en ``task.repair`` (el ``RepairTask`` con el plan, el diagnóstico, los
+        defectos, el snapshot y los criterios). El runner es el mismo objeto inyectado en CAMUS y su
+        método sigue siendo ``execute``; la reparación es trabajo del Developer, no otro rol.
+
+        Dos exigencias, y las dos son fail-closed:
+
+        - la tarea tiene que traer el ``RepairTask``: sin él no hay encargo que ejecutar, y
+          inventarse uno sería fabricar la autorización que el kernel calculó;
+        - el runner tiene que **declarar** que sabe recibir ese contexto
+          (``DeveloperRunner.supports_repair_context``): un runner que lo ignore ejecutaría la
+          reparación como una tarea normal, sin las reglas duras ni los archivos objetivo del plan.
+
+        Los archivos objetivo del plan de reparación entran en la evaluación del Policy Engine junto
+        con los de la receta: la protección constitucional y los presupuestos se aplican **antes**
+        de que nadie toque el disco, y ``forbidden_files`` del plan no puede colarse por una
+        reparación.
+
+        Raises:
+            DeveloperRunnerNotConfiguredError: si no hay runner inyectado.
+            DeveloperExecutionError: si la tarea no trae contexto de reparación o si el runner no
+                declara soportarlo.
+        """
+        repair = task.repair
+        if repair is None:
+            raise DeveloperExecutionError(
+                "execute_repair_task exige el contexto de reparación (DeveloperTask.repair): "
+                "sin él no hay plan, ni diagnóstico, ni defectos que corregir"
+            )
+        runner = self._developer
+        if runner is None:
+            raise DeveloperRunnerNotConfiguredError()
+        if not runner.supports_repair_context:
+            raise DeveloperExecutionError(
+                f"el runner {runner.name} no declara soporte de contexto de reparación "
+                "(supports_repair_context=False): CAMUS no le entrega una reparación como si fuera "
+                "una tarea normal y PUNTO no crea un segundo Developer incompatible"
+            )
+        return self._run_developer_task(task, context, repair=repair)
+
+    def _run_developer_task(
+        self,
+        task: DeveloperTask,
+        context: ExecutionContext,
+        *,
+        repair: RepairTask | None,
+    ) -> DeveloperExecutionResult:
+        """Camino común de la ejecución del Developer: política, auditoría y delegación.
+
+        Lo comparten la tarea normal y la reparación porque la frontera de autoridad es la misma y
+        no puede haber dos políticas distintas para el mismo rol. Lo único que cambia con
+        ``repair`` es que sus ``target_files`` se declaran al Policy Engine como archivos que la
+        acción va a tocar.
         """
         if self._developer is None:
             raise DeveloperRunnerNotConfiguredError()
 
         declared_files = [spec.path for spec in task.files]
         declared_files.extend(replacement.path for replacement in task.replacements)
+        if repair is not None:
+            declared_files.extend(repair.target_files)
 
         request = ActionRequest(
             action=task.action,

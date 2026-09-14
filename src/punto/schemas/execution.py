@@ -5,18 +5,41 @@ recibe un ``DeveloperRunner``, las recetas deterministas que ejecuta el runner
 local, y la evidencia estructurada que produce.
 
 Sin IA: estos modelos describen trabajo **declarado**, no generado.
+
+Contexto de reparación (ENGINE-6.1.1)
+-------------------------------------
+``DeveloperTask.repair`` es opcional y por defecto ``None``: cuando viaja, la tarea es una
+**reparación** y el runner recibe el encargo completo (plan, diagnóstico, defectos, snapshot y
+criterios) dentro de la misma tarea. No hay un segundo Developer ni una segunda interfaz de runner:
+lo que cambia es el contexto, no el contrato de ejecución.
+
+Su tipo se enlaza en la **primera construcción** (:meth:`DeveloperTask.__init__`) y no al importar
+este módulo, y el motivo es un ciclo de importación real: ``punto.schemas.repair`` importa
+``punto.schemas.workflow``, que importa **este** módulo (``ModelUsage``). Importarlo aquí arriba
+rompería la carga de cualquiera de los tres, en cualquiera de los dos órdenes posibles. El enlace
+diferido conserva el contrato exacto —``RepairTask | None``, validado por pydantic— sin cerrar el
+ciclo. Límite declarado: una tarea no se reconstruye desde JSON en PUNTO (el encargo viaja por los
+artefactos durables del handoff, no dentro de la tarea), así que la única vía de construirla es el
+constructor, que es exactamente la que enlaza el tipo.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from punto.common import utc_now
 from punto.schemas.enums import RiskLevel
+
+if TYPE_CHECKING:
+    from punto.schemas.repair import RepairTask
+
+#: ``True`` cuando el campo ``repair`` ya está enlazado con su tipo real. Evita repetir el enlace.
+_REPAIR_FIELD_BOUND: bool = False
 
 #: Código de salida con el que se marca un comando que agotó su timeout. Es el
 #: código convencional de ``timeout(1)``; el campo ``timed_out`` lo desambigua.
@@ -399,6 +422,42 @@ class DeveloperTask(BaseModel):
     max_context_bytes: int = Field(
         default=200_000, gt=0, description="Límite de bytes de contexto enviado al modelo."
     )
+
+    # --- ENGINE-6.1: contexto de reparación del ciclo autónomo acotado ---
+    repair: RepairTask | None = Field(
+        default=None,
+        description=(
+            "Encargo de reparación (``RepairTask``) cuando esta ejecución repara defectos "
+            "declarados. ``None`` en el trabajo normal del Developer."
+        ),
+    )
+
+    def __init__(self, **data: Any) -> None:
+        """Enlaza el tipo del contexto de reparación y construye la tarea.
+
+        El enlace es diferido por el ciclo de importación documentado en el módulo: la primera vez
+        que se construye una tarea —siempre después de que los módulos estén cargados— el campo
+        ``repair`` queda resuelto contra ``RepairTask`` y pydantic lo valida como cualquier otro.
+        Las siguientes construcciones no pagan nada: el enlace se hace una sola vez.
+        """
+        _bind_repair_field()
+        super().__init__(**data)
+
+
+def _bind_repair_field() -> None:
+    """Resuelve el campo ``repair`` de :class:`DeveloperTask` contra su contrato real.
+
+    Se llama en la primera construcción. Falla si ``punto.schemas.repair`` no se puede importar,
+    que ya no es un ciclo de importación sino un defecto de instalación: preferimos un error
+    explícito a una tarea sin el contrato de reparación.
+    """
+    global _REPAIR_FIELD_BOUND
+    if _REPAIR_FIELD_BOUND:
+        return
+    from punto.schemas.repair import RepairTask
+
+    DeveloperTask.model_rebuild(_types_namespace={"RepairTask": RepairTask})
+    _REPAIR_FIELD_BOUND = True
 
 
 # ---------------------------------------------------------------------------

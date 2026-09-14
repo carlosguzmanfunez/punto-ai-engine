@@ -11,6 +11,12 @@ tocar el núcleo ni esta interfaz.
 Un ``DeveloperRunner`` **no** decide autoridad. Aplica los límites técnicos que le
 fija el ``ExecutionContext`` y rechaza lo que los viole, pero jamás eleva
 permisos: la jerarquía es Policy Engine -> CAMUS -> DeveloperRunner.
+
+Reparación (ENGINE-6.1.1): la reparación **no** crea un segundo Developer. El encargo viaja en
+``DeveloperTask.repair`` y lo ejecuta este mismo contrato con :meth:`DeveloperRunner.execute`. Lo
+único que cambia es que el runner tiene que **declarar** que sabe recibir ese contexto
+(:attr:`DeveloperRunner.supports_repair_context`), porque un runner que lo ignorara ejecutaría una
+reparación como una tarea normal: sin las reglas duras y sin la autorización acotada del plan.
 """
 
 from __future__ import annotations
@@ -59,6 +65,25 @@ class DeveloperRunner(ABC):
         if self.generates_code_with_ai:
             return ExecutionTrustLevel.UNTRUSTED_MODEL
         return ExecutionTrustLevel.TRUSTED_LOCAL
+
+    @property
+    def supports_repair_context(self) -> bool:
+        """True si el runner sabe recibir el **contexto de reparación** de la tarea.
+
+        El contexto llega en ``DeveloperTask.repair`` (ENGINE-6.1): plan, diagnóstico, defectos,
+        snapshot y criterios. No hay un runner de reparación distinto —es **este** mismo runner—,
+        pero saber leer ese contexto es una capacidad que se **declara**, nunca se supone: un
+        runner que lo ignore ejecutaría una reparación como si fuera una tarea normal, sin las
+        reglas duras ni la autorización acotada, que es exactamente lo que el ciclo de reparación
+        existe para impedir.
+
+        Por defecto ``False`` (fail-closed). CAMUS y el adaptador de rol exigen esta declaración
+        antes de invocar una reparación, así que un runner que no la declare no recibe trabajo de
+        reparación y la etapa falla de forma explícita en vez de degradarse en silencio. El runner
+        real de DeepSeek todavía no lo declara: recibir y aplicar este contexto es trabajo de una
+        fase posterior, y hasta entonces esta propiedad es la frontera que lo dice.
+        """
+        return False
 
     def resolve_backend(
         self, context: ExecutionContext, backend: ExecutionBackend | None

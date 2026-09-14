@@ -18,6 +18,10 @@ Tres decisiones que conviene leer antes de tocar nada:
   partir de una verificación nueva que ya no reproduce el defecto y con los gates exigidos en PASS.
   El fingerprint canónico (campos estructurados, nunca timestamps) es lo que permite detectar que
   el mismo defecto volvió y cortar el bucle por falta de progreso.
+- **El encargo viaja como contexto, no como un segundo Developer.** ``RepairTask`` reúne plan,
+  diagnóstico, defectos, snapshot y criterios para que el **mismo** ``DeveloperRunner`` de siempre
+  repare con ``DeveloperTask.repair``. No hay un runner de reparación distinto: lo que cambia es el
+  contexto con el que se ejecuta el Developer, y sus reglas duras son texto fijo.
 """
 
 from __future__ import annotations
@@ -48,6 +52,41 @@ MAX_REPAIR_DIAGNOSIS_UNKNOWNS: Final[int] = 12
 #: Cuántas veces puede repetirse **el mismo** intento sin progreso antes de cortar el bucle.
 #: Explícito y pequeño a propósito: el bucle no es «prueba hasta que salga».
 MAX_IDENTICAL_REPAIR_FAILURES: Final[int] = 2
+
+#: Objetivo determinista del encargo de reparación que recibe el Developer.
+#:
+#: No se compone con el texto del diagnóstico ni con el resumen de los defectos: el objetivo es la
+#: instrucción de trabajo —corregir lo declarado sin ampliar el alcance—, y los defectos concretos
+#: viajan en ``findings``, que es dato estructurado y no prosa que un modelo pueda reinterpretar.
+REPAIR_OBJECTIVE: Final[str] = (
+    "corrige los defectos declarados sin ampliar el alcance (mínima modificación)"
+)
+
+#: Reglas duras del prompt de reparación, en texto fijo y numerado.
+#:
+#: Son constantes y no se derivan de ningún campo a propósito: una reparación que pudiera reescribir
+#: sus propias reglas dejaría de ser una reparación acotada. El orden es el de la lista, de modo que
+#: el mismo encargo produce siempre el mismo prompt y un fallo se puede reproducir palabra por
+#: palabra. Cada regla existe porque su infracción ya está prohibida en otra capa (la constitución,
+#: el Policy Engine, el ``RepairGuard`` o el kernel) y el prompt solo la declara antes de trabajar.
+REPAIR_HARD_RULES: Final[tuple[str, ...]] = (
+    "1. mínima modificación: toca solo lo imprescindible para corregir el defecto.",
+    "2. arregla solo los findings declarados: nada fuera de esa lista.",
+    "3. no amplíes el alcance: sin refactorizaciones, renombrados ni reorganizaciones.",
+    "4. no toques archivos prohibidos: respeta forbidden_files y los globs autorizados.",
+    "5. no debilites gates: no relajes validaciones, comprobaciones ni umbrales.",
+    "6. no elimines pruebas ni añadas skip/xfail: una prueba que falla se arregla, no se silencia.",
+    "7. no subas presupuestos: ni coste, ni tiempo, ni archivos, ni reparaciones.",
+    "8. no toques config/constitution.yaml ni config/permissions.yaml: son reglas de autoridad.",
+    "9. no autoapruebes: la verificación la repiten los roles del plan, no quien repara.",
+)
+
+#: Cabecera del bloque de reglas duras. Declara que las reglas no se negocian.
+REPAIR_RULES_HEADER: Final[str] = "REGLAS DURAS DE LA REPARACIÓN (no negociables):"
+
+#: Cabecera de las restricciones adicionales declaradas por el plan de reparación.
+#: Son subordinadas a las reglas duras: nunca las sustituyen ni las recortan.
+REPAIR_EXTRA_RULES_HEADER: Final[str] = "RESTRICCIONES ADICIONALES DEL PLAN DE REPARACIÓN:"
 
 
 class Repairability(StrEnum):
@@ -322,6 +361,66 @@ class RepairCycle(BaseModel):
     completed_at: datetime | None = Field(default=None)
 
 
+class RepairTask(BaseModel):
+    """Encargo de reparación que recibe el Developer real.
+
+    Es el **contexto de reparación**: no crea un segundo Developer ni un runner aparte, viaja dentro
+    de la tarea de desarrollo que el mismo ``DeveloperRunner`` de siempre ya sabe ejecutar
+    (``DeveloperTask.repair``). Reúne lo que la reparación necesita para no improvisar: el contrato
+    (``plan``: qué se puede tocar y qué se espera), el diagnóstico y los defectos que la motivan, el
+    snapshot previo para poder deshacerla y los criterios con los que se volverá a verificar.
+
+    Dos decisiones que conviene leer antes de tocar nada:
+
+    - **el plan manda en la autorización**: ``target_files``, ``allowed_file_globs`` y
+      ``forbidden_files`` se copian del ``RepairPlan``, que es el contrato del ciclo. Este modelo no
+      los recalcula ni los amplía; el adaptador los copia tal cual a la tarea del Developer.
+    - **las reglas duras son texto fijo**: :meth:`prompt_constraints` devuelve siempre
+      :data:`REPAIR_HARD_RULES`. ``constraints`` solo puede **añadir** restricciones del plan, y
+      viajan bajo una cabecera que las declara subordinadas: un campo libre no puede reescribir la
+      regla que prohíbe tocar la constitución.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    repair_id: UUID = Field(...)
+    workflow_id: UUID = Field(...)
+    task_id: UUID = Field(...)
+    cycle: int = Field(..., ge=1)
+    project_id: UUID = Field(...)
+    objective: str = Field(..., min_length=1, max_length=MAX_WORKFLOW_TEXT_CHARS)
+    plan: RepairPlan = Field(...)
+    diagnosis: RepairDiagnosis | None = Field(default=None)
+    findings: tuple[RepairFinding, ...] = Field(default=(), max_length=MAX_REPAIR_FINDINGS)
+    target_files: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_FILES)
+    allowed_file_globs: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_FILES)
+    forbidden_files: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_FILES)
+    snapshot_id: UUID | None = Field(default=None)
+    acceptance_criteria: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_EVIDENCE)
+    verification_roles: tuple[RoleName, ...] = Field(default=(), max_length=8)
+    #: Restricciones adicionales del plan. Se **añaden** a las reglas duras, nunca las recortan.
+    constraints: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_DIAGNOSIS_UNKNOWNS)
+    idempotency_key: str = Field(..., min_length=1, max_length=120)
+    workspace_path: str = Field(default="")
+
+    def prompt_constraints(self) -> str:
+        """Devuelve el bloque de reglas duras del prompt, en texto estable y sin razonamiento.
+
+        El texto es determinista: la misma tarea produce siempre el mismo bloque, sin depender del
+        reloj, del azar ni del proceso que lo pide, de modo que un fallo se puede reproducir y
+        auditar palabra por palabra. Contiene **siempre** :data:`REPAIR_HARD_RULES` completas; si la
+        tarea declara ``constraints``, se añaden al final bajo
+        :data:`REPAIR_EXTRA_RULES_HEADER`, que las declara subordinadas. Nunca se incluye aquí el
+        diagnóstico ni la evidencia: el prompt declara límites, no una narración de por qué se
+        repara.
+        """
+        lines = [REPAIR_RULES_HEADER, *REPAIR_HARD_RULES]
+        if self.constraints:
+            lines.append(REPAIR_EXTRA_RULES_HEADER)
+            lines.extend(f"- {item}" for item in self.constraints)
+        return "\n".join(lines)
+
+
 __all__ = [
     "MAX_IDENTICAL_REPAIR_FAILURES",
     "MAX_REPAIR_CYCLES",
@@ -330,6 +429,10 @@ __all__ = [
     "MAX_REPAIR_FILES",
     "MAX_REPAIR_FINDINGS",
     "MAX_REPAIR_SNAPSHOT_ENTRIES",
+    "REPAIR_EXTRA_RULES_HEADER",
+    "REPAIR_HARD_RULES",
+    "REPAIR_OBJECTIVE",
+    "REPAIR_RULES_HEADER",
     "RepairAttempt",
     "RepairAttemptStatus",
     "RepairConfidence",
@@ -342,5 +445,6 @@ __all__ = [
     "RepairPlan",
     "RepairSnapshot",
     "RepairSnapshotEntry",
+    "RepairTask",
     "Repairability",
 ]

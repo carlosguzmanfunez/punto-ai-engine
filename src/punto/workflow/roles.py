@@ -81,6 +81,23 @@ tenían siguen funcionando—, pero ya no es la única vía: el defecto reconstr
 almacén. Un rol sin constructor oficial (QA, Security, Reviewer, auditoría cruzada y QA visual)
 exige su ``build_input``: PUNTO no improvisa la entrada de un rol que no tiene handoff definido.
 
+Reparación con el mismo Developer (ENGINE-6.1.1)
+------------------------------------------------
+Cuando el paso ``DEVELOPER`` trae un plan de reparación entre sus referencias, el adaptador resuelve
+del almacén el encargo completo —plan, diagnóstico, defectos y snapshot— y se lo entrega al
+**mismo** runner de siempre dentro de la misma tarea (``DeveloperTask.repair``). No hay un segundo
+Developer ni un ejecutor de reparación: lo que cambia es el contexto.
+
+Dos reglas duras de esta rama, y las dos son fail-closed:
+
+- **nada a medias**: si hay plan de reparación y falta el diagnóstico, los defectos o el snapshot,
+  la etapa se declara incompleta (``WORKFLOW_INCOMPLETE_EVIDENCE``) y el kernel la convierte en
+  ``BLOCKED``. PUNTO no repara con medio encargo ni vuelve a diagnosticar por su cuenta.
+- **el runner tiene que declararlo**: la reparación se ejecuta por ``camus.execute_repair_task``,
+  que exige ``DeveloperRunner.supports_repair_context``. Un runner que no sepa recibir el contexto
+  no lo recibe: la etapa falla de forma explícita en vez de ejecutar la reparación como una tarea
+  normal, sin reglas duras ni autorización acotada.
+
 Llamadas reales al modelo (V602-04-B)
 -------------------------------------
 ``RoleExecutionResult.model_calls`` sale del informe real de cada rol: del ``ModelExecutionSummary``
@@ -113,6 +130,7 @@ from punto.schemas.enums import FindingSeverity
 from punto.schemas.execution import DeveloperExecutionResult, ModelUsage
 from punto.schemas.planning import ModelExecutionSummary, ProjectIntent
 from punto.schemas.qa import QAReport
+from punto.schemas.repair import REPAIR_OBJECTIVE, RepairTask
 from punto.schemas.review import ReviewReport
 from punto.schemas.security import SecurityReport
 from punto.schemas.visual import VisualQAReport
@@ -152,6 +170,7 @@ from punto.workflow.errors import (
     WorkflowResumeFailedError,
 )
 from punto.workflow.handoff import (
+    REPAIR_DIAGNOSIS_KIND,
     cross_audit_input,
     developer_input,
     publish_architecture,
@@ -167,6 +186,10 @@ from punto.workflow.handoff import (
     resolve_developer,
     resolve_plan,
     resolve_qa,
+    resolve_repair_diagnosis,
+    resolve_repair_findings,
+    resolve_repair_plan,
+    resolve_repair_snapshot,
     resolve_review,
     resolve_screenshots,
     resolve_security,
@@ -1055,11 +1078,17 @@ class CamusRoleExecutor:
     ) -> tuple[DeveloperTask, ExecutionContext]:
         """Pareja ``(DeveloperTask, ExecutionContext)`` construida desde el plan durable.
 
+        Si el paso trae además un plan de reparación, la tarea se completa con el contexto de
+        reparación **completo** (``RepairTask``): es la misma tarea del Developer y el mismo runner,
+        no un segundo Developer. El plan durable de planificación sigue siendo obligatorio: una
+        reparación también necesita saber sobre qué tarea planificada se está reparando.
+
         Raises:
             _InvalidRoleInputError: si no hay almacén inyectado (defecto de cableado).
             WorkflowIncompleteEvidenceError: si la petición no trae una referencia ``PLANNING``
-                resoluble: es evidencia incompleta y el kernel la convierte en ``BLOCKED``. PUNTO no
-                vuelve a ejecutar al Planner para rellenar el hueco.
+                resoluble, o si trae un plan de reparación y le falta el diagnóstico, los defectos o
+                el snapshot. Es evidencia incompleta y el kernel la convierte en ``BLOCKED``: PUNTO
+                no vuelve a ejecutar al Planner para rellenar el hueco ni repara con medio encargo.
         """
         if self._artifacts is None:
             msg = (
@@ -1074,7 +1103,108 @@ class CamusRoleExecutor:
                 "(RoleExecutionRequest.references): el Developer no trabaja sin plan y PUNTO no "
                 "vuelve a ejecutar al Planner para suplirlo"
             )
-        return developer_input(plan, request)
+        task, context = developer_input(plan, request)
+        repair = self._repair_task(request)
+        if repair is None:
+            return task, context
+        return _with_repair(task, repair), context
+
+    def _repair_task(self, request: RoleExecutionRequest) -> RepairTask | None:
+        """Contexto de reparación resuelto del almacén, o ``None`` si este paso no repara.
+
+        Devuelve ``None`` cuando las referencias no traen plan de reparación: es el camino normal
+        del Developer. Cuando sí lo traen, el encargo se reconstruye **entero** y, si falta lo que
+        el propio plan declara como parte del encargo, falla como evidencia incompleta. Un
+        ``RepairTask`` a medias haría reparar al Developer sin saber qué defectos corregir o sin
+        poder deshacer un cambio: es exactamente el contexto inventado que esta capa existe para
+        impedir.
+
+        Qué se exige, y por qué:
+
+        - el **plan** de reparación, que es la autorización de escritura: sin él no hay reparación;
+        - los **defectos** (``REPAIR_FINDINGS``), porque sin ellos no se sabe qué corregir;
+        - el **snapshot** (``REPAIR_SNAPSHOT``), porque sin estado previo no hay rollback posible y
+          el contrato del ciclo dice que nada se repara sin él;
+        - el **diagnóstico** (``REPAIR_DIAGNOSIS``) solo cuando el plan lo declara
+          (``RepairPlan.diagnosis_id``): si el plan se apoya en un diagnóstico, ese diagnóstico
+          tiene que estar y ser el que el plan nombra, con su mismo identificador. Un diagnóstico
+          ausente o de otro ciclo es un encargo incompleto; no declararlo no lo es, porque el
+          contrato de ``RepairTask`` admite reparaciones sin diagnóstico de modelo.
+
+        Raises:
+            _InvalidRoleInputError: si no hay almacén inyectado (defecto de cableado).
+            WorkflowIncompleteEvidenceError: si hay plan de reparación y falta el contexto exigido.
+                El adaptador lo convierte en ``BLOCKED`` con ``WORKFLOW_INCOMPLETE_EVIDENCE``.
+        """
+        store = self._require_store()
+        plan = _resolve_durable(
+            resolve_repair_plan,
+            store,
+            request.references,
+            detail="falta el plan durable de reparación",
+        )
+        if plan is None:
+            return None
+        diagnosis = _resolve_durable(
+            resolve_repair_diagnosis,
+            store,
+            request.references,
+            detail="falta el diagnóstico durable de reparación",
+        )
+        findings = _resolve_durable(
+            resolve_repair_findings,
+            store,
+            request.references,
+            detail="faltan los defectos durables de reparación",
+        )
+        snapshot = _resolve_durable(
+            resolve_repair_snapshot,
+            store,
+            request.references,
+            detail="falta el snapshot durable de reparación",
+        )
+        if findings is None or snapshot is None:
+            raise WorkflowIncompleteEvidenceError(
+                f"el paso trae el plan de reparación {plan.repair_id} y le falta parte del "
+                f"contexto: defectos={'sí' if findings is not None else 'no'}, "
+                f"snapshot={'sí' if snapshot is not None else 'no'}. PUNTO no repara con un "
+                "encargo a medias: sin los defectos no sabe qué corregir y sin snapshot no puede "
+                "deshacer el cambio"
+            )
+        if plan.diagnosis_id is not None:
+            if diagnosis is None:
+                raise WorkflowIncompleteEvidenceError(
+                    f"el plan de reparación {plan.repair_id} declara el diagnóstico "
+                    f"{plan.diagnosis_id} y el paso no trae ese artefacto "
+                    f"({REPAIR_DIAGNOSIS_KIND}): PUNTO no repara apoyándose en un diagnóstico que "
+                    "no puede leer"
+                )
+            if diagnosis.diagnosis_id != plan.diagnosis_id:
+                raise WorkflowIncompleteEvidenceError(
+                    f"el plan de reparación {plan.repair_id} declara el diagnóstico "
+                    f"{plan.diagnosis_id} y el artefacto resuelto es el diagnóstico "
+                    f"{diagnosis.diagnosis_id}: no es el diagnóstico de este ciclo, y reparar con "
+                    "él sería reparar el defecto de otro ciclo"
+                )
+        return RepairTask(
+            repair_id=plan.repair_id,
+            workflow_id=request.workflow_id,
+            task_id=request.task_id,
+            cycle=plan.cycle,
+            project_id=request.project_id,
+            objective=REPAIR_OBJECTIVE,
+            plan=plan,
+            diagnosis=diagnosis,
+            findings=findings,
+            target_files=plan.target_files,
+            allowed_file_globs=plan.allowed_file_globs,
+            forbidden_files=plan.forbidden_files,
+            snapshot_id=snapshot.snapshot_id,
+            acceptance_criteria=plan.acceptance_criteria,
+            verification_roles=plan.verification_roles,
+            idempotency_key=plan.idempotency_key,
+            workspace_path=request.workspace_path,
+        )
 
     def _publish(
         self,
@@ -1196,11 +1326,31 @@ class CamusRoleExecutor:
         )
 
     def _call_developer(self, payload: object) -> object:
-        """``execute_developer_task`` recibe la tarea de desarrollo y su contexto de ejecución."""
+        """``execute_developer_task`` recibe la tarea de desarrollo y su contexto de ejecución.
+
+        Si la tarea trae contexto de reparación, la ejecuta el **mismo** runner a través de
+        ``camus.execute_repair_task``, y solo si el runner declara que sabe recibirlo
+        (``supports_repair_context``). Un runner que no lo declare no recibe la reparación: la etapa
+        falla de forma explícita en vez de ejecutar una reparación como una tarea normal, sin las
+        reglas duras ni la autorización acotada del plan. PUNTO no crea un segundo Developer para
+        esto: la diferencia es el contexto, no el rol ni el runner.
+        """
         task, context = _pair(payload, RoleName.DEVELOPER, "DeveloperTask y ExecutionContext")
-        return self._camus.execute_developer_task(
-            cast("DeveloperTask", task), cast("ExecutionContext", context)
-        )
+        developer_task = cast("DeveloperTask", task)
+        execution_context = cast("ExecutionContext", context)
+        # ``getattr`` y no acceso directo: ``build_input`` puede devolver el doble de prueba que los
+        # llamantes usan desde antes de la reparación (una pareja de cadenas), y sin contexto de
+        # reparación el camino es exactamente el de siempre.
+        if getattr(developer_task, "repair", None) is None:
+            return self._camus.execute_developer_task(developer_task, execution_context)
+        if not getattr(self._camus, "developer_repair_supported", False):
+            msg = (
+                "el runner del Developer no declara soporte de contexto de reparación "
+                "(supports_repair_context=False): CAMUS no le entrega una reparación como si fuera "
+                "una tarea normal y PUNTO no crea un segundo Developer incompatible"
+            )
+            raise _InvalidRoleInputError(msg)
+        return self._camus.execute_repair_task(developer_task, execution_context)
 
     def _call_qa(self, payload: object) -> object:
         """``qa_task`` delega en el ``QARunner`` inyectado."""
@@ -1543,6 +1693,30 @@ def _pair(payload: object, role: RoleName, expectation: str) -> tuple[object, ob
         f"se recibió {type(payload).__name__}"
     )
     raise _InvalidRoleInputError(msg)
+
+
+def _with_repair(task: DeveloperTask, repair: RepairTask) -> DeveloperTask:
+    """Devuelve la tarea del Developer con el contexto de reparación, sin ampliar su autorización.
+
+    Es la misma tarea y el mismo contrato: lo que se añade es ``repair``. La precedencia de los
+    campos que la reparación puede ajustar es explícita, y ninguna la amplía:
+
+    - ``allowed_files`` y ``context_files``: los ``target_files`` del plan de reparación, que son su
+      autorización de escritura. Si el plan de reparación no declara ninguno, se conserva la
+      autorización que ya traía la tarea planificada, y **nunca** se sustituye por el alcance de la
+      petición: una reparación no puede ampliar lo que el plan autorizó.
+    - ``acceptance_criteria``: los del plan de reparación y, si no declara, los de la tarea.
+    - ``objective``, ``slug``, ``commit_message`` y ``validations``: los de la tarea planificada. El
+      encargo de reparación viaja en ``repair`` —con su propio objetivo y sus reglas duras—, y
+      sobrescribir el objetivo perdería la tarea original que se está reparando.
+    """
+    update: dict[str, object] = {"repair": repair}
+    if repair.target_files:
+        update["allowed_files"] = repair.target_files
+        update["context_files"] = repair.target_files
+    if repair.acceptance_criteria:
+        update["acceptance_criteria"] = repair.acceptance_criteria
+    return task.model_copy(update=update)
 
 
 def _intent_from_request(request: RoleExecutionRequest) -> ProjectIntent:

@@ -371,15 +371,24 @@ def test_max_wall_time_se_mide_con_el_tiempo_transcurrido() -> None:
     assert "10.5" in resultado.detail
 
 
-def test_check_budget_no_comprueba_reparaciones_en_esta_fase() -> None:
-    """``max_repairs`` no bloquea: el ciclo de reparación es ENGINE-6.1 y aún no consume."""
+def test_check_budget_comprueba_reparaciones_desde_engine_6_1() -> None:
+    """``max_repairs`` es un límite real desde ENGINE-6.1: el ciclo se reserva antes de mutar.
+
+    En 6.0 el workflow entraba en ``REPAIRING`` y se detenía, así que el consumo de reparaciones no
+    podía crecer y este límite no se comprobaba. Con el bucle activo sí: un ciclo que no cabe en
+    ``max_repairs`` se rechaza **antes** de tocar un archivo, y el veredicto nombra ese límite.
+    """
     run = _ejecucion(
         presupuesto=WorkflowBudget(max_repairs=0),
         consumo=WorkflowUsage(repairs=5),
     )
 
-    assert check_budget(run, elapsed_seconds=0.0).allowed is True
+    denied = reserve_budget(run, repairs=1, elapsed_seconds=0.0)
+    assert denied.allowed is False
+    assert denied.limit == "max_repairs"
     assert dict(budget_report(run, elapsed_seconds=0.0))["max_repairs"] == "5/0"
+    # Un paso sin reparación sigue cabiendo: el límite solo lo consume quien repara.
+    assert check_budget(run, elapsed_seconds=0.0).allowed is True
 
 
 # ---------------------------------------------------------------------------

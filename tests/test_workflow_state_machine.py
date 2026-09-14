@@ -103,9 +103,25 @@ def test_qa_cannot_approve_directly() -> None:
     assert TaskStatus.COMPLETED not in MACHINE.allowed_from(TaskStatus.QA)
 
 
-def test_repairing_does_not_return_to_work_in_engine_6_0() -> None:
-    """En 6.0 se entra en reparación y se pausa: el bucle de reparación es ENGINE-6.1."""
-    assert TaskStatus.IN_PROGRESS not in MACHINE.allowed_from(TaskStatus.REPAIRING)
+def test_repairing_returns_to_work_or_to_verification_and_never_approves() -> None:
+    """Cambio de contrato (ENGINE-6.1): ``REPAIRING`` deja de ser un callejón sin salida.
+
+    En 6.0 esta prueba fijaba que desde ``REPAIRING`` solo se salía a una pausa, porque el ciclo de
+    reparación completo no existía todavía. Desde 6.1 el estado **sí** vuelve al trabajo
+    (``IN_PROGRESS``) y a la verificación (``QA``, que es el destino real del ciclo: reparar muta
+    código y lo verificado deja de estarlo). El invariante que se conserva —el que importaba en
+    6.0— es que una reparación **no aprueba nada**: ``APPROVED`` y ``COMPLETED`` siguen sin ser
+    alcanzables desde aquí, así que el código reparado tiene que volver a pasar por la cadena de
+    verificación entera.
+    """
+    allowed = MACHINE.allowed_from(TaskStatus.REPAIRING)
+
+    assert TaskStatus.QA in allowed
+    assert TaskStatus.IN_PROGRESS in allowed
+    assert TaskStatus.APPROVED not in allowed
+    assert TaskStatus.COMPLETED not in allowed
+    assert TaskStatus.BLOCKED in allowed
+    assert (TaskStatus.REPAIRING, TaskStatus.APPROVED) in FORBIDDEN_WORKFLOW_TRANSITIONS
 
 
 # ---------------------------------------------------------------------------

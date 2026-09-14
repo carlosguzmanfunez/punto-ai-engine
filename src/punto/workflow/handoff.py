@@ -80,6 +80,31 @@ sea seguro, y el veredicto de la etapa actual lo calcula su runner, no el códec
 códec es negarse a construir una entrada a la que le falta un artefacto del que depende: eso es
 ``WORKFLOW_INCOMPLETE_EVIDENCE``, que el adaptador convierte en ``BLOCKED`` en vez de improvisar.
 
+Reparación (ENGINE-6.1)
+-----------------------
+El ciclo de reparación autónoma acotado necesita que el Developer reciba algo que antes no existía:
+el **encargo** de reparar (plan, diagnóstico, defectos, snapshot y criterios). Ese encargo no es
+memoria del proceso que decidió reparar —tiene que sobrevivir a una caída y a una reanudación en
+otro proceso—, así que viaja por el mismo camino durable que el resto del handoff, con cuatro
+códecs y cuatro tipos de artefacto:
+
+- ``REPAIR_PLAN``: el :class:`~punto.schemas.repair.RepairPlan`, que es la **autorización de
+  escritura** del ciclo (archivos objetivo, globs permitidos, archivos prohibidos, cambios
+  esperados, criterios y roles que vuelven a verificar);
+- ``REPAIR_DIAGNOSIS``: el :class:`~punto.schemas.repair.RepairDiagnosis`, la conclusión técnica
+  estructurada sobre el defecto, sin razonamiento privado;
+- ``REPAIR_FINDINGS``: los :class:`~punto.schemas.repair.RepairFinding` que se van a reparar, con
+  su fingerprint, que es la identidad estable con la que después se comprueba si volvieron;
+- ``REPAIR_SNAPSHOT``: el :class:`~punto.schemas.repair.RepairSnapshot`, el estado previo con
+  hashes para poder deshacer sin adivinar.
+
+Los cuatro se publican con la petición del paso ``DEVELOPER``, que es la etapa que ejecuta la
+reparación, y ninguno lleva bytes binarios: son registros estructurados, redactados y acotados como
+el resto de sobres. La regla del ciclo la aplica quien consume: si hay plan de reparación pero falta
+el diagnóstico, los defectos o el snapshot, la reparación **no se ejecuta a medias** —el adaptador
+la declara ``BLOCKED`` con ``WORKFLOW_INCOMPLETE_EVIDENCE``—, porque un encargo incompleto haría
+trabajar al Developer sin saber qué repara o sin poder deshacerlo.
+
 Qué NO hace este módulo
 -----------------------
 No llama a ningún modelo, no abre red, no ejecuta subprocesos y no decide autoridad. Solo serializa
@@ -104,7 +129,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -130,6 +155,7 @@ from punto.schemas.planning import (
     TaskGraph,
 )
 from punto.schemas.qa import QAReport, QATask
+from punto.schemas.repair import RepairDiagnosis, RepairFinding, RepairPlan, RepairSnapshot
 from punto.schemas.review import ReviewReport, ReviewTask
 from punto.schemas.security import SecurityReport, SecurityTask
 from punto.schemas.visual import VisualQAReport, VisualQATask, VisualSpec
@@ -175,6 +201,17 @@ SCREENSHOT_KIND: Final[str] = "SCREENSHOT"
 #: Tipo del artefacto con el **índice** de capturas: la evidencia canónica de cada una más la
 #: referencia de sus bytes. Ata cada captura a su contenido sin llevar binarios.
 SCREENSHOT_MANIFEST_KIND: Final[str] = "SCREENSHOT_MANIFEST"
+#: Tipo del artefacto que publica el paso ``DEVELOPER`` de un ciclo de reparación: el contrato de la
+#: reparación (``RepairPlan``), que es su autorización de escritura.
+REPAIR_PLAN_KIND: Final[str] = "REPAIR_PLAN"
+#: Tipo del artefacto con el diagnóstico estructurado (``RepairDiagnosis``) que motiva la
+#: reparación. Es una **propuesta** técnica, nunca la decisión: la decisión la calculó el kernel.
+REPAIR_DIAGNOSIS_KIND: Final[str] = "REPAIR_DIAGNOSIS"
+#: Tipo del artefacto con los defectos (``RepairFinding``) que la reparación debe corregir.
+REPAIR_FINDINGS_KIND: Final[str] = "REPAIR_FINDINGS"
+#: Tipo del artefacto con el estado previo a la reparación (``RepairSnapshot``), con hashes para
+#: poder deshacerla sin adivinar.
+REPAIR_SNAPSHOT_KIND: Final[str] = "REPAIR_SNAPSHOT"
 
 #: Nombres de los campos del sobre. Son constantes porque son contrato, no texto decorativo.
 _SCHEMA_FIELD: Final[str] = "schema_version"
@@ -186,6 +223,8 @@ _SPEC_FIELD: Final[str] = "spec"
 _SESSION_FIELD: Final[str] = "session"
 #: Campos del sobre del manifiesto de capturas. Son contrato: los lee otro proceso.
 _SCREENSHOTS_FIELD: Final[str] = "screenshots"
+#: Campo del sobre de los defectos de una reparación: una lista de ``RepairFinding``.
+_FINDINGS_FIELD: Final[str] = "findings"
 _REFERENCE_FIELD: Final[str] = "reference"
 _LOGICAL_NAME_FIELD: Final[str] = "logical_name"
 _TASK_ID_FIELD: Final[str] = "task_id"
@@ -204,6 +243,11 @@ _VISUAL_EVIDENCE_LABEL: Final[str] = "evidencia visual durable (especificación 
 #: Etiquetas de los artefactos de capturas. Describen el tipo, nunca el contenido de la imagen.
 _SCREENSHOT_LABEL: Final[str] = "bytes de una captura de la sesión web"
 _SCREENSHOT_MANIFEST_LABEL: Final[str] = "índice durable de capturas de la sesión web"
+#: Etiquetas de los artefactos de reparación. Describen el tipo, nunca el contenido del encargo.
+_REPAIR_PLAN_LABEL: Final[str] = "contrato durable del plan de reparación"
+_REPAIR_DIAGNOSIS_LABEL: Final[str] = "diagnóstico durable de la reparación"
+_REPAIR_FINDINGS_LABEL: Final[str] = "defectos durables que la reparación debe corregir"
+_REPAIR_SNAPSHOT_LABEL: Final[str] = "estado previo durable a la reparación (snapshot)"
 #: Acción con la que se declara el trabajo del Developer.
 #:
 #: Ni ``RoleExecutionRequest`` ni ``PlannedTask`` declaran una acción, así que inventarla a partir
@@ -827,6 +871,181 @@ def resolve_screenshots(
 
 
 # ---------------------------------------------------------------------------
+# Códecs de la reparación (ENGINE-6.1)
+# ---------------------------------------------------------------------------
+def publish_repair_plan(
+    store: ArtifactStore, *, request: RoleExecutionRequest, plan: RepairPlan
+) -> ArtifactReference:
+    """Publica el contrato de la reparación y devuelve su referencia durable.
+
+    El ``RepairPlan`` es la **autorización de escritura** del ciclo: qué archivos se pueden tocar,
+    cuáles no, qué cambios se esperan y qué roles vuelven a verificar. Se guarda entero porque la
+    reparación se ejecuta en un proceso que puede no ser el que decidió reparar, y sin el plan ese
+    proceso no sabría qué está autorizado a cambiar.
+
+    Se publica con la petición del paso ``DEVELOPER``: es la etapa que ejecuta la reparación, y el
+    artefacto queda registrado en su paso para que la traza diga de dónde salió el encargo.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``. Etiquetar el encargo con el rol
+            equivocado corrompería el handoff, así que se rechaza antes de escribir nada.
+    """
+    return _publish_repair(
+        store,
+        request=request,
+        kind=REPAIR_PLAN_KIND,
+        label=_REPAIR_PLAN_LABEL,
+        content=plan,
+        function="publish_repair_plan",
+    )
+
+
+def resolve_repair_plan(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> RepairPlan | None:
+    """Reconstruye el contrato de la reparación desde la **primera** referencia de su tipo.
+
+    ``None`` significa «este paso no repara»: sin plan de reparación el Developer ejecuta su tarea
+    normal. Un artefacto presente pero ilegible, de otro esquema o manipulado **no** se degrada a
+    ``None``: falla con ``WORKFLOW_RESUME_FAILED`` o lo detecta el almacén, porque confundir
+    corrupción con ausencia ejecutaría la reparación sin saber qué está autorizado a tocar.
+    """
+    return _resolve_report(store, references, REPAIR_PLAN_KIND, RepairPlan)
+
+
+def publish_repair_diagnosis(
+    store: ArtifactStore, *, request: RoleExecutionRequest, diagnosis: RepairDiagnosis
+) -> ArtifactReference:
+    """Publica el diagnóstico estructurado de la reparación y devuelve su referencia durable.
+
+    Viaja entero —causa raíz, evidencia, archivos sospechosos, restricciones, estrategia,
+    confianza y lo que sigue sin saberse— porque es lo que permite a un proceso nuevo entender
+    **por qué** se repara sin volver a diagnosticar. Es una propuesta: la decisión de reparar la
+    calculó el kernel, y este códec no la reinterpreta.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``.
+    """
+    return _publish_repair(
+        store,
+        request=request,
+        kind=REPAIR_DIAGNOSIS_KIND,
+        label=_REPAIR_DIAGNOSIS_LABEL,
+        content=diagnosis,
+        function="publish_repair_diagnosis",
+    )
+
+
+def resolve_repair_diagnosis(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> RepairDiagnosis | None:
+    """Reconstruye el diagnóstico desde la **primera** referencia de su tipo, o ``None``.
+
+    Un diagnóstico de confianza ``LOW`` se resuelve igual que uno ``HIGH``: la categoría es un hecho
+    declarado y quien lo lee decide qué hacer con él, no este códec.
+    """
+    return _resolve_report(store, references, REPAIR_DIAGNOSIS_KIND, RepairDiagnosis)
+
+
+def publish_repair_findings(
+    store: ArtifactStore,
+    *,
+    request: RoleExecutionRequest,
+    findings: Sequence[RepairFinding],
+) -> ArtifactReference:
+    """Publica los defectos que la reparación debe corregir y devuelve su referencia durable.
+
+    El sobre lleva la lista de ``RepairFinding`` —con su fingerprint, que es la identidad estable
+    con la que después se comprueba si el mismo defecto volvió— y nada más. Se guarda la lista
+    **completa**: un defecto que no viaja es un defecto que la reparación no arregla y que la
+    verificación posterior volvería a encontrar sin que nadie sepa por qué.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``.
+    """
+    _assert_role(request, RoleName.DEVELOPER, "publish_repair_findings")
+    payload: dict[str, object] = {
+        _KIND_FIELD: REPAIR_FINDINGS_KIND,
+        _FINDINGS_FIELD: [_bounded_json(finding) for finding in findings],
+    }
+    return store.put(
+        workflow_id=request.workflow_id,
+        role=RoleName.DEVELOPER,
+        step_index=request.step_index,
+        kind=REPAIR_FINDINGS_KIND,
+        label=_REPAIR_FINDINGS_LABEL,
+        data=_encode(payload),
+    )
+
+
+def resolve_repair_findings(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> tuple[RepairFinding, ...]:
+    """Reconstruye los defectos desde la **primera** referencia de su tipo.
+
+    Devuelve la tupla vacía si el paso no trae ninguna referencia de este tipo, que es el caso «este
+    paso no repara» y no un hueco: quien exige el artefacto es la etapa, que lo declara incompleto.
+    Un sobre presente pero sin lista de defectos, con un elemento que no valida contra
+    ``RepairFinding`` o de otro esquema **no** se interpreta «lo mejor posible»: falla con
+    ``WORKFLOW_RESUME_FAILED``, porque una lista a medias haría reparar unos defectos y olvidar
+    otros en silencio.
+    """
+    for reference in references:
+        if reference.kind != REPAIR_FINDINGS_KIND:
+            continue
+        payload = _decode(
+            store.get(reference), expected_kind=REPAIR_FINDINGS_KIND, reference=reference
+        )
+        raw = payload.get(_FINDINGS_FIELD)
+        if not isinstance(raw, list):
+            raise WorkflowResumeFailedError(
+                f"el artefacto {reference.reference!r} se referencia como "
+                f"{REPAIR_FINDINGS_KIND!r} y no lleva una lista en {_FINDINGS_FIELD!r} sino "
+                f"{type(raw).__name__}: no hay defectos que reconstruir"
+            )
+        return tuple(
+            _validate(RepairFinding, item, f"{_FINDINGS_FIELD}[{index}]", reference)
+            for index, item in enumerate(raw)
+        )
+    return ()
+
+
+def publish_repair_snapshot(
+    store: ArtifactStore, *, request: RoleExecutionRequest, snapshot: RepairSnapshot
+) -> ArtifactReference:
+    """Publica el estado previo a la reparación y devuelve su referencia durable.
+
+    El snapshot lleva, por archivo, su hash y su tamaño —o su ausencia declarada—, y no el contenido
+    de los ficheros: lo que permite **deshacer** una reparación local y reversible es comparar
+    hashes, no guardar una copia del proyecto dentro del almacén. Se publica con la petición del
+    paso ``DEVELOPER`` para que el ciclo y su rollback queden en la misma traza.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``.
+    """
+    return _publish_repair(
+        store,
+        request=request,
+        kind=REPAIR_SNAPSHOT_KIND,
+        label=_REPAIR_SNAPSHOT_LABEL,
+        content=snapshot,
+        function="publish_repair_snapshot",
+    )
+
+
+def resolve_repair_snapshot(
+    store: ArtifactStore, references: tuple[ArtifactReference, ...]
+) -> RepairSnapshot | None:
+    """Reconstruye el estado previo desde la **primera** referencia de su tipo, o ``None``.
+
+    Un snapshot ilegible o manipulado no se degrada a ``None``: sin él no se puede deshacer la
+    reparación con fundamento, y confundir «no hay snapshot» con «el snapshot está roto» haría
+    intentar un rollback a ciegas.
+    """
+    return _resolve_report(store, references, REPAIR_SNAPSHOT_KIND, RepairSnapshot)
+
+
+# ---------------------------------------------------------------------------
 # Entrada oficial del rol DEVELOPER
 # ---------------------------------------------------------------------------
 def developer_input(
@@ -1225,6 +1444,35 @@ def _decode_architecture(data: bytes, reference: ArtifactReference) -> Architect
     )
 
 
+def _publish_repair(
+    store: ArtifactStore,
+    *,
+    request: RoleExecutionRequest,
+    kind: str,
+    label: str,
+    content: BaseModel,
+    function: str,
+) -> ArtifactReference:
+    """Publica uno de los tres sobres de reparación que son un modelo, con el rol comprobado.
+
+    Plan, diagnóstico y snapshot comparten mecánica —comprobar que la petición es del paso que
+    repara, envolver el modelo con su ``kind`` y escribir el JSON canónico—, así que comparten
+    helper. Los defectos no pasan por aquí porque su sobre lleva una **lista**, no un modelo.
+
+    Raises:
+        ValueError: si la petición no es de la etapa ``DEVELOPER``.
+    """
+    return _publish_report(
+        store,
+        request=request,
+        role=RoleName.DEVELOPER,
+        kind=kind,
+        label=label,
+        report=content,
+        function=function,
+    )
+
+
 def _publish_report(
     store: ArtifactStore,
     *,
@@ -1237,11 +1485,11 @@ def _publish_report(
 ) -> ArtifactReference:
     """Publica el sobre de un informe de rol con el rol comprobado y el contenido saneado.
 
-    Lo comparten los seis publicadores de informes porque la mecánica es la misma y solo cambia qué
-    se serializa: comprobar que la petición es de la etapa que publica, envolver el informe con su
-    ``kind`` y escribirlo con la versión del esquema y el JSON canónico. La comprobación va
-    **antes** de tocar el disco: un artefacto etiquetado con el rol equivocado corrompería el
-    handoff.
+    Lo comparten los publicadores de informes —y los de reparación— porque la mecánica es la misma
+    y solo cambia qué se serializa: comprobar que la petición es de la etapa que publica, envolver
+    el informe con su ``kind`` y escribirlo con la versión del esquema y el JSON canónico. La
+    comprobación va **antes** de tocar el disco: un artefacto etiquetado con el rol equivocado
+    corrompería el handoff.
 
     Raises:
         ValueError: si la petición no es de ``role``.
@@ -2119,6 +2367,10 @@ __all__ = [
     "HANDOFF_SCHEMA_VERSION",
     "PLAN_KIND",
     "QA_KIND",
+    "REPAIR_DIAGNOSIS_KIND",
+    "REPAIR_FINDINGS_KIND",
+    "REPAIR_PLAN_KIND",
+    "REPAIR_SNAPSHOT_KIND",
     "REVIEW_KIND",
     "SCREENSHOT_KIND",
     "SCREENSHOT_MANIFEST_KIND",
@@ -2133,6 +2385,10 @@ __all__ = [
     "publish_developer",
     "publish_plan",
     "publish_qa",
+    "publish_repair_diagnosis",
+    "publish_repair_findings",
+    "publish_repair_plan",
+    "publish_repair_snapshot",
     "publish_review",
     "publish_screenshots",
     "publish_security",
@@ -2144,6 +2400,10 @@ __all__ = [
     "resolve_developer",
     "resolve_plan",
     "resolve_qa",
+    "resolve_repair_diagnosis",
+    "resolve_repair_findings",
+    "resolve_repair_plan",
+    "resolve_repair_snapshot",
     "resolve_review",
     "resolve_screenshots",
     "resolve_security",

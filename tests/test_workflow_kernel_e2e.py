@@ -262,7 +262,16 @@ def test_a_developer_failure_ends_in_failed(tmp_path: Path) -> None:
 
 
 def test_a_qa_defect_enters_repair_and_never_approves(tmp_path: Path) -> None:
-    """B. QA encuentra un defecto: llega a REPAIRING y se detiene; jamás aprueba."""
+    """B. QA encuentra un defecto: se entra en reparación y nunca se aprueba sin reparar.
+
+    Cambio de contrato (ENGINE-6.1): con ``max_repairs=1`` el defecto ya no se detiene en
+    ``WORKFLOW_REPAIR_DEFERRED`` —ese código queda para ``max_repairs=0``, que es el caso de la
+    prueba siguiente—, sino que **abre el ciclo de reparación**. El invariante que esta prueba
+    protegía se conserva entero: el workflow no aprueba ni completa con un defecto bloqueante vivo y
+    el defecto queda registrado como defecto de reparación. Aquí el kernel no tiene almacén de
+    artefactos ni workspace, así que el ciclo no puede autorizar la mutación y bloquea con
+    ``WORKFLOW_REPAIR_NOT_ALLOWED``: reparar a ciegas es exactamente lo que no ocurre.
+    """
     executors = all_stage_executors()
     executors[RoleName.QA] = FakeRoleExecutor(
         RoleName.QA,
@@ -277,8 +286,11 @@ def test_a_qa_defect_enters_repair_and_never_approves(tmp_path: Path) -> None:
     assert TaskStatus.REPAIRING in [transition.to_status for transition in run.transitions]
     assert run.status is TaskStatus.BLOCKED
     assert run.failure is not None
-    assert run.failure.code is WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED
+    assert run.failure.code is WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED
     assert TaskStatus.APPROVED not in [t.to_status for t in run.transitions]
+    assert TaskStatus.COMPLETED not in [t.to_status for t in run.transitions]
+    assert run.repair_findings, "el defecto real de QA queda registrado como defecto de reparación"
+    assert run.repair_findings[0].source_role is RoleName.QA
 
 
 def test_a_qa_defect_without_repair_budget_blocks(tmp_path: Path) -> None:

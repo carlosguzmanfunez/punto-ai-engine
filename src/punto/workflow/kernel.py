@@ -1,4 +1,4 @@
-"""Kernel de workflow autónomo (ENGINE-6.0 / 6.0.1 / 6.0.2).
+"""Kernel de workflow autónomo (ENGINE-6.0 / 6.0.1 / 6.0.2 / 6.1).
 
 CAMUS coordina; el kernel conduce. Este módulo recibe una intención y la lleva, paso a paso y de
 forma determinista, por los roles que ya existen.
@@ -26,14 +26,23 @@ Reglas que no se negocian, y dónde están:
   checkpoint, así que un proceso nuevo puede reconstruir la entrada del siguiente rol.
 - **El modelo no escribe el estado**: estado, autoridad, decisión, presupuesto y cierre los calcula
   PUNTO.
+- **El bucle de reparación es acotado y se decide con hechos** (ENGINE-6.1): un defecto bloqueante
+  se convierte en un :class:`~punto.schemas.repair.RepairFinding` de identidad estable, se
+  clasifica con reglas fijas —no con la opinión del modelo—, se autoriza con un
+  :class:`~punto.schemas.repair.RepairPlan` y un snapshot del estado previo, y solo se da por
+  resuelto después de que la verificación completa vuelva a pasar. El contexto del ciclo viaja al
+  Developer por el **almacén de artefactos** (referencias durables), no por memoria de proceso.
 """
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Final
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -42,9 +51,23 @@ from punto.common import utc_now
 from punto.policy.human_gate import BudgetReconciliationProof, HumanApprovalProof
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.policy import PolicyOutcome
+from punto.schemas.repair import (
+    Repairability,
+    RepairCycle,
+    RepairCycleStatus,
+    RepairDecision,
+    RepairFinding,
+    RepairFindingStatus,
+    RepairPlan,
+    RepairSnapshot,
+)
 from punto.schemas.workflow import (
     MAX_BUDGET_BREACHES,
     MAX_RECONCILIATION_PROOFS,
+    MAX_REPAIR_APPLIED_DIGESTS,
+    MAX_REPAIR_FINDINGS_STORED,
+    MAX_REPAIR_HISTORY,
+    MAX_RESOLVED_FINDINGS_REPORTED,
     MAX_ROLES_EXECUTED,
     MAX_WORKFLOW_EVIDENCE,
     MAX_WORKFLOW_FINDINGS,
@@ -53,6 +76,7 @@ from punto.schemas.workflow import (
     ArtifactReference,
     BudgetAllowance,
     BudgetBreachRecord,
+    EffectRecord,
     EffectStatus,
     HumanGateRequest,
     InvocationBudgetAuthorization,
@@ -61,6 +85,7 @@ from punto.schemas.workflow import (
     RoleExecutionResult,
     RoleName,
     RoleStatus,
+    StageArtifacts,
     WorkflowDecisionKind,
     WorkflowFailure,
     WorkflowFailureCode,
@@ -70,12 +95,11 @@ from punto.schemas.workflow import (
     WorkflowStep,
     WorkflowTransition,
 )
-from punto.workflow.artifacts import WorkflowContext, record_stage
+from punto.workflow.artifacts import ArtifactStore, WorkflowContext, record_stage
 from punto.workflow.budgets import BudgetCheck, loop_check, reserve_budget
 from punto.workflow.checkpoints import CheckpointStore, step_idempotency_key
 from punto.workflow.decisions import (
     WorkflowDecision,
-    decide_after_repair,
     decide_after_role,
 )
 from punto.workflow.effects import EffectLedger, effect_key
@@ -90,6 +114,11 @@ from punto.workflow.errors import (
     WorkflowResumeFailedError,
     WorkflowTerminalError,
 )
+from punto.workflow.handoff import (
+    publish_repair_findings,
+    publish_repair_plan,
+    publish_repair_snapshot,
+)
 from punto.workflow.pipeline import (
     VisualApplicability,
     next_stage,
@@ -98,7 +127,17 @@ from punto.workflow.pipeline import (
     visual_applicability,
 )
 from punto.workflow.policy import PolicyGate, WorkflowPolicy
+from punto.workflow.repair import (
+    build_repair_decision,
+    build_repair_plan,
+    classify_repairability,
+    findings_from_result,
+    next_cycle_status,
+    no_progress,
+)
+from punto.workflow.repair_guard import RepairGuard
 from punto.workflow.roles import RoleExecutor
+from punto.workflow.snapshots import SNAPSHOT_DIR_NAME, FileRepairSnapshots, RollbackVerdict
 from punto.workflow.state_machine import WorkflowStateMachine
 
 #: Espacio de nombres para derivar el identificador del workflow de su clave de idempotencia.
@@ -117,6 +156,104 @@ EFFECTFUL_ROLES: Final[frozenset[RoleName]] = frozenset({RoleName.DEVELOPER})
 
 #: Campos de la petición que **no** forman parte de su huella: son marcas de tiempo, no contenido.
 _FINGERPRINT_EXCLUDED: Final[frozenset[str]] = frozenset({"created_at"})
+
+#: Etapas del camino limpio, en orden. Una reparación aceptada invalida todo lo verificado
+#: **después** de la etapa por la que se reinicia —siempre ``QA``—: ninguna gate se reutiliza.
+_CLEAN_PATH_ORDER: Final[tuple[TaskStatus, ...]] = (
+    TaskStatus.NEW,
+    TaskStatus.ANALYZING,
+    TaskStatus.PLANNING,
+    TaskStatus.READY,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.QA,
+    TaskStatus.SECURITY,
+    TaskStatus.REVIEW,
+    TaskStatus.APPROVED,
+    TaskStatus.COMPLETED,
+)
+
+#: Códigos de fallo que describen al **entorno** y no al producto. Un defecto así se reintenta; no
+#: se repara código por un proveedor ausente, y el kernel lo clasifica como infraestructura aunque
+#: el rol lo haya etiquetado como un defecto del producto.
+_INFRASTRUCTURE_FAILURE_CODES: Final[frozenset[WorkflowFailureCode]] = frozenset(
+    {WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE}
+)
+
+
+def _is_after_qa(stage: TaskStatus) -> bool:
+    """True si la etapa es **posterior** a ``QA`` en el camino limpio.
+
+    Es la pregunta que decide qué evidencia invalida una reparación: lo verificado después de la
+    etapa por la que se reinicia ya no describe el árbol. Una etapa que no pertenece al camino
+    limpio —``REPAIRING``, que es el propio ciclo— no es una verificación invalidada: ``False``.
+    """
+    if stage not in _CLEAN_PATH_ORDER:
+        return False
+    return _CLEAN_PATH_ORDER.index(stage) > _CLEAN_PATH_ORDER.index(TaskStatus.QA)
+
+#: Orden de precedencia de las clasificaciones de reparabilidad cuando un ciclo cubre varios
+#: defectos: gana siempre la **menos** autónoma. El orden es explícito para que dos ejecuciones del
+#: mismo caso decidan lo mismo, y para que un defecto de seguridad o uno no reparable no quede
+#: diluido entre defectos reparables.
+_REPAIRABILITY_PRECEDENCE: Final[tuple[Repairability, ...]] = (
+    Repairability.SECURITY_STOP,
+    Repairability.NON_REPAIRABLE,
+    Repairability.BLOCKED_EVIDENCE,
+    Repairability.RETRYABLE_INFRASTRUCTURE,
+    Repairability.HUMAN_REQUIRED,
+    Repairability.AUTONOMOUS_REPAIRABLE,
+)
+
+#: Cota de caracteres del diff textual que se le pasa al guard de reparación. Acota memoria y
+#: checkpoint-adyacentes: el diff se calcula en memoria y se usa para juzgar el intento, no se
+#: guarda.
+_MAX_REPAIR_DIFF_CHARS: Final[int] = 60_000
+#: Cota de bytes por archivo para construir el diff: un archivo mayor se declara no comparable en
+#: texto en vez de leerse entero.
+_MAX_REPAIR_DIFF_FILE_BYTES: Final[int] = 2_000_000
+
+#: Código con el que se bloquea cada clasificación que **no** autoriza reparar. La clasificación es
+#: del dominio y este mapa es su traducción al vocabulario del kernel: cada motivo conserva su
+#: código para que un bloqueo se entienda sin volver a reproducir el caso.
+_BLOCKED_REPAIRABILITY_CODES: Final[Mapping[Repairability, WorkflowFailureCode]] = {
+    Repairability.SECURITY_STOP: WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+    Repairability.NON_REPAIRABLE: WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+    Repairability.RETRYABLE_INFRASTRUCTURE: WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE,
+    Repairability.BLOCKED_EVIDENCE: WorkflowFailureCode.WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE,
+}
+
+#: Código de fallo de un intento de reparación cuyo rol no completó. El del rol manda cuando lo
+#: trae; este mapa solo cubre los estados sin código propio.
+_REPAIR_ROLE_FAILURE_CODES: Final[Mapping[RoleStatus, WorkflowFailureCode]] = {
+    RoleStatus.PROVIDER_UNAVAILABLE: WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE,
+    RoleStatus.PENDING_CREDENTIALS: WorkflowFailureCode.WORKFLOW_PROVIDER_UNAVAILABLE,
+    RoleStatus.FAILED: WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
+    RoleStatus.BLOCKED: WorkflowFailureCode.WORKFLOW_INCOMPLETE_EVIDENCE,
+    RoleStatus.NEEDS_REPAIR: WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+    RoleStatus.NOT_APPLICABLE: WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+}
+
+#: Código con el que se audita el cierre de un ciclo que no progresó, por estado.
+_STALLED_CYCLE_AUDIT_CODES: Final[Mapping[RepairCycleStatus, WorkflowFailureCode]] = {
+    RepairCycleStatus.NO_PROGRESS: WorkflowFailureCode.WORKFLOW_REPAIR_NO_PROGRESS,
+    RepairCycleStatus.FAILED: WorkflowFailureCode.WORKFLOW_ROLE_FAILED,
+    RepairCycleStatus.BLOCKED: WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _RepairAttempt:
+    """Contexto del intento de reparación que ``_run_role`` necesita para no repetir nada.
+
+    Existe para que la ejecución del Developer de reparación pase por la **misma** frontera de
+    presupuesto, efectos y auditoría que cualquier otro rol, sin duplicar esa lógica ni relajarla:
+    lo único que cambia es la clave del efecto —que es la del ciclo, no la del paso— y la decisión
+    que se aplica al final, que la calcula el guard y el resultado de la verificación.
+    """
+
+    effect_key: str
+    plan: RepairPlan
+    snapshot: RepairSnapshot
 
 
 def request_fingerprint(request: WorkflowRequest) -> str:
@@ -148,13 +285,28 @@ class WorkflowKernel:
         clock: Callable[[], datetime] | None = None,
         policy: WorkflowPolicy | None = None,
         effects: EffectLedger | None = None,
+        artifacts: ArtifactStore | None = None,
+        workspace: Path | None = None,
+        guard: RepairGuard | None = None,
     ) -> None:
         """Construye el kernel.
 
         ``policy`` es **obligatoria**: es la frontera constitucional que decide qué puede hacer el
         workflow (hallazgo V602-02). El parámetro admite ``None`` solo para poder fallar de forma
         explícita y comprobable: un kernel sin política no se construye, en vez de ejecutar trabajo
-        autonómo sin que nadie evalúe la autoridad.
+        autónomo sin que nadie evalúe la autoridad.
+
+        ``artifacts`` y ``workspace`` son las dos dependencias que necesita el bucle de reparación
+        (ENGINE-6.1) y son opcionales para no romper a quien construye un kernel de 6.0:
+
+        - ``artifacts`` es el almacén estable donde el kernel publica el plan, los defectos y el
+          snapshot del ciclo. El contexto de reparación viaja al Developer **por ahí**, como
+          referencias durables, y no por memoria de proceso. Sin almacén no hay handoff posible y el
+          ciclo se bloquea en vez de ejecutar una mutación a ciegas;
+        - ``workspace`` es la raíz del árbol sobre la que se captura el snapshot y se comprueba lo
+          que la reparación cambió de verdad. Si no se inyecta se usa ``request.workspace_path``, y
+          sin ninguna de las dos el ciclo también se bloquea: reparar sin saber sobre qué árbol es
+          exactamente lo que un snapshot existe para impedir.
 
         Raises:
             WorkflowPolicyRejectedError: si no se inyecta una frontera de política válida.
@@ -171,6 +323,9 @@ class WorkflowKernel:
         self._clock = clock or utc_now
         self._policy: WorkflowPolicy = policy
         self._effects = effects or EffectLedger()
+        self._artifacts = artifacts
+        self._workspace = Path(workspace) if workspace is not None else None
+        self._guard = guard or RepairGuard()
 
     # ------------------------------------------------------------------ estado
     @property
@@ -281,6 +436,11 @@ class WorkflowKernel:
                 step_index=None,
             )
         run = self._refresh_authority(run, verdict)
+        if run.status is TaskStatus.REPAIRING:
+            # El ciclo de reparación se conduce aquí y no por ``_pending_role``: ``REPAIRING`` no
+            # tiene roles de etapa, y lo que hay que ejecutar lo decide la decisión de reparación
+            # —clasificación, política, plan y snapshot—, no la lista de roles del pipeline.
+            return self._repair_step(run)
         if verdict.requires_human and not self._approval_covers(run, verdict):
             if self._machine.can_transition(run.status, TaskStatus.HUMAN_APPROVAL):
                 return self._open_human_gate(run, verdict)
@@ -468,10 +628,18 @@ class WorkflowKernel:
 
         Se mira el **último** paso de cada rol en la etapa (un reintento posterior manda sobre el
         intento fallido anterior) y solo se acepta un resultado que no deje trabajo pendiente.
+
+        Desde ENGINE-6.1 hay una segunda condición, y es la que hace que una reparación no se
+        reutilice a sí misma: **una mutación invalida todo lo verificado antes de ella**. Los pasos
+        anteriores al último paso de ``REPAIRING`` describen código que ya no existe, así que no
+        cuentan como cumplidos. Sin este corte, la etapa ``QA`` seguiría dándose por satisfecha con
+        el informe del QA previo a la reparación y el workflow avanzaría hacia las gates posteriores
+        sin volver a verificar nada —exactamente el atajo que el ciclo existe para impedir—.
         """
+        epoch = self._verification_epoch(run)
         satisfied: set[RoleName] = set()
         for step in run.steps:
-            if step.stage is not run.status:
+            if step.stage is not run.status or step.index <= epoch:
                 continue
             done = step.status is RoleStatus.NOT_APPLICABLE or (
                 step.status is RoleStatus.COMPLETED and not step.blocking_findings
@@ -481,6 +649,18 @@ class WorkflowKernel:
             else:
                 satisfied.discard(step.role)
         return frozenset(satisfied)
+
+    def _verification_epoch(self, run: WorkflowRun) -> int:
+        """Índice del último paso de mutación por reparación, o ``-1`` si no hubo ninguno.
+
+        El corte se deriva de la **traza** —los pasos ejecutados en ``REPAIRING``— y no de un campo
+        aparte: es un hecho ya persistido, sigue siendo válido en un proceso nuevo y no puede
+        desincronizarse con lo que de verdad ocurrió.
+        """
+        indexes = (
+            step.index for step in run.steps if step.stage is TaskStatus.REPAIRING
+        )
+        return max(indexes, default=-1)
 
     def _requires_human(self, run: WorkflowRun) -> bool:
         """True si el workflow debe detenerse en un Human Gate.
@@ -494,8 +674,21 @@ class WorkflowKernel:
             return True
         return run.request.risk.requires_human_gate or run.request.authority.requires_human
 
-    def _run_role(self, run: WorkflowRun, role: RoleName, elapsed: float) -> WorkflowRun:
-        """Ejecuta un rol con reintento técnico acotado, decide y aplica la transición."""
+    def _run_role(
+        self,
+        run: WorkflowRun,
+        role: RoleName,
+        elapsed: float,
+        *,
+        repair: _RepairAttempt | None = None,
+    ) -> WorkflowRun:
+        """Ejecuta un rol con reintento técnico acotado, decide y aplica la transición.
+
+        ``repair`` marca que este rol es el Developer de un ciclo de reparación: entonces la
+        intención del efecto ya está apuntada y persistida (la apuntó el ciclo, antes de cualquier
+        mutación) y la decisión final no la calcula ``decide_after_role`` sino el guard del plan
+        junto con el resultado real.
+        """
         executor = self._executors.get(role)
         index = len(run.steps)
         key = step_idempotency_key(run.workflow_id, index, role, run.status)
@@ -510,14 +703,19 @@ class WorkflowKernel:
                 error_detail="no hay ejecutor inyectado para el rol: no se sustituye por otro",
             )
             return self._finish_step(
-                run, role, unavailable, key, attempts=1, request=request
+                run, role, unavailable, key, attempts=1, request=request, repair=repair
             )
 
         # Frontera de efectos (hallazgos V602-02 y V602-05): antes de un rol con efectos
         # secundarios se vuelve a evaluar la autoridad con la política **actual** y se apunta la
         # intención del efecto. Una aprobación antigua no autoriza un efecto que la política de hoy
         # prohíbe, y una intención en vuelo no se reintenta a ciegas.
-        if role in EFFECTFUL_ROLES:
+        if repair is not None:
+            # El ciclo de reparación ya evaluó la política para este intento y ya apuntó —y
+            # persistió— su intención de efecto: volver a apuntarla daría un «ya existe» que
+            # bloquearía el intento legítimo del propio ciclo.
+            resolved_key = repair.effect_key
+        elif role in EFFECTFUL_ROLES:
             guard = self._effect_boundary(run, role, index)
             if guard is not None:
                 return guard
@@ -610,7 +808,18 @@ class WorkflowKernel:
                 last_error = exc
                 self._audit_step_failed(run, index, role, exc, attempts)
                 if role in EFFECTFUL_ROLES:
-                    return self._effect_uncertain(run, role, resolved_key, exc, index)
+                    return self._effect_uncertain(
+                        run,
+                        role,
+                        resolved_key,
+                        exc,
+                        index,
+                        code=(
+                            WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED
+                            if repair is not None
+                            else None
+                        ),
+                    )
                 # Hallazgo N6-02: una invocación que pudo gastar modelo no se reintenta a ciegas.
                 # Los reintentos de transporte viven en el cliente del proveedor, así que
                 # duplicarlos aquí gastaría dos veces dentro de una misma reserva. El reintento solo
@@ -681,7 +890,9 @@ class WorkflowKernel:
             )
             run = self._effects.resolve(run, key=resolved_key, status=status)
 
-        return self._finish_step(run, role, result, key, attempts=attempts, request=request)
+        return self._finish_step(
+            run, role, result, key, attempts=attempts, request=request, repair=repair
+        )
 
     def _billable_failure(self, error: WorkflowError) -> bool:
         """True si el fallo pudo dejar una petición facturable en el proveedor (hallazgo N6-02).
@@ -1310,11 +1521,16 @@ class WorkflowKernel:
         resolved_key: str,
         error: WorkflowError,
         index: int,
+        *,
+        code: WorkflowFailureCode | None = None,
     ) -> WorkflowRun:
         """Bloquea el workflow ante un efecto con resultado incierto, sin repetirlo.
 
         Si el efecto ya tenía su intención apuntada y la ejecución falló, no se sabe si el efecto
-        ocurrió: la única salida segura es la reconciliación explícita.
+        ocurrió: la única salida segura es la reconciliación explícita. ``code`` permite declarar la
+        incertidumbre con el código del bucle de reparación cuando lo que quedó en el aire fue una
+        mutación de un ciclo (``WORKFLOW_REPAIR_RECONCILIATION_REQUIRED``), que es un hecho distinto
+        de un efecto cualquiera sin resolver.
         """
         if resolved_key:
             run = self._effects.mark_unknown(
@@ -1326,7 +1542,7 @@ class WorkflowKernel:
             run,
             BudgetCheck(
                 False,
-                WorkflowFailureCode.WORKFLOW_EFFECT_RECONCILIATION_REQUIRED,
+                code or WorkflowFailureCode.WORKFLOW_EFFECT_RECONCILIATION_REQUIRED,
                 (
                     f"el rol {role.value} declaró un efecto con efectos secundarios y falló "
                     f"después ({error.code.value}): su resultado es incierto, así que no se "
@@ -1345,8 +1561,15 @@ class WorkflowKernel:
         *,
         attempts: int,
         request: RoleExecutionRequest,
+        repair: _RepairAttempt | None = None,
     ) -> WorkflowRun:
-        """Registra el paso y su handoff, decide y aplica la transición (o la pausa)."""
+        """Registra el paso y su handoff, captura los defectos reales, decide y aplica.
+
+        El orden importa: los defectos se **capturan** antes de decidir, porque la decisión de
+        reparación necesita el conjunto actualizado, y el ciclo vigente se cierra antes de decidir
+        porque una verificación que reproduce el defecto es el final de ese ciclo, no una parte de
+        él.
+        """
         del request  # el intento ya quedó reflejado como reserva en el consumo del run
         index = len(run.steps)
         roles_now = stage_roles(run.status, run.request)
@@ -1400,11 +1623,23 @@ class WorkflowKernel:
             result=result,
         )
         self._audit_step_completed(updated, step)
+        if repair is not None:
+            return self._finish_repair_step(updated, result, repair, step_index=index)
+        blocking_now = bool(result.blocking_findings) or result.status is RoleStatus.NEEDS_REPAIR
+        updated = self._upsert_repair_findings(
+            updated, role=role, result=result, step_index=index
+        )
+        updated = self._close_reproduced_cycle(updated, blocking_now=blocking_now)
         return self._apply_decision(updated, decision, step_index=index)
 
     def _advance(self, run: WorkflowRun) -> WorkflowRun:
         """Avanza cuando la etapa actual no tiene roles pendientes."""
         if run.status is TaskStatus.APPROVED:
+            # El cierre es el único punto en el que se puede declarar resuelto un defecto: todas las
+            # gates exigidas ya volvieron a pasar sobre el código reparado. Se resuelve **antes** de
+            # comprobar los requisitos, porque la comprobación de cierre incluye que no queden
+            # defectos sin resolver.
+            run = self._resolve_repair_cycle(run)
             missing = self._missing_requirements(run)
             if missing:
                 return self._block(
@@ -1522,6 +1757,8 @@ class WorkflowKernel:
         if target is TaskStatus.REPAIRING:
             return self._enter_repair(run, decision, step_index)
         if target is TaskStatus.BLOCKED:
+            if decision.failure_code is WorkflowFailureCode.WORKFLOW_REPAIR_BUDGET_EXHAUSTED:
+                return self._block_repair_budget_exhausted(run, None, step_index)
             return self._block(
                 run,
                 BudgetCheck(
@@ -1552,12 +1789,31 @@ class WorkflowKernel:
     def _enter_repair(
         self, run: WorkflowRun, decision: WorkflowDecision, step_index: int | None
     ) -> WorkflowRun:
-        """Entra en ``REPAIRING`` y se detiene ahí: dos transiciones, reservadas antes.
+        """Entra en ``REPAIRING`` para ejecutar el ciclo acotado (ENGINE-6.1).
 
-        La reserva es **compuesta** (``count=2``) porque reservar de una en una permitiría que la
-        segunda mitad rebasara el tope de transiciones.
+        Una sola transición, reservada antes de aplicarla: entrar en reparación ya no es una pausa,
+        así que no hay segunda mitad que reservar. El ciclo —clasificación, política, plan,
+        snapshot, intento y verificación— lo conduce el paso siguiente, que es donde vive su
+        presupuesto.
+        Si la tabla no permitiera entrar en reparación desde la etapa actual (``IN_PROGRESS``, por
+        ejemplo, cuando el propio Developer pide cambios), se bloquea con un código estable en vez
+        de dejar que la máquina lance una excepción: el workflow nunca se queda sin constancia de
+        por qué no reparó.
         """
-        reserved = self._reserve_transition(run, count=2)
+        if not self._machine.can_transition(run.status, TaskStatus.REPAIRING):
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+                    (
+                        f"la tabla de transiciones no permite entrar en reparación desde "
+                        f"{run.status.value}: el defecto no se repara solo en esta etapa"
+                    ),
+                ),
+                step_index=step_index,
+            )
+        reserved = self._reserve_transition(run, count=1)
         if not reserved.allowed:
             return self._block(run, reserved, step_index=step_index)
         entering = self._machine.apply_transition(
@@ -1567,32 +1823,1466 @@ class WorkflowKernel:
             reason=decision.reason,
             step_index=step_index,
         )
+        # La etapa de origen del ciclo es donde apareció el defecto: es lo que conserva la traza
+        # —por dónde se salió del camino limpio— aunque la verificación vuelva a empezar por QA.
+        entering = entering.model_copy(update={"repair_origin_stage": run.status})
         self._audit_transition(entering)
         self._store.save(entering)
+        return entering
 
-        pause = decide_after_repair(entering.status)
-        blocked = self._machine.apply_transition(
-            entering,
-            TaskStatus.BLOCKED,
-            decision=pause.kind,
-            reason=pause.reason,
+    # ------------------------------------------------- bucle de reparación 6.1
+    def _repair_step(self, run: WorkflowRun) -> WorkflowRun:
+        """Conduce el ciclo de reparación vigente: reanudarlo o abrirlo.
+
+        Dos situaciones, y las dos se deciden con hechos durables. Si el run trae un ciclo a medias
+        —plan y snapshot ya persistidos— lo primero es averiguar si la mutación ocurrió: una
+        intención de efecto sin resolver significa que quizá sí, y entonces no se repite nada. Si no
+        hay ciclo abierto, se abre uno nuevo desde cero.
+        """
+        pending = self._effects.pending(run)
+        if pending:
+            return self._block(
+                run,
+                self._pending_effect_check(pending[0]),
+                step_index=len(run.steps),
+            )
+        if run.active_repair_plan is not None:
+            return self._resume_repair(run)
+        return self._begin_repair_cycle(run)
+
+    def _pending_effect_check(self, record: EffectRecord) -> BudgetCheck:
+        """Veredicto de «hay una mutación de reparación sin resolver»: no se repite.
+
+        Vale para la reanudación tras una caída y para cualquier reentrada en ``REPAIRING``: si la
+        intención del efecto quedó ``IN_FLIGHT`` o ``UNKNOWN``, el árbol pudo cambiar y volver a
+        invocar al Developer podría duplicar la mutación. La única salida es reconciliar.
+        """
+        return BudgetCheck(
+            False,
+            WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+            (
+                f"hay un efecto de reparación sin resolver ({record.idempotency_key!r}, "
+                f"{record.status.value}): la mutación pudo ocurrir, así que no se repite. Hace "
+                "falta reconciliar antes de continuar"
+            ),
+        )
+
+    def _resume_repair(self, run: WorkflowRun) -> WorkflowRun:
+        """Reanuda un ciclo cuyo plan ya está persistido y sin intención de efecto en vuelo.
+
+        Solo se continúa si el árbol **verifica** contra el snapshot: eso demuestra que la mutación
+        todavía no ocurrió —la intención se persiste antes de invocar, así que sin intención no hubo
+        llamada— y apuntarla es exactamente la operación que quedó pendiente. Si el árbol no
+        verifica, el estado de la mutación no consta y se bloquea para reconciliar: continuar
+        podría aplicar por segunda vez un cambio que ya está hecho.
+        """
+        plan = run.active_repair_plan
+        snapshot = run.active_repair_snapshot
+        workspace = self._workspace_root(run)
+        if plan is None or snapshot is None or workspace is None:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+                    (
+                        "hay un ciclo de reparación a medias sin snapshot o sin workspace: el "
+                        "estado de la mutación no consta y no se continúa a ciegas"
+                    ),
+                ),
+                step_index=len(run.steps),
+            )
+        if not FileRepairSnapshots(workspace).verify(snapshot):
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+                    (
+                        "el árbol no coincide con el snapshot del ciclo: la mutación pudo ocurrir "
+                        "sin dejar constancia y no se repite"
+                    ),
+                ),
+                step_index=len(run.steps),
+            )
+        return self._execute_repair(run, plan=plan, snapshot=snapshot)
+
+    def _begin_repair_cycle(self, run: WorkflowRun) -> WorkflowRun:
+        """Abre el ciclo: clasificación, política, plan, presupuesto, guard, snapshot e intención.
+
+        El orden es el de la autorización: primero se decide **qué** se repara y con qué autoridad,
+        después se reserva el presupuesto de reparaciones (antes de cualquier mutación), se rechaza
+        el plan que tocaría un archivo protegido, se captura el estado previo, se publica el
+        contexto durable que el Developer resolverá y solo entonces se apunta la intención del
+        efecto. Cualquier «no» deja el árbol intacto.
+        """
+        findings = self._open_repair_findings(run)
+        step_index = len(run.steps)
+        if not findings:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+                    (
+                        "el workflow entró en REPAIRING sin ningún defecto abierto: no hay nada "
+                        "que reparar y no se muta código por si acaso"
+                    ),
+                ),
+                step_index=step_index,
+            )
+        # El handoff de reparaciones anteriores se retira antes de abrir este ciclo: las referencias
+        # se resuelven por la primera de su tipo, y el plan viejo no puede ser el que autorice esta
+        # reparación.
+        run = self._drop_previous_repair_handoff(run)
+        cycle = run.usage.repairs + 1
+        origin = run.repair_origin_stage or self._origin_stage(run)
+        gate = self._policy.evaluate_action(
+            request=run.request, role=RoleName.DEVELOPER, stage=run.status
+        )
+        if gate.outcome is PolicyOutcome.REJECT:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_POLICY_REJECTED,
+                    (
+                        f"la política rechaza reparar la acción {run.request.action!r}: "
+                        f"{gate.reason}. No se muta nada sin autorización"
+                    ),
+                ),
+                step_index=step_index,
+            )
+        run = self._refresh_authority(run, gate)
+        authorized_by_human = self._repair_authorized_by_human(run)
+        policy_allows = (gate.allowed and not gate.requires_human) or authorized_by_human
+        repairability = self._aggregate_repairability(run, findings, policy_allows=policy_allows)
+        decision = build_repair_decision(
+            findings=findings,
+            request=run.request,
+            repairability=repairability,
+            policy_decision_id=gate.decision.id,
+            origin_stage=origin,
+            max_allowed_attempts=run.request.budget.max_repairs,
+            reason=self._repair_decision_reason(repairability, findings),
+            effective_risk=run.effective_risk,
+            effective_authority=run.effective_authority,
+        )
+        run = run.model_copy(
+            update={
+                "active_repair_decision": decision,
+                "repair_origin_stage": origin,
+                "repair_findings": self._mark_in_repair(run.repair_findings, findings),
+            }
+        )
+        blocked = _BLOCKED_REPAIRABILITY_CODES.get(repairability)
+        if blocked is not None:
+            self._audit_repair_decided(run, decision, cycle=cycle)
+            return self._fail_repair_cycle(run, blocked=blocked, decision=decision)
+        if repairability is Repairability.HUMAN_REQUIRED or (
+            gate.requires_human and not authorized_by_human
+        ):
+            self._audit_repair_decided(run, decision, cycle=cycle)
+            return self._open_human_gate(
+                run,
+                gate,
+                step_index=step_index,
+                resume_target=decision.restart_stage,
+                reason_code=WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+            )
+
+        plan = self._repair_plan(
+            run, decision=decision, gate=gate, findings=findings, cycle=cycle, origin=origin
+        )
+        self._audit_repair_decided(run, decision, cycle=cycle, repair_id=plan.repair_id)
+        if no_progress(
+            history=run.repair_history, plan_fingerprint_value=plan.plan_fingerprint
+        ):
+            # El mismo intento ya falló sin avanzar: gastar otra reparación en repetirlo sería el
+            # bucle que el presupuesto no puede permitirse.
+            self._audit_repair_no_progress(run, plan, cycle=cycle)
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_NO_PROGRESS,
+                    (
+                        f"el plan {plan.plan_fingerprint[:16]} ya falló sin mover el defecto: no "
+                        "se repite el mismo intento"
+                    ),
+                ),
+                step_index=step_index,
+            )
+        reserved = reserve_budget(run, repairs=1, elapsed_seconds=self._elapsed(run))
+        if not reserved.allowed:
+            return self._block_repair_budget_exhausted(run, reserved, step_index)
+        run = self._consume(run, repairs=1)
+        run = self._open_cycle_record(
+            run, plan=plan, decision=decision, cycle=cycle, findings=findings
+        )
+        # El consumo de reparación se persiste **antes** de tocar el árbol: una caída después de
+        # mutar no puede devolver el intento como no gastado.
+        self._store.save(run)
+        denied = self._pre_guard_verdict(plan)
+        if denied is not None:
+            return self._fail_repair_cycle(run, denied=denied, plan=plan, cycle=cycle)
+        snapshot, failed = self._capture_snapshot(run, plan=plan, cycle=cycle)
+        if snapshot is None:
+            return self._fail_repair_cycle(
+                run,
+                denied=failed
+                or BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_SNAPSHOT_INVALID,
+                    "no se pudo capturar el estado previo de los archivos autorizados",
+                ),
+                plan=plan,
+                cycle=cycle,
+            )
+        run = run.model_copy(update={"active_repair_snapshot": snapshot})
+        published, failure = self._publish_repair_context(
+            run, plan=plan, snapshot=snapshot, findings=findings
+        )
+        if failure is not None:
+            return self._fail_repair_cycle(run, denied=failure, plan=plan, cycle=cycle)
+        run = published
+        self._store.save(run)
+        return self._execute_repair(run, plan=plan, snapshot=snapshot)
+
+    def _repair_plan(
+        self,
+        run: WorkflowRun,
+        *,
+        decision: RepairDecision,
+        gate: PolicyGate,
+        findings: Sequence[RepairFinding],
+        cycle: int,
+        origin: TaskStatus,
+    ) -> RepairPlan:
+        """Materializa el contrato de escritura del ciclo.
+
+        El plan declara como autorizados los archivos que la petición ya declaró
+        (``changed_files``); el kernel **no** amplía esa lista con nada que venga de un rol: la
+        autorización de escritura la fija la petición, y el guard comprueba después que lo escrito
+        cabe en ella.
+        """
+        return build_repair_plan(
+            workflow_id=run.workflow_id,
+            cycle=cycle,
+            findings=findings,
+            # El kernel no fabrica un diagnóstico: el plan apunta a uno **solo** si algo lo publicó
+            # para este mismo paso, y hoy nadie lo hace. Dejar aquí un identificador que no
+            # corresponde a un artefacto publicado haría que el Developer esperara una pieza que no
+            # existe.
+            diagnosis_id=None,
+            target_files=self._repair_target_files(run),
+            expected_changes=tuple(finding.summary for finding in findings if finding.summary),
+            acceptance_criteria=run.request.acceptance_criteria,
+            verification_roles=decision.verification_plan,
+            risk=run.effective_risk or run.request.risk,
+            authority=run.effective_authority or run.request.authority,
+            policy_decision_id=gate.decision.id,
+            budget_model_calls=self._repair_model_calls(run),
+            budget_total_tokens=self._repair_tokens(run),
+            idempotency_key=self._repair_idempotency_key(run, cycle),
+            strategy=self._repair_strategy(origin, findings),
+        )
+
+    def _open_cycle_record(
+        self,
+        run: WorkflowRun,
+        *,
+        plan: RepairPlan,
+        decision: RepairDecision,
+        cycle: int,
+        findings: Sequence[RepairFinding],
+    ) -> WorkflowRun:
+        """Deja el ciclo abierto y **durable**: plan vigente, decisión e historia.
+
+        Se apunta antes de mutar nada porque el ciclo tiene que poder reconstruirse desde el
+        checkpoint: un proceso nuevo encuentra el plan, el snapshot y los defectos que cubre, y con
+        eso sabe qué se autorizó y qué falta por verificar.
+        """
+        record = RepairCycle(
+            cycle=cycle,
+            repair_id=plan.repair_id,
+            decision_id=decision.decision_id,
+            plan_id=plan.repair_id,
+            origin_stage=decision.origin_stage,
+            restart_stage=decision.restart_stage,
+            status=RepairCycleStatus.DECIDED,
+            findings_in=tuple(finding.finding_id for finding in findings),
+            plan_fingerprint=plan.plan_fingerprint,
+            detail=(
+                f"ciclo {cycle} de {run.request.budget.max_repairs}: {len(findings)} defecto(s) "
+                f"desde {decision.origin_stage.value}"
+            ),
+        )
+        return run.model_copy(
+            update={
+                "active_repair_id": plan.repair_id,
+                "active_repair_cycle": cycle,
+                "active_repair_plan": plan,
+                "repair_history": (*run.repair_history, record)[-MAX_REPAIR_HISTORY:],
+                # El ciclo arranca por el principio de la cadena de verificación: ninguna gate
+                # anterior a la mutación se puede reutilizar.
+                "verification_restart_stage": decision.restart_stage,
+            }
+        )
+
+    def _pre_guard_verdict(self, plan: RepairPlan) -> BudgetCheck | None:
+        """Comprueba **antes** de mutar que el plan no autoriza ningún archivo protegido.
+
+        Se usa la consulta pública del guard (:meth:`RepairGuard.is_protected`) y no un
+        ``check`` completo, porque antes de la mutación no hay diff ni estado posterior que juzgar:
+        un ``check`` aquí solo podría responder «no cambió nada», que no es lo que se pregunta. Lo
+        que se pregunta es si el plan pretende escribir donde no puede, y eso se sabe ya.
+        """
+        blocked = tuple(
+            path for path in plan.target_files if self._guard.is_protected(path)
+        )
+        if not blocked:
+            return None
+        return BudgetCheck(
+            False,
+            WorkflowFailureCode.WORKFLOW_REPAIR_SCOPE_VIOLATION,
+            (
+                "el plan de reparación incluye archivo(s) protegido(s) o prohibido(s): "
+                + ", ".join(blocked)
+                + ". Una reparación no toca la constitución, los permisos, los presupuestos, la "
+                "frontera de política, la auditoría, los secretos ni los gates de CI"
+            ),
+        )
+
+    def _capture_snapshot(
+        self, run: WorkflowRun, *, plan: RepairPlan, cycle: int
+    ) -> tuple[RepairSnapshot | None, BudgetCheck | None]:
+        """Captura el estado previo de los archivos autorizados, con su copia de seguridad.
+
+        Sin snapshot no hay reparación: es lo que permite deshacerla con hashes y lo que demuestra,
+        ante una caída, si la mutación llegó a ocurrir. Un error de captura no se ignora ni se
+        degrada: bloquea el ciclo con su código.
+        """
+        workspace = self._workspace_root(run)
+        if workspace is None:
+            return None, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+                (
+                    "no hay workspace declarado: no se sabe sobre qué árbol reparar, así que no se "
+                    "captura snapshot ni se muta nada"
+                ),
+            )
+        try:
+            snapshot = FileRepairSnapshots(workspace).create(
+                repair_id=plan.repair_id,
+                cycle=cycle,
+                paths=plan.target_files,
+                workspace_path=run.request.workspace_path,
+            )
+        except (OSError, ValueError) as exc:
+            return None, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_SNAPSHOT_INVALID,
+                f"no se pudo capturar el estado previo de la reparación: {exc}",
+            )
+        self._audit_repair_snapshot_created(run, plan, snapshot)
+        return snapshot, None
+
+    def _publish_repair_context(
+        self,
+        run: WorkflowRun,
+        *,
+        plan: RepairPlan,
+        snapshot: RepairSnapshot,
+        findings: Sequence[RepairFinding],
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """Publica el plan, el snapshot y los defectos, y los deja como referencias del run.
+
+        El contexto del ciclo viaja al Developer **por el almacén de artefactos**: el kernel publica
+        los tres artefactos y añade sus referencias a ``run.stage_artifacts``, que es lo que un
+        proceso nuevo —y el adaptador del rol— puede resolver. Nada viaja por memoria de proceso ni
+        por un campo nuevo de la petición.
+        """
+        store = self._artifacts
+        if store is None:
+            return run, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED,
+                (
+                    "el kernel no tiene almacén de artefactos: el plan de reparación no puede "
+                    "viajar al Developer como referencia durable, así que no se repara a ciegas"
+                ),
+            )
+        request = self._role_request(
+            run, RoleName.DEVELOPER, len(run.steps), step_idempotency_key(
+                run.workflow_id, len(run.steps), RoleName.DEVELOPER, run.status
+            )
+        )
+        try:
+            references = (
+                publish_repair_plan(store, request=request, plan=plan),
+                publish_repair_snapshot(store, request=request, snapshot=snapshot),
+                publish_repair_findings(store, request=request, findings=tuple(findings)),
+            )
+        except (WorkflowError, ValueError, OSError) as exc:
+            return run, BudgetCheck(
+                False,
+                WorkflowFailureCode.WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE,
+                f"no se pudo publicar el contexto de la reparación en el almacén: {exc}",
+            )
+        # Las referencias se registran con ``record_stage``: es el mecanismo por el que una etapa
+        # deja su handoff en el checkpoint. El resultado que se registra es sintético —el ciclo
+        # todavía no ha ejecutado al Developer— y solo describe lo que esta etapa deja: el contrato
+        # del ciclo.
+        handoff = RoleExecutionResult(
+            role=RoleName.DEVELOPER,
+            status=RoleStatus.COMPLETED,
+            summary=f"plan de reparación del ciclo {plan.cycle} (contrato y estado previo)",
+            artifact_references=references,
+        )
+        published = record_stage(
+            run,
+            role=RoleName.DEVELOPER,
+            stage=TaskStatus.REPAIRING,
+            step_index=len(run.steps),
+            result=handoff,
+        )
+        return published, None
+
+    def _execute_repair(
+        self, run: WorkflowRun, *, plan: RepairPlan, snapshot: RepairSnapshot
+    ) -> WorkflowRun:
+        """Apunta la intención del efecto y ejecuta el Developer de reparación.
+
+        La intención se apunta **y se persiste** antes de invocar: es lo que impide que una caída
+        repita una mutación que quizá ya ocurrió. La clave del efecto incluye el ciclo y el
+        identificador de la reparación, de modo que un reintento del mismo ciclo no pueda crear una
+        intención distinta que esquivara la comprobación.
+        """
+        index = len(run.steps)
+        key = self._repair_effect_key(run, plan)
+        run, effect = self._effects.begin_intent(
+            run,
+            key=key,
+            action=f"repair-cycle-{plan.cycle}",
+            role=RoleName.DEVELOPER,
+            step_index=index,
+            reversible=True,
+        )
+        if not effect.allowed:
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+                    effect.detail,
+                ),
+                step_index=index,
+            )
+        self._store.save(run)
+        self._audit_repair_started(run, plan)
+        return self._run_role(
+            run,
+            RoleName.DEVELOPER,
+            self._elapsed(run),
+            repair=_RepairAttempt(effect_key=key, plan=plan, snapshot=snapshot),
+        )
+
+    def _finish_repair_step(
+        self,
+        run: WorkflowRun,
+        result: RoleExecutionResult,
+        repair: _RepairAttempt,
+        *,
+        step_index: int,
+    ) -> WorkflowRun:
+        """Cierra el intento: el guard juzga lo que **de verdad** cambió y se vuelve a QA.
+
+        Los archivos cambiados no son los que el rol declare: son los que el sistema de archivos
+        demuestra, comparando el hash actual de cada archivo autorizado con el capturado en el
+        snapshot. El diff textual —cuando se puede construir— se calcula desde la copia de seguridad
+        del snapshot, porque el kernel no ejecuta git.
+        """
+        if result.status is not RoleStatus.COMPLETED or result.blocking_findings:
+            return self._fail_repair_attempt(run, result, repair, step_index=step_index)
+        changed, before, after = self._repair_change_set(run, repair.snapshot)
+        diff = self._repair_diff(run, repair.snapshot, changed)
+        verdict = self._guard.check(
+            plan=repair.plan,
+            changed_files=changed,
+            before=before,
+            after=after,
+            diff_text=diff,
+        )
+        if not verdict.allowed:
+            self._audit_repair_failed(
+                run,
+                repair.plan,
+                verdict.code or WorkflowFailureCode.WORKFLOW_REPAIR_SCOPE_VIOLATION,
+                verdict.detail,
+            )
+            # El rollback se intenta **antes** de cerrar el ciclo: después, el snapshot y el estado
+            # aplicado ya no estarían vigentes y no habría con qué demostrar que se puede deshacer.
+            cycle = self._active_cycle(run)
+            undone = False
+            refusal = None
+            if cycle is not None:
+                undone, refusal = self._rollback_and_audit(run, cycle, expected=after)
+            detail = verdict.detail
+            if undone:
+                detail = f"{detail}; revertida al estado previo"
+            if refusal is not None:
+                detail = f"{detail} | {refusal.detail}"
+            run = self._close_cycle(
+                run,
+                cycle=repair.plan.cycle,
+                status=RepairCycleStatus.FAILED,
+                detail=detail,
+            )
+            return self._block(
+                run,
+                BudgetCheck(
+                    False,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_SCOPE_VIOLATION,
+                    detail,
+                ),
+                step_index=step_index,
+            )
+        accepted = self._applied_state(run, after)
+        self._audit_repair_applied(run, repair.plan, changed, result)
+        return self._accept_repair(
+            accepted, repair=repair, changed=changed, step_index=step_index
+        )
+
+    def _accept_repair(
+        self,
+        run: WorkflowRun,
+        *,
+        repair: _RepairAttempt,
+        changed: Sequence[str],
+        step_index: int,
+    ) -> WorkflowRun:
+        """Acepta la mutación: vuelve a ``QA`` e invalida toda la evidencia posterior.
+
+        Dos cosas ocurren aquí y las dos son la misma regla: lo que estaba verificado ya no lo está.
+        La etapa de reinicio queda declarada en ``verification_restart_stage`` y las etapas
+        registradas **después** de ``QA`` se retiran del handoff, porque describen código que la
+        reparación acaba de cambiar. Ninguna gate previa se reutiliza: la cadena de verificación
+        vuelve a empezar por QA y el bucle normal la recorre entera.
+        """
+        transitioned, denied = self._transition(
+            run,
+            TaskStatus.QA,
+            decision=WorkflowDecisionKind.CONTINUE,
+            reason="reparación aplicada: la verificación vuelve a empezar por QA",
             step_index=step_index,
         )
-        blocked = blocked.model_copy(
+        if denied is not None:
+            return self._fail_repair_cycle(
+                run, denied=denied, plan=repair.plan, cycle=repair.plan.cycle
+            )
+        accepted = transitioned.model_copy(
             update={
-                "failure": WorkflowFailure(
-                    code=pause.failure_code or WorkflowFailureCode.WORKFLOW_REPAIR_DEFERRED,
-                    detail=pause.reason,
-                    step_index=step_index,
+                "verification_restart_stage": TaskStatus.QA,
+                "repair_history": self._cycle_with_status(
+                    transitioned, repair.plan.cycle, RepairCycleStatus.VERIFYING
+                ),
+                "stage_artifacts": self._without_invalidated_stages(transitioned),
+            }
+        )
+        self._audit_transition(accepted)
+        self._audit_repair_verification_started(accepted, repair.plan)
+        self._store.save(accepted)
+        return accepted
+
+    def _applied_state(self, run: WorkflowRun, after: Mapping[str, str]) -> WorkflowRun:
+        """Registra de forma durable el estado que la reparación **dejó** en cada archivo.
+
+        Es lo que hace demostrable un rollback: sin esta foto, «los hashes actuales son los que dejó
+        la reparación» no se puede comprobar en un proceso nuevo y restaurar el snapshot sería
+        hacerlo sobre un árbol que pudo cambiar por otra vía.
+        """
+        return run.model_copy(
+            update={
+                "repair_applied_digests": tuple(sorted(after.items()))[
+                    :MAX_REPAIR_APPLIED_DIGESTS
+                ]
+            }
+        )
+
+    def _repair_change_set(
+        self, run: WorkflowRun, snapshot: RepairSnapshot
+    ) -> tuple[tuple[str, ...], dict[str, str], dict[str, str]]:
+        """Archivos que **de verdad** cambiaron, con su estado antes y después.
+
+        El estado «antes» sale del snapshot y el «después» del disco, no de lo que declare el rol:
+        una reparación que dijera haber cambiado algo que no cambió se juzga por lo que hay, no por
+        lo que dice. Una entrada que no se puede leer se trata como cambio (nunca como ausencia de
+        cambio): el guard tiene que verla para poder rechazarla.
+        """
+        workspace = self._workspace_root(run)
+        before: dict[str, str] = {}
+        after: dict[str, str] = {}
+        changed: list[str] = []
+        snapshots = None if workspace is None else FileRepairSnapshots(workspace)
+        for entry in snapshot.entries:
+            previous = entry.sha256 if entry.existed else ""
+            before[entry.path] = previous
+            current = previous
+            if snapshots is not None:
+                try:
+                    current = snapshots.digest(entry.path)
+                except ValueError:
+                    current = ""
+            after[entry.path] = current
+            if current != previous:
+                changed.append(entry.path)
+        return tuple(changed), before, after
+
+    def _repair_diff(
+        self, run: WorkflowRun, snapshot: RepairSnapshot, changed: Sequence[str]
+    ) -> str:
+        """Diff textual del intento, construido desde la copia de seguridad del snapshot.
+
+        El kernel no ejecuta git —el workspace puede tener trabajo sin confirmar y el motor no
+        depende del estado de un repositorio para juzgar su propia mutación—, así que el «antes» se
+        lee de la copia que el snapshot dejó en ``<workspace>/.punto-repair-snapshots/<id>/`` y el
+        «después» del archivo actual. El límite es explícito: solo se comparan los archivos
+        autorizados por el plan, y el diff se acota en caracteres; lo que no cabe no se juzga como
+        texto, y el guard sigue juzgando los cambios por los hashes.
+        """
+        workspace = self._workspace_root(run)
+        if workspace is None:
+            return ""
+        backups = workspace / SNAPSHOT_DIR_NAME / str(snapshot.snapshot_id)
+        by_path = {entry.path: entry for entry in snapshot.entries}
+        chunks: list[str] = []
+        total = 0
+        for path in changed:
+            entry = by_path.get(path)
+            if entry is None:
+                continue
+            before = self._read_diff_side(backups.joinpath(*path.split("/")))
+            after = self._read_diff_side(workspace.joinpath(*path.split("/")))
+            if before is None or after is None:
+                continue
+            chunk = "\n".join(
+                difflib.unified_diff(
+                    before.splitlines(),
+                    after.splitlines(),
+                    fromfile=path,
+                    tofile=path,
+                    lineterm="",
+                )
+            )
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _MAX_REPAIR_DIFF_CHARS:
+                chunks.append(f"# diff truncado: se superó el límite de {_MAX_REPAIR_DIFF_CHARS}")
+                break
+            chunks.append(chunk)
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _read_diff_side(path: Path) -> str | None:
+        """Contenido textual de un archivo para el diff, o ``None`` si no se puede comparar.
+
+        Un archivo ausente se compara como texto vacío (creación o borrado) y uno ilegible o
+        demasiado grande se declara no comparable en texto: el hash sigue siendo la prueba.
+        """
+        if not path.is_file():
+            return ""
+        try:
+            if path.stat().st_size > _MAX_REPAIR_DIFF_FILE_BYTES:
+                return None
+        except OSError:
+            return None
+        try:
+            return path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _fail_repair_attempt(
+        self,
+        run: WorkflowRun,
+        result: RoleExecutionResult,
+        repair: _RepairAttempt,
+        *,
+        step_index: int,
+    ) -> WorkflowRun:
+        """Un intento que no completó: el ciclo no se acepta y el workflow se bloquea.
+
+        Un Developer que falla, que se bloquea o que pide cambios no ha reparado nada, así que no se
+        pasa a verificación: el defecto sigue donde estaba y seguir adelante sería verificar código
+        sin arreglar. El código del bloqueo es el del rol, salvo que el rol no diera ninguno.
+
+        Antes de bloquear se comprueba el árbol: un intento que falló **después** de escribir pudo
+        dejar cambios a medias, y si puede demostrarse que el estado actual es el que dejó el
+        intento, se deshace. Un intento que no completó no deja el árbol mutado.
+        """
+        code = _REPAIR_ROLE_FAILURE_CODES.get(
+            result.status, WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED
+        )
+        if result.error_code is not None and result.status is RoleStatus.FAILED:
+            code = result.error_code
+        detail = result.error_detail or result.summary or "el intento de reparación no completó"
+        self._audit_repair_failed(run, repair.plan, code, detail)
+        cycle = self._active_cycle(run)
+        changed, _before, after = self._repair_change_set(run, repair.snapshot)
+        undone = False
+        refusal = None
+        if changed and cycle is not None:
+            undone, refusal = self._rollback_and_audit(run, cycle, expected=after)
+        detail = (
+            f"{detail}; revertida al estado previo"
+            if undone
+            else detail
+        )
+        if refusal is not None:
+            detail = f"{detail} | {refusal.detail}"
+        closed = self._close_cycle(
+            run,
+            cycle=repair.plan.cycle,
+            status=RepairCycleStatus.FAILED,
+            detail=detail,
+        )
+        return self._block(
+            closed, BudgetCheck(False, code, detail), step_index=step_index
+        )
+
+    def _fail_repair_cycle(
+        self,
+        run: WorkflowRun,
+        *,
+        blocked: WorkflowFailureCode | None = None,
+        denied: BudgetCheck | None = None,
+        decision: RepairDecision | None = None,
+        plan: RepairPlan | None = None,
+        cycle: int | None = None,
+    ) -> WorkflowRun:
+        """Cierra un ciclo que no llegó a mutar nada y bloquea con el motivo declarado.
+
+        Nada se reparó, así que no hay rollback que hacer ni hallazgo que reabrir: lo que hay es un
+        motivo que el workflow tiene que conservar. El ciclo queda registrado como ``BLOCKED`` en la
+        historia para que la traza no pierda el intento.
+        """
+        code = (
+            blocked
+            or (denied.code if denied is not None else None)
+            or WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED
+        )
+        if denied is not None:
+            detail = denied.detail
+        elif decision is not None:
+            detail = (
+                "la reparación no está autorizada para este defecto: "
+                f"{decision.repairability.value}"
+            )
+        else:
+            detail = "reparación rechazada"
+        if cycle is not None:
+            self._audit_repair_failed(run, plan, code, detail)
+            run = self._close_cycle(
+                run, cycle=cycle, status=RepairCycleStatus.BLOCKED, detail=detail
+            )
+        return self._block(run, BudgetCheck(False, code, detail), step_index=len(run.steps))
+
+    # ------------------------------------------- estado y resolución de defectos
+    def _upsert_repair_findings(
+        self,
+        run: WorkflowRun,
+        *,
+        role: RoleName,
+        result: RoleExecutionResult,
+        step_index: int,
+    ) -> WorkflowRun:
+        """Captura los defectos bloqueantes del resultado, sin duplicar los ya conocidos.
+
+        La identidad es el ``fingerprint``: el mismo defecto visto dos veces actualiza su marca de
+        tiempo y —si estaba en reparación— su contador de intentos, pero **no** crea un segundo
+        defecto. Un defecto nuevo entra con su propio identificador y el ciclo en el que apareció,
+        que es lo que permite distinguir «volvió el mismo» de «la reparación rompió otra cosa».
+        """
+        captured = findings_from_result(
+            result=result,
+            stage=run.status,
+            step_index=step_index,
+            acceptance_criteria=run.request.acceptance_criteria,
+            affected_files=self._repair_target_files(run),
+            code="" if result.error_code is None else result.error_code.value,
+        )
+        if not captured:
+            return run
+        stamp = self._clock()
+        by_fingerprint: dict[str, RepairFinding] = {}
+        for finding in captured:
+            by_fingerprint.setdefault(finding.fingerprint, finding)
+        merged: list[RepairFinding] = []
+        for existing in run.repair_findings:
+            fresh = by_fingerprint.pop(existing.fingerprint, None)
+            if fresh is None:
+                merged.append(existing)
+                continue
+            engaged = existing.status is RepairFindingStatus.IN_REPAIR
+            merged.append(
+                existing.model_copy(
+                    update={
+                        "last_seen_at": stamp,
+                        # Volvió después de una reparación: el intento no lo resolvió, así que
+                        # cuenta como intento fallido y el defecto sigue abierto.
+                        "status": (
+                            RepairFindingStatus.OPEN if engaged else existing.status
+                        ),
+                        "repair_attempts": existing.repair_attempts + (1 if engaged else 0),
+                    }
+                )
+            )
+        for fresh in by_fingerprint.values():
+            merged.append(
+                fresh.model_copy(
+                    update={
+                        "first_seen_at": stamp,
+                        "last_seen_at": stamp,
+                        "cycle_introduced": run.active_repair_cycle,
+                    }
+                )
+            )
+        return run.model_copy(
+            update={"repair_findings": tuple(merged)[-MAX_REPAIR_FINDINGS_STORED:]}
+        )
+
+    def _close_reproduced_cycle(self, run: WorkflowRun, *, blocking_now: bool) -> WorkflowRun:
+        """Cierra el ciclo vigente si la nueva verificación **reprodujo** el defecto.
+
+        Un ciclo en ``VERIFYING`` que recibe un hallazgo bloqueante de la cadena de verificación no
+        progresó: o el mismo defecto sigue ahí (``NO_PROGRESS``) o apareció uno nuevo que el intento
+        introdujo (``FAILED``). En los dos casos el árbol vuelve a su estado previo **si puede
+        demostrarse** que está como la reparación lo dejó, y si no se bloquea para reconciliar.
+        """
+        if not blocking_now:
+            return run
+        cycle = self._active_cycle(run)
+        if cycle is None or cycle.status is not RepairCycleStatus.VERIFYING:
+            return run
+        if run.status not in (TaskStatus.QA, TaskStatus.SECURITY, TaskStatus.REVIEW):
+            return run
+        findings = run.repair_findings
+        status = self._cycle_status(cycle, findings)
+        if status is RepairCycleStatus.RESOLVED:
+            # No reapareció nada: el ciclo sigue verificándose hasta el cierre.
+            return run
+        detail = (
+            f"la verificación del ciclo {cycle.cycle} reprodujo el defecto: "
+            f"{len([f for f in findings if f.is_open])} defecto(s) abierto(s)"
+        )
+        if status is RepairCycleStatus.NO_PROGRESS:
+            self._audit_repair_no_progress(run, None, cycle=cycle.cycle, detail=detail)
+        else:
+            self._audit_repair_failed(
+                run,
+                None,
+                _STALLED_CYCLE_AUDIT_CODES.get(
+                    status, WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED
+                ),
+                detail,
+            )
+        closed, refusal = self._close_cycle_with_rollback(
+            run, cycle=cycle, status=status, detail=detail
+        )
+        if refusal is not None:
+            return self._block(closed, refusal, step_index=len(run.steps))
+        return closed
+
+    def _resolve_repair_cycle(self, run: WorkflowRun) -> WorkflowRun:
+        """Declara resueltos los defectos, **después** de la nueva verificación.
+
+        Es el único sitio donde se escribe ``RESOLVED``, y se escribe con la evidencia de las
+        verificaciones que acaban de pasar. Dos casos, y los dos son la misma regla:
+
+        - el ciclo vigente se cierra con los defectos que la verificación ya no reproduce;
+        - cualquier defecto que siguiera pendiente se resuelve también, porque el workflow solo
+          llega aquí con **toda** la cadena en verde: si alguno se hubiera reproducido, el upsert lo
+          habría devuelto a ``OPEN`` y el workflow no estaría aprobando. Es el caso de un defecto
+          capturado sin ciclo (por ejemplo, con ``max_repairs=0`` el engine no repara, pero una
+          verificación posterior sí puede demostrar que el defecto ya no está).
+        """
+        cycle = self._active_cycle(run)
+        resolved: tuple[UUID, ...] = ()
+        excluded: frozenset[UUID] = frozenset()
+        if cycle is not None:
+            if cycle.status is not RepairCycleStatus.VERIFYING:
+                # Un ciclo a medias no se cierra en la frontera de aprobación: cerrarlo aquí sería
+                # declarar resuelto lo que todavía no se ha vuelto a verificar.
+                return run
+            findings = self._findings_with_resolution(run, cycle)
+            status = self._cycle_status(cycle, findings)
+            seed = set(cycle.findings_in)
+            resolved = tuple(
+                finding.finding_id
+                for finding in findings
+                if finding.status is RepairFindingStatus.RESOLVED
+                and finding.finding_id in seed
+            )
+            unresolved = tuple(finding.finding_id for finding in findings if finding.is_open)
+            # Un defecto del ciclo que la verificación volvió a reproducir sigue ``OPEN``: no se
+            # resuelve por llegar a la frontera de aprobación, se queda abierto y el cierre se
+            # bloquea. Es la cara del invariante «no se completa con defectos bloqueantes vivos».
+            excluded = frozenset(
+                finding.finding_id
+                for finding in findings
+                if finding.finding_id in seed
+                and finding.status is RepairFindingStatus.OPEN
+            )
+            run = run.model_copy(
+                update={
+                    "repair_findings": findings,
+                    "verification_restart_stage": None,
+                }
+            )
+            run = self._close_cycle(
+                run, cycle=cycle.cycle, status=status, detail=f"cierre del ciclo {cycle.cycle}"
+            )
+            if status is RepairCycleStatus.RESOLVED:
+                self._audit_repair_resolved(run, cycle, resolved, unresolved)
+            else:
+                self._audit_repair_failed(
+                    run,
+                    None,
+                    WorkflowFailureCode.WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE,
+                    f"el ciclo {cycle.cycle} cerró en {status.value}",
+                )
+        run = self._resolve_remaining_findings(run, excluded=excluded)
+        self._store.save(run)
+        return run
+
+    def _resolve_remaining_findings(
+        self, run: WorkflowRun, *, excluded: frozenset[UUID] = frozenset()
+    ) -> WorkflowRun:
+        """Resuelve los defectos pendientes que la cadena de verificación ya no reproduce.
+
+        Se llama en la frontera de cierre, con todas las gates en verde. La evidencia de cada
+        defecto son las referencias de las etapas de verificación posteriores al paso que lo
+        detectó: son los informes con los que se volvió a comprobar, y sin ellos la resolución sería
+        una afirmación sin respaldo. ``excluded`` son los defectos que la verificación **sí**
+        reprodujo: esos no se resuelven aquí, se quedan abiertos y el cierre se bloquea.
+        """
+        pending = tuple(
+            finding
+            for finding in run.repair_findings
+            if finding.status
+            not in (RepairFindingStatus.RESOLVED, RepairFindingStatus.WAIVED_BY_HUMAN)
+            and finding.finding_id not in excluded
+        )
+        if not pending:
+            return run
+        stamp = self._clock()
+        resolved_ids = {finding.finding_id for finding in pending}
+        evidence_by_id = {
+            finding.finding_id: self._evidence_after_step(run, finding.source_step_index)
+            for finding in pending
+        }
+        return run.model_copy(
+            update={
+                "repair_findings": tuple(
+                    finding.model_copy(
+                        update={
+                            "status": RepairFindingStatus.RESOLVED,
+                            "resolved_at": stamp,
+                            "resolution_evidence": evidence_by_id[finding.finding_id],
+                        }
+                    )
+                    if finding.finding_id in resolved_ids
+                    else finding
+                    for finding in run.repair_findings
                 )
             }
         )
-        self._audit_transition(blocked)
-        self._store.save(blocked)
-        failure = blocked.failure
-        if failure is not None:
-            self._audit_blocked(blocked, failure)
-        return blocked
+
+    def _evidence_after_step(
+        self, run: WorkflowRun, step_index: int
+    ) -> tuple[ArtifactReference, ...]:
+        """Referencias de las verificaciones posteriores a un paso, acotadas al contrato."""
+        references: list[ArtifactReference] = []
+        for entry in run.stage_artifacts:
+            if entry.step_index <= step_index or entry.role is RoleName.DEVELOPER:
+                continue
+            references.extend(entry.references)
+        return tuple(references[:MAX_WORKFLOW_EVIDENCE])
+
+    def _findings_with_resolution(
+        self, run: WorkflowRun, cycle: RepairCycle
+    ) -> tuple[RepairFinding, ...]:
+        """Marca ``RESOLVED`` los defectos del ciclo que la nueva verificación ya no reproduce.
+
+        La discriminación es el estado: un defecto del ciclo se marca ``IN_REPAIR`` al abrirlo, y si
+        la verificación posterior lo reproduce, el upsert lo devuelve a ``OPEN`` con un intento más.
+        Así que un defecto que sigue ``IN_REPAIR`` **no reapareció** y se resuelve; uno que volvió a
+        ``OPEN`` sigue abierto, que es lo que impide cerrar y lo que detecta la falta de progreso.
+
+        La evidencia de resolución son las referencias de las etapas de verificación registradas
+        **después** de la mutación: son los informes con los que la cadena volvió a pasar, y sin
+        ellos un cierre sería una afirmación sin respaldo.
+        """
+        seed = set(cycle.findings_in)
+        evidence = self._resolution_evidence(run)
+        stamp = self._clock()
+        return tuple(
+            finding.model_copy(
+                update={
+                    "status": RepairFindingStatus.RESOLVED,
+                    "resolved_at": stamp,
+                    "resolution_evidence": evidence,
+                }
+            )
+            if finding.finding_id in seed
+            and finding.status is RepairFindingStatus.IN_REPAIR
+            else finding
+            for finding in run.repair_findings
+        )
+
+    def _resolution_evidence(self, run: WorkflowRun) -> tuple[ArtifactReference, ...]:
+        """Referencias durables de las verificaciones posteriores a la última mutación.
+
+        Solo cuentan las etapas de la cadena de verificación —no el propio ciclo de reparación, cuyo
+        handoff describe la autorización, no la comprobación—. Si esos roles no dejaron ninguna
+        referencia, la lista queda vacía: no se inventa evidencia que no exista.
+        """
+        epoch = self._verification_epoch(run)
+        references: list[ArtifactReference] = []
+        for entry in run.stage_artifacts:
+            if entry.step_index <= epoch or entry.role is RoleName.DEVELOPER:
+                continue
+            references.extend(entry.references)
+        return tuple(references[:MAX_WORKFLOW_EVIDENCE])
+
+    def _cycle_status(
+        self, cycle: RepairCycle, findings: Sequence[RepairFinding]
+    ) -> RepairCycleStatus:
+        """Estado del ciclo a partir de los defectos que quedaron abiertos.
+
+        ``next_cycle_status`` necesita el conjunto **anterior**; se reconstruye desde los
+        identificadores del ciclo —todos estaban abiertos cuando el ciclo empezó— en vez de guardar
+        una segunda copia de los defectos en el checkpoint.
+        """
+        seed = set(cycle.findings_in)
+        previous = tuple(
+            finding.model_copy(update={"status": RepairFindingStatus.IN_REPAIR})
+            for finding in findings
+            if finding.finding_id in seed
+        )
+        return next_cycle_status(resolved=findings, previous=previous)
+
+    def _active_cycle(self, run: WorkflowRun) -> RepairCycle | None:
+        """Ciclo vigente, si lo hay: el último registrado y aún sin cerrar."""
+        if run.active_repair_cycle < 1 or not run.repair_history:
+            return None
+        last = run.repair_history[-1]
+        return last if last.cycle == run.active_repair_cycle else None
+
+    def _close_cycle_with_rollback(
+        self,
+        run: WorkflowRun,
+        *,
+        cycle: RepairCycle,
+        status: RepairCycleStatus,
+        detail: str,
+    ) -> tuple[WorkflowRun, BudgetCheck | None]:
+        """Cierra el ciclo y, si la reparación no sirvió, intenta deshacerla con garantías.
+
+        El rollback lo decide :meth:`_rollback_and_audit`: si puede demostrarse que el árbol está
+        como la reparación lo dejó, se deshace. El estado del ciclo **no** pasa a ``ROLLED_BACK`` a
+        propósito: el ciclo falló sin mover el defecto, y ese es el hecho que cuenta la falta de
+        progreso. Marcarlo ``ROLLED_BACK`` —que la detección de no-progreso no cuenta como intento
+        fallido— dejaría el bucle repitiendo el mismo plan hasta agotar el presupuesto, que es
+        justo lo que existe para impedir. El rollback queda en el detalle del ciclo y en su evento.
+        """
+        undone, refusal = self._rollback_and_audit(run, cycle, expected=None)
+        final_detail = detail if not undone else f"{detail}; revertida al estado previo"
+        if refusal is not None:
+            final_detail = f"{final_detail} | {refusal.detail}"
+        closed = self._close_cycle(run, cycle=cycle.cycle, status=status, detail=final_detail)
+        return closed, refusal
+
+    def _rollback_and_audit(
+        self,
+        run: WorkflowRun,
+        cycle: RepairCycle,
+        *,
+        expected: Mapping[str, str] | None,
+    ) -> tuple[bool, BudgetCheck | None]:
+        """Intenta deshacer la mutación, la audita si lo consigue y da ``(deshecho, rechazo)``.
+
+        ``(False, None)`` significa «no había nada que deshacer»: sin snapshot, sin estado aplicado
+        o sin workspace no se intenta siquiera, porque no hay con qué demostrar nada.
+        ``(True, None)`` significa que el árbol volvió a su estado previo. Un rechazo es un bloqueo
+        para reconciliar: el árbol pudo cambiar por otra vía y restaurar a ciegas destruiría trabajo
+        ajeno.
+        """
+        verdict = self._rollback_repair(run, expected=expected)
+        if verdict is None:
+            return False, None
+        if verdict.rolled_back:
+            self._audit_repair_rolled_back(run, cycle, verdict)
+            return True, None
+        return False, self._rollback_refused(verdict.detail)
+
+    def _rollback_repair(
+        self, run: WorkflowRun, *, expected: Mapping[str, str] | None = None
+    ) -> RollbackVerdict | None:
+        """Deshace la mutación **solo** si puede demostrarse que el árbol está como la dejó.
+
+        Tres condiciones, las tres comprobables: hay snapshot y estado aplicado registrado; el hash
+        actual de cada archivo autorizado es exactamente el que la reparación dejó —lo que demuestra
+        que nadie más tocó el árbol desde entonces—; y no consta ningún efecto externo (la
+        reparación es una escritura local autorizada por el plan y verificada por el guard). Si algo
+        no cuadra, el veredicto es «no se toca nada» y quien llama bloquea para reconciliar:
+        restaurar a ciegas sobre trabajo ajeno sería peor que no restaurar.
+
+        ``expected`` permite declarar el estado que dejó un intento que **no** llegó a aceptarse (el
+        guard lo rechazó, o el rol falló después de escribir): en ese caso se acaba de medir el
+        árbol y ese es el estado que hay que demostrar antes de restaurar.
+        """
+        snapshot = run.active_repair_snapshot
+        wanted = dict(run.repair_applied_digests) if expected is None else dict(expected)
+        workspace = self._workspace_root(run)
+        if snapshot is None or not wanted or workspace is None:
+            return None
+        return FileRepairSnapshots(workspace).rollback(
+            snapshot=snapshot,
+            expected=wanted,
+            external_side_effects=False,
+        )
+
+    @staticmethod
+    def _rollback_refused(detail: str) -> BudgetCheck:
+        """Veredicto de rollback rechazado: el árbol queda para reconciliar, no a medias."""
+        return BudgetCheck(
+            False,
+            WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+            f"no se pudo deshacer la reparación con garantías: {detail}",
+        )
+
+    def _close_cycle(
+        self,
+        run: WorkflowRun,
+        *,
+        cycle: int,
+        status: RepairCycleStatus,
+        detail: str,
+    ) -> WorkflowRun:
+        """Cierra el ciclo en la historia y libera el estado activo.
+
+        La historia es el registro durable del ciclo —estado, defectos resueltos y abiertos—; el
+        estado activo se limpia porque un ciclo cerrado no tiene plan ni snapshot vigentes. Los
+        defectos siguen en ``repair_findings``: son el hilo por el que se reconoce que un defecto
+        volvió.
+        """
+        stamp = self._clock()
+        history = tuple(
+            entry.model_copy(
+                update={
+                    "status": status,
+                    "findings_resolved": tuple(
+                        finding.finding_id
+                        for finding in run.repair_findings
+                        if finding.status is RepairFindingStatus.RESOLVED
+                        and finding.finding_id in set(entry.findings_in)
+                    ),
+                    "findings_open": tuple(
+                        finding.finding_id
+                        for finding in run.repair_findings
+                        if finding.is_open and finding.finding_id in set(entry.findings_in)
+                    ),
+                    "completed_at": stamp,
+                    "detail": detail[:MAX_WORKFLOW_SUMMARY_CHARS],
+                }
+            )
+            if entry.cycle == cycle
+            else entry
+            for entry in run.repair_history
+        )
+        return run.model_copy(
+            update={
+                "repair_history": history,
+                "active_repair_id": None,
+                "active_repair_cycle": 0,
+                "active_repair_decision": None,
+                "active_repair_plan": None,
+                "active_repair_snapshot": None,
+                "repair_applied_digests": (),
+            }
+        )
+
+    def _cycle_with_status(
+        self, run: WorkflowRun, cycle: int, status: RepairCycleStatus
+    ) -> tuple[RepairCycle, ...]:
+        """Historia con el estado de un ciclo actualizado (sin cerrarlo)."""
+        return tuple(
+            entry.model_copy(update={"status": status}) if entry.cycle == cycle else entry
+            for entry in run.repair_history
+        )
+
+    def _block_repair_budget_exhausted(
+        self,
+        run: WorkflowRun,
+        check: BudgetCheck | None,
+        step_index: int | None,
+    ) -> WorkflowRun:
+        """Bloquea por presupuesto de reparación agotado y marca los defectos sin resolver.
+
+        Un defecto que se quedó sin intentos no se declara resuelto ni se deja abierto como si
+        fuera a repararse: queda ``UNRESOLVED``, que es lo que impide que el workflow cierre y lo
+        que dice, sin adornos, que hizo falta una persona o un presupuesto nuevo.
+
+        El código es siempre ``WORKFLOW_REPAIR_BUDGET_EXHAUSTED``: la frontera de presupuesto
+        devuelve ``max_repairs`` agotado con su código genérico, y el bucle lo **traduce** a su
+        propio vocabulario para que un bloqueo por reparaciones no se confunda con otro tope.
+        """
+        budget = run.request.budget
+        detail = (
+            f"el presupuesto de reparación está agotado "
+            f"({run.usage.repairs}/{budget.max_repairs}): no se abre otro ciclo ni se amplía solo"
+        )
+        if check is not None and check.detail:
+            detail = f"{detail} ({check.detail})"
+        self._audit_repair_budget_exhausted(run, detail)
+        run = self._mark_unresolved(run)
+        run = run.model_copy(
+            update={
+                "active_repair_decision": None,
+                "active_repair_plan": None,
+                "active_repair_snapshot": None,
+                "active_repair_id": None,
+                "repair_applied_digests": (),
+                "active_repair_cycle": 0,
+            }
+        )
+        return self._block(
+            run,
+            BudgetCheck(
+                False, WorkflowFailureCode.WORKFLOW_REPAIR_BUDGET_EXHAUSTED, detail
+            ),
+            step_index=step_index,
+        )
+
+    def _mark_unresolved(self, run: WorkflowRun) -> WorkflowRun:
+        """Marca como ``UNRESOLVED`` los defectos que el presupuesto dejó sin reparar."""
+        cycle = run.active_repair_cycle
+        seed = set()
+        if cycle and run.repair_history and run.repair_history[-1].cycle == cycle:
+            seed = set(run.repair_history[-1].findings_in)
+        return run.model_copy(
+            update={
+                "repair_findings": tuple(
+                    finding.model_copy(update={"status": RepairFindingStatus.UNRESOLVED})
+                    if finding.is_open and (not seed or finding.finding_id in seed)
+                    else finding
+                    for finding in run.repair_findings
+                )
+            }
+        )
+
+    # ------------------------------------------------------- consultas del ciclo
+    @staticmethod
+    def _open_repair_findings(run: WorkflowRun) -> tuple[RepairFinding, ...]:
+        """Defectos abiertos, en el orden en que se conocieron."""
+        return tuple(finding for finding in run.repair_findings if finding.is_open)
+
+    @staticmethod
+    def _mark_in_repair(
+        findings: Sequence[RepairFinding], covered: Sequence[RepairFinding]
+    ) -> tuple[RepairFinding, ...]:
+        """Marca los defectos que este ciclo intenta reparar, sin tocar los demás."""
+        seed = {finding.finding_id for finding in covered}
+        return tuple(
+            finding.model_copy(update={"status": RepairFindingStatus.IN_REPAIR})
+            if finding.finding_id in seed
+            else finding
+            for finding in findings
+        )
+
+    def _aggregate_repairability(
+        self,
+        run: WorkflowRun,
+        findings: Sequence[RepairFinding],
+        *,
+        policy_allows: bool,
+    ) -> Repairability:
+        """Clasificación del ciclo: la **menos** autónoma de los defectos que cubre.
+
+        Cada defecto se clasifica por separado con las reglas fijas del dominio y el ciclo se queda
+        con la peor: un defecto de seguridad o uno no reparable no puede quedar diluido entre
+        defectos reparables solo porque el plan los cubra a la vez. La precedencia es explícita para
+        que dos ejecuciones del mismo caso decidan lo mismo.
+        """
+        infrastructure = any(self._is_infrastructure(run, finding) for finding in findings)
+        classified = {
+            classify_repairability(
+                finding=finding,
+                request=run.request,
+                policy_allows=policy_allows,
+                # Sin evidencia observada no se repara: el resumen dice qué falla, pero lo que
+                # permite diagnosticar sin adivinar es la evidencia. Un defecto que solo trae
+                # «algo va mal» se bloquea con ``WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE``.
+                evidence_sufficient=bool(finding.evidence.strip()),
+                infrastructure=infrastructure,
+            )
+            for finding in findings
+        }
+        for candidate in _REPAIRABILITY_PRECEDENCE:
+            if candidate in classified:
+                return candidate
+        return Repairability.NON_REPAIRABLE
+
+    @staticmethod
+    def _is_infrastructure(run: WorkflowRun, finding: RepairFinding) -> bool:
+        """True si el defecto describe al entorno y no al producto.
+
+        Se comprueba en el paso que lo reportó: un rol que terminó con el código de proveedor no
+        disponible no está describiendo código que haya que reparar.
+        """
+        for step in reversed(run.steps):
+            if step.role is finding.source_role and step.stage is finding.source_stage:
+                return step.error_code in _INFRASTRUCTURE_FAILURE_CODES
+        return False
+
+    @staticmethod
+    def _repair_decision_reason(
+        repairability: Repairability, findings: Sequence[RepairFinding]
+    ) -> str:
+        """Motivo determinista de la decisión, con lo que la justifica."""
+        codes = sorted({finding.code or finding.category for finding in findings})
+        return (
+            f"{len(findings)} defecto(s) bloqueante(s) clasificados como "
+            f"{repairability.value}: {', '.join(codes[:8])}"
+        )
+
+    @staticmethod
+    def _repair_target_files(run: WorkflowRun) -> tuple[str, ...]:
+        """Archivos autorizados por la petición, sin repetidos y en su orden declarado.
+
+        Es la única fuente de la autorización de escritura: ni el rol que reportó el defecto ni el
+        modelo proponen la lista, y la petición es lo que un humano revisó al pedir el trabajo.
+        """
+        declared: dict[str, str] = {}
+        for path in run.request.changed_files:
+            cleaned = path.strip()
+            if cleaned:
+                declared.setdefault(cleaned, cleaned)
+        return tuple(declared.values())
+
+    @staticmethod
+    def _repair_strategy(origin: TaskStatus, findings: Sequence[RepairFinding]) -> str:
+        """Estrategia del plan: identidad estable de «qué se intenta» en este ciclo.
+
+        Es lo que entra en el ``plan_fingerprint``, así que tiene que ser idéntica cuando el mismo
+        defecto se intenta reparar otra vez desde la misma etapa: dos intentos idénticos no son dos
+        oportunidades, son el mismo intento repetido.
+        """
+        codes = sorted({finding.code or finding.category for finding in findings})
+        return f"repair:{origin.value}:{','.join(codes)}"
+
+    @staticmethod
+    def _repair_idempotency_key(run: WorkflowRun, cycle: int) -> str:
+        """Clave de idempotencia del plan: distingue ciclos y no cambia al reanudar."""
+        return f"repair-{run.workflow_id}-{cycle}"[:120]
+
+    @staticmethod
+    def _repair_model_calls(run: WorkflowRun) -> int:
+        """Saldo de llamadas de modelo que el plan autoriza, sin el sobregasto conocido."""
+        budget = run.request.budget
+        used = run.usage.model_calls_committed + run.usage.known_budget_overrun_model_calls
+        return max(0, budget.max_model_calls - used)
+
+    @staticmethod
+    def _repair_tokens(run: WorkflowRun) -> int:
+        """Saldo de tokens que el plan autoriza, sin el sobregasto conocido."""
+        budget = run.request.budget
+        used = run.usage.tokens_committed + run.usage.known_budget_overrun_tokens
+        return max(0, budget.max_total_tokens - used)
+
+    @staticmethod
+    def _repair_effect_key(run: WorkflowRun, plan: RepairPlan) -> str:
+        """Clave de idempotencia del efecto de reparación, estable para el mismo ciclo.
+
+        Se deriva de :func:`~punto.workflow.effects.effect_key` con el paso y el rol reales y una
+        acción que identifica el ciclo y la reparación: la clave tiene que ser la misma en el
+        proceso que mutó y en el que reanuda, y distinta entre ciclos.
+        """
+        return effect_key(
+            run.workflow_id,
+            len(run.steps),
+            RoleName.DEVELOPER,
+            f"repair:{plan.cycle}:{plan.repair_id}",
+        )
+
+    def _repair_authorized_by_human(self, run: WorkflowRun) -> bool:
+        """True si un Human Gate aprobado autorizó **este** bucle de reparación.
+
+        No vale cualquier aprobación: se exige que el gate se abriera desde ``REPAIRING`` y por el
+        motivo de reparación. Si no, la aprobación de un cierre —por ejemplo— se convertiría en un
+        permiso general para reparar lo que la política reserva a una persona.
+        """
+        gate = run.human_gate
+        if not run.human_gate_approved or gate is None:
+            return False
+        return (
+            gate.reason_code is WorkflowFailureCode.WORKFLOW_REPAIR_NOT_ALLOWED
+            and gate.current_state is TaskStatus.REPAIRING
+        )
+
+    def _workspace_root(self, run: WorkflowRun) -> Path | None:
+        """Raíz del árbol sobre la que se captura y se restaura.
+
+        Gana el workspace inyectado en el kernel —el *composition root* conoce el árbol real— y, si
+        no lo hay, se usa el declarado en la petición. Sin ninguna de las dos no se repara: mutar un
+        árbol desconocido es exactamente lo que el snapshot existe para impedir.
+        """
+        if self._workspace is not None:
+            return self._workspace
+        declared = run.request.workspace_path.strip()
+        return Path(declared) if declared else None
+
+    def _origin_stage(self, run: WorkflowRun) -> TaskStatus:
+        """Etapa de la que salió el ciclo cuando la traza no la declara."""
+        last = run.last_step()
+        if last is None or last.stage is TaskStatus.REPAIRING:
+            return TaskStatus.QA
+        return last.stage
+
+    @staticmethod
+    def _without_invalidated_stages(run: WorkflowRun) -> tuple[StageArtifacts, ...]:
+        """Handoff sin la evidencia que la mutación acaba de invalidar.
+
+        Una reparación cambia el código sobre el que se emitieron los informes posteriores a ``QA``,
+        así que esos informes dejan de describir el árbol: se retiran para que la verificación que
+        vuelve a empezar no los reutilice como si fueran suyos. Los defectos no se pierden —viven en
+        ``repair_findings``— y el resultado final los conserva por esa vía.
+
+        Las etapas que no pertenecen al camino limpio (``REPAIRING``, que es donde vive el propio
+        ciclo) se conservan: describen la reparación, no la verificación invalidada.
+        """
+        return tuple(
+            entry for entry in run.stage_artifacts if not _is_after_qa(entry.stage)
+        )
+
+    @staticmethod
+    def _drop_previous_repair_handoff(run: WorkflowRun) -> WorkflowRun:
+        """Retira el handoff de reparaciones anteriores antes de abrir un ciclo nuevo.
+
+        El contexto del ciclo viaja al Developer por referencias y las referencias se resuelven por
+        la **primera** del tipo: si el plan del ciclo anterior siguiera registrado, el Developer
+        resolvería el plan viejo y repararía con una autorización que ya se consumió. El ciclo nuevo
+        publica su plan, su snapshot y sus defectos justo después de esta limpieza.
+        """
+        kept = tuple(
+            entry for entry in run.stage_artifacts if entry.stage is not TaskStatus.REPAIRING
+        )
+        if kept == run.stage_artifacts:
+            return run
+        return run.model_copy(update={"stage_artifacts": kept})
 
     def _fail(
         self, run: WorkflowRun, decision: WorkflowDecision, step_index: int | None
@@ -1670,27 +3360,38 @@ class WorkflowKernel:
         gate: PolicyGate | None = None,
         *,
         step_index: int | None = None,
+        resume_target: TaskStatus | None = None,
+        reason_code: WorkflowFailureCode | None = None,
     ) -> WorkflowRun:
         """Crea un Human Gate **real** y detiene el workflow. Nunca lo aprueba.
 
-        El destino es el estado actual del workflow (donde se interrumpió el trabajo), y se declara
-        **igual** en ``proposed_next_state`` y en ``human_gate_resume_status``: la autorización que
-        emita el humano describe exactamente la transición que la reanudación aplicará, sin
-        sustituciones (hallazgo V602-01). Si esa pareja no fuera legal en las dos tablas —la de
-        transiciones y la de reanudación—, el workflow no se pausa con una promesa falsa: se
-        bloquea.
+        El destino por defecto es el estado actual del workflow (donde se interrumpió el trabajo), y
+        se declara **igual** en ``proposed_next_state`` y en ``human_gate_resume_status``: la
+        autorización que emita el humano describe exactamente la transición que la reanudación
+        aplicará, sin sustituciones (hallazgo V602-01). Si esa pareja no fuera legal en las dos
+        tablas —la de transiciones y la de reanudación—, el workflow no se pausa con una promesa
+        falsa: se bloquea.
+
+        ``resume_target`` permite declarar un destino **distinto** del estado actual, y existe por
+        un caso concreto del bucle de reparación: ``REPAIRING`` no es un destino de reanudación
+        autorizado del motor, así que un gate abierto desde ahí autorizaría una vuelta que la tabla
+        de reanudación no admite. El ciclo lo abre con el destino de reinicio de la verificación
+        (``QA``), que sí lo es, y esa aprobación es la que después habilita el ciclo con autoridad
+        humana. El estado actual se conserva en ``current_state``: la traza sigue diciendo dónde se
+        interrumpió el trabajo.
         """
         verdict = gate or self._evaluate_policy(run.request)
-        target = run.status
-        if self._machine.is_terminal(target) or not self._machine.can_transition(
-            target, TaskStatus.HUMAN_APPROVAL
+        target = run.status if resume_target is None else resume_target
+        if self._machine.is_terminal(run.status) or not self._machine.can_transition(
+            run.status, TaskStatus.HUMAN_APPROVAL
         ):
             return self._block(
                 run,
                 BudgetCheck(
                     False,
                     WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
-                    f"la tabla de transiciones no permite abrir un Human Gate desde {target.value}",
+                    f"la tabla de transiciones no permite abrir un Human Gate desde "
+                    f"{run.status.value}",
                 ),
                 step_index=step_index,
             )
@@ -1708,14 +3409,14 @@ class WorkflowKernel:
         draft = HumanGateRequest(
             workflow_id=run.workflow_id,
             task_id=run.task_id,
-            reason_code=WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
+            reason_code=reason_code or WorkflowFailureCode.WORKFLOW_HUMAN_APPROVAL_REQUIRED,
             requested_action=f"autorizar la ejecución autónoma de {run.request.objective[:120]}",
             risk=verdict.risk,
             # Un gate existe porque hace falta un humano: la autoridad que se exige para seguir es
             # humana. El nivel que la política concede a la acción viaja en ``effective_authority``
             # y no sustituye a este campo, que describe lo que la solicitud necesita.
             authority_required=AuthorityLevel.LEVEL_3_HUMAN,
-            current_state=target,
+            current_state=run.status,
             proposed_next_state=target,
             context_summary=run.request.context_summary,
             policy_decision_id=verdict.decision.id,
@@ -1839,10 +3540,29 @@ class WorkflowKernel:
             )
         if run.human_gate is not None and not run.human_gate_approved:
             missing.append("hay un Human Gate pendiente")
+        # Un workflow no cierra con defectos sin resolver (ENGINE-6.1): ``RESOLVED`` solo lo escribe
+        # el kernel tras la verificación nueva, así que cualquier defecto que no esté resuelto —o
+        # que una persona haya exonerado explícitamente— impide el cierre.
+        pending = tuple(
+            finding
+            for finding in run.repair_findings
+            if finding.status
+            not in (RepairFindingStatus.RESOLVED, RepairFindingStatus.WAIVED_BY_HUMAN)
+        )
+        if pending:
+            missing.append(
+                f"{len(pending)} defecto(s) de reparación sin resolver "
+                f"({', '.join(sorted({finding.code or finding.category for finding in pending}))})"
+            )
         return tuple(missing)
 
     def _build_result(self, run: WorkflowRun, status: TaskStatus) -> WorkflowResult:
-        """Construye el resultado final **conservando los hallazgos reales** de los roles."""
+        """Construye el resultado final **conservando los hallazgos reales** de los roles.
+
+        Lleva además el resumen del bucle de reparación —ciclos, defectos resueltos y pendientes,
+        historia acotada— y el sobregasto de modelo ya reconocido: son las dos cosas que un informe
+        final no puede reconstruir a ojo, porque el checkpoint puede ser mucho más grande.
+        """
         findings = tuple(
             finding for entry in run.stage_artifacts for finding in entry.findings
         )
@@ -1851,13 +3571,45 @@ class WorkflowKernel:
             f"({step.blocking_findings} bloqueante(s))"
             for step in run.steps
         )
+        resolved = tuple(
+            finding.finding_id
+            for finding in run.repair_findings
+            if finding.status is RepairFindingStatus.RESOLVED
+        )
+        unresolved = tuple(
+            finding.finding_id
+            for finding in run.repair_findings
+            if finding.status is not RepairFindingStatus.RESOLVED
+        )
         return WorkflowResult(
             status=status,
             summary=f"workflow {status.value} en {len(run.steps)} paso(s)",
             roles_executed=tuple(step.role for step in run.steps)[:MAX_ROLES_EXECUTED],
             findings=findings[:MAX_WORKFLOW_FINDINGS],
             evidence=evidence[:MAX_WORKFLOW_EVIDENCE],
+            repair_cycles=len(run.repair_history),
+            resolved_findings=resolved[:MAX_RESOLVED_FINDINGS_REPORTED],
+            unresolved_findings=unresolved[:MAX_RESOLVED_FINDINGS_REPORTED],
+            repair_history=tuple(
+                self._cycle_summary(cycle) for cycle in run.repair_history
+            )[:MAX_REPAIR_HISTORY],
+            known_budget_overrun_model_calls=run.usage.known_budget_overrun_model_calls,
+            known_budget_overrun_tokens=run.usage.known_budget_overrun_tokens,
+            human_gates=sum(
+                1
+                for transition in run.transitions
+                if transition.to_status is TaskStatus.HUMAN_APPROVAL
+            ),
         )
+
+    @staticmethod
+    def _cycle_summary(cycle: RepairCycle) -> str:
+        """Resumen acotado y determinista de un ciclo, para el informe final."""
+        return (
+            f"ciclo {cycle.cycle}: {cycle.status.value} desde {cycle.origin_stage.value} hacia "
+            f"{cycle.restart_stage.value} ({len(cycle.findings_resolved)} resuelto(s), "
+            f"{len(cycle.findings_open)} abierto(s))"
+        )[:MAX_WORKFLOW_SUMMARY_CHARS]
 
     def _elapsed(self, run: WorkflowRun) -> float:
         """Segundos transcurridos desde el arranque del workflow."""
@@ -2069,6 +3821,242 @@ class WorkflowKernel:
             task_id=run.task_id,
             workflow_id=run.workflow_id,
             reason=reason,
+        )
+
+    # ------------------------------------------- auditoría del ciclo de reparación
+    def _audit_repair_decided(
+        self,
+        run: WorkflowRun,
+        decision: RepairDecision,
+        *,
+        cycle: int,
+        repair_id: UUID | None = None,
+    ) -> None:
+        """Registra la decisión del ciclo y su veredicto de reparabilidad.
+
+        ``repair_id`` es el del plan cuando existe. Cuando el ciclo no llega a planificarse —el
+        defecto es no reparable, de seguridad o sin evidencia— se usa un identificador determinista
+        derivado del workflow, el ciclo y la decisión: la traza de un rechazo también debe poder
+        correlacionarse, y no hay plan al que apuntar.
+        """
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_decided(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=repair_id or self._repair_audit_id(run, cycle, decision),
+            cycle=cycle,
+            repairability=decision.repairability.value,
+            finding_ids=[str(value) for value in decision.finding_ids],
+            requires_human=decision.requires_human,
+            policy_decision_id=(
+                "" if decision.policy_decision_id is None else str(decision.policy_decision_id)
+            ),
+            reason=decision.reason,
+        )
+
+    def _audit_repair_started(self, run: WorkflowRun, plan: RepairPlan) -> None:
+        """Registra el arranque del intento, con la etapa de la que salió y a la que vuelve."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_started(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=plan.repair_id,
+            cycle=plan.cycle,
+            origin_stage=(run.repair_origin_stage or TaskStatus.QA).value,
+            restart_stage=(run.verification_restart_stage or TaskStatus.QA).value,
+            plan_fingerprint=plan.plan_fingerprint,
+        )
+
+    def _audit_repair_snapshot_created(
+        self, run: WorkflowRun, plan: RepairPlan, snapshot: RepairSnapshot
+    ) -> None:
+        """Registra la instantánea previa: es la base de cualquier rollback posterior."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_snapshot_created(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=plan.repair_id,
+            cycle=plan.cycle,
+            snapshot_id=snapshot.snapshot_id,
+            files=snapshot.files,
+            workspace_fingerprint=snapshot.workspace_fingerprint,
+        )
+
+    def _audit_repair_applied(
+        self,
+        run: WorkflowRun,
+        plan: RepairPlan,
+        changed: Sequence[str],
+        result: RoleExecutionResult,
+    ) -> None:
+        """Registra que el guard aceptó la mutación y cuántos archivos cambió de verdad."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_applied(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=plan.repair_id,
+            cycle=plan.cycle,
+            changed_files=len(changed),
+            status=result.status.value,
+            detail=", ".join(changed)[:MAX_WORKFLOW_SUMMARY_CHARS],
+        )
+
+    def _audit_repair_verification_started(self, run: WorkflowRun, plan: RepairPlan) -> None:
+        """Registra que la verificación vuelve a empezar, con los roles que tienen que pasar."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_verification_started(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=plan.repair_id,
+            cycle=plan.cycle,
+            roles=[role.value for role in plan.verification_roles],
+        )
+
+    def _audit_repair_resolved(
+        self,
+        run: WorkflowRun,
+        cycle: RepairCycle,
+        resolved: Sequence[UUID],
+        unresolved: Sequence[UUID],
+    ) -> None:
+        """Registra el cierre del ciclo con lo que se resolvió y lo que sigue abierto."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_resolved(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=cycle.repair_id,
+            cycle=cycle.cycle,
+            resolved_findings=[str(value) for value in resolved],
+            unresolved_findings=[str(value) for value in unresolved],
+        )
+
+    def _audit_repair_failed(
+        self,
+        run: WorkflowRun,
+        plan: RepairPlan | None,
+        code: WorkflowFailureCode,
+        detail: str,
+    ) -> None:
+        """Registra el fallo del ciclo con su código estable.
+
+        El ``repair_id`` es el del plan si lo hay; si el ciclo no llegó a planificarse se usa el
+        identificador determinista de la decisión vigente, que es lo que permite ligar el fallo con
+        el evento de decisión que lo precede.
+        """
+        if self._audit is None:
+            return
+        decision = run.active_repair_decision
+        cycle = plan.cycle if plan is not None else max(1, run.usage.repairs)
+        repair_id = (
+            plan.repair_id
+            if plan is not None
+            else (
+                self._repair_audit_id(run, cycle, decision)
+                if decision is not None
+                else run.workflow_id
+            )
+        )
+        self._audit.log_workflow_repair_failed(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=repair_id,
+            cycle=cycle,
+            code=code.value,
+            detail=detail,
+        )
+
+    def _audit_repair_no_progress(
+        self,
+        run: WorkflowRun,
+        plan: RepairPlan | None,
+        *,
+        cycle: int,
+        detail: str = "",
+    ) -> None:
+        """Registra que el mismo intento se repitió sin mover el defecto."""
+        if self._audit is None:
+            return
+        fingerprint = "" if plan is None else plan.plan_fingerprint
+        repeats = sum(
+            1
+            for entry in run.repair_history
+            if entry.plan_fingerprint == fingerprint
+            and entry.status
+            in (RepairCycleStatus.FAILED, RepairCycleStatus.NO_PROGRESS)
+        )
+        self._audit.log_workflow_repair_no_progress(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=(
+                plan.repair_id
+                if plan is not None
+                else (run.active_repair_id or run.workflow_id)
+            ),
+            cycle=cycle,
+            fingerprint=fingerprint,
+            repeats=repeats,
+            detail=detail,
+        )
+
+    def _audit_repair_budget_exhausted(self, run: WorkflowRun, detail: str) -> None:
+        """Registra el agotamiento del presupuesto de reparaciones, con sus dos cifras."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_budget_exhausted(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repairs_used=run.usage.repairs,
+            max_repairs=run.request.budget.max_repairs,
+            detail=detail,
+        )
+
+    def _audit_repair_rolled_back(
+        self, run: WorkflowRun, cycle: RepairCycle, verdict: RollbackVerdict
+    ) -> None:
+        """Registra la restauración del árbol al estado previo a la reparación."""
+        if self._audit is None:
+            return
+        self._audit.log_workflow_repair_rolled_back(
+            project_id=run.project_id,
+            task_id=run.task_id,
+            workflow_id=run.workflow_id,
+            repair_id=cycle.repair_id,
+            cycle=cycle.cycle,
+            snapshot_id=(
+                run.active_repair_snapshot.snapshot_id
+                if run.active_repair_snapshot is not None
+                else run.workflow_id
+            ),
+            restored_files=len(verdict.restored_files),
+            detail=verdict.detail,
+        )
+
+    @staticmethod
+    def _repair_audit_id(run: WorkflowRun, cycle: int, decision: RepairDecision) -> UUID:
+        """Identificador determinista del ciclo para los eventos que no tienen plan.
+
+        Un rechazo —no reparable, de seguridad, sin evidencia— se audita antes de que exista
+        contrato de escritura alguno, y aun así su traza tiene que poder correlacionarse con la
+        decisión que lo motivó: se deriva del workflow, del ciclo y de la decisión, que son los
+        tres datos que existen.        """
+        return uuid5(
+            WORKFLOW_ID_NAMESPACE,
+            f"{run.workflow_id}:repair:{cycle}:{decision.decision_id}",
         )
 
 

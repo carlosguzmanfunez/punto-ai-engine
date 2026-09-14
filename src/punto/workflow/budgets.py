@@ -74,6 +74,7 @@ def reserve_budget(
     transitions: int = 0,
     failures: int = 0,
     tokens: int = 0,
+    repairs: int = 0,
     elapsed_seconds: float = 0.0,
 ) -> BudgetCheck:
     """Comprueba si **cabe** lo que se está a punto de gastar, antes de gastarlo.
@@ -102,10 +103,11 @@ def reserve_budget(
     actualizar. El tiempo no se reserva —no hay forma de saber de antemano cuánto durará el
     paso— así que se compara el ya transcurrido.
 
-    ``max_repairs`` no se comprueba aquí a propósito: en ENGINE-6.0 el workflow llega a
-    ``REPAIRING`` y se detiene (``WORKFLOW_REPAIR_DEFERRED``), así que el consumo de
-    reparaciones todavía no puede crecer. Sí aparece en :func:`budget_report` para que el
-    informe sea completo.
+    ``max_repairs`` se comprueba **también** aquí desde ENGINE-6.1: el ciclo de reparación es
+    pre-gasto como todo lo demás, así que un ciclo se reserva antes de mutar nada y agotar el
+    presupuesto se declara con su propio código (``WORKFLOW_REPAIR_BUDGET_EXHAUSTED``). Solo se mira
+    cuando la operación **pide** un ciclo (``repairs > 0``): una operación que no repara no gasta
+    reparaciones, y bloquearla por un contador agotado dejaría el workflow sin poder ni cerrarse.
 
     Args:
         run: Ejecución con el presupuesto declarado y el consumo acumulado.
@@ -115,6 +117,7 @@ def reserve_budget(
         transitions: Transiciones que aplicará (2 si la operación es compuesta).
         failures: Fallos que registrará.
         tokens: Tokens que consumirá.
+        repairs: Ciclos de reparación que consumirá (uno por ciclo que se autoriza a mutar).
         elapsed_seconds: Segundos transcurridos desde el inicio, medidos por el kernel.
 
     Returns:
@@ -148,6 +151,14 @@ def reserve_budget(
         ("max_failures", usage.failures, max(0, failures), budget.max_failures),
         ("max_transitions", usage.transitions, max(0, transitions), budget.max_transitions),
     )
+    # El presupuesto de reparación solo lo consume quien repara: se comprueba cuando la operación
+    # **pide** un ciclo. Mirarlo siempre dejaría un run con las reparaciones agotadas incapaz hasta
+    # de transicionar o de cerrarse, y la frontera que impide reparar de más ya actuó antes.
+    if repairs > 0:
+        reservations = (
+            *reservations,
+            ("max_repairs", usage.repairs, repairs, budget.max_repairs),
+        )
     for name, used, requested, maximum in reservations:
         if used + requested > maximum:
             return _exceeded(name, used, requested, maximum)

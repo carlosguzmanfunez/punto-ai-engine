@@ -1,4 +1,4 @@
-"""Contratos del kernel de workflow autónomo (ENGINE-6.0).
+"""Contratos del kernel de workflow autónomo (ENGINE-6.0 / 6.1).
 
 Vocabulario primero, porque es lo que hace determinista lo demás:
 
@@ -18,9 +18,10 @@ se serializan de forma determinista: dos ejecuciones del mismo caso producen el 
 
 from __future__ import annotations
 
+import importlib
 from datetime import datetime
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,6 +30,13 @@ from punto.common import utc_now
 from punto.schemas.enums import AuthorityLevel, FindingSeverity, RiskLevel, TaskStatus
 from punto.schemas.execution import ModelUsage
 from punto.schemas.planning import SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    # El módulo de contratos de reparación depende de este (``RoleName``, ``ArtifactReference`` y
+    # las cotas de texto), así que la referencia es solo para el comprobador de tipos: en tiempo de
+    # ejecución se enlaza al final del módulo, cuando este ya está definido. Ver
+    # :func:`_bind_repair_schemas`.
+    import punto.schemas.repair as repair_schemas
 
 #: Máximos del contrato. Acotan la memoria, los informes y el tamaño de un checkpoint.
 MAX_WORKFLOW_STEPS: Final[int] = 64
@@ -53,6 +61,23 @@ MAX_BUDGET_BREACHES: Final[int] = 16
 MAX_RECONCILIATION_PROOFS: Final[int] = 16
 MAX_ROLES_EXECUTED: Final[int] = 12
 MAX_ROLE_SUPPORT: Final[int] = 12
+#: Cotas del estado durable del bucle de reparación (ENGINE-6.1). Son propias del checkpoint y
+#: espejan las del contrato de reparación: un run no puede crecer porque un ciclo acumule defectos,
+#: historia o hashes sin límite.
+MAX_REPAIR_FINDINGS_STORED: Final[int] = 32
+MAX_REPAIR_HISTORY: Final[int] = 8
+MAX_REPAIR_APPLIED_DIGESTS: Final[int] = 64
+MAX_RESOLVED_FINDINGS_REPORTED: Final[int] = 32
+
+#: Nombres de los modelos de reparación que :class:`WorkflowRun` referencia en sus campos.
+_REPAIR_MODEL_NAMES: Final[tuple[str, ...]] = (
+    "RepairCycle",
+    "RepairDecision",
+    "RepairDiagnosis",
+    "RepairFinding",
+    "RepairPlan",
+    "RepairSnapshot",
+)
 
 
 class RoleName(StrEnum):
@@ -686,6 +711,26 @@ class WorkflowResult(BaseModel):
         max_length=MAX_WORKFLOW_EVIDENCE,
         description=f"Evidencia acotada (máx. {MAX_WORKFLOW_EVIDENCE}).",
     )
+    #: Ciclos de reparación autónoma iniciados. Es una cifra del ciclo, no del modelo.
+    repair_cycles: int = Field(default=0, ge=0, le=MAX_REPAIR_HISTORY)
+    #: Defectos que quedaron ``RESOLVED`` y defectos que siguen pendientes. Se informan por
+    #: identificador y no por defecto entero: el detalle durable vive en el checkpoint del run.
+    resolved_findings: tuple[UUID, ...] = Field(
+        default=(), max_length=MAX_RESOLVED_FINDINGS_REPORTED
+    )
+    unresolved_findings: tuple[UUID, ...] = Field(
+        default=(), max_length=MAX_RESOLVED_FINDINGS_REPORTED
+    )
+    #: Resúmenes acotados de la historia de ciclos, en orden cronológico.
+    repair_history: tuple[str, ...] = Field(default=(), max_length=MAX_REPAIR_HISTORY)
+    #: Sobregasto de modelo ya reconocido por una reconciliación explícita (hallazgo N6-01). Se
+    #: informa aparte porque no se suma a ``usage``: es gasto real que cierra la puerta a nuevas
+    #: invocaciones, no consumo autorizado.
+    known_budget_overrun_model_calls: int = Field(default=0, ge=0)
+    known_budget_overrun_tokens: int = Field(default=0, ge=0)
+    #: Human Gates abiertos durante el workflow. Un cierre con gates abiertos y sin aprobar no
+    #: completa, así que la cifra es la traza de cuántas veces hizo falta una persona.
+    human_gates: int = Field(default=0, ge=0)
     completed_at: datetime = Field(default_factory=utc_now)
 
     @property
@@ -777,6 +822,46 @@ class WorkflowRun(BaseModel):
     policy_decision_id: UUID | None = Field(default=None)
     effective_authority: AuthorityLevel | None = Field(default=None)
     effective_risk: RiskLevel | None = Field(default=None)
+    #: ---------------------------------------------------------------------------------------
+    #: Estado durable del bucle de reparación autónoma acotado (ENGINE-6.1).
+    #:
+    #: Todo lo que un proceso nuevo necesita para reconstruir el ciclo sin memoria del anterior:
+    #: qué defectos hay, cuántos ciclos se hicieron, dónde se originaron, por dónde hay que volver a
+    #: verificar y qué decisión, plan, snapshot y digests están vigentes. Los defectos y los ciclos
+    #: se guardan enteros —no solo sus identificadores— porque un proceso reanudado tiene que poder
+    #: decidir sin volver a preguntar a ningún rol.
+    #: ---------------------------------------------------------------------------------------
+    repair_findings: tuple[repair_schemas.RepairFinding, ...] = Field(
+        default=(),
+        max_length=MAX_REPAIR_FINDINGS_STORED,
+        description=f"Defectos seguidos (máx. {MAX_REPAIR_FINDINGS_STORED}).",
+    )
+    repair_history: tuple[repair_schemas.RepairCycle, ...] = Field(
+        default=(),
+        max_length=MAX_REPAIR_HISTORY,
+        description=f"Ciclos de reparación ya registrados (máx. {MAX_REPAIR_HISTORY}).",
+    )
+    #: Etapa en la que apareció el defecto que abrió el ciclo vigente.
+    repair_origin_stage: TaskStatus | None = Field(default=None)
+    #: Etapa por la que tiene que volver a empezar la verificación tras una mutación aceptada.
+    #: Mientras valga ``QA``, el kernel no reutiliza ninguna gate: solo avanza la cadena de
+    #: :func:`punto.workflow.repair.verification_chain` desde ahí.
+    verification_restart_stage: TaskStatus | None = Field(default=None)
+    #: Reparación vigente (identificador del plan), ciclo vigente (1 o más) y su decisión.
+    active_repair_id: UUID | None = Field(default=None)
+    active_repair_cycle: int = Field(default=0, ge=0, le=MAX_REPAIR_HISTORY)
+    active_repair_decision: repair_schemas.RepairDecision | None = Field(default=None)
+    active_repair_diagnosis: repair_schemas.RepairDiagnosis | None = Field(default=None)
+    active_repair_plan: repair_schemas.RepairPlan | None = Field(default=None)
+    active_repair_snapshot: repair_schemas.RepairSnapshot | None = Field(default=None)
+    #: Estado que la reparación **dejó** en cada archivo autorizado, por ruta (``""`` = no existe).
+    #:
+    #: Es lo que hace demostrable un rollback: sin este registro, «los hashes actuales son los que
+    #: dejó la reparación» no se puede comprobar en un proceso nuevo y restaurar el snapshot sería
+    #: hacerlo a ciegas sobre un árbol que pudo cambiar por otra vía.
+    repair_applied_digests: tuple[tuple[str, str], ...] = Field(
+        default=(), max_length=MAX_REPAIR_APPLIED_DIGESTS
+    )
     human_gate: HumanGateRequest | None = Field(default=None)
     human_gate_approved: bool = Field(
         default=False,
@@ -841,6 +926,36 @@ PAUSED_WORKFLOW_STATUSES: Final[frozenset[TaskStatus]] = frozenset(
 )
 
 
+def _bind_repair_schemas() -> None:
+    """Enlaza el módulo de contratos de reparación para resolver las anotaciones diferidas.
+
+    Los campos de reparación de :class:`WorkflowRun` se anotan como ``repair_schemas.X`` y no como
+    ``X`` a secas por un motivo concreto: ``punto.schemas.repair`` importa de este módulo
+    (``RoleName``, ``ArtifactReference`` y las cotas de texto), así que **este** módulo no puede
+    importarlo en su cabecera sin cerrar un ciclo de importación.
+
+    El enlace se hace al final, cuando todas las clases de este módulo ya existen, y funciona en las
+    dos direcciones posibles de importación:
+
+    - si este módulo se importa primero, el import completa el de reparación y Pydantic puede
+      completar el esquema de ``WorkflowRun`` inmediatamente;
+    - si ``punto.schemas.repair`` se importa primero, lo que se enlaza es el objeto del módulo **a
+      medio ejecutar**, que terminará de definirse cuando su importación acabe. Pydantic resuelve la
+      anotación de forma diferida en el primer uso, y para entonces los modelos ya existen.
+
+    Se enlaza el **módulo** y no los nombres sueltos porque en la segunda dirección esos nombres
+    todavía no existen, y Pydantic no consulta el ``__getattr__`` de un módulo: resolvería la
+    anotación contra un nombre ausente y el contrato quedaría incompleto.
+    """
+    module = importlib.import_module("punto.schemas.repair")
+    globals()["repair_schemas"] = module
+    if all(hasattr(module, name) for name in _REPAIR_MODEL_NAMES):
+        WorkflowRun.model_rebuild()
+
+
+_bind_repair_schemas()
+
+
 __all__ = [
     "MAX_ACCEPTANCE_CRITERIA",
     "MAX_BUDGET_BREACHES",
@@ -848,6 +963,10 @@ __all__ = [
     "MAX_CONTEXT_ENTRIES",
     "MAX_EFFECT_RECORDS",
     "MAX_RECONCILIATION_PROOFS",
+    "MAX_REPAIR_APPLIED_DIGESTS",
+    "MAX_REPAIR_FINDINGS_STORED",
+    "MAX_REPAIR_HISTORY",
+    "MAX_RESOLVED_FINDINGS_REPORTED",
     "MAX_ROLES_EXECUTED",
     "MAX_ROLE_SUPPORT",
     "MAX_WORKFLOW_ARTIFACTS",

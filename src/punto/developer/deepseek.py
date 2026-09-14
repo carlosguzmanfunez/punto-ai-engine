@@ -98,6 +98,15 @@ BLOCKED_TOKEN_BUDGET: Final[str] = "MAX_TOKENS_EXCEEDED"
 BLOCKED_INVALID_PROPOSAL: Final[str] = "INVALID_PROPOSAL"
 #: El encargo de reparación no autoriza ningún archivo: no hay nada que el motor pueda escribir.
 BLOCKED_REPAIR_SCOPE: Final[str] = "REPAIR_SCOPE_EMPTY"
+#: La propuesta pidió escribir donde la tarea no la autoriza (o donde el encargo lo prohíbe).
+#:
+#: Código estable y **compartido** por los tres rechazos de frontera de una propuesta: ruta no
+#: relativa o con traversal, ruta prohibida por el encargo y ruta fuera de la autorización
+#: enumerada (``allowed_files`` en el camino normal, ``target_files`` del plan en la reparación). El
+#: motor no escribe nada, no reintenta y se detiene con este código, que es lo que la auditoría
+#: necesita para distinguir «el modelo se equivocó de formato» de «el modelo pidió salir de su
+#: autorización». El prompt **pide**; esta validación es la que **impone**.
+BLOCKED_UNAUTHORIZED_PROPOSAL: Final[str] = "UNAUTHORIZED_PROPOSAL"
 
 #: Caracteres máximos de cada archivo incluido como contexto.
 MAX_CONTEXT_FILE_CHARS: Final[int] = 60_000
@@ -248,6 +257,34 @@ class _AttemptOutcome:
     validation: ValidationResult | None
     failure_detail: str
     failed_check: str
+
+
+class UnauthorizedProposalError(DeveloperExecutionError):
+    """La propuesta pidió escribir fuera de la autorización del encargo.
+
+    Es un error de **frontera**, no de formato: el modelo no se equivocó al escribir el JSON, pidió
+    tocar una ruta que la tarea no autoriza (o que el encargo de reparación declara prohibida). Se
+    distingue de :class:`DeveloperExecutionError` a propósito, porque la respuesta del motor tiene
+    que ser distinta:
+
+    - una propuesta malformada es reparable: vuelve al modelo como evidencia y cuesta uno de los
+      intentos que fija PUNTO;
+    - una propuesta no autorizada **no se reintenta**: no se escribe nada, la ejecución se detiene y
+      se reporta el código estable :data:`BLOCKED_UNAUTHORIZED_PROPOSAL`. Reintentar no añade
+      seguridad —el motor ya rechazó la ruta— y solo gastaría presupuesto pidiendo otra vez algo que
+      ya se le declaró por escrito.
+
+    La seguridad **no** depende del prompt. El prompt declara las reglas duras, los ``target_files``
+    y los ``forbidden_files``; esta validación es la que decide, de forma determinista y sobre la
+    propuesta **completa**, qué se puede escribir, y lo hace antes de tocar un solo byte del
+    workspace. Un modelo que ignorara el prompt —o que fuera inducido a ignorarlo por el contenido
+    de un archivo— se encuentra exactamente con esta puerta.
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{BLOCKED_UNAUTHORIZED_PROPOSAL}: {reason} (ruta propuesta: {path!r})")
 
 
 class DeepSeekDeveloperRunner(DeveloperRunner):
@@ -408,6 +445,12 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                 try:
                     proposal = self._parse_proposal(task, attempt, completion.content)
                     self._validate_proposal(task, attempt, proposal, allowed, forbidden)
+                except UnauthorizedProposalError:
+                    # Frontera de autorización: la propuesta entera se rechaza, no se escribe nada
+                    # y NO se reintenta. No es un defecto de formato que otra vuelta arregle —el
+                    # modelo ya pidió salir de lo autorizado— así que se deja subir al manejador
+                    # que bloquea con el código estable, sin gastar más presupuesto de modelo.
+                    raise
                 except DeveloperExecutionError as exc:
                     # La propuesta se rechaza ENTERA y no se escribe nada. El motivo
                     # vuelve al modelo como evidencia: reparar cuesta un intento y una
@@ -475,6 +518,7 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
             ProtectedFileError,
             SandboxRequiredError,
             SandboxUnavailableError,
+            UnauthorizedProposalError,
             UntrustedExecutionDeniedError,
             WorkspaceViolationError,
         ) as exc:
@@ -566,7 +610,15 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         además contra las prohibiciones del plan **y** contra el piso constitucional. En el camino
         normal es ``None`` y la validación es exactamente la de siempre.
 
+        Las rutas se validan contra la autorización enumerada (``allowed``, que en una reparación
+        son los ``target_files`` del plan) y contra las prohibiciones. Una ruta que no esté
+        autorizada, que tenga traversal o que toque una prohibición no es un defecto de formato que
+        el modelo pueda corregir con otra vuelta: se rechaza con
+        :class:`UnauthorizedProposalError` y el código estable
+        :data:`BLOCKED_UNAUTHORIZED_PROPOSAL`, sin escribir nada y sin reintentar.
+
         Raises:
+            UnauthorizedProposalError: si algún cambio sale de la autorización de la tarea.
             DeveloperExecutionError: si la propuesta no es aplicable.
         """
         if not proposal.changes:
@@ -580,19 +632,22 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
             if normalized.startswith("/") or ".." in normalized.split("/"):
                 reason = f"ruta no relativa o con traversal: {change.path!r}"
                 self._audit_proposal_rejected(task, attempt, reason)
-                raise DeveloperExecutionError(reason)
+                raise UnauthorizedProposalError(normalized or change.path, reason)
             if forbidden is not None and _is_forbidden_path(normalized, forbidden):
                 reason = f"ruta prohibida por el encargo de reparación: {normalized!r}"
                 self._audit_proposal_rejected(task, attempt, reason)
-                raise DeveloperExecutionError(reason)
+                raise UnauthorizedProposalError(normalized, reason)
             if normalized in seen:
                 reason = f"ruta propuesta dos veces: {normalized!r}"
                 self._audit_proposal_rejected(task, attempt, reason)
                 raise DeveloperExecutionError(reason)
             if allowed and normalized not in allowed:
-                reason = f"ruta fuera de allowed_files: {normalized!r}"
+                reason = (
+                    f"ruta fuera de la autorización enumerada "
+                    f"(allowed_files/target_files): {normalized!r}"
+                )
                 self._audit_proposal_rejected(task, attempt, reason)
-                raise DeveloperExecutionError(reason)
+                raise UnauthorizedProposalError(normalized, reason)
             if change.operation is not ProposalOperation.CREATE and not change.content:
                 reason = f"REPLACE sin contenido en {normalized!r}"
                 self._audit_proposal_rejected(task, attempt, reason)
@@ -1231,8 +1286,10 @@ def _assert_within_repair_scope(
     cerrada (``BLOCKED`` con rollback) y nunca se acepta un archivo fuera del plan.
 
     Raises:
-        WorkspaceViolationError: si lo escrito sale de los ``target_files`` del plan o excede la
-            cota de archivos del contrato.
+        WorkspaceViolationError: si lo escrito excede la cota de archivos del contrato.
+        UnauthorizedProposalError: si lo escrito sale de los ``target_files`` del plan. Lleva el
+            mismo código estable que el rechazo previo, porque es el mismo hecho: una escritura no
+            autorizada.
         ProtectedFileError: si lo escrito toca una prohibición del encargo.
     """
     if len(changes) > MAX_REPAIR_FILES:
@@ -1248,8 +1305,8 @@ def _assert_within_repair_scope(
                 normalized, "el encargo de reparación lo prohíbe expresamente"
             )
         if allowed and normalized not in allowed:
-            raise WorkspaceViolationError(
-                normalized, workspace, "fuera de los target_files del plan de reparación"
+            raise UnauthorizedProposalError(
+                normalized, "lo escrito queda fuera de los target_files del plan de reparación"
             )
 
 
@@ -1259,6 +1316,7 @@ __all__ = [
     "BLOCKED_MODEL_CALLS",
     "BLOCKED_REPAIR_SCOPE",
     "BLOCKED_TOKEN_BUDGET",
+    "BLOCKED_UNAUTHORIZED_PROPOSAL",
     "DEVELOPER_REPAIR_CONTEXT_TEMPLATE",
     "MAX_CONTEXT_FILE_CHARS",
     "MAX_EVIDENCE_CHARS",
@@ -1271,4 +1329,5 @@ __all__ = [
     "TRUNCATION_MARKER",
     "DeepSeekDeveloperRunner",
     "ModelLimits",
+    "UnauthorizedProposalError",
 ]

@@ -60,13 +60,16 @@ composición de las dos—. El Planner recibe el diseño del Architect reconstru
 referencia durable de la petición; si esa referencia no resuelve a un diseño válido, la etapa
 falla con ``WORKFLOW_ROLE_FAILED`` en vez de repetir el diseño por su cuenta.
 
-El handoff durable es automático (ENGINE-6.0.2)
------------------------------------------------
-Desde 6.0.2 el adaptador **real** no necesita ninguna *closure* externa para el handoff (defecto
-V602-03): si se le inyecta un :class:`~punto.workflow.artifacts.ArtifactStore` en ``artifacts``,
+El handoff durable cubre toda la pipeline (ENGINE-6.0.2 y V603-04)
+-----------------------------------------------------------------
+El adaptador **real** no necesita ninguna *closure* externa para el handoff (defectos V602-03 y
+V603-04): con un :class:`~punto.workflow.artifacts.ArtifactStore` inyectado en ``artifacts``, el
+adaptador reconstruye la entrada de **todos** los roles desde las referencias durables del
+``RoleExecutionRequest`` y el contenido del almacén. No hay ningún rol del pipeline que exija una
+*closure*:
 
-- el ``ARCHITECT`` publica su ``ArchitectureOutcome`` completo con
-  :func:`~punto.workflow.handoff.publish_architecture` y reporta la referencia en
+- el ``ARCHITECT`` deriva su ``ProjectIntent`` de la petición y publica su ``ArchitectureOutcome``
+  completo con :func:`~punto.workflow.handoff.publish_architecture`, reportando la referencia en
   ``artifact_references``;
 - el ``PLANNER`` resuelve el diseño desde las referencias de la petición
   (:func:`~punto.workflow.handoff.resolve_architecture`), planifica sobre él y publica el bundle
@@ -74,12 +77,17 @@ V602-03): si se le inyecta un :class:`~punto.workflow.artifacts.ArtifactStore` e
 - el ``DEVELOPER`` resuelve el plan durable
   (:func:`~punto.workflow.handoff.resolve_plan`) y construye su pareja
   ``(DeveloperTask, ExecutionContext)`` con el constructor oficial
-  :func:`~punto.workflow.handoff.developer_input`.
+  :func:`~punto.workflow.handoff.developer_input`; si el paso trae un plan de reparación, añade el
+  ``RepairTask`` completo al mismo encargo;
+- ``QA``, ``SECURITY``, ``REVIEWER``, ``CROSS_AUDIT`` y ``VISUAL_QA`` reconstruyen su tarea desde el
+  plan durable y los informes durables de las etapas anteriores (``qa_input``, ``security_input``,
+  ``review_input``, ``cross_audit_input`` y ``visual_qa_input``). Si falta un artefacto del que
+  dependen, la etapa se declara con evidencia incompleta (``WORKFLOW_INCOMPLETE_EVIDENCE``) en vez
+  de inventar la entrada.
 
-Sigue siendo posible inyectar un ``build_input`` explícito —los dobles y los llamantes que ya lo
-tenían siguen funcionando—, pero ya no es la única vía: el defecto reconstruye la entrada desde el
-almacén. Un rol sin constructor oficial (QA, Security, Reviewer, auditoría cruzada y QA visual)
-exige su ``build_input``: PUNTO no improvisa la entrada de un rol que no tiene handoff definido.
+Un ``build_input`` explícito sigue siendo válido y **manda** cuando se inyecta —es el contrato que
+ya existía—, pero es solo el atajo: el que usan los dobles de prueba y los llamantes que construyen
+su propia entrada. No es un requisito de ningún rol, y sin él el camino de producción es el almacén.
 
 Reparación con el mismo Developer (ENGINE-6.1.1)
 ------------------------------------------------
@@ -594,12 +602,17 @@ class CamusRoleExecutor:
       compatibilidad y para los dobles; si se da, manda;
     - sin ``build_input`` y con ``artifacts``: el adaptador construye la entrada él mismo. El
       ``ARCHITECT`` deriva la intención de la petición, el ``PLANNER`` resuelve el diseño del
-      almacén y el ``DEVELOPER`` resuelve el plan durable. Es el camino de producción
-      (ENGINE-6.0.2): el handoff no depende de variables del proceso anterior.
+      almacén, el ``DEVELOPER`` resuelve el plan durable (y el contexto de reparación cuando el
+      ciclo lo pide) y ``QA``, ``SECURITY``, ``REVIEWER``, ``CROSS_AUDIT`` y ``VISUAL_QA``
+      reconstruyen su entrada del plan y de los informes durables de las etapas anteriores. Es el
+      camino de producción (ENGINE-6.0.2): el handoff no depende de variables del proceso anterior
+      (hallazgo F611-11: la versión anterior de este docstring decía que esos cinco roles exigían
+      ``build_input``, y no era cierto).
 
-    Un rol sin constructor oficial (``QA``, ``SECURITY``, ``REVIEWER``, ``CROSS_AUDIT`` y
-    ``VISUAL_QA``) sigue exigiendo ``build_input``: PUNTO no improvisa la entrada de un rol cuyo
-    handoff no está definido, y lo dice con un fallo explícito.
+    ``build_input`` es, por tanto, un **atajo** para los dobles de prueba, no un requisito de
+    ningún rol: un rol sin constructor inyectado y con almacén se construye solo, y si falta el
+    artefacto del que depende la etapa se declara incompleta (``WORKFLOW_INCOMPLETE_EVIDENCE``) en
+    vez de improvisar la entrada.
 
     Publicación automática: con ``artifacts`` inyectado, el ``ARCHITECT`` publica su
     ``ArchitectureOutcome`` completo y el ``PLANNER`` el bundle durable del plan, y ambos reportan

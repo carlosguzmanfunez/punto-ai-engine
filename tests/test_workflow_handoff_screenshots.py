@@ -10,6 +10,13 @@ no se podía reconstruir en un proceso nuevo. Aquí se ejercitan **solo** los do
 para cerrarlo, sobre un :class:`~punto.workflow.artifacts.FileArtifactStore` real en ``tmp_path``,
 sin red y sin podman: ningún proveedor de modelo, ningún navegador y ninguna llamada al kernel.
 
+El defecto V605-06 añade la otra mitad del mismo contrato: el manifiesto ya guardaba la identidad de
+la sesión (``task_id``, ``project_id`` e ``id``), pero el resolutor no la comparaba, así que un
+manifiesto de **otro replay** del mismo proyecto, con las mismas capturas y los mismos nombres
+lógicos, se aceptaba y Visual QA habría analizado la evidencia de otra ejecución. Por eso la sesión
+de estas pruebas lleva un ``id`` **fijo** y no el que el contrato genera por defecto: publicar y
+resolver tienen que hablar del mismo replay, y las pruebas de identidad piden a propósito el otro.
+
 Qué se comprueba, en el orden de la prueba:
 
 1. ida y vuelta feliz de dos capturas, con bytes idénticos y el manifiesto con su ``kind``, su
@@ -24,7 +31,10 @@ Qué se comprueba, en el orden de la prueba:
 5. que una sesión sin capturas resuelve a un mapa vacío y que publicar una sesión sin capturas se
    rechaza;
 6. que el artefacto de bytes es exactamente lo que se publicó y que el manifiesto no lleva los
-   bytes dentro.
+   bytes dentro;
+7. la identidad de la sesión (V605-06): otro replay, otra tarea y otro proyecto son huecos de
+   evidencia y no aprobaciones, la identidad correcta sigue resolviendo los bytes exactos y un
+   manifiesto reescrito en su identidad no entrega ningún payload a medias.
 
 Los PNG se generan aquí con su firma, su IHDR, un IDAT comprimido de verdad y su IEND: no hace
 falta que sean bonitos, pero sí bytes no vacíos, distintos entre sí y con dimensiones reales.
@@ -76,6 +86,17 @@ WORKFLOW_ID = UUID("44444444-4444-4444-8444-444444444444")
 TASK_ID = UUID("11111111-1111-4111-8111-111111111111")
 PROJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
 IDEMPOTENCY_KEY = "handoff-screenshots"
+#: Identidad de la **sesión web** del caso (V605-06).
+#:
+#: El manifiesto la guarda y el resolutor la exige, así que el ``id`` de la sesión de la prueba es
+#: fijo y no el que el contrato genera por defecto: un ``id`` nuevo por llamada haría que publicar y
+#: resolver hablaran de dos replays distintos, que es exactamente lo que V605-06 dejaba pasar.
+SESSION_ID = UUID("33333333-3333-4333-8333-333333333333")
+#: Identidades de otros replays: misma forma que la del caso y **un solo** campo distinto, para que
+#: cada prueba aísle la identidad que no cuadra.
+OTHER_TASK_ID = UUID("11111111-1111-4111-8111-111111111112")
+OTHER_PROJECT_ID = UUID("22222222-2222-4222-8222-222222222223")
+OTHER_SESSION_ID = UUID("33333333-3333-4333-8333-333333333334")
 #: Viewports del caso: dimensiones explícitas, como exige el contrato de la capa web.
 _DESKTOP = Viewport(name=ViewportName.DESKTOP, width=1440, height=900)
 _MOBILE = Viewport(name=ViewportName.MOBILE, width=390, height=844)
@@ -135,11 +156,23 @@ _ARTIFACT_C = build_screenshot_artifact(
 )
 
 
-def _session(*artifacts: ScreenshotArtifact) -> WebSessionReport:
-    """Sesión web del caso con las capturas indicadas, sin abrir ningún navegador."""
+def _session(
+    *artifacts: ScreenshotArtifact,
+    session_id: UUID = SESSION_ID,
+    task_id: UUID = TASK_ID,
+    project_id: UUID = PROJECT_ID,
+) -> WebSessionReport:
+    """Sesión web del caso con la identidad indicada, sin abrir ningún navegador.
+
+    El ``id`` por defecto es el del caso —``SESSION_ID``, no el que el contrato genera—: desde
+    V605-06 el manifiesto ata la evidencia a la sesión que la midió y el resolutor exige esa misma
+    identidad, así que publicar y resolver tienen que hablar del mismo replay. Las pruebas de
+    identidad piden explícitamente la otra tarea, el otro proyecto o el otro ``id`` de sesión.
+    """
     return WebSessionReport(
-        task_id=TASK_ID,
-        project_id=PROJECT_ID,
+        id=session_id,
+        task_id=task_id,
+        project_id=project_id,
         status=WebTechnicalStatus.PASS,
         summary="La página carga sin errores y sin desbordamiento.",
         screenshots=artifacts,
@@ -621,3 +654,101 @@ def test_the_manifest_carries_no_image_bytes(tmp_path: Path) -> None:
         assert entry["media_type"] == SCREENSHOT_MEDIA_TYPE
         assert entry["route"].startswith("/")
         assert entry["viewport"] in {"MOBILE", "TABLET", "DESKTOP"}
+
+
+# ---------------------------------------------------------------------------
+# 7. La identidad de la sesión ata el manifiesto a su replay (ENGINE-6.0.5, V605-06)
+# ---------------------------------------------------------------------------
+def test_evidence_from_another_replay_is_incomplete_evidence(tmp_path: Path) -> None:
+    """Mismo ``task_id``, mismo proyecto, mismas capturas y nombres, pero otro ``id`` de sesión."""
+    store = _store(tmp_path)
+    manifest = _publish(store, _session(_ARTIFACT_A, _ARTIFACT_B))
+    other_replay = _session(_ARTIFACT_A, _ARTIFACT_B, session_id=OTHER_SESSION_ID)
+
+    with pytest.raises(WorkflowIncompleteEvidenceError) as error:
+        resolve_screenshots(store, (manifest,), other_replay)
+    _assert_incomplete(error)
+    assert "sesión" in error.value.detail
+    assert str(OTHER_SESSION_ID) in error.value.detail
+    assert str(SESSION_ID) in error.value.detail
+
+
+def test_evidence_from_another_task_is_incomplete_evidence(tmp_path: Path) -> None:
+    """La misma sesión de navegador, pero la tarea que se quiere resolver es otra."""
+    store = _store(tmp_path)
+    manifest = _publish(store, _session(_ARTIFACT_A, _ARTIFACT_B))
+    other_task = _session(_ARTIFACT_A, _ARTIFACT_B, task_id=OTHER_TASK_ID)
+
+    with pytest.raises(WorkflowIncompleteEvidenceError) as error:
+        resolve_screenshots(store, (manifest,), other_task)
+    _assert_incomplete(error)
+    assert "tarea" in error.value.detail
+    assert str(OTHER_TASK_ID) in error.value.detail
+
+
+def test_evidence_from_another_project_is_incomplete_evidence(tmp_path: Path) -> None:
+    """Misma tarea y misma sesión, pero otro proyecto: el índice no es de este workflow."""
+    store = _store(tmp_path)
+    manifest = _publish(store, _session(_ARTIFACT_A, _ARTIFACT_B))
+    other_project = _session(_ARTIFACT_A, _ARTIFACT_B, project_id=OTHER_PROJECT_ID)
+
+    with pytest.raises(WorkflowIncompleteEvidenceError) as error:
+        resolve_screenshots(store, (manifest,), other_project)
+    _assert_incomplete(error)
+    assert "proyecto" in error.value.detail
+    assert str(OTHER_PROJECT_ID) in error.value.detail
+
+
+def test_the_same_session_identity_resolves_the_exact_bytes(tmp_path: Path) -> None:
+    """La identidad correcta —tarea, proyecto y ``id`` de sesión— resuelve los dos payloads."""
+    store = _store(tmp_path)
+    manifest = _publish(store, _session(_ARTIFACT_A, _ARTIFACT_B))
+    same = _session(
+        _ARTIFACT_A,
+        _ARTIFACT_B,
+        session_id=SESSION_ID,
+        task_id=TASK_ID,
+        project_id=PROJECT_ID,
+    )
+
+    resolved = resolve_screenshots(store, (manifest,), same)
+    assert set(resolved) == {"home-desktop.png", "about-mobile.png"}
+    assert resolved["home-desktop.png"].data == _PNG_A
+    assert resolved["about-mobile.png"].data == _PNG_B
+    assert hashlib.sha256(resolved["about-mobile.png"].data).hexdigest() == _ARTIFACT_B.sha256
+
+
+def test_a_manifest_rewritten_in_its_identity_delivers_no_payload(tmp_path: Path) -> None:
+    """Un manifiesto manipulado en su identidad falla tipado y no entrega un mapa a medias.
+
+    Se ataca por las dos vías reales. Primero el **contenido**: se reescribe ``session_id`` en el
+    índice y se vuelve a publicar —el digest es coherente porque lo escribió la prueba—, y además se
+    borran los bytes de las capturas; si el resolutor mirara los bytes antes que la identidad el
+    fallo hablaría del almacén, y como mira la identidad primero el fallo es de sesión y no se lee
+    ninguna captura. Después el **fichero**: se reescribe el manifiesto en disco a mano, que el
+    almacén detecta como manipulación y el resolutor traduce al mismo error tipado.
+    """
+    store = _store(tmp_path)
+    manifest = _publish(store, _session(_ARTIFACT_A, _ARTIFACT_B))
+
+    def rewrite(payload: dict[str, object]) -> None:
+        payload["session_id"] = str(OTHER_SESSION_ID)
+
+    reissued = _mutated_manifest(store, manifest, rewrite)
+    for entry in _entries(_manifest_payload(store, reissued)):
+        _path_of(store, _bytes_reference(entry)).unlink()
+
+    with pytest.raises(WorkflowIncompleteEvidenceError) as error:
+        resolve_screenshots(store, (reissued,), _session(_ARTIFACT_A, _ARTIFACT_B))
+    _assert_incomplete(error)
+    assert "sesión" in error.value.detail
+    assert "no están en el almacén" not in error.value.detail
+
+    tampered = _manifest_payload(store, manifest)
+    tampered["session_id"] = str(OTHER_SESSION_ID)
+    _path_of(store, manifest).write_bytes(
+        json.dumps(tampered, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    with pytest.raises(WorkflowIncompleteEvidenceError) as rewritten:
+        resolve_screenshots(store, (manifest,), _session(_ARTIFACT_A, _ARTIFACT_B))
+    _assert_incomplete(rewritten)

@@ -33,7 +33,8 @@
 | **ENGINE-6.0.1** | **Authority, Real Handoff & Budget Hardening.** Gobierno real de autoridad (default deny, L3 no rebajable), Human Gate con prueba verificable, etapas Architect/Planner sin duplicación, handoff durable por artefactos, presupuesto pre-gasto, checkpoints coherentes, conflicto de idempotencia, colecciones acotadas, aplicabilidad visual por perfil web y efectos que no se repiten a ciegas. | ✅ Implementada |
 | **ENGINE-6.0.2** | **Final Autonomy Boundary Hardening.** La prueba humana autoriza exactamente la transición que se aplica, la política es obligatoria y se re-evalúa en cada paso y antes del efecto, el handoff durable vive en los adaptadores reales, el presupuesto es pre-gasto también en modelo/tokens y en transiciones, un efecto incierto no se reintenta y la verificación visual no se desactiva omitiendo metadatos. | ✅ Implementada |
 | **ENGINE-6.0.3** | **Final Execution Continuity & Budget Enforcement.** El saldo de modelo/tokens es una cota que llega al runner, la reserva pre-gasto se persiste antes de la llamada, un rol solo queda satisfecho con un resultado aceptable —así que reanudar reabre el rol que no terminó— y el handoff durable cubre toda la pipeline, de Architect a VisualQA. | ✅ Implementada |
-| **ENGINE-6.0.4** | **Token Accounting & Real Visual Handoff Closure.** `max_total_tokens` es un tope de **total** (entrada + salida) con reserva durable de llamada y tokens que un crash no devuelve, y el handoff visual transporta los **bytes reales** de las capturas con revalidación canónica: una captura manipulada, ausente o con hash que no cuadra bloquea el workflow sin ejecutar VisualQA. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
+| **ENGINE-6.0.4** | **Token Accounting & Real Visual Handoff Closure.** `max_total_tokens` es un tope de **total** (entrada + salida) con reserva durable de llamada y tokens que un crash no devuelve, y el handoff visual transporta los **bytes reales** de las capturas con revalidación canónica: una captura manipulada, ausente o con hash que no cuadra bloquea el workflow sin ejecutar VisualQA. | ✅ Implementada |
+| **ENGINE-6.0.5** | **Real Provider Budget Enforcement.** El presupuesto del workflow llega hasta el HTTP del proveedor: los runners reales de DeepSeek toman `request.limits` (nunca su propia configuración) y el `max_tokens` del cuerpo es el autorizado, gasto a gasto; la reserva durable cubre el máximo que la invocación puede gastar; el kernel valida el consumo que declara el runner y bloquea si lo supera; un rol que declara no usar IA corre con presupuesto de modelo cero; y el manifiesto de capturas ata la evidencia a la identidad de su sesión. | ✅ Implementada — **cierre final `PENDING PROGRAMMER-IN-CHIEF AUDIT`** |
 
 ENGINE-0 no es un agente inteligente: es el **esqueleto de gobernanza**. ENGINE-1
 tampoco: es la **capa de ejecución controlada**, que permite ejecutar trabajo real
@@ -3128,17 +3129,40 @@ su CAMUS y sus almacenes reconstruidos desde disco) y una variante sin proyecto 
 | V604-01 Saldo de tokens | `max_total_tokens` es un tope de **total** (entrada + salida): la cota efectiva reparte el saldo entre `max_input_tokens` y `max_output_tokens` (`entrada_autorizada + salida_autorizada <= total`), la entrada se estima de forma conservadora —o se cuenta con un tokenizador inyectado— y si ya consume el saldo no se llama al proveedor. El consumo distingue **gastado** de **reservado**: antes de invocar se reservan una llamada de modelo y un colchón de tokens, se persiste el checkpoint y solo entonces se llama; con resultado se convierte en consumo real y se libera, sin resultado (crash) queda comprometido. Un runner con IA sin cota declarada **no se ejecuta** (`UNKNOWN` no es «sin límite») y uno determinista no reserva nada |
 | V604-02 Capturas | `handoff.py` publica los **bytes exactos** de cada captura (`SCREENSHOT`) y un manifiesto que los ata a su evidencia canónica (`SCREENSHOT_MANIFEST`), reutilizando la validación de ENGINE-5.3 (`ScreenshotArtifact.as_image_payload`) sin una segunda más débil. Un proceso nuevo reconstruye el `Mapping[str, ImagePayload]` del almacén; una captura ausente, unos bytes modificados con el mismo tamaño, un hash o un nombre que no cuadran bloquean el workflow con `WORKFLOW_INCOMPLETE_EVIDENCE` y **cero** llamadas a VisualQA |
 
+### ENGINE-6.0.5 — Presupuesto real en la frontera del proveedor
+
+Quinta pasada, sobre los seis hallazgos que dejó la auditoría de 6.0.4: el presupuesto estaba bien
+calculado en el kernel pero se perdía —o no se creía— en la frontera donde de verdad se gasta.
+
+| Hallazgo | Cómo se cierra |
+| --- | --- |
+| V605-01 Límites que no gobernaban a los runners reales | `DeepSeekArchitectRunner` y `DeepSeekPlannerRunner` ejecutaban `self._limits` (su configuración) e ignoraban `request.limits`. Ahora la cota efectiva es `min(configuración del runner, petición)` **campo a campo** (`max_attempts`, `max_model_calls`, `max_input_tokens`, `max_output_tokens`): la configuración estática nunca amplía la autorización del workflow. Con una llamada autorizada y un runner configurado para cinco, el transporte recibe **una** petición HTTP |
+| V605-02 El tope de salida no llegaba al proveedor | `StructuredModelClient.complete_json` y `complete_multimodal_json` aceptan `max_output_tokens` (la autorización de esta invocación) y el cliente envía `min(config.max_tokens, autorizado)` como `max_tokens` en el cuerpo, **antes** de generar. En cada reintento el tope se recalcula con lo ya consumido: con 10 000 autorizados y 7 000 gastados, la segunda llamada pide 3 000, no 10 000. `accepts_output_budget` deja que un doble antiguo se declare incompatible en vez de romper con `TypeError` |
+| V605-03 Reserva por debajo del gasto posible | La reserva durable cubre el **máximo** que la invocación puede gastar bajo los límites efectivos —`min(cota declarada, saldo)` en llamadas y en tokens totales—, no una llamada ni un colchón arbitrario. Se persiste antes de invocar, se liquida con el consumo real cuando hay resultado y, sin resultado (crash), queda entera: un proceso nuevo no la reutiliza. Un reintento técnico del kernel corre **dentro** de la reserva del paso, que es una sola |
+| V605-04 La postcondición se creía al runner | El kernel valida el `RoleExecutionResult` contra el saldo que autorizó (llamadas y tokens) antes de darlo por bueno. Un consumo declarado por encima bloquea con `WORKFLOW_BUDGET_EXCEEDED`, no avanza de etapa, nunca puede declararse `COMPLETED`, y el veredicto deja escritas las dos cifras (lo declarado y lo autorizado). El consumo declarado **no** se suma al contador del workflow: sumarlo dejaría el presupuesto rebasado y la propia transición de bloqueo —que también pasa por el presupuesto— ya no cabría |
+| V605-05 Roles deterministas sin saldo | La exigencia de saldo de modelo se decide **después** de preguntar por el rol: un ejecutor que declara `uses_ai=False` no reserva, no gasta y se ejecuta con `max_model_calls=0` y `max_total_tokens=0`. El silencio no habilita ese camino: `ModelCallLimits.uses_ai` vale `True` por defecto y un runner mudo se trata como uno con modelo |
+| V605-06 Evidencia visual sin identidad | `resolve_screenshots` exige que el manifiesto sea de la **misma** sesión (`task_id`, `project_id`, `session_id`) antes de leer un solo byte de captura. Un manifiesto de otro replay —aunque traiga los mismos PNG y los mismos nombres lógicos— es `WORKFLOW_INCOMPLETE_EVIDENCE`: cero capturas resueltas, cero llamadas a VisualQA y ninguna aprobación |
+
+La frontera del proveedor se prueba con los runners y el cliente **reales** sobre un
+`httpx.MockTransport`: el cuerpo de cada petición se guarda tal como viajó, que es la única prueba de
+qué `max_tokens` se envió. La suite `tests/test_workflow_provider_budget_e2e.py` recorre kernel,
+`CamusRoleExecutor`, CAMUS, los runners reales de DeepSeek y `DeepSeekClient` para cada hallazgo.
+
+ENGINE-6.0.5 **no** declara cerrada la fase 6.0: el cierre final sigue pendiente de auditoría del
+programador en jefe, y ENGINE-6.1 (ciclo de reparación) no está autorizada.
+
 ### Limitación declarada
 
 - **No hay ciclo de reparación autónomo**: ENGINE-6.0 llega a `REPAIRING` y se detiene ahí con
   `WORKFLOW_REPAIR_DEFERRED`. Reinvocar, reparar y reverificar es ENGINE-6.1.
-- ENGINE-6.0.4 **no** declara cerrada la fase 6.0: su cierre final queda pendiente de auditoría del
-  programador en jefe.
+- Ni ENGINE-6.0.4 ni ENGINE-6.0.5 declaran cerrada la fase 6.0: el cierre final queda pendiente de
+  auditoría del programador en jefe.
 - La estimación de tokens de entrada es deliberadamente pesimista (dos caracteres por token más la
   sobrecarga del prompt): con un tokenizador real disponible se inyecta un conteo exacto
   (`input_estimator`), y sin él se prefiere no ejecutar antes que autorizar un gasto que no cabe.
-- La reserva de tokens por defecto (`8 000`) es una reserva que se liquida con el consumo real; si el
-  proceso muere en medio, queda comprometida hasta la reconciliación.
+- La reserva de tokens es el **máximo** que la invocación puede gastar (cota declarada por el runner
+  o el saldo autorizado), se liquida con el consumo real y, si el proceso muere en medio, queda
+  comprometida entera hasta la reconciliación: nunca se devuelve presupuesto automáticamente.
 - Política conservadora del presupuesto: un rol sin cota inyectable por petición (todo menos
   Architect y Planner) **no se ejecuta** si su máximo declarado no cabe en el saldo restante. Es
   deliberado —antes no gastar que gastar de más— y se declara con `WORKFLOW_BUDGET_EXCEEDED`.
@@ -3148,7 +3172,9 @@ su CAMUS y sus almacenes reconstruidos desde disco) y una variante sin proyecto 
   automática: la única salida es una reconciliación explícita (`EffectLedger.reconcile`).
 - Ejecución **secuencial** por diseño; el paralelismo y el DAG llegan más adelante.
 - El reintento técnico del kernel está acotado (2 intentos) y solo cubre tropiezos técnicos; los
-  reintentos de transporte ya viven en cada cliente de proveedor.
+  reintentos de transporte ya viven en cada cliente de proveedor. Los intentos de un mismo paso
+  comparten la reserva del paso: un intento fallido no reserva otra vez ni libera nada, y si el paso
+  se queda sin resultado la reserva entera sigue comprometida.
 - Un veredicto `FAILED` o `TIMEOUT` de un rol se trata como «hay que rehacer» (reparación), no como
   fallo técnico del kernel.
 - Sin endpoint público para lanzar workflows: el kernel es interno y `GET /health` sigue intacto.

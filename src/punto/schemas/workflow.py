@@ -279,13 +279,16 @@ class ModelCallLimits(BaseModel):
 
     ``uses_ai`` distingue un runner con modelo de uno determinista, y una cota en ``None`` significa
     **desconocida**, no «sin límite»: para un runner con IA, una cota desconocida es motivo de
-    bloqueo, porque PUNTO no puede garantizar que no se rebase el presupuesto.
+    bloqueo, porque PUNTO no puede garantizar que no se rebase el presupuesto. El valor por defecto
+    es ``True``: declarar una cota sin decir que no se usa IA es declarar un runner **con** modelo,
+    y el silencio nunca habilita el camino sin saldo que el hallazgo V605-05 abre a quien lo
+    declara explícitamente.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     #: True si el runner puede llamar a un modelo (y por tanto consume presupuesto de modelo).
-    uses_ai: bool = Field(default=False)
+    uses_ai: bool = Field(default=True)
     #: ``None`` = el runner no declara cota de llamadas.
     max_model_calls: int | None = Field(default=None, ge=1)
     #: ``None`` = el runner no declara cota de tokens de entrada.

@@ -822,6 +822,14 @@ class Camus:
         - una cota ausente se devuelve como ``None`` en ese campo, que significa **desconocida**, no
           «sin límite»: para un runner con IA, una cota desconocida es motivo de bloqueo.
 
+        Un runner que no responda a ``uses_ai`` se trata como si **sí** usara modelo cuando declara
+        alguna cota: el silencio no es una declaración de determinismo, y suponer lo contrario
+        dejaría a un runner mudo gastando sin reserva (hallazgo V605-05, que abre el camino sin
+        saldo solo a quien lo declara). Un runner que no declara **nada** —ni uso de modelo ni
+        cotas— devuelve ``None``: no es determinista, es desconocido, y el kernel lo trata con la
+        política conservadora que ya aplica a un ejecutor mudo (reserva el saldo entero). Es el caso
+        del contrato del Developer, que no expone ninguna de las dos cosas.
+
         Args:
             role: Rol del workflow cuya cota se consulta.
 
@@ -831,8 +839,14 @@ class Camus:
         runner = self._runner_for(role)
         if runner is None:
             return None
-        uses_ai = bool(getattr(runner, "uses_ai", False))
+        declared_ai = getattr(runner, "uses_ai", None)
         limits = getattr(runner, "limits", None)
+        if declared_ai is None and limits is None:
+            # Ni uso de modelo ni cotas: no es un runner determinista, es un contrato que no declara
+            # nada (el del Developer, sin ir más lejos). El kernel lo reserva entero, que es la
+            # política conservadora, y el adaptador no se inventa un máximo que nadie ha declarado.
+            return None
+        uses_ai = True if declared_ai is None else bool(declared_ai)
         if limits is None:
             return ModelCallLimits(uses_ai=uses_ai)
         return ModelCallLimits(

@@ -8,8 +8,10 @@ ensamblado determinista del roadmap y del grafo.
 from __future__ import annotations
 
 import json
+from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from planning_support import (
@@ -31,7 +33,7 @@ from punto.planner.deepseek import (
     DeepSeekPlannerRunner,
 )
 from punto.planner.prompts import PLANNER_FORMAT_REMINDER, PLANNER_PROMPT_VERSION
-from punto.providers.deepseek import DeepSeekBalanceError
+from punto.providers.deepseek import DeepSeekBalanceError, DeepSeekClient, DeepSeekConfig
 from punto.schemas.audit import AuditEventType
 from punto.schemas.planning import (
     ArchitectureProposal,
@@ -459,3 +461,164 @@ def test_proposal_model_rejects_dangling_references_before_assembly() -> None:
         PlannerProposal.model_validate(
             {"project_name": "X", "milestones": [], "epics": [], "tasks": [{"id": "T1"}]}
         )
+
+
+# ---------------------------------------------------------------------------
+# Presupuesto de la petición (hallazgos V605-01 y V605-02)
+#
+# Estas pruebas usan el runner y el cliente **reales** sobre un ``httpx.MockTransport``: el
+# defecto era que el límite no llegaba al HTTP, y un doble que no construye peticiones no
+# podría demostrar lo contrario.
+# ---------------------------------------------------------------------------
+
+#: Credencial sintética: nunca una clave real, ni siquiera en las pruebas.
+FAKE_API_KEY = "sk-test-planner-budget"
+
+#: Tope propio del cliente, holgado a propósito: el valor que se observe debe ser el que
+#: autoriza la petición, no el del cliente.
+CLIENT_MAX_TOKENS = 65_536
+
+
+class RecordedChatApi:
+    """API falsa que registra los cuerpos enviados y responde el guion indicado.
+
+    El guion repite su última respuesta, de modo que varias llamadas no lo agotan. Se guarda
+    el cuerpo **tal como viajó**: es la única prueba de qué ``max_tokens`` se envió.
+    """
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = responses
+        self.bodies: list[dict[str, Any]] = []
+
+    @property
+    def calls(self) -> int:
+        """Número de peticiones HTTP recibidas."""
+        return len(self.bodies)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Registra el cuerpo de la petición y devuelve la siguiente respuesta del guion."""
+        self.bodies.append(json.loads(request.content))
+        index = min(len(self.bodies) - 1, len(self._responses) - 1)
+        return self._responses[index]
+
+
+def chat_response(content: str, *, completion_tokens: int = 50) -> httpx.Response:
+    """Respuesta 200 con el dialecto de DeepSeek y el consumo de salida indicado."""
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl-budget",
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": completion_tokens,
+                "total_tokens": 100 + completion_tokens,
+            },
+        },
+    )
+
+
+def budget_client(api: RecordedChatApi) -> DeepSeekClient:
+    """Cliente real de DeepSeek contra el transporte simulado: sin red y sin clave real."""
+    return DeepSeekClient(
+        DeepSeekConfig(api_key=FAKE_API_KEY, max_tokens=CLIENT_MAX_TOKENS),
+        transport=httpx.MockTransport(api.handler),
+    )
+
+
+def rejected_roadmap() -> str:
+    """Roadmap que PUNTO rechaza (tarea sin criterios de aceptación), ya serializado."""
+    broken = broken_planner(lambda data: data["tasks"][0].update({"acceptance_criteria": []}))
+    return payload(broken)
+
+
+def test_request_limits_bound_the_model_calls_of_the_real_runner() -> None:
+    """V605-01: una autorización de una llamada es **una** petición HTTP, no cinco.
+
+    El runner está configurado para cinco llamadas y la petición autoriza una. Con el defecto
+    que se cierra —el runner ejecutaba ``self._limits`` e ignoraba ``request.limits``— el
+    transporte habría recibido cinco peticiones; ahora recibe exactamente una.
+    """
+    api = RecordedChatApi([chat_response(rejected_roadmap())])
+
+    with budget_client(api) as client:
+        runner = DeepSeekPlannerRunner(
+            client=client, limits=PlannerLimits(max_attempts=5, max_model_calls=5)
+        )
+        outcome = runner.plan(
+            build_request(limits=PlannerLimits(max_attempts=1, max_model_calls=1))
+        )
+
+    assert api.calls == 1
+    assert outcome.summary.model_calls == 1
+    assert outcome.summary.attempts_used == 1
+    assert outcome.status is ProjectPlanStatus.BLOCKED
+    assert BLOCKED_PLANNER_ATTEMPTS in outcome.error
+
+
+def test_request_limits_never_widen_the_runner_budget() -> None:
+    """La petición no puede autorizar más de lo que el runner declara.
+
+    El runner está configurado para una sola llamada y la petición autoriza cinco: manda el
+    runner, así que el transporte recibe una única petición.
+    """
+    api = RecordedChatApi([chat_response(rejected_roadmap())])
+
+    with budget_client(api) as client:
+        runner = DeepSeekPlannerRunner(
+            client=client, limits=PlannerLimits(max_attempts=5, max_model_calls=1)
+        )
+        outcome = runner.plan(
+            build_request(limits=PlannerLimits(max_attempts=5, max_model_calls=5))
+        )
+
+    assert api.calls == 1
+    assert outcome.status is ProjectPlanStatus.BLOCKED
+    assert BLOCKED_PLANNER_CALLS in outcome.error
+
+
+def test_each_attempt_receives_only_the_remaining_output_budget() -> None:
+    """V605-02: la segunda llamada no repite el total autorizado.
+
+    Con 10 000 tokens autorizados y 7 000 consumidos en el primer intento, al segundo le
+    quedan 3 000: volver a enviar 10 000 multiplicaría el gasto autorizado por el número de
+    intentos, que es exactamente lo que ocurría cuando el tope no llegaba al HTTP.
+    """
+    api = RecordedChatApi(
+        [
+            chat_response(rejected_roadmap(), completion_tokens=7_000),
+            chat_response(payload(PYTHON_API_PLANNER)),
+        ]
+    )
+    limits = PlannerLimits(max_attempts=2, max_model_calls=2, max_output_tokens=10_000)
+
+    with budget_client(api) as client:
+        runner = DeepSeekPlannerRunner(client=client)
+        outcome = runner.plan(build_request(limits=limits))
+
+    assert api.calls == 2
+    assert api.bodies[0]["max_tokens"] == 10_000
+    assert api.bodies[1]["max_tokens"] == 3_000
+    assert api.bodies[1]["max_tokens"] <= 10_000 - 7_000
+    assert outcome.succeeded is True
+
+
+def test_without_remaining_output_balance_the_model_is_not_called_again() -> None:
+    """Si el saldo de salida llega a cero, se bloquea sin gastar otra petición."""
+    api = RecordedChatApi([chat_response(rejected_roadmap(), completion_tokens=5_000)])
+    limits = PlannerLimits(max_attempts=3, max_model_calls=3, max_output_tokens=5_000)
+
+    with budget_client(api) as client:
+        runner = DeepSeekPlannerRunner(client=client)
+        outcome = runner.plan(build_request(limits=limits))
+
+    assert api.calls == 1
+    assert outcome.status is ProjectPlanStatus.BLOCKED
+    assert BLOCKED_PLANNER_TOKENS in outcome.error

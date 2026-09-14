@@ -34,7 +34,7 @@ from punto.audit.logger import AuditLogger
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
-from punto.planner.base import PlannerRequest, PlannerRunner, PlanningOutcome
+from punto.planner.base import PlannerLimits, PlannerRequest, PlannerRunner, PlanningOutcome
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.qa.base import QALimits, QARunner
@@ -428,7 +428,13 @@ class ProviderLoopArchitect(ArchitectRunner):
 
 
 class FixedPlannerRunner(PlannerRunner):
-    """Planner doble que declara una llamada y no vuelve a planificar a nadie."""
+    """Planner doble que declara una llamada y no vuelve a planificar a nadie.
+
+    Declara ``uses_ai`` y su cota como cualquier Planner real: su informe cuenta llamadas de modelo,
+    así que no puede presentarse como determinista y colarse por el camino que el hallazgo V605-05
+    abre —a propósito— para los roles que **no** usan IA. Con la declaración honesta, el kernel lo
+    trata como un rol con modelo y no lo invoca cuando el saldo ya está agotado (hallazgo V605-04).
+    """
 
     def __init__(self, *, model_calls: int = 1) -> None:
         self.model_calls = model_calls
@@ -438,6 +444,21 @@ class FixedPlannerRunner(PlannerRunner):
     def provider(self) -> str:
         """Proveedor declarado por el doble."""
         return "doble"
+
+    @property
+    def uses_ai(self) -> bool:
+        """El doble consume modelo, como el Planner real."""
+        return True
+
+    @property
+    def limits(self) -> PlannerLimits:
+        """Cota declarada por el doble: una llamada y un prompt corto."""
+        return PlannerLimits(
+            max_attempts=1,
+            max_model_calls=1,
+            max_input_tokens=4_000,
+            max_output_tokens=4_000,
+        )
 
     def plan(self, request: PlannerRequest) -> PlanningOutcome:
         """Devuelve un plan válido con el consumo declarado."""

@@ -9,7 +9,11 @@ Reparto de responsabilidades:
 - el **modelo** propone la especificación, la arquitectura y el perfil de capacidades;
 - **PUNTO** valida el contrato y los invariantes, y decide si la propuesta se acepta;
 - un rechazo consume un intento de reparación; un fallo de red consume un reintento
-  de transporte del cliente. Nunca se mezclan (§11).
+  de transporte del cliente. Nunca se mezclan (§11);
+- el **presupuesto de la petición** es vinculante: se ejecuta el mínimo entre los límites del
+  runner y los de la petición, y el saldo de salida se reparte intento a intento, de modo que
+  la autorización del workflow llega hasta la petición HTTP y no se queda en una comprobación
+  posterior (hallazgos V605-01 y V605-02).
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from punto.planning.graph import (
     validate_capability_profile,
     validate_project_spec,
 )
+from punto.providers.base import accepts_output_budget
 from punto.providers.deepseek import (
     DeepSeekClient,
     DeepSeekError,
@@ -65,6 +70,25 @@ def _bullets(items: tuple[str, ...]) -> str:
     if not items:
         return "(no declarado)"
     return "\n".join(f"- {item}" for item in items)
+
+
+def _effective_limits(configured: ArchitectLimits, requested: ArchitectLimits) -> ArchitectLimits:
+    """Combina el presupuesto del runner con el de la petición, campo por campo.
+
+    La petición es **vinculante** (hallazgo V605-01): CAMUS calcula ahí la cota efectiva que el
+    workflow autoriza, y el runner la ignoraba ejecutando su propio presupuesto, de modo que
+    una autorización de una llamada acababa en cinco peticiones HTTP.
+
+    La combinación es el **mínimo** de los dos, nunca la suma ni el máximo: la configuración
+    del runner es un techo declarado y no puede ampliar lo que la petición autoriza. Si la
+    petición pide menos, manda la petición; si pide más, manda el runner.
+    """
+    return ArchitectLimits(
+        max_attempts=min(configured.max_attempts, requested.max_attempts),
+        max_model_calls=min(configured.max_model_calls, requested.max_model_calls),
+        max_input_tokens=min(configured.max_input_tokens, requested.max_input_tokens),
+        max_output_tokens=min(configured.max_output_tokens, requested.max_output_tokens),
+    )
 
 
 class DeepSeekArchitectRunner(ArchitectRunner):
@@ -116,9 +140,14 @@ class DeepSeekArchitectRunner(ArchitectRunner):
     def design(self, request: ArchitectRequest) -> ArchitectureOutcome:
         """Produce y valida la especificación, la arquitectura y el perfil.
 
+        Los límites que gobiernan esta invocación son los efectivos —el mínimo entre los
+        configurados del runner y los de la petición—, no los del runner a secas: la petición
+        es la autorización del llamante y el runner no puede ampliarla.
+
         Nunca lanza por un fallo del trabajo: lo traduce a ``status`` con
         ``violations`` o ``error``.
         """
+        limits = _effective_limits(self._limits, request.limits)
         usage = ModelUsage()
         model_calls = 0
         attempts_used = 0
@@ -126,14 +155,14 @@ class DeepSeekArchitectRunner(ArchitectRunner):
         error = ""
         status = ProjectPlanStatus.BLOCKED
 
-        self._audit_request_started(request)
+        self._audit_request_started(request, limits.max_attempts)
 
         try:
-            for attempt in range(1, self._limits.max_attempts + 1):
+            for attempt in range(1, limits.max_attempts + 1):
                 attempts_used = attempt
-                if model_calls >= self._limits.max_model_calls:
+                if model_calls >= limits.max_model_calls:
                     raise PlanningLimitExceededError(
-                        BLOCKED_ARCHITECT_CALLS, model_calls, self._limits.max_model_calls
+                        BLOCKED_ARCHITECT_CALLS, model_calls, limits.max_model_calls
                     )
 
                 prompt = (
@@ -142,10 +171,21 @@ class DeepSeekArchitectRunner(ArchitectRunner):
                     else self._repair_prompt(request.intent, violations, error)
                 )
 
-                completion = self._call_model(request, attempt, prompt)
+                # La autorización de salida de **esta** llamada es el saldo que queda tras lo
+                # ya consumido: volver a enviar el total en cada intento multiplicaría el
+                # gasto autorizado por el número de intentos.
+                remaining_output = limits.max_output_tokens - usage.completion_tokens
+                if remaining_output < 1:
+                    raise PlanningLimitExceededError(
+                        BLOCKED_ARCHITECT_TOKENS,
+                        usage.completion_tokens,
+                        limits.max_output_tokens,
+                    )
+
+                completion = self._call_model(request, attempt, prompt, remaining_output)
                 model_calls += 1
                 usage = usage.merged(completion.usage)
-                self._assert_token_budget(usage)
+                self._assert_token_budget(usage, limits)
 
                 proposal, violations = self._parse_and_validate(request, attempt, completion)
                 if proposal is not None:
@@ -195,14 +235,32 @@ class DeepSeekArchitectRunner(ArchitectRunner):
         )
 
     def _call_model(
-        self, request: ArchitectRequest, attempt: int, prompt: str
+        self,
+        request: ArchitectRequest,
+        attempt: int,
+        prompt: str,
+        max_output_tokens: int,
     ) -> ModelCompletion:
-        """Llama al modelo y audita inicio, fin y fallo."""
+        """Llama al modelo y audita inicio, fin y fallo.
+
+        ``max_output_tokens`` es el saldo de salida autorizado para esta invocación: viaja en
+        la petición HTTP para que el proveedor no genere más de lo permitido, en vez de
+        comprobarse después con el ``usage``, cuando el gasto ya ocurrió (hallazgo V605-02).
+        Un cliente que no declare el parámetro —un doble de prueba anterior al hallazgo— se
+        invoca como antes, sin el tope, y entonces el presupuesto se comprueba a posteriori.
+        """
         self._audit_model_started(request, attempt, prompt)
         try:
-            completion = self._client.complete_json(
-                system_prompt=ARCHITECT_SYSTEM_PROMPT, user_prompt=prompt
-            )
+            if accepts_output_budget(self._client):
+                completion = self._client.complete_json(
+                    system_prompt=ARCHITECT_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_output_tokens=max_output_tokens,
+                )
+            else:
+                completion = self._client.complete_json(
+                    system_prompt=ARCHITECT_SYSTEM_PROMPT, user_prompt=prompt
+                )
         except DeepSeekError as exc:
             self._audit_model_failed(request, attempt, self._client.redact(str(exc)))
             raise
@@ -240,15 +298,15 @@ class DeepSeekArchitectRunner(ArchitectRunner):
 
         return proposal, ()
 
-    def _assert_token_budget(self, usage: ModelUsage) -> None:
-        """Comprueba el presupuesto acumulado de tokens."""
-        if usage.prompt_tokens > self._limits.max_input_tokens:
+    def _assert_token_budget(self, usage: ModelUsage, limits: ArchitectLimits) -> None:
+        """Comprueba el consumo acumulado contra los límites **efectivos** de la invocación."""
+        if usage.prompt_tokens > limits.max_input_tokens:
             raise PlanningLimitExceededError(
-                BLOCKED_ARCHITECT_TOKENS, usage.prompt_tokens, self._limits.max_input_tokens
+                BLOCKED_ARCHITECT_TOKENS, usage.prompt_tokens, limits.max_input_tokens
             )
-        if usage.completion_tokens > self._limits.max_output_tokens:
+        if usage.completion_tokens > limits.max_output_tokens:
             raise PlanningLimitExceededError(
-                BLOCKED_ARCHITECT_TOKENS, usage.completion_tokens, self._limits.max_output_tokens
+                BLOCKED_ARCHITECT_TOKENS, usage.completion_tokens, limits.max_output_tokens
             )
 
     def _initial_prompt(self, intent: ProjectIntent) -> str:
@@ -294,7 +352,7 @@ class DeepSeekArchitectRunner(ArchitectRunner):
         }
 
     # --------------------------------------------------------------- auditoría
-    def _audit_request_started(self, request: ArchitectRequest) -> None:
+    def _audit_request_started(self, request: ArchitectRequest, max_attempts: int) -> None:
         if self._audit is None:
             return
         self._audit.log_architect_request_started(
@@ -303,7 +361,7 @@ class DeepSeekArchitectRunner(ArchitectRunner):
             provider=self.provider,
             model=self.model,
             prompt_version=self.prompt_version,
-            max_attempts=self._limits.max_attempts,
+            max_attempts=max_attempts,
         )
 
     def _audit_plan_received(

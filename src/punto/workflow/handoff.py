@@ -53,6 +53,17 @@ El JSON del manifiesto no lleva binarios —solo metadatos y referencias—, y c
 por la sesión tiene que estar entera y verificada, o el resolutor falla con
 ``WORKFLOW_INCOMPLETE_EVIDENCE`` en vez de entregar un mapa a medias.
 
+Identidad de la sesión en el manifiesto (ENGINE-6.0.5, V605-06)
+--------------------------------------------------------------
+El manifiesto ya guardaba la identidad de la sesión que midió las capturas (``task_id``,
+``project_id`` e ``id``), pero el resolutor no la comparaba con el
+:class:`~punto.schemas.web.WebSessionReport` que recibe: un manifiesto de **otro replay** —mismo
+proyecto, mismas capturas y los mismos nombres lógicos— se resolvía como si fuera el de la sesión
+pedida, y Visual QA habría analizado la evidencia de otra ejecución creyendo analizar la suya. Ahora
+:func:`resolve_screenshots` compara las tres identidades **antes** de tocar ningún byte y falla con
+``WORKFLOW_INCOMPLETE_EVIDENCE`` diciendo qué identidad no cuadra y qué se esperaba. La evidencia de
+otro replay es un hueco de evidencia, nunca una aprobación.
+
 Dos reglas gobiernan lo que viaja en esos sobres, y conviene leerlas antes de tocar el códec:
 
 - **nada de secretos**: el almacén es disco y un volcado de error puede traer la cabecera de
@@ -756,13 +767,21 @@ def resolve_screenshots(
     con la misma función canónica con la que se publicaron. Así la verificación visual no depende de
     ninguna variable del proceso que midió la sesión.
 
+    Antes de reconstruir ningún byte se comprueba que el manifiesto es el de la **sesión pedida**:
+    su ``task_id``, su ``project_id`` y su ``session_id`` tienen que ser los que declara ``session``
+    (V605-06). Un manifiesto de otro replay —mismo proyecto, mismas capturas y los mismos nombres
+    lógicos— se rechaza con ``WORKFLOW_INCOMPLETE_EVIDENCE`` diciendo qué identidad no cuadra y qué
+    se esperaba. Analizar la evidencia de otra ejecución no es una aprobación: es un hueco de
+    evidencia, y quien lo recibe declara ``BLOCKED`` en vez de dar por verificado lo que no se miró.
+
     Nada se entrega a medias: o están **todas** las capturas declaradas y verificadas, o hay
-    ``WORKFLOW_INCOMPLETE_EVIDENCE``. Una captura que falte, unos bytes ausentes, unos bytes del
-    tamaño declarado cuyo hash no cuadra, un sha256 que no corresponde, una entrada bajo otro nombre
-    lógico, una entrada de más en el manifiesto o una referencia de bytes que el almacén no puede
-    verificar son, todos, huecos de evidencia recuperables: el adaptador los convierte en
-    ``BLOCKED`` en vez de cerrar el workflow. Traducirlos aquí es deliberado, porque en esta función
-    «la captura durable no es de fiar» significa exactamente eso.
+    ``WORKFLOW_INCOMPLETE_EVIDENCE``. Un manifiesto de otro replay, una captura que falte, unos
+    bytes ausentes, unos bytes del tamaño declarado cuyo hash no cuadra, un sha256 que no
+    corresponde, una entrada bajo otro nombre lógico, una entrada de más en el manifiesto o una
+    referencia de bytes que el almacén no puede verificar son, todos, huecos de evidencia
+    recuperables: el adaptador los convierte en ``BLOCKED`` en vez de cerrar el workflow.
+    Traducirlos aquí es deliberado, porque en esta función «la evidencia durable no es la de esta
+    sesión o no es de fiar» significa exactamente eso.
 
     Un ``session`` ausente o sin capturas devuelve un mapa vacío y no toca el almacén: es el caso
     «sin capturas» del adaptador, donde no hay nada que analizar y el informe dirá cero, que es un
@@ -773,12 +792,13 @@ def resolve_screenshots(
         declarada, en el orden en que la sesión las declara.
 
     Raises:
-        WorkflowIncompleteEvidenceError: si la sesión declara capturas y falta el manifiesto, o si
+        WorkflowIncompleteEvidenceError: si la sesión declara capturas y falta el manifiesto, si el
+            manifiesto no es el de esa sesión (otra tarea, otro proyecto u otro replay) o si
             cualquier comprobación de integridad de las capturas falla.
     """
-    declared = () if session is None else tuple(session.screenshots)
-    if not declared:
+    if session is None or not session.screenshots:
         return {}
+    declared = tuple(session.screenshots)
     manifest = _first_reference(references, SCREENSHOT_MANIFEST_KIND)
     if manifest is None:
         raise WorkflowIncompleteEvidenceError(
@@ -786,7 +806,9 @@ def resolve_screenshots(
             f"ningún manifiesto {SCREENSHOT_MANIFEST_KIND}: sin él los bytes no se pueden "
             "reconstruir en un proceso nuevo y la verificación visual se haría a ciegas"
         )
-    entries = _read_capture_manifest(store, manifest)
+    index = _read_capture_manifest(store, manifest)
+    _assert_same_session(index, session, manifest)
+    entries = index.entries
     images: dict[str, ImagePayload] = {}
     for artifact in declared:
         name = _bounded_text(artifact.logical_name)
@@ -1719,19 +1741,38 @@ def _first_reference(
     return None
 
 
-def _read_capture_manifest(
-    store: ArtifactStore, reference: ArtifactReference
-) -> Mapping[str, dict[str, object]]:
-    """Lee el manifiesto de capturas y lo indexa por nombre lógico, o fallo de evidencia.
+@dataclass(frozen=True, slots=True)
+class _CaptureIndex:
+    """Manifiesto de capturas ya leído: la identidad de sesión que declara y su índice por nombre.
 
-    Un manifiesto ausente, ilegible, de otro esquema, sin lista de capturas, con una entrada que no
-    es un objeto o con dos entradas para el mismo nombre lógico no se interpreta «lo mejor posible»:
-    es evidencia incompleta, porque el índice que ata cada captura a sus bytes no es de fiar y sin
-    él no se puede saber qué imagen se midió.
+    La identidad viaja con el índice y no por separado porque son **el mismo artefacto**: si el
+    manifiesto es de otra sesión, sus capturas tampoco son las de esta, así que leerlas por separado
+    invitaría a resolver unas con la identidad de otras. Es privado a propósito: la identidad del
+    manifiesto es un detalle del códec, no parte del contrato de ``resolve_screenshots``, que
+    devuelve solo bytes verificados.
+    """
+
+    task_id: str
+    project_id: str
+    session_id: str
+    entries: Mapping[str, dict[str, object]]
+
+
+def _read_capture_manifest(store: ArtifactStore, reference: ArtifactReference) -> _CaptureIndex:
+    """Lee el manifiesto de capturas, con su identidad de sesión y su índice por nombre lógico.
+
+    Un manifiesto ausente, ilegible, de otro esquema, sin identidad de sesión, sin lista de
+    capturas, con una entrada que no es un objeto o con dos entradas para el mismo nombre lógico no
+    se interpreta «lo mejor posible»: es evidencia incompleta, porque el índice que ata cada captura
+    a sus bytes no es de fiar y sin él no se puede saber qué imagen se midió ni en qué replay.
+
+    Leer la identidad aquí —y no en una segunda pasada del almacén— es deliberado: el manifiesto se
+    verifica por digest una sola vez y la identidad que se compara es la del **mismo** contenido que
+    aporta las capturas.
 
     Raises:
-        WorkflowIncompleteEvidenceError: si el manifiesto no se puede leer o no tiene la forma que
-            este códec escribió.
+        WorkflowIncompleteEvidenceError: si el manifiesto no se puede leer, no tiene la forma que
+            este códec escribió o no declara la identidad de su sesión web.
     """
     try:
         data = store.get(reference)
@@ -1773,7 +1814,71 @@ def _read_capture_manifest(
                 f"{name!r}: no se puede saber cuál de las dos es la captura medida"
             )
         entries[name] = entry
-    return entries
+    return _CaptureIndex(
+        task_id=_identity_field(payload, _TASK_ID_FIELD, "tarea", reference),
+        project_id=_identity_field(payload, _PROJECT_ID_FIELD, "proyecto", reference),
+        session_id=_identity_field(payload, _SESSION_ID_FIELD, "sesión", reference),
+        entries=entries,
+    )
+
+
+def _identity_field(
+    payload: Mapping[str, object], field: str, label: str, reference: ArtifactReference
+) -> str:
+    """Campo de identidad del manifiesto, o evidencia incompleta si no es un texto utilizable.
+
+    Un manifiesto que no declara con qué sesión se midió no se interpreta «lo mejor posible»:
+    aceptarlo sería resolver evidencia que no se puede atribuir a ningún replay. El fallo se dice
+    con el nombre de la identidad que falta —tarea, proyecto o sesión— porque es lo que permite
+    distinguir un índice de otro replay de un índice incompleto.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si el campo no está o no es un texto no vacío.
+    """
+    raw = payload.get(field)
+    if not isinstance(raw, str) or not raw:
+        raise WorkflowIncompleteEvidenceError(
+            f"el manifiesto {reference.reference!r} no declara la identidad de {label} de la "
+            f"sesión web ({field}={raw!r}): sin ella la evidencia no se puede atribuir al replay "
+            "que se quiere analizar y analizarla sería aprobar sin haber mirado"
+        )
+    return raw
+
+
+def _assert_same_session(
+    index: _CaptureIndex, session: WebSessionReport, reference: ArtifactReference
+) -> None:
+    """Comprueba que el manifiesto es el de la sesión que se quiere resolver (V605-06).
+
+    El manifiesto ya guardaba la identidad de la sesión, pero el resolutor no la comparaba: un
+    manifiesto de otro replay —mismo proyecto, mismas capturas y los mismos nombres lógicos— se
+    resolvía como el de la sesión pedida y Visual QA habría analizado la evidencia de otra
+    ejecución. Se comparan las **tres** identidades y se falla con la primera que no cuadra,
+    diciendo cuál es y qué se esperaba; el orden es el de la cadena de atribución —tarea,
+    proyecto, sesión—, de modo que el detalle nombra el hecho más general que falla antes que el
+    más específico.
+
+    La comprobación ocurre antes de leer ningún byte de captura, así que un manifiesto de otro
+    replay no consume el almacén ni entrega un mapa a medias.
+
+    Raises:
+        WorkflowIncompleteEvidenceError: si la tarea, el proyecto o la sesión que declara el
+            manifiesto no son los de ``session``. La evidencia de otro replay es un hueco de
+            evidencia, nunca una aprobación.
+    """
+    identities: tuple[tuple[str, str, str, str], ...] = (
+        ("tarea", _TASK_ID_FIELD, index.task_id, str(session.task_id)),
+        ("proyecto", _PROJECT_ID_FIELD, index.project_id, str(session.project_id)),
+        ("sesión", _SESSION_ID_FIELD, index.session_id, str(session.id)),
+    )
+    for label, field, stored, expected in identities:
+        if stored != expected:
+            raise WorkflowIncompleteEvidenceError(
+                f"el manifiesto {reference.reference!r} es de otra sesión web: declara la "
+                f"identidad de {label} {stored!r} ({field}) y la sesión que se quiere resolver "
+                f"declara {expected!r}. La evidencia es de otro replay: entregarla sería analizar "
+                "la ejecución equivocada y aprobar sin haber mirado la pedida"
+            )
 
 
 def _capture_entry(

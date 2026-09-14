@@ -31,6 +31,7 @@ from punto.providers.base import (
     JsonSchema,
     ModelCompletion,
     StructuredModelClient,
+    effective_max_tokens,
 )
 from punto.schemas.execution import ModelUsage
 
@@ -325,6 +326,7 @@ class DeepSeekClient(StructuredModelClient):
         system_prompt: str,
         user_prompt: str,
         json_schema: JsonSchema | None = None,
+        max_output_tokens: int | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada al modelo.
 
@@ -333,15 +335,23 @@ class DeepSeekClient(StructuredModelClient):
         **textual**: no se finge que la API lo impone, y PUNTO sigue validando con Pydantic.
         Ignorarlo en silencio sería peor que declararlo como lo que es.
 
+        El tope de salida autorizado viaja en el ``max_tokens`` de la petición, que es la
+        única forma de que la API no genere más de lo permitido: comprobarlo después con el
+        ``usage`` llega tarde, porque el gasto ya ocurrió.
+
         Args:
             system_prompt: Prompt de sistema versionado del Developer.
             user_prompt: Contexto y petición concretos.
             json_schema: Esquema que la respuesta debería cumplir, si se declara.
+            max_output_tokens: Tope de salida autorizado para esta invocación. ``None`` deja
+                mandar a ``DeepSeekConfig.max_tokens``; con valor, se envía el menor de los
+                dos, nunca uno mayor.
 
         Returns:
             El contenido, el modelo, el consumo y la latencia.
 
         Raises:
+            ValueError: si el tope autorizado es menor que 1. Se falla antes de la petición.
             DeepSeekAuthError: 401.
             DeepSeekBalanceError: 402.
             DeepSeekRateLimitError: 429 tras los reintentos.
@@ -349,6 +359,7 @@ class DeepSeekClient(StructuredModelClient):
             DeepSeekTimeoutError: timeout tras los reintentos.
             DeepSeekInvalidResponseError: respuesta vacía o no parseable.
         """
+        max_tokens = effective_max_tokens(self._config.max_tokens, max_output_tokens)
         payload: dict[str, Any] = {
             "model": self._config.model,
             "messages": [
@@ -356,7 +367,7 @@ class DeepSeekClient(StructuredModelClient):
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": self._config.max_tokens,
+            "max_tokens": max_tokens,
             "stream": False,
             "thinking": {"type": self._config.thinking},
             "reasoning_effort": self._config.reasoning_effort,
@@ -366,7 +377,9 @@ class DeepSeekClient(StructuredModelClient):
         response, retries = self._post_with_retries(payload)
         latency_ms = int((time.perf_counter() - started) * 1000)
 
-        return self._parse(response, latency_ms=latency_ms, transport_retries=retries)
+        return self._parse(
+            response, latency_ms=latency_ms, transport_retries=retries, max_tokens=max_tokens
+        )
 
     def _post_with_retries(
         self, payload: dict[str, Any]
@@ -417,9 +430,19 @@ class DeepSeekClient(StructuredModelClient):
         return DeepSeekError(f"respuesta inesperada ({status}): {detail}")
 
     def _parse(
-        self, response: httpx.Response, *, latency_ms: int, transport_retries: int
+        self,
+        response: httpx.Response,
+        *,
+        latency_ms: int,
+        transport_retries: int,
+        max_tokens: int,
     ) -> ModelCompletion:
-        """Extrae contenido, modelo y consumo de la respuesta."""
+        """Extrae contenido, modelo y consumo de la respuesta.
+
+        ``max_tokens`` es el tope que **realmente** viajó en la petición, no el configurado:
+        si una autorización más pequeña provocó el truncamiento, el diagnóstico tiene que
+        decirlo, o el mensaje acusaría al límite equivocado.
+        """
         try:
             body = response.json()
         except ValueError as exc:
@@ -451,7 +474,7 @@ class DeepSeekClient(StructuredModelClient):
                 "respuesta truncada por el límite de tokens de salida "
                 f"(finish_reason='length', contenido de {len(content or '')} caracteres, "
                 f"razonamiento {'presente' if reasoning else 'ausente'}, "
-                f"max_tokens={self._config.max_tokens}). Aumenta max_tokens."
+                f"max_tokens={max_tokens}). Aumenta max_tokens."
             )
 
         if not isinstance(content, str) or not content.strip():
@@ -459,7 +482,7 @@ class DeepSeekClient(StructuredModelClient):
                 "el modelo devolvió contenido vacío "
                 f"(finish_reason={finish_reason!r}, "
                 f"razonamiento={'presente' if reasoning else 'ausente'}, "
-                f"max_tokens={self._config.max_tokens})"
+                f"max_tokens={max_tokens})"
             )
 
         usage = _parse_usage(body.get("usage"))

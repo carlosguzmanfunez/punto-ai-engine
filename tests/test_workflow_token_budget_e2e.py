@@ -282,7 +282,12 @@ def test_d_an_ai_runner_without_declared_limits_is_not_invoked(tmp_path: Path) -
 
 
 def test_e_a_deterministic_runner_runs_without_model_budget(tmp_path: Path) -> None:
-    """V604-01 E: un runner determinista no reserva ni gasta presupuesto de modelo."""
+    """V604-01 E: un runner determinista no reserva ni gasta presupuesto de modelo.
+
+    El caso extremo —presupuesto de modelo **cero** en las dos cotas— vive en
+    ``test_workflow_provider_budget_e2e.py`` (hallazgo V605-05), donde toda la pipeline es
+    determinista y por tanto no hay ninguna etapa con modelo por delante.
+    """
     calls = {"provider": 0}
 
     class DeterministicQA(QARunner):

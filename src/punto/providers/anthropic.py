@@ -43,6 +43,7 @@ from punto.providers.base import (
     ProviderAuthenticationError,
     ProviderError,
     ProviderRefusalError,
+    effective_max_tokens,
 )
 from punto.providers.json_schema import prepare_json_schema
 from punto.schemas.execution import ModelUsage
@@ -440,14 +441,24 @@ class AnthropicClient(MultimodalModelClient):
         system_prompt: str,
         user_prompt: str,
         json_schema: JsonSchema | None = None,
+        max_output_tokens: int | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta estructurada solo con texto.
 
         Delega en el mismo camino multimodal con ``images=()``: un único camino de
         petición significa un único lugar donde equivocarse.
 
+        Args:
+            system_prompt: Prompt de sistema versionado.
+            user_prompt: Petición concreta.
+            json_schema: Esquema que la respuesta debe cumplir, si se declara.
+            max_output_tokens: Tope de salida autorizado para esta invocación. ``None`` deja
+                mandar a ``AnthropicConfig.max_tokens``; con valor, se envía el menor de los
+                dos, nunca uno mayor.
+
         Raises:
             SchemaValidationError: si el esquema no cumple el contrato de PUNTO.
+            ValueError: si el tope autorizado es menor que 1. Se falla antes de la petición.
             AnthropicError: cualquier fallo clasificado del proveedor.
         """
         return self.complete_multimodal_json(
@@ -455,6 +466,7 @@ class AnthropicClient(MultimodalModelClient):
             user_prompt=user_prompt,
             images=(),
             json_schema=json_schema,
+            max_output_tokens=max_output_tokens,
         )
 
     def complete_multimodal_json(
@@ -465,6 +477,7 @@ class AnthropicClient(MultimodalModelClient):
         images: Sequence[ImagePayload],
         limits: ImageLimits | None = None,
         json_schema: JsonSchema | None = None,
+        max_output_tokens: int | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta estructurada a partir de texto e imágenes.
 
@@ -473,21 +486,28 @@ class AnthropicClient(MultimodalModelClient):
         ``output_config.format`` con el JSON Schema preparado, de modo que el formato no
         depende de que el prompt lo pida por favor.
 
+        El tope autorizado de salida se resuelve también antes: viaja como ``max_tokens`` de
+        la petición, que es la única forma de que el proveedor no genere más de lo permitido.
+
         Raises:
             ImageValidationError: si una imagen incumple los límites.
             SchemaValidationError: si el esquema no cumple el contrato de PUNTO.
+            ValueError: si el tope autorizado es menor que 1. Se falla antes de la petición.
             AnthropicError: cualquier fallo clasificado del proveedor.
         """
         effective_limits = limits if limits is not None else ImageLimits()
         validated = effective_limits.validate(images)
         prepared = None if json_schema is None else prepare_json_schema(json_schema)
-        payload = self._build_payload(system_prompt, user_prompt, validated, prepared)
+        max_tokens = effective_max_tokens(self._config.max_tokens, max_output_tokens)
+        payload = self._build_payload(system_prompt, user_prompt, validated, prepared, max_tokens)
 
         started = time.perf_counter()
         response, retries = self._post_with_retries(payload)
         latency_ms = int((time.perf_counter() - started) * 1000)
 
-        return self._parse(response, latency_ms=latency_ms, transport_retries=retries)
+        return self._parse(
+            response, latency_ms=latency_ms, transport_retries=retries, max_tokens=max_tokens
+        )
 
     def _build_payload(
         self,
@@ -495,16 +515,20 @@ class AnthropicClient(MultimodalModelClient):
         user_prompt: str,
         images: Sequence[ImagePayload],
         schema: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Construye el cuerpo de ``POST /v1/messages``.
 
         El esquema viaja en ``output_config.format`` (la forma actual de la Messages API). No
         se usa ``output_format`` ni *assistant prefill*: el primero es una forma antigua y el
         segundo condiciona la generación en vez de restringir el formato.
+
+        ``max_tokens`` es el tope ya resuelto para la invocación; ``None`` deja mandar al
+        configurado, que es lo que hacía este camino antes de existir la autorización.
         """
         payload: dict[str, Any] = {
             "model": self._config.model,
-            "max_tokens": self._config.max_tokens,
+            "max_tokens": self._config.max_tokens if max_tokens is None else max_tokens,
             "system": system_prompt,
             "messages": [
                 {"role": "user", "content": build_content_blocks(user_prompt, images)}
@@ -595,9 +619,17 @@ class AnthropicClient(MultimodalModelClient):
         return AnthropicProviderError(f"respuesta inesperada ({status}): {detail}")
 
     def _parse(
-        self, response: httpx.Response, *, latency_ms: int, transport_retries: int
+        self,
+        response: httpx.Response,
+        *,
+        latency_ms: int,
+        transport_retries: int,
+        max_tokens: int,
     ) -> ModelCompletion:
         """Extrae contenido, modelo, consumo y motivo de parada de la respuesta.
+
+        ``max_tokens`` es el tope que **realmente** viajó en la petición, no el configurado:
+        si una autorización más pequeña provocó el truncamiento, el diagnóstico debe decirlo.
 
         Raises:
             AnthropicInvalidResponseError: el cuerpo no es interpretable.
@@ -644,7 +676,7 @@ class AnthropicClient(MultimodalModelClient):
             raise AnthropicTruncatedResponseError(
                 "respuesta truncada por el límite de tokens de salida "
                 f"(provider={PROVIDER_ANTHROPIC}, model={model}, "
-                f"stop_reason={stop_reason!r}, max_tokens={self._config.max_tokens}, "
+                f"stop_reason={stop_reason!r}, max_tokens={max_tokens}, "
                 f"texto recibido de {len(_extract_text(blocks))} caracteres). "
                 "Aumenta max_tokens."
             )

@@ -8,7 +8,8 @@ nombre», que es justo lo que la fase prohíbe.
 Aquí está lo mínimo que un proveedor debe ofrecer:
 
 - ``provider`` y ``model``: quién responde y con qué modelo, declarado, nunca inferido;
-- ``complete_json(...)``: una respuesta JSON estructurada con consumo y latencia;
+- ``complete_json(...)``: una respuesta JSON estructurada con consumo y latencia, más el tope
+  de salida que esa invocación tiene **autorizado**;
 - ``redact(...)``: saneado de credenciales, porque cada proveedor conoce la suya;
 - ``ModelCompletion``: el resultado común, con ``provider``, ``stop_reason`` y ``request_id``.
 
@@ -24,6 +25,7 @@ aquí para no romper a ningún agente existente.
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -230,6 +232,67 @@ class ImageLimits:
         return tuple(images)
 
 
+def effective_max_tokens(configured: int, authorized: int | None) -> int:
+    """Resuelve el tope de salida de una invocación, sin ampliar nunca la autorización.
+
+    El presupuesto de salida autorizado —el saldo del workflow, por ejemplo— es vinculante
+    para la llamada concreta: la configuración del cliente es un **techo**, no una licencia
+    para gastar más de lo autorizado. Por eso manda siempre el menor de los dos, igual para
+    todos los proveedores: la regla es del contrato, no del dialecto de una API.
+
+    Args:
+        configured: Tope propio del cliente, ya validado como positivo.
+        authorized: Tope autorizado para esta invocación, o ``None`` si no hay ninguno.
+
+    Returns:
+        El valor que debe viajar como ``max_tokens`` en la petición.
+
+    Raises:
+        ValueError: si el tope autorizado es menor que 1. Enviar ``max_tokens=0`` al
+            proveedor sería pedirle una respuesta imposible y, además, lo dejaría sin
+            presupuesto para cerrar el JSON: es un error de quien llama y se detecta
+            **antes** de gastar la petición.
+    """
+    if authorized is None:
+        return configured
+    if authorized < 1:
+        raise ValueError(
+            f"max_output_tokens autorizado debe ser mayor que cero, no {authorized}"
+        )
+    return min(configured, authorized)
+
+
+def accepts_output_budget(client: object) -> bool:
+    """Indica si un cliente admite el tope autorizado de salida por invocación.
+
+    ``max_output_tokens`` forma parte del contrato, así que todo cliente conforme —los
+    reales lo son— debe declararlo. Un doble de prueba escrito antes del hallazgo V605-02 no
+    lo declara y fallaría con ``TypeError`` al recibirlo, de modo que quien llama necesita
+    poder **preguntarlo** en vez de suponerlo. Se acepta tanto el parámetro con nombre como
+    un ``**kwargs`` que lo absorba.
+
+    Args:
+        client: Cliente candidato. No se exige que implemente el contrato: la pregunta es
+            precisamente si lo implementa con este parámetro.
+
+    Returns:
+        ``True`` si la firma de ``complete_json`` acepta ``max_output_tokens``.
+    """
+    method = getattr(client, "complete_json", None)
+    if not callable(method):
+        return False
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        # Una firma que no se puede introspeccionar no es una promesa de aceptar el parámetro.
+        return False
+    return any(
+        parameter.name == "max_output_tokens"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 class StructuredModelClient(ABC):
     """Proveedor que sabe devolver JSON estructurado.
 
@@ -254,6 +317,7 @@ class StructuredModelClient(ABC):
         system_prompt: str,
         user_prompt: str,
         json_schema: JsonSchema | None = None,
+        max_output_tokens: int | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada.
 
@@ -263,6 +327,13 @@ class StructuredModelClient(ABC):
             json_schema: Esquema que la respuesta debe cumplir, si el proveedor puede
                 aplicarlo. Un proveedor sin la primitiva nativa puede cumplirlo de forma
                 textual; lo que no puede es ignorarlo en silencio.
+            max_output_tokens: Tope de tokens de salida **autorizado** para esta
+                invocación (el saldo del presupuesto del workflow, por ejemplo). El cliente
+                nunca lo amplía: envía el menor entre este valor y su propio tope, y lo hace
+                **antes** de generar, no como comprobación posterior del ``usage``.
+                ``None`` significa «sin autorización específica» y deja mandar al tope del
+                cliente, que es el comportamiento de siempre. Un valor menor que 1 es un uso
+                incorrecto y se rechaza antes de construir la petición.
 
         Raises:
             ProviderError: cualquier fallo clasificado del proveedor.
@@ -318,6 +389,7 @@ class MultimodalModelClient(StructuredModelClient):
         images: Sequence[ImagePayload],
         limits: ImageLimits | None = None,
         json_schema: JsonSchema | None = None,
+        max_output_tokens: int | None = None,
     ) -> ModelCompletion:
         """Solicita una respuesta JSON estructurada a partir de texto e imágenes.
 
@@ -328,6 +400,9 @@ class MultimodalModelClient(StructuredModelClient):
             limits: Límites a aplicar. Si es ``None`` se usan los seguros por defecto.
             json_schema: Esquema que la respuesta debe cumplir, si el proveedor puede
                 aplicarlo.
+            max_output_tokens: Tope de tokens de salida autorizado para esta invocación, con
+                la misma semántica que en ``complete_json``: nunca amplía el tope del
+                cliente y ``None`` deja mandar a este último.
 
         Raises:
             ImageValidationError: si una imagen incumple los límites.
@@ -354,4 +429,6 @@ __all__ = [
     "ProviderRefusalError",
     "ProviderUnavailableError",
     "StructuredModelClient",
+    "accepts_output_budget",
+    "effective_max_tokens",
 ]

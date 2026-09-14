@@ -62,6 +62,7 @@ from punto.audit.logger import AuditLogger
 from punto.crossaudit.base import CrossAuditLimits, CrossAuditRunner
 from punto.developer.base import DeveloperRunner
 from punto.developer.context import ExecutionContext
+from punto.developer.deepseek import ModelLimits
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
@@ -360,6 +361,20 @@ class RepairingDeveloper(DeveloperRunner):
     def repair_calls(self) -> int:
         """Reparaciones recibidas: la cifra que la prueba exige que sea exactamente una."""
         return len(self.repairs)
+
+    @property
+    def generates_code_with_ai(self) -> bool:
+        """El doble declara generar código con IA: su informe cuenta llamadas de modelo.
+
+        Desde F613-01A ``uses_ai`` se deriva de aquí; declararse determinista reportando consumo
+        dejaría al Developer fuera de la reserva de modelo y abriría una brecha de contrato.
+        """
+        return True
+
+    @property
+    def limits(self) -> ModelLimits:
+        """Cota declarada por el doble, como la de cualquier Developer real."""
+        return ModelLimits(max_model_calls=2, max_input_tokens=8_000, max_output_tokens=4_000)
 
     def execute(self, task: DeveloperTask, context: ExecutionContext) -> DeveloperExecutionResult:
         """Aplica la mutación autorizada y devuelve el resultado correcto."""

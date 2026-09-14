@@ -45,6 +45,7 @@ from punto.developer.prompts import (
     REPAIR_AFTER_VALIDATION_FAILURE,
 )
 from punto.policy.permissions import is_protected_path
+from punto.providers.base import accepts_output_budget
 from punto.providers.deepseek import (
     DeepSeekClient,
     DeepSeekError,
@@ -110,6 +111,12 @@ BLOCKED_UNAUTHORIZED_PROPOSAL: Final[str] = "UNAUTHORIZED_PROPOSAL"
 
 #: Caracteres máximos de cada archivo incluido como contexto.
 MAX_CONTEXT_FILE_CHARS: Final[int] = 60_000
+
+#: Caracteres por token de la estimación conservadora de entrada (misma política que el motor, H1).
+_CHARS_PER_TOKEN: Final[int] = 2
+
+#: Sobrecarga fija del prompt de sistema en la estimación conservadora de entrada.
+_PROMPT_OVERHEAD_TOKENS: Final[int] = 1_000
 
 #: Caracteres máximos de la evidencia de fallo enviada en una reparación.
 MAX_EVIDENCE_CHARS: Final[int] = 4_000
@@ -248,6 +255,51 @@ class ModelLimits:
             raise ValueError("los límites de tokens deben ser positivos")
 
 
+def _estimate_prompt_tokens(prompt: str) -> int:
+    """Estimación **conservadora** de los tokens de entrada de un prompt (F613-01C).
+
+    Es la misma política que el resto del motor (backlog H1): dos caracteres por token —cuando los
+    tokenizadores reales rondan cuatro en texto latino— más la sobrecarga del prompt de sistema. No
+    se declara exacta, y por eso el recorte que decide es siempre pesimista: si con esta estimación
+    el saldo no cubre la salida, no se llama al proveedor. Cuando esté disponible el tokenizer
+    exacto del proveedor, esta función es el único punto que hay que sustituir.
+    """
+    return _PROMPT_OVERHEAD_TOKENS + -(-len(prompt) // _CHARS_PER_TOKEN)
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveDeveloperLimits:
+    """Techos efectivos de una invocación: el mínimo de los que existan, nunca su suma.
+
+    Tres fronteras pueden acotar el gasto del Developer y ninguna amplía a otra (F613-01):
+
+    - la **configuración del runner** (``ModelLimits``), que es su techo declarado;
+    - la **autorización de la invocación** que el workflow reservó (``context.model_limits``);
+    - el **presupuesto del ``RepairPlan``**, cuando el paso es una reparación.
+
+    ``max_total_tokens`` es la cota de **totales** (entrada más salida) de la invocación, y es la
+    que gobierna el tope dinámico de salida de cada llamada: ``remaining_total - entrada_estimada``.
+    """
+
+    max_model_calls: int
+    max_input_tokens: int
+    max_output_tokens: int
+    max_total_tokens: int | None
+    source: str
+
+    def output_cap_after(self, *, total_tokens_used: int, estimated_input_tokens: int) -> int:
+        """Tope de salida que le queda a la siguiente llamada, o ``0`` si ya no cabe ninguna.
+
+        Devuelve ``0`` cuando el saldo total no cubre ni la entrada estimada del prompt: la llamada
+        no se hace. El tope nunca supera el máximo de salida por llamada del runner ni de la
+        autorización.
+        """
+        if self.max_total_tokens is None:
+            return self.max_output_tokens
+        remaining = self.max_total_tokens - total_tokens_used - estimated_input_tokens
+        return max(0, min(self.max_output_tokens, remaining))
+
+
 @dataclass(frozen=True, slots=True)
 class _AttemptOutcome:
     """Resultado interno de un intento."""
@@ -315,6 +367,25 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         return True
 
     @property
+    def uses_ai(self) -> bool:
+        """Siempre ``True``: consume modelo y por tanto gasta presupuesto de modelo.
+
+        Se declara explícitamente, y no solo por derivación, porque es la pregunta que hace el
+        presupuesto del workflow: sin ella el kernel reservaba a ciegas y la cota se quedaba fuera
+        del bucle real de llamadas (hallazgo F613-01A).
+        """
+        return True
+
+    @property
+    def limits(self) -> ModelLimits:
+        """Cota máxima de modelo declarada por este runner, pública (hallazgo F613-01A).
+
+        ``Camus.declared_model_limits`` la lee de aquí; antes solo existía como atributo privado y
+        el Developer real quedaba fuera de la consulta, así que el kernel no podía acotar su gasto.
+        """
+        return self._limits
+
+    @property
     def provider(self) -> str:
         """Proveedor del modelo."""
         return "deepseek"
@@ -372,6 +443,10 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         except (SandboxRequiredError, SandboxUnavailableError) as exc:
             return self._blocked(task, context, reason="SANDBOX_REQUIRED", error=str(exc))
 
+        # La autorización de modelo de esta invocación (F613-01): el mínimo entre la configuración
+        # del runner, la cota que el workflow reservó y el presupuesto del plan de reparación. Se
+        # calcula **una vez**, antes de la primera llamada, y gobierna el bucle entero.
+
         self._log_backend_selected(task, context, backend)
 
         # El encargo de reparación, si lo hay, manda sobre el alcance: sin archivos autorizados
@@ -379,6 +454,11 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         repair = task.repair
         if repair is not None and not _normalize_paths(repair.target_files):
             return self._blocked_repair_scope(task, context, repair)
+
+        # Techos efectivos de la invocación: mínimo entre la configuración del runner, la cota que
+        # el workflow reservó y el presupuesto del plan de reparación (F613-01). Se calcula **una
+        # vez**, antes de la primera llamada, y gobierna el bucle entero.
+        limits = self._effective_limits(context, repair)
 
         # La orchestación de PUNTO es código nuestro, no del modelo: corre en el
         # host con contexto confiable. El código GENERADO solo corre en el sandbox.
@@ -411,9 +491,9 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                 attempts_used = attempt
                 self._log_attempt(task, attempt, "started")
 
-                if model_calls >= self._limits.max_model_calls:
+                if model_calls >= limits.max_model_calls:
                     raise ExecutionLimitExceededError(
-                        BLOCKED_MODEL_CALLS, model_calls, self._limits.max_model_calls
+                        BLOCKED_MODEL_CALLS, model_calls, limits.max_model_calls
                     )
 
                 if repair is None:
@@ -437,10 +517,24 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                         ),
                     )
 
-                completion = self._call_model(task, attempt, prompt)
+                # El tope de salida de **esta** llamada se recalcula con el saldo que queda: enviar
+                # otra vez el máximo configurado multiplicaría el gasto autorizado por el número de
+                # intentos (F613-01C). Si no cabe ni la entrada estimada, no se llama al proveedor.
+                output_cap = limits.output_cap_after(
+                    total_tokens_used=usage.total_tokens,
+                    estimated_input_tokens=_estimate_prompt_tokens(prompt),
+                )
+                if output_cap < 1:
+                    raise ExecutionLimitExceededError(
+                        BLOCKED_TOKEN_BUDGET,
+                        usage.total_tokens,
+                        limits.max_total_tokens or self._limits.max_output_tokens,
+                    )
+
+                completion = self._call_model(task, attempt, prompt, max_output_tokens=output_cap)
                 model_calls += 1
                 usage = usage.merged(completion.usage)
-                self._assert_token_budget(usage)
+                self._assert_token_budget(usage, limits)
 
                 try:
                     proposal = self._parse_proposal(task, attempt, completion.content)
@@ -560,14 +654,37 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
 
     # ------------------------------------------------------------------ modelo
     def _call_model(
-        self, task: DeveloperTask, attempt: int, prompt: str
+        self,
+        task: DeveloperTask,
+        attempt: int,
+        prompt: str,
+        *,
+        max_output_tokens: int,
     ) -> ModelCompletion:
-        """Llama al modelo y audita inicio, fin y consumo."""
+        """Llama al modelo y audita inicio, fin y consumo.
+
+        ``max_output_tokens`` es el saldo de salida autorizado para **esta** llamada: viaja en la
+        petición HTTP para que el proveedor no genere más de lo permitido, en vez de comprobarse
+        después con el ``usage``, cuando el gasto ya ocurrió (hallazgo F613-01C). Sin la cota, el
+        límite del workflow solo se podía auditar a posteriori.
+
+        Un cliente que no declare el parámetro —un doble de prueba anterior al hallazgo— se invoca
+        como antes, sin el tope, y entonces el presupuesto se comprueba a posteriori con el
+        ``usage`` y con la postcondición del kernel. La conformidad se **pregunta**
+        (``accepts_output_budget``) en vez de suponerse, como en el Architect y el Planner.
+        """
         self._audit_model_started(task, attempt, prompt)
         try:
-            completion = self._client.complete_json(
-                system_prompt=DEVELOPER_SYSTEM_PROMPT, user_prompt=prompt
-            )
+            if accepts_output_budget(self._client):
+                completion = self._client.complete_json(
+                    system_prompt=DEVELOPER_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    max_output_tokens=max_output_tokens,
+                )
+            else:
+                completion = self._client.complete_json(
+                    system_prompt=DEVELOPER_SYSTEM_PROMPT, user_prompt=prompt
+                )
         except DeepSeekError as exc:
             self._audit_model_failed(task, attempt, self._client.redact(str(exc)))
             raise
@@ -890,16 +1007,69 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
             blocks.append(f"=== {relative} ===\n{content}")
         return "\n\n".join(blocks) if blocks else "(sin archivos autorizados)"
 
-    def _assert_token_budget(self, usage: ModelUsage) -> None:
-        """Comprueba el presupuesto de tokens acumulado."""
-        if usage.prompt_tokens > self._limits.max_input_tokens:
+    def _assert_token_budget(self, usage: ModelUsage, limits: _EffectiveDeveloperLimits) -> None:
+        """Comprueba el presupuesto de tokens acumulado contra los techos efectivos."""
+        if usage.prompt_tokens > limits.max_input_tokens:
             raise ExecutionLimitExceededError(
-                BLOCKED_TOKEN_BUDGET, usage.prompt_tokens, self._limits.max_input_tokens
+                BLOCKED_TOKEN_BUDGET, usage.prompt_tokens, limits.max_input_tokens
             )
-        if usage.completion_tokens > self._limits.max_output_tokens:
+        if usage.completion_tokens > limits.max_output_tokens:
             raise ExecutionLimitExceededError(
-                BLOCKED_TOKEN_BUDGET, usage.completion_tokens, self._limits.max_output_tokens
+                BLOCKED_TOKEN_BUDGET, usage.completion_tokens, limits.max_output_tokens
             )
+        if limits.max_total_tokens is not None and usage.total_tokens > limits.max_total_tokens:
+            raise ExecutionLimitExceededError(
+                BLOCKED_TOKEN_BUDGET, usage.total_tokens, limits.max_total_tokens
+            )
+
+    def _effective_limits(
+        self, context: ExecutionContext, repair: RepairTask | None
+    ) -> _EffectiveDeveloperLimits:
+        """Techos efectivos de la invocación: mínimo de runner, autorización y plan (F613-01).
+
+        Los tres son **techos** y ninguno amplía a otro: la configuración del runner no puede
+        ampliar lo que el workflow autorizó, la autorización del workflow no puede ampliar el
+        presupuesto que el propio ``RepairPlan`` se dio, y el plan no puede ampliar la autorización
+        del workflow. Se aplica igual al Developer normal y al de reparación, porque el proveedor es
+        el mismo (hallazgo F613-01E).
+        """
+        invocation = context.model_limits
+        calls = self._limits.max_model_calls
+        input_tokens = self._limits.max_input_tokens
+        output_tokens = self._limits.max_output_tokens
+        total_tokens: int | None = None
+        sources: list[str] = ["runner"]
+        if invocation is not None:
+            calls = min(calls, invocation.max_model_calls)
+            if invocation.max_output_tokens is not None:
+                output_tokens = min(output_tokens, invocation.max_output_tokens)
+            if invocation.max_total_tokens is not None:
+                total_tokens = invocation.max_total_tokens
+            sources.append(invocation.source)
+        if repair is not None:
+            plan = repair.plan
+            if plan.budget_model_calls > 0:
+                calls = min(calls, plan.budget_model_calls)
+                sources.append("repair_plan")
+            if plan.budget_total_tokens > 0:
+                previous = total_tokens
+                total_tokens = (
+                    plan.budget_total_tokens
+                    if previous is None
+                    else min(previous, plan.budget_total_tokens)
+                )
+        # El tope de entrada y el de salida nunca pueden sumar más que el total autorizado: si el
+        # total es menor, se recorta la salida (la entrada es lo que el prompt mide de verdad).
+        if total_tokens is not None:
+            input_tokens = min(input_tokens, max(1, total_tokens))
+            output_tokens = min(output_tokens, max(1, total_tokens - 1))
+        return _EffectiveDeveloperLimits(
+            max_model_calls=calls,
+            max_input_tokens=input_tokens,
+            max_output_tokens=output_tokens,
+            max_total_tokens=total_tokens,
+            source="+".join(dict.fromkeys(sources)),
+        )
 
     # ------------------------------------------------------------------ salida
     def _finalize(

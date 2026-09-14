@@ -28,6 +28,7 @@ from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.developer.base import DeveloperRunner
 from punto.developer.context import ExecutionContext
+from punto.developer.deepseek import ModelLimits
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
@@ -158,6 +159,21 @@ class E2eDeveloperRunner(DeveloperRunner):
     def supports_repair_context(self) -> bool:
         """El runner sabe leer ``DeveloperTask.repair``."""
         return True
+
+    @property
+    def generates_code_with_ai(self) -> bool:
+        """El doble declara generar código con IA: su informe cuenta llamadas de modelo.
+
+        Declararlo es obligatorio desde F613-01A: ``uses_ai`` se deriva de aquí, y un runner que
+        reporta ``model_calls=1`` no puede presentarse como determinista —el kernel lo trataría como
+        un rol sin gasto de modelo y su propio informe dispararía una brecha de contrato—.
+        """
+        return True
+
+    @property
+    def limits(self) -> ModelLimits:
+        """Cota declarada por el doble, como la de cualquier Developer real."""
+        return ModelLimits(max_model_calls=2, max_input_tokens=8_000, max_output_tokens=4_000)
 
     @property
     def repair_calls(self) -> int:

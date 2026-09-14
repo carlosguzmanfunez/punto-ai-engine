@@ -113,6 +113,11 @@ del Architect y el Planner, del contador ``model_calls`` del resto de informes y
 declara llamadas, de los intentos que sí declara. **Nunca** se deduce de los tokens: un rol puede
 llamar tres veces gastando pocos tokens o una sola gastando muchos.
 
+El Developer es la excepción, y está documentada: su informe lleva un contador propio que
+**siempre** existe, así que un ``0`` es un hecho —no llamó— y no se suple con los intentos. Suplirlo
+convertía el intento de un runner determinista en una llamada de modelo inexistente y la
+postcondición del kernel bloqueaba el workflow por un gasto que nunca ocurrió (hallazgo V605-05).
+
 Saldo de modelo autorizado (V602-04-C)
 --------------------------------------
 El kernel calcula el saldo del intento (``RoleExecutionRequest.budget_allowance``) **antes** de
@@ -125,7 +130,7 @@ la cota del kernel tiene que estar también en la frontera que gasta.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
@@ -135,7 +140,11 @@ from punto.common import utc_now
 from punto.planner.base import PlannerLimits, PlanningOutcome
 from punto.schemas.cross_audit import CrossAuditReport
 from punto.schemas.enums import FindingSeverity
-from punto.schemas.execution import DeveloperExecutionResult, ModelUsage
+from punto.schemas.execution import (
+    DeveloperExecutionResult,
+    DeveloperInvocationLimits,
+    ModelUsage,
+)
 from punto.schemas.planning import ModelExecutionSummary, ProjectIntent
 from punto.schemas.qa import QAReport
 from punto.schemas.repair import REPAIR_OBJECTIVE, RepairTask
@@ -895,7 +904,7 @@ class CamusRoleExecutor:
         - **Runner determinista** (``uses_ai=False``): no reserva ni gasta presupuesto de modelo,
           así que la cota de tokens no lo frena.
         """
-        if self._role in (RoleName.ARCHITECT, RoleName.PLANNER):
+        if self._role in (RoleName.ARCHITECT, RoleName.PLANNER, RoleName.DEVELOPER):
             if input_tokens >= cap.total_tokens:
                 return self._cap_failure(request, cap, declared=None, input_tokens=input_tokens)
             return None
@@ -1294,6 +1303,8 @@ class CamusRoleExecutor:
             return self._call_analyze_project(payload, cap, input_tokens)
         if self._role is RoleName.PLANNER:
             return self._call_plan_from_architecture(payload, cap, input_tokens)
+        if self._role is RoleName.DEVELOPER:
+            return self._call_developer(payload, cap)
         return handler(payload)
 
     def _call_analyze_project(
@@ -1338,7 +1349,47 @@ class CamusRoleExecutor:
             limits=_planner_limits(cap, input_tokens),
         )
 
-    def _call_developer(self, payload: object) -> object:
+    def _with_invocation_limits(
+        self,
+        context: ExecutionContext,
+        *,
+        cap: _EffectiveCap | None,
+        repair: RepairTask | None,
+    ) -> ExecutionContext:
+        """Contexto del Developer con la autorización de modelo de **esta** invocación (F613-01).
+
+        Los techos se toman por **mínimo**, nunca por suma: la cota del workflow es lo que el
+        kernel reservó, y el presupuesto del ``RepairPlan`` puede ser más estrecho que el saldo
+        global, pero nunca más ancho. Ninguno de los dos amplía al otro, y el runner aplicará
+        después el mínimo con su propia configuración.
+
+        Sin cota declarada —una ejecución fuera del workflow— el contexto se devuelve intacto y
+        manda la configuración del runner, que es el comportamiento de siempre.
+        """
+        if cap is None:
+            return context
+        calls = cap.model_calls
+        total_tokens: int | None = cap.total_tokens
+        if repair is not None:
+            plan = repair.plan
+            if plan.budget_model_calls > 0:
+                calls = min(calls, plan.budget_model_calls)
+            if plan.budget_total_tokens > 0:
+                total_tokens = (
+                    plan.budget_total_tokens
+                    if total_tokens is None
+                    else min(total_tokens, plan.budget_total_tokens)
+                )
+        return replace(
+            context,
+            model_limits=DeveloperInvocationLimits(
+                max_model_calls=max(0, calls),
+                max_total_tokens=total_tokens if total_tokens is None else max(1, total_tokens),
+                source="repair_plan" if repair is not None else "workflow",
+            ),
+        )
+
+    def _call_developer(self, payload: object, cap: _EffectiveCap | None) -> object:
         """``execute_developer_task`` recibe la tarea de desarrollo y su contexto de ejecución.
 
         Si la tarea trae contexto de reparación, la ejecuta el **mismo** runner a través de
@@ -1347,10 +1398,19 @@ class CamusRoleExecutor:
         falla de forma explícita en vez de ejecutar una reparación como una tarea normal, sin las
         reglas duras ni la autorización acotada del plan. PUNTO no crea un segundo Developer para
         esto: la diferencia es el contexto, no el rol ni el runner.
+
+        La **autorización de modelo de esta invocación** entra por el contexto (hallazgo F613-01):
+        es la cota que el kernel reservó, acotada además por el presupuesto del ``RepairPlan`` si el
+        paso repara. Sin esto, el presupuesto del workflow se quedaba en la reserva del kernel y el
+        bucle real de llamadas del Developer ejecutaba la configuración del runner.
         """
         task, context = _pair(payload, RoleName.DEVELOPER, "DeveloperTask y ExecutionContext")
         developer_task = cast("DeveloperTask", task)
-        execution_context = cast("ExecutionContext", context)
+        execution_context = self._with_invocation_limits(
+            cast("ExecutionContext", context),
+            cap=cap,
+            repair=getattr(developer_task, "repair", None),
+        )
         # ``getattr`` y no acceso directo: ``build_input`` puede devolver el doble de prueba que los
         # llamantes usan desde antes de la reparación (una pareja de cadenas), y sin contexto de
         # reparación el camino es exactamente el de siempre.
@@ -1462,6 +1522,11 @@ def normalize_developer(result: object, request: RoleExecutionRequest) -> RoleEx
 
     El Developer no declara hallazgos ni gravedades, así que este normalizador **no** fabrica
     ninguno: copia el estado, los archivos cambiados, los checks fallidos y el consumo real.
+
+    Las llamadas al modelo se copian del contador **propio** del informe, que siempre existe y cuyo
+    ``0`` es un hecho (no llamó), no un silencio: sin esa distinción un runner determinista
+    reportaba una llamada que nunca hizo y el kernel lo bloqueaba por un gasto inexistente (hallazgo
+    V605-05, ver :func:`_declared_model_calls`).
     """
     status, error_code, status_detail = _map_status(result)
     validation = _nested(result, "validation")
@@ -1476,7 +1541,7 @@ def normalize_developer(result: object, request: RoleExecutionRequest) -> RoleEx
             model=_text(result, "model"),
             artifacts=_attribute_texts(result, "files_changed", "path"),
             usage=_as_usage(getattr(result, "usage", None)),
-            model_calls=_model_calls(result, None),
+            model_calls=_declared_model_calls(result),
             attempts=_int(result, "attempts_used"),
             started_at=_moment(result, "started_at"),
             completed_at=_moment(result, "completed_at"),
@@ -1913,6 +1978,26 @@ def _model_calls(report: object, summary: ModelExecutionSummary | None) -> int:
 def _bounded_model_calls(value: int) -> int:
     """Acota las llamadas al rango del contrato (``ge=0, le=64``) sin cambiar su significado."""
     return min(max(value, 0), _MAX_MODEL_CALLS)
+
+
+def _declared_model_calls(report: object) -> int:
+    """Llamadas al modelo que el informe **declara** con su propio contador (V605-05).
+
+    Es la lectura que usa el Developer, y es distinta de :func:`_model_calls` en un punto que
+    importa: ``DeveloperExecutionResult.model_calls`` existe siempre y un ``0`` ahí es un hecho
+    declarado —el runner no llamó al modelo—, no un silencio que haya que suplir con los intentos.
+    Tratar ese ``0`` como un silencio convertía el intento técnico de un runner **determinista** en
+    una llamada de modelo que nunca ocurrió, y la postcondición del kernel (un rol con
+    ``uses_ai=False`` tiene autorización cero, así que cualquier gasto reportado es una brecha)
+    bloqueaba el workflow por un gasto inexistente: exactamente lo que el hallazgo V605-05 prohíbe.
+
+    Un informe que no exponga el contador no tiene nada que declarar: ahí se mantiene la política de
+    :func:`_model_calls`, que es la de los roles cuyo informe no cuenta llamadas.
+    """
+    declared = getattr(report, "model_calls", None)
+    if isinstance(declared, int) and not isinstance(declared, bool):
+        return _bounded_model_calls(declared)
+    return _model_calls(report, None)
 
 
 def _component_ids(outcome: object) -> tuple[str, ...]:

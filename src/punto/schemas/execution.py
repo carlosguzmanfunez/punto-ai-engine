@@ -244,6 +244,33 @@ class ValidationResult(BaseModel):
         return len(self.checks)
 
 
+class DeveloperInvocationLimits(BaseModel):
+    """Autorización de modelo de **una** invocación del Developer (ENGINE-6.1.3, F613-01).
+
+    El presupuesto del workflow ya era una frontera pre-gasto para el Architect y el Planner, y para
+    el Developer solo llegaba hasta la reserva del kernel: su bucle de llamadas ejecutaba la
+    configuración del runner, así que una autorización de una llamada podía acabar en varias. Esta
+    autorización viaja con la invocación —dentro del ``ExecutionContext``— y es un **techo**:
+
+    - el runner toma el mínimo entre su propia configuración, esta autorización y el presupuesto del
+      ``RepairPlan`` cuando el paso repara; ninguna de las tres amplía a otra;
+    - se aplica al Developer **normal** y al de reparación, porque el proveedor es el mismo;
+    - el conteo es **acumulado** en la invocación, y el tope de tokens es de totales (entrada más
+      salida), igual que en el resto del motor.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: Llamadas de modelo autorizadas para toda la invocación (cero significa «ninguna»).
+    max_model_calls: int = Field(..., ge=0)
+    #: Tokens totales autorizados (entrada más salida) para toda la invocación.
+    max_total_tokens: int | None = Field(default=None, ge=1)
+    #: Tope de salida autorizado por llamada, si la autorización lo declara.
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    #: Procedencia de la autorización, para la traza (``"workflow"``, ``"repair_plan"``…).
+    source: str = Field(default="workflow", max_length=40)
+
+
 class ModelUsage(BaseModel):
     """Consumo real de tokens reportado por el proveedor."""
 

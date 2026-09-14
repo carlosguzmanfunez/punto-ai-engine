@@ -34,6 +34,7 @@ from punto.architect.base import ArchitectRequest, ArchitectRunner, Architecture
 from punto.audit.logger import AuditLogger
 from punto.developer.base import DeveloperRunner
 from punto.developer.context import ExecutionContext
+from punto.developer.deepseek import ModelLimits
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
@@ -193,12 +194,27 @@ class CountingPlannerRunner(PlannerRunner):
 
 
 class RecordingDeveloperRunner(DeveloperRunner):
-    """Doble del Developer: registra la tarea y el contexto que le entrega el handoff durable."""
+    """Doble del Developer: registra la tarea y el contexto que le entrega el handoff durable.
+
+    Declara generar código con IA porque su informe cuenta llamadas de modelo: desde F613-01A
+    ``uses_ai`` se deriva de aquí, y un doble que reporta consumo presentándose como determinista
+    quedaría fuera de la reserva de modelo y su propio informe abriría una brecha de contrato.
+    """
 
     def __init__(self, ledger: CallLedger) -> None:
         self._ledger = ledger
         self.tasks: list[DeveloperTask] = []
         self.contexts: list[ExecutionContext] = []
+
+    @property
+    def generates_code_with_ai(self) -> bool:
+        """El doble consume modelo, como el Developer real."""
+        return True
+
+    @property
+    def limits(self) -> ModelLimits:
+        """Cota declarada por el doble, como la de cualquier Developer real."""
+        return ModelLimits(max_model_calls=1, max_input_tokens=8_000, max_output_tokens=4_000)
 
     def execute(self, task: DeveloperTask, context: ExecutionContext) -> DeveloperExecutionResult:
         """Anota la llamada, guarda la entrada recibida y declara una ejecución correcta."""

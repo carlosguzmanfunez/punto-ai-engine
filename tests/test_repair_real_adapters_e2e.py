@@ -41,6 +41,7 @@ from punto.audit.logger import AuditLogger
 from punto.crossaudit.base import CrossAuditLimits, CrossAuditRunner
 from punto.developer.base import DeveloperRunner
 from punto.developer.context import ExecutionContext
+from punto.developer.deepseek import ModelLimits
 from punto.orchestrator.camus import Camus
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import StateMachine
@@ -274,6 +275,21 @@ class LedgerDeveloperRunner(DeveloperRunner):
     def supports_repair_context(self) -> bool:
         """El runner sabe leer ``DeveloperTask.repair``."""
         return True
+
+    @property
+    def generates_code_with_ai(self) -> bool:
+        """El doble declara generar código con IA: su informe cuenta llamadas de modelo.
+
+        Desde F613-01A ``uses_ai`` se deriva de aquí: un runner que reporta ``model_calls`` y se
+        declarara determinista quedaría fuera de la reserva de modelo y su propio informe dispararía
+        una brecha de contrato.
+        """
+        return True
+
+    @property
+    def limits(self) -> ModelLimits:
+        """Cota declarada por el doble, como la de cualquier Developer real."""
+        return ModelLimits(max_model_calls=2, max_input_tokens=8_000, max_output_tokens=4_000)
 
     def execute(self, task: DeveloperTask, context: ExecutionContext) -> DeveloperExecutionResult:
         """Trabajo normal no toca nada; la reparación escribe lo que el plan autoriza."""

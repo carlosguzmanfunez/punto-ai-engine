@@ -56,6 +56,32 @@ class DeveloperRunner(ABC):
         return False
 
     @property
+    def uses_ai(self) -> bool:
+        """True si el runner consume modelo (y por tanto gasta presupuesto de modelo).
+
+        Se **deriva** de :attr:`generates_code_with_ai` por defecto, y esa derivación es deliberada
+        (hallazgo F613-01A): el presupuesto del workflow pregunta por ``uses_ai`` y por ``limits``,
+        y un runner de código con IA que no lo declarara quedaba fuera de esa pregunta —el kernel
+        reservaba a ciegas y la cota no llegaba a su bucle de llamadas—. Un runner determinista
+        (``LocalDeveloperRunner``) devuelve ``False`` y no reserva nada.
+
+        Un runner real que use IA **además** declara :attr:`limits`; declarar ``uses_ai=True`` sin
+        cotas conocidas es una frontera legítima (el kernel reserva el saldo entero), pero no es lo
+        que hace el runner real de DeepSeek, que sí las publica.
+        """
+        return self.generates_code_with_ai
+
+    @property
+    def limits(self) -> object | None:
+        """Cota máxima de modelo que declara el runner, o ``None`` si no declara ninguna.
+
+        Lo consume ``Camus.declared_model_limits`` para no autorizar una ejecución que podría gastar
+        más de lo permitido. Es público a propósito: la cota **no** se lee de un atributo privado
+        (hallazgo F613-01A), porque entonces dependía del nombre interno de cada runner.
+        """
+        return None
+
+    @property
     def trust_level_required(self) -> ExecutionTrustLevel:
         """Nivel de confianza que este runner exige.
 

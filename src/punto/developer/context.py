@@ -19,7 +19,7 @@ from typing import Final
 from uuid import UUID
 
 from punto.policy.permissions import is_protected_path
-from punto.schemas.execution import ExecutionTrustLevel
+from punto.schemas.execution import DeveloperInvocationLimits, ExecutionTrustLevel
 from punto.tools.errors import (
     BranchPolicyViolationError,
     ProtectedFileError,
@@ -63,6 +63,13 @@ class ExecutionContext:
     #: confiar en este valor: viene obligado a exigir ``UNTRUSTED_MODEL`` y a
     #: rechazar el backend local.
     trust_level: ExecutionTrustLevel = ExecutionTrustLevel.TRUSTED_LOCAL
+    #: Autorización de modelo de **esta** invocación (ENGINE-6.1.3, F613-01).
+    #:
+    #: El presupuesto del workflow entra por aquí: es la cota pre-gasto que el kernel reservó y que
+    #: el bucle de llamadas del runner debe respetar. ``None`` significa «el kernel no declaró
+    #: cota» —por ejemplo, una ejecución directa del runner fuera del workflow—, y entonces manda
+    #: la configuración del propio runner, como antes.
+    model_limits: DeveloperInvocationLimits | None = None
     #: Si el trabajo puede acceder a la red. Por defecto **no**.
     network_access: bool = False
     #: Raíz del workspace ya resuelta (enlaces seguidos). Derivada, no declarada.

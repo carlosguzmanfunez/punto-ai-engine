@@ -3573,6 +3573,535 @@ class AuditLogger:
             actor=actor,
         )
 
+    # --- Bounded autonomous replanning (ENGINE-6.3) ---------------------------
+    #
+    # Una replanificación es el hito más caro del proyecto —autoriza una llamada a un modelo, cambia
+    # el grafo y puede consumir presupuesto que ya no vuelve—, así que cada paso deja su evento: qué
+    # fallo se clasificó, qué disparador se creó, qué se reservó, qué se publicó, qué dijeron el
+    # guard y la política, y qué generación se adoptó. Sin estos eventos, un replan rechazado sería
+    # indistinguible de uno que nunca se intentó.
+    def log_project_replan_eligibility_evaluated(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        eligibility: str,
+        category: str = "",
+        child_failure_code: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la clasificación determinista del fallo de un nodo.
+
+        El veredicto es del motor y sale del estado durable: el evento deja escrito **por qué** un
+        fallo admitió (o no) replanificación autónoma, con su categoría y su elegibilidad.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_ELIGIBILITY_EVALUATED,
+            action="project_replan_eligibility_evaluated",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status=eligibility,
+            detail=detail,
+            metadata={
+                "category": category,
+                "child_failure_code": child_failure_code,
+                "eligibility": eligibility,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_trigger_created(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        trigger_id: UUID | None = None,
+        eligibility: str = "",
+        category: str = "",
+        fingerprint: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la creación del disparador durable de la replanificación."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_TRIGGER_CREATED,
+            action="project_replan_trigger_created",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={
+                "category": category,
+                "eligibility": eligibility,
+                "fingerprint": fingerprint,
+                "trigger_id": "" if trigger_id is None else str(trigger_id),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_trigger_stale(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        fingerprint: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el disparador dejó de estar vigente **antes** de gastar nada."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_TRIGGER_STALE,
+            action="project_replan_trigger_stale",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="STALE",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"fingerprint": fingerprint},
+            actor=actor,
+        )
+
+    def log_project_replan_no_progress(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        fingerprint: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el mismo fallo se estaba intentando replanificar por segunda vez."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_NO_PROGRESS,
+            action="project_replan_no_progress",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="NO_PROGRESS",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"fingerprint": fingerprint},
+            actor=actor,
+        )
+
+    def log_project_replan_budget_exhausted(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        attempted: int,
+        maximum: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que no quedan replanificaciones autorizadas por el presupuesto del proyecto."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_BUDGET_EXHAUSTED,
+            action="project_replan_budget_exhausted",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="BUDGET_EXHAUSTED",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"attempted": attempted, "max_replans": maximum},
+            actor=actor,
+        )
+
+    def log_project_replan_reserved(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        trigger_id: UUID | None = None,
+        authorization_id: UUID | None = None,
+        attempt: int,
+        model_calls: int,
+        tokens: int,
+        max_output_tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la reserva de presupuesto que autoriza **una** invocación del replanner."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_RESERVED,
+            action="project_replan_reserved",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={
+                "attempt": attempt,
+                "authorization_id": "" if authorization_id is None else str(authorization_id),
+                "max_output_tokens": max_output_tokens,
+                "model_calls": model_calls,
+                "tokens": tokens,
+                "trigger_id": "" if trigger_id is None else str(trigger_id),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_invocation_started(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        authorization_id: UUID | None = None,
+        attempt: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que la llamada al replanner **salió**, persistida antes de tocarlo.
+
+        Es el evento que hace reconciliable un gasto desconocido: si el proceso muere con la
+        llamada en vuelo, el intento está escrito y un proceso nuevo exigirá reconciliación en vez
+        de reintentar a ciegas.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_INVOCATION_STARTED,
+            action="project_replan_invocation_started",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="INVOCATION_STARTED",
+            result=AuditResult.PENDING,
+            metadata={
+                "attempt": attempt,
+                "authorization_id": "" if authorization_id is None else str(authorization_id),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_spend_reconciliation_required(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        authorization_id: UUID | None = None,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un intento de replan con gasto en vuelo y sin propuesta durable."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED,
+            action="project_replan_spend_reconciliation_required",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="SPEND_UNKNOWN",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={
+                "authorization_id": "" if authorization_id is None else str(authorization_id)
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_invalid_proposal(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el replanner falló o devolvió algo que no es un contrato válido."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_INVALID_PROPOSAL,
+            action="project_replan_invalid_proposal",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="INVALID_PROPOSAL",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            actor=actor,
+        )
+
+    def log_project_replan_proposal_published(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        proposal_id: UUID | None = None,
+        trigger_id: UUID | None = None,
+        generation_index: int = 0,
+        fingerprint: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la propuesta publicada como artefacto durable del proyecto."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_PROPOSAL_PUBLISHED,
+            action="project_replan_proposal_published",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={
+                "generation_index": generation_index,
+                "proposal_fingerprint": fingerprint,
+                "proposal_id": "" if proposal_id is None else str(proposal_id),
+                "trigger_id": "" if trigger_id is None else str(trigger_id),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_guard_evaluated(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        accepted: bool,
+        reason_codes: Sequence[str] = (),
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el veredicto del guard determinista sobre la propuesta.
+
+        Los motivos de un rechazo viajan como **códigos estables**, no como prosa del modelo: el
+        guard es quien enumera qué no cuadraba con el contrato.
+        """
+        return self._project_event(
+            (
+                AuditEventType.PROJECT_REPLAN_GUARD_PASSED
+                if accepted
+                else AuditEventType.PROJECT_REPLAN_GUARD_REJECTED
+            ),
+            action=(
+                "project_replan_guard_passed" if accepted else "project_replan_guard_rejected"
+            ),
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="ACCEPTED" if accepted else "REJECTED",
+            detail=detail,
+            result=AuditResult.SUCCESS if accepted else AuditResult.FAILURE,
+            metadata={"reason_codes": list(reason_codes)},
+            actor=actor,
+        )
+
+    def log_project_replan_policy_evaluated(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        outcome: str,
+        policy_decision_id: UUID | None = None,
+        risk: str = "",
+        authority: str = "",
+        action: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el veredicto del Policy Engine sobre la acción de la replanificación."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_POLICY_EVALUATED,
+            action="project_replan_policy_evaluated",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status=outcome,
+            metadata={
+                "action": action,
+                "authority": authority,
+                "outcome": outcome,
+                "policy_decision_id": (
+                    "" if policy_decision_id is None else str(policy_decision_id)
+                ),
+                "risk": risk,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_policy_rejected(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el Policy Engine **rechazó** la acción de la replanificación."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_POLICY_REJECTED,
+            action="project_replan_policy_rejected",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="REJECTED",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            actor=actor,
+        )
+
+    def log_project_replan_human_required(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        outcome: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que la replanificación exige una persona y no se adopta en autonomía."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_HUMAN_REQUIRED,
+            action="project_replan_human_required",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status=outcome or "HUMAN_REQUIRED",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"outcome": outcome},
+            actor=actor,
+        )
+
+    def log_project_replan_decided(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        accepted: bool,
+        reason_code: str,
+        detail: str = "",
+        generation_index: int = 0,
+        new_generation_id: UUID | None = None,
+        model_calls: int = 0,
+        total_tokens: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la decisión del motor sobre la propuesta (aceptada o rechazada)."""
+        return self._project_event(
+            (
+                AuditEventType.PROJECT_REPLAN_ACCEPTED
+                if accepted
+                else AuditEventType.PROJECT_REPLAN_REJECTED
+            ),
+            action="project_replan_accepted" if accepted else "project_replan_rejected",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="ACCEPTED" if accepted else "REJECTED",
+            detail=detail,
+            result=AuditResult.SUCCESS if accepted else AuditResult.FAILURE,
+            metadata={
+                "generation_index": generation_index,
+                "model_calls": model_calls,
+                "new_generation_id": (
+                    "" if new_generation_id is None else str(new_generation_id)
+                ),
+                "reason_code": reason_code,
+                "total_tokens": total_tokens,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_generation_adopted(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        generation_id: UUID,
+        generation_index: int,
+        graph_fingerprint: str,
+        superseded_node_ids: Sequence[str] = (),
+        new_node_ids: Sequence[str] = (),
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la adopción de una generación nueva del grafo.
+
+        Es el evento que cierra la ventana de caída de la adopción: deja escritos la identidad y la
+        huella de la generación que manda, y qué nodos se retiraron y cuáles entraron.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_GENERATION_ADOPTED,
+            action="project_replan_generation_adopted",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="ADOPTED",
+            detail=detail,
+            metadata={
+                "generation_id": str(generation_id),
+                "generation_index": generation_index,
+                "graph_fingerprint": graph_fingerprint,
+                "new_node_ids": list(new_node_ids),
+                "superseded_node_ids": list(superseded_node_ids),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_reconciled(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        generation_id: UUID,
+        generation_index: int,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que un proceso nuevo adoptó una generación **pendiente** tras una caída.
+
+        Sin este evento, una reconciliación sería indistinguible de una replanificación normal y no
+        se podría auditar que el motor reutilizó la generación ya publicada en vez de volver a
+        gastar.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_RECONCILED,
+            action="project_replan_reconciled",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="RECONCILED",
+            result=AuditResult.PENDING,
+            detail=detail,
+            metadata={
+                "generation_id": str(generation_id),
+                "generation_index": generation_index,
+            },
+            actor=actor,
+        )
+
+    def log_project_node_superseded(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que un nodo fue sustituido por una replanificación.
+
+        El nodo conserva su historia y su gasto: el evento dice **qué** nodo dejó de participar en
+        el scheduling activo, y el checkpoint sigue teniendo sus intentos, su child y sus cifras.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_SUPERSEDED,
+            action="project_node_superseded",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status="SUPERSEDED",
+            detail=detail,
+            result=AuditResult.PENDING,
+            actor=actor,
+        )
+
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""
         return tuple(self._events)

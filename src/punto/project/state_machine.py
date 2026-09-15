@@ -51,10 +51,27 @@ PROJECT_TRANSITIONS: Final[dict[ProjectState, frozenset[ProjectState]]] = {
     ProjectState.RUNNING: frozenset(
         {
             ProjectState.READY,
+            # Replanificación autónoma acotada (ENGINE-6.3): el motor solo entra aquí desde un fallo
+            # técnico elegible y con presupuesto de replan disponible. La transición existe para que
+            # el paso por ``REPLANNING`` sea explícito y auditable, no para autorizar nada por sí
+            # sola: el kernel sigue comprobando elegibilidad, trigger, guard y política.
+            ProjectState.REPLANNING,
             ProjectState.HUMAN_APPROVAL,
             ProjectState.BLOCKED,
             ProjectState.FAILED,
             ProjectState.COMPLETED,
+            ProjectState.CANCELLED,
+        }
+    ),
+    #: Desde ``REPLANNING`` solo se sale a ``RUNNING`` (replan adoptado y proyecto continuando), a
+    #: ``BLOCKED`` (trigger obsoleto, propuesta inválida, guard o política en contra, gasto sin
+    #: reconciliar, tope agotado), a ``FAILED`` (fallo duro) o a ``CANCELLED``. No hay camino a
+    #: ``COMPLETED``: cerrar el proyecto exige nodos aceptados, y eso se decide en ``RUNNING``.
+    ProjectState.REPLANNING: frozenset(
+        {
+            ProjectState.RUNNING,
+            ProjectState.BLOCKED,
+            ProjectState.FAILED,
             ProjectState.CANCELLED,
         }
     ),

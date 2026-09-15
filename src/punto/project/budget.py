@@ -123,6 +123,20 @@ def remaining_wall_time(run: ProjectRun, *, elapsed_seconds: float) -> float:
     return max(0.0, run.budget.max_wall_time_seconds - elapsed_seconds)
 
 
+def remaining_replans(run: ProjectRun) -> int:
+    """Replanificaciones autónomas que el proyecto todavía puede autorizar.
+
+    Cuenta como consumido lo **intentado** (``usage.replans_attempted``: incluye las rechazadas) y
+    lo
+    que está comprometido en un intento en vuelo (``usage.replans_reserved``): una replanificación
+    que se reservó y todavía no se liquidó no se puede ofrecer dos veces. Es la misma política que
+    el
+    resto del presupuesto del proyecto (hallazgo V604-01) aplicada a la dimensión del replan.
+    """
+    committed = run.usage.replans_attempted + run.usage.replans_reserved
+    return max(0, run.budget.max_replans - committed)
+
+
 def reserve_project_budget(
     run: ProjectRun,
     *,
@@ -132,6 +146,7 @@ def reserve_project_budget(
     tokens: int = 0,
     repairs: int = 0,
     failures: int = 0,
+    replans: int = 0,
     elapsed_seconds: float = 0.0,
 ) -> ProjectBudgetCheck:
     """Comprueba si **cabe** lo que el proyecto está a punto de autorizar, antes de autorizarlo.
@@ -140,6 +155,12 @@ def reserve_project_budget(
     en un orden fijo para que dos ejecuciones del mismo caso informen del mismo motivo. Es
     deliberado que sea ``<=`` y no ``<``: el máximo es gastable hasta el último céntimo, pero
     estando en el máximo ya no cabe nada más.
+
+    ``replans`` es la dimensión de la replanificación autónoma (ENGINE-6.3): lo **intentado**
+    (``usage.replans_attempted``, que incluye las rechazadas) más lo solicitado no puede superar
+    ``max_replans``. Se cuenta lo intentado y no lo aceptado porque el gasto de un intento ocurre
+    igual —la llamada al Planner se paga aunque la propuesta se rechace después—; contar solo las
+    aceptadas permitiría rebasar el tope intento a intento.
     """
     reservations: tuple[tuple[str, float, float, float], ...] = (
         ("max_nodes", run.usage.nodes_started, max(0, nodes), run.budget.max_nodes),
@@ -163,6 +184,12 @@ def reserve_project_budget(
         ),
         ("max_repairs", run.usage.repairs, max(0, repairs), run.budget.max_repairs),
         ("max_failures", run.usage.failures, max(0, failures), run.budget.max_failures),
+        (
+            "max_replans",
+            run.usage.replans_attempted + run.usage.replans_reserved,
+            max(0, replans),
+            run.budget.max_replans,
+        ),
         (
             "max_wall_time_seconds",
             elapsed_seconds,
@@ -400,6 +427,11 @@ def budget_is_consistent(run: ProjectRun, *, elapsed_seconds: float) -> ProjectB
         ("max_repairs", float(run.usage.repairs), float(run.budget.max_repairs)),
         ("max_failures", float(run.usage.failures), float(run.budget.max_failures)),
         (
+            "max_replans",
+            float(run.usage.replans_attempted + run.usage.replans_reserved),
+            float(run.budget.max_replans),
+        ),
+        (
             "max_wall_time_seconds",
             elapsed_seconds,
             float(run.budget.max_wall_time_seconds),
@@ -442,6 +474,7 @@ __all__ = [
     "remaining_model_calls",
     "remaining_nodes",
     "remaining_repairs",
+    "remaining_replans",
     "remaining_tokens",
     "remaining_wall_time",
     "reserve_project_budget",

@@ -35,6 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from punto.common import utc_now
 from punto.schemas.enums import AuthorityLevel, RiskLevel
+from punto.schemas.replan import (
+    MAX_PROJECT_GENERATIONS,
+    ProjectGraphGeneration,
+    ProjectReplanTrigger,
+    ReplanInvocationAuthorization,
+)
 from punto.schemas.workflow import ArtifactReference, WorkflowBudget
 
 #: Versión del esquema de los modelos de proyecto.
@@ -96,6 +102,8 @@ class ProjectState(StrEnum):
     VALIDATING = "VALIDATING"
     READY = "READY"
     RUNNING = "RUNNING"
+    #: Replanificación autónoma en curso: solo se entra desde un fallo elegible.
+    REPLANNING = "REPLANNING"
     HUMAN_APPROVAL = "HUMAN_APPROVAL"
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
@@ -125,6 +133,9 @@ class ProjectNodeStatus(StrEnum):
     """
 
     PENDING = "PENDING"
+    #: Nodo sustituido por una replanificación: no participa en el scheduling activo, pero su
+    #: historia (child, gasto, evidencia, intentos) se conserva.
+    SUPERSEDED = "SUPERSEDED"
     READY = "READY"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
@@ -176,6 +187,33 @@ class ProjectFailureCode(StrEnum):
     PROJECT_NODE_SCOPE_VIOLATION = "PROJECT_NODE_SCOPE_VIOLATION"
     #: Un efecto del proyecto quedó en vuelo y no se puede repetir a ciegas.
     PROJECT_EFFECT_UNRECONCILED = "PROJECT_EFFECT_UNRECONCILED"
+    # --- Replanificación autónoma acotada (ENGINE-6.3) ----------------------------
+    #: El fallo no admite replanificación autónoma (o exige una persona).
+    PROJECT_REPLAN_NOT_ALLOWED = "PROJECT_REPLAN_NOT_ALLOWED"
+    #: El disparador ya no está vigente: el estado cambió desde que se creó.
+    PROJECT_REPLAN_TRIGGER_STALE = "PROJECT_REPLAN_TRIGGER_STALE"
+    #: La propuesta exigiría cambiar el contrato inmutable del proyecto.
+    PROJECT_REPLAN_CONTRACT_CHANGE_REQUIRED = "PROJECT_REPLAN_CONTRACT_CHANGE_REQUIRED"
+    #: El guard determinista rechazó la propuesta.
+    PROJECT_REPLAN_GUARD_REJECTED = "PROJECT_REPLAN_GUARD_REJECTED"
+    #: El Policy Engine rechazó la acción de replanificación.
+    PROJECT_REPLAN_POLICY_REJECTED = "PROJECT_REPLAN_POLICY_REJECTED"
+    #: La propuesta excede la autoridad autónoma: hace falta una persona.
+    PROJECT_REPLAN_HUMAN_REQUIRED = "PROJECT_REPLAN_HUMAN_REQUIRED"
+    #: El tope de replanificaciones del proyecto está agotado.
+    PROJECT_REPLAN_BUDGET_EXHAUSTED = "PROJECT_REPLAN_BUDGET_EXHAUSTED"
+    #: La propuesta no cambia nada: la misma generación no se acepta dos veces.
+    PROJECT_REPLAN_NO_PROGRESS = "PROJECT_REPLAN_NO_PROGRESS"
+    #: Una invocación del replanner quedó con gasto desconocido.
+    PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED = (
+        "PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED"
+    )
+    #: La propuesta no es un contrato válido de PUNTO.
+    PROJECT_REPLAN_INVALID_PROPOSAL = "PROJECT_REPLAN_INVALID_PROPOSAL"
+    #: Falta el artefacto de una generación de grafo que el run declara activa.
+    PROJECT_GRAPH_GENERATION_MISSING = "PROJECT_GRAPH_GENERATION_MISSING"
+    #: La prueba humana autoriza otra propuesta, no esta.
+    PROJECT_REPLAN_PROOF_INVALID = "PROJECT_REPLAN_PROOF_INVALID"
     #: El proyecto no puede cerrarse: falta algún requisito de cierre.
     PROJECT_COMPLETION_INCOMPLETE = "PROJECT_COMPLETION_INCOMPLETE"
 
@@ -209,6 +247,10 @@ class ProjectBudget(BaseModel):
         default=8, ge=0, le=8, description="Ciclos de reparación agregados de todos los children."
     )
     max_failures: int = Field(default=3, ge=0, le=16, description="Fallos de nodo admitidos.")
+    #: Replanificaciones autónomas autorizadas. Por defecto **0**: un proyecto de ENGINE-6.2
+    #: conserva exactamente su comportamiento (sin replanificación autónoma) hasta que alguien
+    #: la autorice de forma explícita. Nunca se amplía sola.
+    max_replans: int = Field(default=0, ge=0, le=8)
     max_wall_time_seconds: float = Field(
         default=86_400.0, gt=0, description="Tiempo de pared máximo del proyecto."
     )
@@ -236,6 +278,13 @@ class ProjectUsage(BaseModel):
     repairs: int = Field(default=0, ge=0)
     failures: int = Field(default=0, ge=0)
     human_gates: int = Field(default=0, ge=0)
+    #: Replanificaciones intentadas (incluye las rechazadas) y aceptadas.
+    replans_attempted: int = Field(default=0, ge=0)
+    replans_accepted: int = Field(default=0, ge=0)
+    #: Intentos de replanificación con reserva viva y aún sin liquidar.
+    replans_reserved: int = Field(default=0, ge=0)
+    #: Generaciones de grafo creadas (la 0 es el grafo original).
+    graph_generations: int = Field(default=0, ge=0)
     wall_time_seconds: float = Field(default=0.0, ge=0.0)
 
     @property
@@ -395,6 +444,12 @@ class ProjectResult(BaseModel):
     usage: ProjectUsage = Field(default_factory=ProjectUsage)
     repairs_total: int = Field(default=0, ge=0)
     human_gates_encountered: int = Field(default=0, ge=0)
+    #: Cifras del replan (ENGINE-6.3), acotadas y sin copias de grafos.
+    graph_generations_count: int = Field(default=0, ge=0)
+    replans_attempted: int = Field(default=0, ge=0)
+    replans_accepted: int = Field(default=0, ge=0)
+    superseded_nodes_count: int = Field(default=0, ge=0)
+    final_graph_fingerprint: str = Field(default="", max_length=64)
     evidence: tuple[str, ...] = Field(default=(), max_length=MAX_PROJECT_EVIDENCE)
     failure_code: ProjectFailureCode | None = Field(default=None)
     failure_summary: str = Field(default="", max_length=MAX_PROJECT_FAILURE_TEXT)
@@ -430,6 +485,35 @@ class ProjectRun(BaseModel):
     workspace: ProjectWorkspaceState = Field(default_factory=ProjectWorkspaceState)
     budget: ProjectBudget = Field(default_factory=ProjectBudget)
     usage: ProjectUsage = Field(default_factory=ProjectUsage)
+    # --- Contrato inmutable y generaciones del grafo (ENGINE-6.3) ----------------
+    #
+    #: Huella del contrato del proyecto y su referencia durable.
+    contract_fingerprint: str = Field(default="", max_length=64)
+    contract_ref: ArtifactReference | None = Field(default=None)
+    #: Generación de grafo **activa**: lo que el scheduler lee. Las anteriores se conservan.
+    active_generation: ProjectGraphGeneration | None = Field(default=None)
+    #: Historia acotada de generaciones (la 0 es el grafo original de ENGINE-6.2).
+    generations: tuple[ProjectGraphGeneration, ...] = Field(
+        default=(), max_length=MAX_PROJECT_GENERATIONS
+    )
+    # --- Estado durable del replan en curso (ENGINE-6.3) ------------------------
+    active_replan_trigger: ProjectReplanTrigger | None = Field(default=None)
+    active_replan_trigger_ref: ArtifactReference | None = Field(default=None)
+    active_replan_authorization: ReplanInvocationAuthorization | None = Field(default=None)
+    active_replan_proposal_ref: ArtifactReference | None = Field(default=None)
+    active_replan_decision_ref: ArtifactReference | None = Field(default=None)
+    #: Huellas de los replanes **ya intentados** (trigger, propuesta o grafo), acotadas a
+    #: ``MAX_PROJECT_GENERATIONS``.
+    #:
+    #: Existen para no volver a gastar en el mismo fallo: si el fallo que motiva una replanificación
+    #: produce una huella que ya está aquí y el proyecto ya intentó algo, el disparador es
+    #: ``PROJECT_REPLAN_NO_PROGRESS`` y no se llama a ningún proveedor. La cota es la de la historia
+    #: de generaciones —una huella por generación como mucho—, de modo que la colección no puede
+    #: crecer con los reintentos; se conservan las **últimas** entradas porque lo reciente es lo que
+    #: permite detectar el bucle en curso.
+    replan_fingerprints: tuple[str, ...] = Field(
+        default=(), max_length=MAX_PROJECT_GENERATIONS
+    )
     result: ProjectResult | None = Field(default=None)
     failure_code: ProjectFailureCode | None = Field(default=None)
     failure_detail: str = Field(default="", max_length=MAX_PROJECT_FAILURE_TEXT)

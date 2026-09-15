@@ -580,8 +580,21 @@ class ProjectExecutionKernel:
             change.path for result in results for change in result.files_changed
         ))
         revision_after = revision_before
+        revision_mismatch = ""
         if completed and not violation:
-            revision_after = self._accepted_revision(results, fallback=revision_before)
+            candidate = self._accepted_revision(results, fallback=revision_before)
+            if candidate == revision_before:
+                revision_after = revision_before
+            else:
+                try:
+                    self._lineage.assert_at(candidate)
+                except ProjectRevisionMismatchError as exc:
+                    # El árbol no demuestra la revisión que el child declara: no se acepta. Se
+                    # conserva la anterior —aceptar una revisión que nadie puede reproducir
+                    # dejaría a los nodos siguientes sobre un contenido inexistente— y se para.
+                    revision_mismatch = str(exc)
+                else:
+                    revision_after = candidate
         settled = node_run.model_copy(
             update={
                 "status": (
@@ -644,6 +657,10 @@ class ProjectExecutionKernel:
         )
         self._store.save(run)
         self._audit_node_completed(run, settled, revision_before, revision_after)
+        if revision_mismatch:
+            return self._block(
+                run, ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH, revision_mismatch
+            )
         if breach is not None:
             return self._block(run, _code_of(breach), breach.detail)
         if violation:

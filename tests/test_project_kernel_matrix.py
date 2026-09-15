@@ -526,6 +526,75 @@ def test_caso_23_un_child_fallido_falla_el_proyecto(tmp_path: Path) -> None:
     assert run.is_terminal
 
 
+def test_caso_10_una_revision_que_el_arbol_no_demuestra_se_rechaza(tmp_path: Path) -> None:
+    """CASO 10: el child dice haber commiteado una revisión que el árbol no tiene; se rechaza.
+
+    La revisión aceptada del proyecto no es lo que el child **dice**: es lo que el árbol demuestra.
+    Con un linaje que no está en la revisión que el child declara, el proyecto liquida el gasto real
+    —ocurrió— y se detiene con ``PROJECT_WORKSPACE_REVISION_MISMATCH``: aceptar esa revisión dejaría
+    a los nodos siguientes trabajando sobre un contenido que nadie puede reproducir.
+    """
+    lineage = FixedLineage(FAKE_REVISION)
+    h = harness(tmp_path, nodes=("A",), lineage=lineage, outcomes={"A": ChildOutcome()})
+
+    run = h.run()
+
+    assert run.status is ProjectState.BLOCKED, describe(run)
+    assert run.failure_code is ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH
+    assert run.workspace.accepted_revision == FAKE_REVISION, "no se acepta lo que no se demuestra"
+    node = run.node("A")
+    assert node is not None
+    assert node.status is ProjectNodeStatus.COMPLETED, "el nodo cerró: el gasto es real"
+    assert run.usage.model_calls == 1
+    assert run.usage.child_workflows == 1
+
+
+def test_caso_18_las_reparaciones_del_proyecto_se_agregan_entre_nodos(tmp_path: Path) -> None:
+    """CASO 18: las reparaciones de cada child cuentan contra el tope del proyecto.
+
+    Con un tope de 3 reparaciones y un nodo que consume 2, al siguiente solo le queda 1: el
+    presupuesto del child es el mínimo con el saldo del proyecto, así que no puede usar su plantilla
+    (que declara 4). Es la agregación que el encargo exige, con su cifra.
+    """
+    budget = ProjectBudget(max_model_calls=10, max_total_tokens=50_000, max_repairs=3)
+    template = WorkflowBudget(max_model_calls=4, max_repairs=4, max_total_tokens=10_000)
+    h = harness(
+        tmp_path,
+        nodes=("A", "B"),
+        edges={"B": ("A",)},
+        budget=budget,
+        child_budget=template,
+        outcomes={"A": ChildOutcome(repairs=2), "B": ChildOutcome()},
+    )
+
+    run = h.run()
+
+    assert run.status is ProjectState.COMPLETED, describe(run)
+    first = run.node("A")
+    second = run.node("B")
+    assert first is not None and second is not None
+    assert first.child_budget is not None and second.child_budget is not None
+    assert first.child_budget.max_repairs == 3, "el primer nodo usa todo el saldo del proyecto"
+    assert first.repairs == 2
+    assert second.child_budget.max_repairs == 1, "al segundo solo le queda una reparación"
+    assert run.usage.repairs == 2
+
+
+def test_caso_27_el_proyecto_no_puede_aprobar_nada_por_si_mismo(tmp_path: Path) -> None:
+    """CASO 27: la frontera L3 sigue siendo humana: el proyecto no emite ni amplía aprobaciones.
+
+    El kernel del proyecto no tiene ninguna operación de aprobación —aprobar es del Human Gate, y la
+    prueba se valida contra el child exacto—, así que no puede agrupar varias acciones L3 ni
+    convertirlas en una autorización amplia. Un proyecto en ``HUMAN_APPROVAL`` no avanza solo.
+    """
+    kernel = harness(tmp_path, nodes=("A",)).kernel()
+
+    for forbidden in ("approve", "authorize_resume", "authorize", "approve_gate"):
+        assert not hasattr(kernel, forbidden), (
+            f"el kernel del proyecto no debe poder {forbidden}: la aprobación es del Human Gate"
+        )
+
+
 def test_caso_29_un_nodo_que_agota_intentos_pide_replanificar(tmp_path: Path) -> None:
     """CASO 29: un nodo sin intentos disponibles pide replanificar en vez de reintentarse sin fin.
 

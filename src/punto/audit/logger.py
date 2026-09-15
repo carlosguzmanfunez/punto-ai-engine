@@ -3189,10 +3189,393 @@ class AuditLogger:
             },
         )
 
+    # --- Autonomous task graph execution (ENGINE-6.2) -------------------------
+    def _project_event(
+        self,
+        event_type: AuditEventType,
+        *,
+        action: str,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str = "",
+        child_workflow_id: UUID | None = None,
+        status: str = "",
+        detail: str = "",
+        result: AuditResult = AuditResult.SUCCESS,
+        metadata: Mapping[str, object] | None = None,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Construye y registra un hito de proyecto, con metadatos acotados y sin secretos.
+
+        El detalle se recorta y los campos vacíos no se escriben: un evento de auditoría tiene que
+        poder leerse entero y no crecer con el tamaño del proyecto. Todo lo que viaja aquí son
+        identificadores, estados y cifras; nunca contenido de archivos, prompts ni credenciales.
+        """
+        payload: dict[str, object] = {
+            "project_run_id": str(project_run_id),
+            "project_id": str(project_id),
+        }
+        if node_id:
+            payload["node_id"] = node_id
+        if child_workflow_id is not None:
+            payload["child_workflow_id"] = str(child_workflow_id)
+        if status:
+            payload["status"] = status
+        if detail:
+            payload["detail"] = detail[:300]
+        if metadata:
+            payload.update({key: metadata[key] for key in sorted(metadata)})
+        return self.record(
+            event_type,
+            action=action,
+            resource_id=project_run_id,
+            result=result,
+            actor=actor,
+            metadata=payload,
+        )
+
+    def log_project_run_created(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        graph_fingerprint: str = "",
+        nodes_total: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la creación (o la carga idempotente) de un proyecto."""
+        return self._project_event(
+            AuditEventType.PROJECT_RUN_CREATED,
+            action="project_run_created",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            metadata={"graph_fingerprint": graph_fingerprint, "nodes_total": nodes_total},
+            actor=actor,
+        )
+
+    def log_project_graph_validated(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        graph_fingerprint: str,
+        nodes_total: int,
+        valid: bool,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el veredicto de la validación del grafo, con su huella congelada."""
+        return self._project_event(
+            AuditEventType.PROJECT_GRAPH_VALIDATED,
+            action="project_graph_validated",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="VALID" if valid else "INVALID",
+            detail=detail,
+            result=AuditResult.SUCCESS if valid else AuditResult.FAILURE,
+            metadata={"graph_fingerprint": graph_fingerprint, "nodes_total": nodes_total},
+            actor=actor,
+        )
+
+    def log_project_node_ready(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        ready: Sequence[str],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el conjunto de nodos listos que el scheduler calculó."""
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_READY,
+            action="project_node_ready",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={"ready": list(ready)},
+            actor=actor,
+        )
+
+    def log_project_node_selected(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        attempt: int,
+        declared_order: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el nodo elegido por el scheduler y con qué intento."""
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_SELECTED,
+            action="project_node_selected",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={"attempt": attempt, "declared_order": declared_order},
+            actor=actor,
+        )
+
+    def log_project_child_workflow_reserved(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        model_calls: int,
+        tokens: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la reserva de presupuesto que autoriza el child del nodo."""
+        return self._project_event(
+            AuditEventType.PROJECT_CHILD_WORKFLOW_RESERVED,
+            action="project_child_workflow_reserved",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            metadata={"model_calls": model_calls, "tokens": tokens},
+            actor=actor,
+        )
+
+    def log_project_child_workflow_created(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        idempotency_key: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la creación (o la reutilización) del child workflow del nodo."""
+        return self._project_event(
+            AuditEventType.PROJECT_CHILD_WORKFLOW_CREATED,
+            action="project_child_workflow_created",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            metadata={"idempotency_key": idempotency_key[:120]},
+            actor=actor,
+        )
+
+    def log_project_child_workflow_resumed(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        child_status: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que un child ya existente se continuó en vez de crearse de nuevo."""
+        return self._project_event(
+            AuditEventType.PROJECT_CHILD_WORKFLOW_RESUMED,
+            action="project_child_workflow_resumed",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status=child_status,
+            actor=actor,
+        )
+
+    def log_project_node_completed(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        status: str,
+        revision_before: str = "",
+        revision_after: str = "",
+        repair_cycles: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre de un nodo con su estado final y su linaje de revisión."""
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_COMPLETED,
+            action="project_node_completed",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status=status,
+            result=AuditResult.SUCCESS,
+            metadata={
+                "repair_cycles": repair_cycles,
+                "revision_after": revision_after,
+                "revision_before": revision_before,
+            },
+            actor=actor,
+        )
+
+    def log_project_revision_accepted(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        revision_before: str,
+        revision_after: str,
+        changed: bool,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la revisión aceptada del proyecto tras un nodo completado."""
+        return self._project_event(
+            AuditEventType.PROJECT_REVISION_ACCEPTED,
+            action="project_revision_accepted",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={
+                "changed": changed,
+                "revision_after": revision_after,
+                "revision_before": revision_before,
+            },
+            actor=actor,
+        )
+
+    def log_project_budget_settled(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        model_calls: int,
+        total_tokens: int,
+        repairs: int,
+        children: int,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la liquidación del presupuesto de un nodo con el gasto real."""
+        return self._project_event(
+            AuditEventType.PROJECT_BUDGET_SETTLED,
+            action="project_budget_settled",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            metadata={
+                "child_workflows": children,
+                "model_calls": model_calls,
+                "repairs": repairs,
+                "total_tokens": total_tokens,
+            },
+            actor=actor,
+        )
+
+    def log_project_human_gate_propagated(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        approval_id: UUID | None = None,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el proyecto espera por el Human Gate del child activo.
+
+        El binding es el del **child exacto**: la aprobación que falta es la de ese workflow, no una
+        autorización genérica del proyecto.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_HUMAN_GATE_PROPAGATED,
+            action="project_human_gate_propagated",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status="HUMAN_APPROVAL",
+            result=AuditResult.PENDING,
+            metadata={"approval_id": "" if approval_id is None else str(approval_id)},
+            actor=actor,
+        )
+
+    def log_project_blocked(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        code: str,
+        detail: str = "",
+        node_id: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el bloqueo del proyecto con su código estable."""
+        return self._project_event(
+            AuditEventType.PROJECT_BLOCKED,
+            action="project_blocked",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="BLOCKED",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"code": code},
+            actor=actor,
+        )
+
+    def log_project_failed(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        code: str,
+        detail: str = "",
+        node_id: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el fallo del proyecto con su código estable."""
+        return self._project_event(
+            AuditEventType.PROJECT_FAILED,
+            action="project_failed",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status="FAILED",
+            detail=detail,
+            result=AuditResult.FAILURE,
+            metadata={"code": code},
+            actor=actor,
+        )
+
+    def log_project_completed(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        graph_fingerprint: str,
+        nodes_total: int,
+        nodes_completed: int,
+        final_revision: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el cierre del proyecto: todos los nodos completados y una revisión aceptada."""
+        return self._project_event(
+            AuditEventType.PROJECT_COMPLETED,
+            action="project_completed",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="COMPLETED",
+            metadata={
+                "final_revision": final_revision,
+                "graph_fingerprint": graph_fingerprint,
+                "nodes_completed": nodes_completed,
+                "nodes_total": nodes_total,
+            },
+            actor=actor,
+        )
+
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""
         return tuple(self._events)
-
     def count(self) -> int:
         """Número total de eventos registrados."""
         return len(self._events)

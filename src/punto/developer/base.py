@@ -125,12 +125,30 @@ class DeveloperRunner(ABC):
         - un runner determinista exige ``TRUSTED_LOCAL`` y usa
           ``TrustedLocalBackend`` por defecto.
 
+        Invariante de coherencia (hallazgo N61-01): quien declara generar código con IA **no puede**
+        declararse confiable. ``trust_level_required`` es una propiedad y una subclase puede
+        sobrescribirla, así que la frontera no se apoya solo en ella: se comprueba aquí, contra el
+        hecho declarado (``generates_code_with_ai``), y un runner incoherente falla en cerrado antes
+        de resolver backend alguno. Sin esta comprobación, un runner que mintiera —o que se
+        configurara mal— devolvería ``TRUSTED_LOCAL`` y ejecutaría código de modelo en el host.
+
         Raises:
-            UntrustedExecutionDeniedError: si el nivel de confianza declarado no
-                corresponde al runner o el backend no lo admite.
+            UntrustedExecutionDeniedError: si el runner se declara IA y a la vez confiable, si el
+                nivel de confianza declarado no corresponde al runner, o si el backend no lo admite.
             SandboxRequiredError: si se requiere sandbox y el backend no lo es.
             SandboxUnavailableError: si se requiere sandbox y no hay ninguno.
         """
+        if (
+            self.generates_code_with_ai
+            and self.trust_level_required is not ExecutionTrustLevel.UNTRUSTED_MODEL
+        ):
+            raise UntrustedExecutionDeniedError(
+                f"{self.name} declara generar código con IA y a la vez declarar "
+                f"{self.trust_level_required.value} como nivel requerido: la declaración es "
+                "incoherente y el trabajo originado por un modelo no puede ejecutarse en el host. "
+                "Quien genera código con IA está obligado a exigir UNTRUSTED_MODEL."
+            )
+
         required = self.trust_level_required
 
         if required is ExecutionTrustLevel.UNTRUSTED_MODEL:

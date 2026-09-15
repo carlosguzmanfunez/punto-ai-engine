@@ -29,7 +29,9 @@ from punto.developer.backend import (
 )
 from punto.developer.base import DeveloperRunner
 from punto.developer.context import ExecutionContext
+from punto.developer.deepseek import DeepSeekDeveloperRunner
 from punto.developer.local import LocalDeveloperRunner
+from punto.providers.deepseek import DeepSeekClient, DeepSeekConfig
 from punto.schemas.audit import AuditEventType
 from punto.schemas.execution import (
     FULL_SANDBOX_CAPABILITIES,
@@ -305,6 +307,89 @@ def test_local_runner_cannot_execute_untrusted_work(
     """Un runner determinista tampoco acepta un contexto no confiable."""
     with pytest.raises(UntrustedExecutionDeniedError):
         LocalDeveloperRunner().resolve_backend(untrusted_context, None)
+
+
+# ---------------------------------------------------------------------------
+# N61-01 - coherencia del invariante: quien genera con IA no puede declararse confiable
+# ---------------------------------------------------------------------------
+class LiarRunner(DeveloperRunner):
+    """Runner **incoherente**: dice generar código con IA y a la vez declararse confiable.
+
+    Es el doble del hallazgo N61-01: ``trust_level_required`` es una propiedad y una subclase puede
+    sobrescribirla, así que la frontera no puede depender solo de ella. El runner no implementa nada
+    de modelo: lo único que hace es intentar resolver un backend, que es donde el motor tiene que
+    negarse.
+    """
+
+    def __init__(self, *, backend: ExecutionBackend | None = None) -> None:
+        self._backend = backend
+        self.executed = False
+
+    @property
+    def generates_code_with_ai(self) -> bool:
+        """Declara generar código con IA: el hecho que la propiedad mentirosa contradice."""
+        return True
+
+    @property
+    def trust_level_required(self) -> ExecutionTrustLevel:
+        """Miente: se declara confiable pese a generar código con IA."""
+        return ExecutionTrustLevel.TRUSTED_LOCAL
+
+    def execute(
+        self, task: DeveloperTask, context: ExecutionContext
+    ) -> DeveloperExecutionResult:
+        """Resuelve el backend (enforcement) y, si llegara aquí, ejecutaría."""
+        self.resolve_backend(context, self._backend)
+        self.executed = True
+        raise AssertionError("un runner incoherente no debe alcanzar la ejecución")
+
+
+def test_ai_runner_that_declares_trusted_local_is_denied(
+    context: ExecutionContext, untrusted_context: ExecutionContext
+) -> None:
+    """N61-01 (CASO 33): ``generates_code_with_ai=True`` + ``TRUSTED_LOCAL`` falla en cerrado.
+
+    La comprobación es doble: con un contexto confiable (el que el propio runner mentiroso pide) y
+    con uno no confiable (el honesto), y en los dos casos con un sandbox apto inyectado. Ninguna
+    combinación ejecuta: el invariante se comprueba contra el hecho declarado, no contra la
+    propiedad que se puede sobrescribir.
+    """
+    task = DeveloperTask(
+        task_id=context.task_id,
+        objective="x",
+        commit_message="x",
+    )
+    sandbox = FakeSandboxBackend()
+    liar = LiarRunner(backend=sandbox)
+
+    assert liar.generates_code_with_ai is True
+    assert liar.trust_level_required is ExecutionTrustLevel.TRUSTED_LOCAL
+
+    with pytest.raises(UntrustedExecutionDeniedError, match="incoherente"):
+        liar.execute(task, context)
+    with pytest.raises(UntrustedExecutionDeniedError, match="incoherente"):
+        liar.execute(task, untrusted_context)
+
+    assert liar.executed is False, "no puede alcanzar la ejecución ni con sandbox"
+    assert sandbox.invocations == 0, "no hay ejecución en el sandbox tampoco"
+
+
+def test_the_real_runners_keep_their_declared_levels() -> None:
+    """Los runners de producción siguen coherentes: IA → ``UNTRUSTED_MODEL``, determinista → local.
+
+    La corrección de N61-01 no cambia la frontera de nadie: el runner determinista sigue ejecutando
+    en local y el runner real de DeepSeek sigue exigiendo aislamiento. Lo que añade es que un runner
+    **incoherente** ya no puede aprovechar la propiedad sobrescribible para saltársela.
+    """
+    local = LocalDeveloperRunner()
+    assert local.generates_code_with_ai is False
+    assert local.trust_level_required is ExecutionTrustLevel.TRUSTED_LOCAL
+
+    with DeepSeekClient(DeepSeekConfig(api_key="sk-test-n61-01")) as client:
+        ai = DeepSeekDeveloperRunner(client=client)
+        assert ai.generates_code_with_ai is True
+        assert ai.trust_level_required is ExecutionTrustLevel.UNTRUSTED_MODEL
+        assert ai.uses_ai is True
 
 
 # ---------------------------------------------------------------------------

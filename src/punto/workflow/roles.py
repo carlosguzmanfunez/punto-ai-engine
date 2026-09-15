@@ -143,6 +143,7 @@ from punto.schemas.enums import FindingSeverity
 from punto.schemas.execution import (
     DeveloperExecutionResult,
     DeveloperInvocationLimits,
+    ExecutionTrustLevel,
     ModelUsage,
 )
 from punto.schemas.planning import ModelExecutionSummary, ProjectIntent
@@ -1095,6 +1096,29 @@ class CamusRoleExecutor:
             )
         return design
 
+    def _developer_trust_level(self) -> ExecutionTrustLevel:
+        """Nivel de confianza que exige el runner del Developer, según la frontera que representa.
+
+        Hallazgo F614-01: el contexto durable se construía con el valor por defecto
+        (``TRUSTED_LOCAL``), así que el camino oficial —kernel → adaptador → almacén →
+        ``developer_input`` → CAMUS → runner— no podía ejecutar un Developer que genera código con
+        IA: su frontera exige ``UNTRUSTED_MODEL`` y bloqueaba antes de llamar al modelo. El nivel se
+        deriva **determinísticamente** de ``DeveloperRunner.trust_level_required``, que es la
+        autoridad de PUNTO sobre la frontera elegida; nunca del modelo, del plan, del almacén ni de
+        un texto.
+
+        Solo se **eleva** el aislamiento: si el runner exige ``UNTRUSTED_MODEL``, el contexto
+        generado por PUNTO se construye así (sin red). Un runner determinista conserva
+        ``TRUSTED_LOCAL`` y no cambia de comportamiento. La elevación vale para el contexto que
+        PUNTO construye en el handoff durable: un ``build_input`` explícito sigue fallando cerrado
+        si entrega un contexto incompatible, porque ese contexto no lo ha construido el motor.
+        """
+        runner = getattr(self._camus, "developer_runner", None)
+        required = getattr(runner, "trust_level_required", None)
+        if isinstance(required, ExecutionTrustLevel):
+            return required
+        return ExecutionTrustLevel.TRUSTED_LOCAL
+
     def _developer_input(
         self, request: RoleExecutionRequest
     ) -> tuple[DeveloperTask, ExecutionContext]:
@@ -1125,7 +1149,9 @@ class CamusRoleExecutor:
                 "(RoleExecutionRequest.references): el Developer no trabaja sin plan y PUNTO no "
                 "vuelve a ejecutar al Planner para suplirlo"
             )
-        task, context = developer_input(plan, request)
+        task, context = developer_input(
+            plan, request, trust_level=self._developer_trust_level()
+        )
         repair = self._repair_task(request)
         if repair is None:
             return task, context

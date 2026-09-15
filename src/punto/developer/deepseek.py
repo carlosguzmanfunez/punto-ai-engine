@@ -465,13 +465,24 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         trusted = replace(context, trust_level=ExecutionTrustLevel.TRUSTED_LOCAL)
         git = GitWorkspace(trusted, ShellRunner(trusted))
         filesystem = FilesystemTool(trusted)
-        sandbox_shell = ShellRunner(context, backend=backend)
         base_sha = ""
 
         try:
             branch = git.ensure_task_branch(task.task_id, task.slug)
             branch = git.assert_writable_branch()
             base_sha = git.head_sha()
+
+            # F614-02: la rama **real** del repositorio manda sobre la declarada en el contexto. El
+            # ``git`` de arriba ya la creó y la comprobó contra el repositorio de verdad, así que el
+            # contexto con el que corren el sandbox y el validador tiene que declarar esa misma
+            # rama: si el repositorio se quedara en ``main``, la ejecución no continuaría (el guard
+            # de escritura la bloquea), pero mientras se ejecuta en la rama de tarea, la evidencia
+            # de los comandos no puede decir otra cosa que la rama donde de verdad se trabaja.
+            # Es reconciliación de identidad, no relajación: ``PROTECTED_BRANCHES``,
+            # ``TASK_BRANCH_PREFIX`` y ``assert_writable_branch`` siguen decidiendo, y este
+            # ``replace`` solo aplica el resultado que ya devolvieron.
+            effective_context = replace(context, branch_name=branch)
+            sandbox_shell = ShellRunner(effective_context, backend=backend)
 
             # Camino normal (``repair is None``): prompt, contexto y validación exactamente como
             # antes. Camino de reparación: la autorización es la del plan y el prompt se compone del
@@ -565,7 +576,7 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
                     proposal,
                     filesystem,
                     sandbox_shell,
-                    context,
+                    effective_context,
                     files,
                     allowed=allowed,
                     forbidden=forbidden,
@@ -785,6 +796,10 @@ class DeepSeekDeveloperRunner(DeveloperRunner):
         forbidden: tuple[str, ...] | None = None,
     ) -> _AttemptOutcome:
         """Aplica la propuesta y ejecuta los checks en el sandbox.
+
+        El ``context`` que llega es el **efectivo** (F614-02): el mismo de la invocación con la rama
+        real ya reconciliada, para que el validador y la comprobación de alcance trabajen sobre la
+        rama donde de verdad se está ejecutando.
 
         Cuando ``forbidden`` no es ``None`` la tarea es una reparación: lo escrito se comprueba
         **después** de escribir y **antes** de correr los checks, contra la autorización del plan.

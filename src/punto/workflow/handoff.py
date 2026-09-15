@@ -142,7 +142,12 @@ from punto.planner.base import PlanningOutcome
 from punto.providers.base import ImagePayload
 from punto.schemas.cross_audit import CrossAuditReport, CrossAuditTask
 from punto.schemas.enums import AuthorityLevel, RiskLevel
-from punto.schemas.execution import CommandSpec, DeveloperExecutionResult, DeveloperTask
+from punto.schemas.execution import (
+    CommandSpec,
+    DeveloperExecutionResult,
+    DeveloperTask,
+    ExecutionTrustLevel,
+)
 from punto.schemas.planning import (
     ArchitecturePlan,
     ArchitectureProposal,
@@ -1049,7 +1054,10 @@ def resolve_repair_snapshot(
 # Entrada oficial del rol DEVELOPER
 # ---------------------------------------------------------------------------
 def developer_input(
-    plan: DurablePlan, request: RoleExecutionRequest
+    plan: DurablePlan,
+    request: RoleExecutionRequest,
+    *,
+    trust_level: ExecutionTrustLevel = ExecutionTrustLevel.TRUSTED_LOCAL,
 ) -> tuple[DeveloperTask, ExecutionContext]:
     """Construye la pareja ``(DeveloperTask, ExecutionContext)`` desde el plan durable.
 
@@ -1060,6 +1068,14 @@ def developer_input(
     Regla de precedencia, explícita porque es el contrato de esta función: **el plan manda cuando
     declara el dato y la petición es el respaldo declarado**, nunca una invención. Lo que la
     petición declara y el plan no lleva (identidad, workspace, acción) sale de la petición.
+
+    El **nivel de confianza del contexto** no se decide aquí (hallazgo F614-01): lo declara quien
+    conoce la frontera de ejecución elegida —el adaptador, a partir de
+    ``DeveloperRunner.trust_level_required``— y esta función solo lo aplica. ``handoff`` no adivina
+    qué proveedor genera el código, ni lo deduce del plan, del almacén o de un texto: si lo hiciera,
+    el aislamiento dependería de un dato que el modelo o un artefacto podrían influir. El valor por
+    defecto es ``TRUSTED_LOCAL`` porque es el contexto de las ejecuciones deterministas que
+    construían esta entrada antes de que existiera el parámetro.
 
     Decisiones, una a una, y por qué son deterministas:
 
@@ -1092,12 +1108,14 @@ def developer_input(
       ``default_timeout_seconds`` y ``attempts_allowed``: los valores por defecto del contrato. El
       plan no declara presupuesto de ejecución por tarea y derivarlo de un contador inventado sería
       conceder límites que nadie aprobó.
-    - ``trust_level``: el valor por defecto del contrato. La frontera de confianza la impone el
-      runner que ejecute (``DeveloperRunner.resolve_backend``) y **no** la decide el handoff: quien
-      ejecuta es quien conoce si el trabajo lo generó un modelo. Si el runner exige
-      ``UNTRUSTED_MODEL`` y el contexto declara confianza local, el motor falla en cerrado en vez de
-      ejecutar en el host; lo contrario —declarar desconfianza aquí— rompería los runners
-      deterministas sin ganar ninguna garantía.
+    - ``trust_level``: el que declara el llamante, que es el único que conoce la frontera de
+      ejecución elegida; por defecto ``TRUSTED_LOCAL``, el de las ejecuciones deterministas. El
+      handoff **no** infiere el nivel: lo aplica. Quien construye el paso durable lo deriva de
+      ``DeveloperRunner.trust_level_required`` y solo **eleva** el aislamiento —nunca lo degrada—,
+      de modo que un runner que genera código con IA recibe el ``UNTRUSTED_MODEL`` que su frontera
+      exige y un runner determinista sigue trabajando en local. Un ``build_input`` explícito que
+      entregue un contexto incompatible no pasa por aquí y sigue fallando en cerrado, que es lo
+      correcto: ese contexto no lo construyó el motor.
 
     Raises:
         WorkspaceViolationError: si el workspace declarado por la petición no existe. Es el error
@@ -1123,6 +1141,7 @@ def developer_input(
         task_id=request.task_id,
         workspace_path=_workspace(request),
         branch_name=_branch_name(request, slug),
+        trust_level=trust_level,
     )
     return developer_task, context
 

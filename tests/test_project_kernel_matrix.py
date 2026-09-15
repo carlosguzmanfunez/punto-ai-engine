@@ -460,11 +460,14 @@ def test_caso_19_sin_saldo_no_se_crea_ningun_child(tmp_path: Path) -> None:
 
 
 def test_caso_20_y_21_una_brecha_de_presupuesto_detiene_el_proyecto(tmp_path: Path) -> None:
-    """CASO 20/21: el child que gasta más de lo autorizado se liquida y el proyecto se detiene.
+    """CASO 20/21 (F621-01): el child que gasta más de lo autorizado **no** queda aceptado.
 
     El gasto real ocurrió, así que se registra entero —no se perdona ni se ignora—, y el proyecto
-    bloquea con ``PROJECT_BUDGET_BREACH``: un child que rebasa su autorización no puede seguir
-    alimentando nodos siguientes. La liquidación ocurre una sola vez.
+    bloquea con ``PROJECT_BUDGET_BREACH``. Lo que cambia el hallazgo F621-01 es el estado del nodo:
+    el child cerró ``COMPLETED`` y aun así el nodo **no** es ``COMPLETED``, porque el parent no lo
+    aceptó. Conserva su ``child_status`` como evidencia histórica, su ``failure_code`` real y
+    **sin**
+    handoff: un nodo rechazado no puede alimentar a sus dependientes.
     """
     budget = ProjectBudget(max_model_calls=5, max_total_tokens=10_000, max_repairs=3)
     h = harness(
@@ -481,8 +484,15 @@ def test_caso_20_y_21_una_brecha_de_presupuesto_detiene_el_proyecto(tmp_path: Pa
     assert run.usage.model_calls == 50, "el gasto real se registra: ocurrió"
     assert run.usage.model_calls_reserved == 0
     assert run.usage.child_workflows == 1
-    assert run.node("A") is not None
-    assert run.node("A").status is ProjectNodeStatus.COMPLETED
+    assert run.usage.nodes_completed == 0, "el nodo no está aceptado: no cuenta como completado"
+    node = run.node("A")
+    assert node is not None
+    assert node.status is ProjectNodeStatus.BLOCKED, "child COMPLETED no es nodo ACEPTADO"
+    assert node.child_status == TaskStatus.COMPLETED.value, "el cierre real del child es evidencia"
+    assert node.failure_code is ProjectFailureCode.PROJECT_BUDGET_BREACH
+    assert node.handoff_ref is None, "un nodo rechazado no deja evidencia para los siguientes"
+    assert run.workspace.accepted_revision == FAKE_REVISION, "la revisión no avanza"
+    assert run.workspace.last_completed_node_id == ""
 
 
 # ---------------------------------------------------------------------------
@@ -527,12 +537,13 @@ def test_caso_23_un_child_fallido_falla_el_proyecto(tmp_path: Path) -> None:
 
 
 def test_caso_10_una_revision_que_el_arbol_no_demuestra_se_rechaza(tmp_path: Path) -> None:
-    """CASO 10: el child dice haber commiteado una revisión que el árbol no tiene; se rechaza.
+    """CASO 10 (F621-01): el child dice haber commiteado una revisión que el árbol no tiene.
 
     La revisión aceptada del proyecto no es lo que el child **dice**: es lo que el árbol demuestra.
     Con un linaje que no está en la revisión que el child declara, el proyecto liquida el gasto real
-    —ocurrió— y se detiene con ``PROJECT_WORKSPACE_REVISION_MISMATCH``: aceptar esa revisión dejaría
-    a los nodos siguientes trabajando sobre un contenido que nadie puede reproducir.
+    —ocurrió— y el nodo queda **rechazado**: ``BLOCKED`` con su código, sin handoff y sin mover la
+    revisión aceptada. Aceptar esa revisión dejaría a los nodos siguientes trabajando sobre un
+    contenido que nadie puede reproducir.
     """
     lineage = FixedLineage(FAKE_REVISION)
     h = harness(tmp_path, nodes=("A",), lineage=lineage, outcomes={"A": ChildOutcome()})
@@ -544,9 +555,13 @@ def test_caso_10_una_revision_que_el_arbol_no_demuestra_se_rechaza(tmp_path: Pat
     assert run.workspace.accepted_revision == FAKE_REVISION, "no se acepta lo que no se demuestra"
     node = run.node("A")
     assert node is not None
-    assert node.status is ProjectNodeStatus.COMPLETED, "el nodo cerró: el gasto es real"
+    assert node.status is ProjectNodeStatus.BLOCKED, "child COMPLETED no es nodo ACEPTADO"
+    assert node.failure_code is ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH
+    assert node.child_status == TaskStatus.COMPLETED.value
+    assert node.handoff_ref is None
     assert run.usage.model_calls == 1
     assert run.usage.child_workflows == 1
+    assert run.usage.nodes_completed == 0
 
 
 def test_caso_18_las_reparaciones_del_proyecto_se_agregan_entre_nodos(tmp_path: Path) -> None:
@@ -801,12 +816,13 @@ def test_los_eventos_de_auditoria_del_proyecto_se_registran(tmp_path: Path) -> N
     assert plan_events[0].metadata[1][0] in {"attempt", "declared_order", "node_id"}
 
 
-def test_un_child_que_completa_sin_resultado_durable_no_cierra_el_proyecto(tmp_path: Path) -> None:
-    """Un child que dice ``COMPLETED`` sin dejar el resultado del Developer no cierra el proyecto.
+def test_un_child_que_completa_sin_resultado_durable_es_rechazado(tmp_path: Path) -> None:
+    """Un child que dice ``COMPLETED`` sin dejar el resultado del Developer no se acepta (F621-01).
 
-    La revisión aceptada se demuestra con evidencia: si no hay resultado durable del Developer, el
-    proyecto no puede afirmar sobre qué árbol trabajó. El nodo queda en su revisión anterior y el
-    proyecto no se da por completado con evidencia incompleta.
+    La aceptación se demuestra con evidencia durable: si no hay resultado del Developer, el parent
+    no puede afirmar sobre qué árbol ni qué archivos trabajó el nodo. El nodo queda rechazado, la
+    revisión no avanza y el proyecto se detiene con ``PROJECT_COMPLETION_INCOMPLETE``. La
+    liquidación del gasto real sigue ocurriendo: lo que no ocurre es la aceptación.
     """
     h = harness(
         tmp_path,
@@ -816,10 +832,16 @@ def test_un_child_que_completa_sin_resultado_durable_no_cierra_el_proyecto(tmp_p
 
     run = h.run()
 
-    assert run.node("A") is not None
-    assert run.node("A").accepted_revision_after == FAKE_REVISION
+    assert run.status is ProjectState.BLOCKED, describe(run)
+    assert run.failure_code is ProjectFailureCode.PROJECT_COMPLETION_INCOMPLETE
+    node = run.node("A")
+    assert node is not None
+    assert node.status is ProjectNodeStatus.BLOCKED
+    assert node.handoff_ref is None
+    assert node.accepted_revision_after == FAKE_REVISION
     assert run.workspace.accepted_revision == FAKE_REVISION
-    assert run.status is ProjectState.COMPLETED, "el nodo cerró: no commiteó, no hay revisión nueva"
+    assert run.usage.child_workflows == 1, "el child se ejecutó y su gasto se registra"
+    assert run.usage.nodes_completed == 0
 
 
 def test_el_proyecto_no_puede_cerrarse_con_un_nodo_sin_completar(tmp_path: Path) -> None:

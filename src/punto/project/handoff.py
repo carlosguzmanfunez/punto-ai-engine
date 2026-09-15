@@ -290,7 +290,13 @@ def node_request(
     declarado, y el orden declarado es información: lo que se pierde es lo último que el nodo dijo.
 
     Es determinista por construcción: los mismos argumentos producen la misma petición, sin reloj,
-    sin azar y sin leer nada del entorno.
+    sin azar y sin leer nada del entorno. El ``created_at`` es el de la **petición del proyecto**
+    —una marca durable, no el reloj del proceso—: sin él, ``WorkflowRequest`` pondría ``utc_now()``
+    y
+    dos llamadas con los mismos argumentos no serían iguales (hallazgo F621-02). La petición del
+    child
+    tiene que ser **idéntica** entre procesos, porque de su huella depende la idempotencia: dos
+    objetos distintos con la misma clave son un conflicto, no una repetición.
     """
     return WorkflowRequest(
         task_id=node_task_id(run.project_run_id, node.node_id),
@@ -309,6 +315,7 @@ def node_request(
         budget=budget,
         idempotency_key=node_idempotency_key(run.project_run_id, node.node_id),
         requested_by=request.requested_by,
+        created_at=request.created_at,
     )
 
 

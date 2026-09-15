@@ -22,7 +22,7 @@ Nada de este módulo se usa en producción.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid5
@@ -290,11 +290,22 @@ class FakeChildKernel:
                 WorkflowFailureCode.WORKFLOW_APPROVAL_PROOF_INVALID,
                 "la prueba no corresponde al child que espera aprobación",
             )
+        resumed_outcome = replace(self.outcome_for(run.request), status=TaskStatus.COMPLETED)
+        reference = self._publish_developer(workflow_id, run.request, resumed_outcome)
         resumed = run.model_copy(
             update={
                 "status": TaskStatus.COMPLETED,
                 "human_gate_approved": True,
-                "result": self._result(run),
+                "result": self._result(run, outcome=resumed_outcome),
+                "stage_artifacts": (
+                    StageArtifacts(
+                        role=RoleName.DEVELOPER,
+                        stage=TaskStatus.IN_PROGRESS,
+                        step_index=0,
+                        summary="child del nodo de prueba aprobado por una persona",
+                        references=(reference,),
+                    ),
+                ),
             }
         )
         self._store.save(resumed)

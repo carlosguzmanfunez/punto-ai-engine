@@ -46,6 +46,7 @@ gates pasadas— y el proyecto acepta la revisión que ese resultado demuestra.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
@@ -158,6 +159,45 @@ class ProjectHumanApprovalRequiredError(ProjectExecutionError):
 
 class ProjectApprovalProofInvalidError(ProjectExecutionError):
     """La prueba de aprobación no corresponde al child activo de **este** proyecto."""
+
+
+class ProjectReconciliationRequiredError(ProjectExecutionError):
+    """El proyecto está bloqueado por una postcondición fallida y exige reconciliación explícita.
+
+    Hallazgo F621-01B: una reanudación genérica **no** puede cerrar un bloqueo cuyo motivo es una
+    postcondición del parent (brecha de presupuesto, violación de alcance, revisión que el árbol no
+    demuestra, evidencia incompleta, grafo cambiado o inválido, dependencia sin evidencia, plan que
+    necesita revisión). Antes, ``resume`` borraba el ``failure_code`` y volvía a conducir el
+    proyecto: una postcondición fallida desaparecía por el mero hecho de reanudar.
+
+    ENGINE-6.2.1 no construye todavía la API de reconciliación —es fail-closed a propósito—: el
+    código se conserva en el checkpoint y este error es la frontera que exige una decisión explícita
+    (una persona, un ticket, una fase posterior) antes de volver a conducir el proyecto.
+    """
+
+
+#: Códigos de bloqueo que una reanudación genérica **no** puede cerrar (hallazgo F621-01B).
+#:
+#: Es una lista explícita y no una regla implícita: cada código dice qué postcondición falta, y
+#: ninguno se puede resolver reintentando el mismo trabajo sin cambiar nada. La lista es la del
+#: hallazgo; el resto de códigos de la fase también exigen reconciliación salvo que no haya código
+#: (un bloqueo sin causa declarada es un defecto y la reanudación solo puede fallar cerrado).
+RECONCILIATION_REQUIRED_CODES: Final[frozenset[ProjectFailureCode]] = frozenset(
+    {
+        ProjectFailureCode.PROJECT_BUDGET_BREACH,
+        ProjectFailureCode.PROJECT_NODE_SCOPE_VIOLATION,
+        ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH,
+        ProjectFailureCode.PROJECT_GRAPH_CHANGED,
+        ProjectFailureCode.PROJECT_GRAPH_INVALID,
+        ProjectFailureCode.PROJECT_DEPENDENCY_EVIDENCE_INCOMPLETE,
+        ProjectFailureCode.PROJECT_REPLAN_REQUIRED,
+        ProjectFailureCode.PROJECT_COMPLETION_INCOMPLETE,
+        ProjectFailureCode.PROJECT_BUDGET_EXCEEDED,
+        ProjectFailureCode.PROJECT_CHILD_BLOCKED,
+        ProjectFailureCode.PROJECT_CHILD_FAILED,
+        ProjectFailureCode.PROJECT_EFFECT_UNRECONCILED,
+    }
+)
 
 
 def child_references(run: WorkflowRun) -> tuple[ArtifactReference, ...]:
@@ -343,6 +383,7 @@ class ProjectExecutionKernel:
         if run.status is ProjectState.HUMAN_APPROVAL:
             run = self._resume_human_gate(run, proof)
         elif self._machine.is_resumable(run.status):
+            self._assert_resumable(run)
             run = self._transition(run, ProjectState.RUNNING)
             run = run.model_copy(update={"failure_code": None, "failure_detail": ""})
             self._store.save(run)
@@ -351,6 +392,31 @@ class ProjectExecutionKernel:
                 f"el proyecto {project_run_id} está en {run.status.value} y no admite reanudación"
             )
         return self._drive(run, max_steps=max_steps)
+
+    def _assert_resumable(self, run: ProjectRun) -> None:
+        """Impide que una reanudación genérica borre la causa de un bloqueo (hallazgo F621-01B).
+
+        Un ``BLOCKED`` por postcondición fallida no se arregla volviendo a conducir el proyecto: el
+        nodo rechazado sigue rechazado y el motivo sigue siendo cierto. Reanudarlo borraba el
+        ``failure_code`` y permitía que el scheduler tratara como aceptado un nodo que el parent
+        había
+        rechazado —la brecha de presupuesto del hallazgo F621-01, por ejemplo—. Aquí se falla
+        cerrado
+        y el proyecto queda tal cual estaba, con su código y su detalle.
+
+        Raises:
+            ProjectReconciliationRequiredError: si el bloqueo tiene un código que exige una decisión
+                explícita antes de continuar.
+        """
+        code = run.failure_code
+        if code is None:
+            return
+        if code in RECONCILIATION_REQUIRED_CODES:
+            raise ProjectReconciliationRequiredError(
+                f"el proyecto {run.project_run_id} está bloqueado por {code.value} y no se reanuda "
+                f"con una reanudación genérica: {run.failure_detail} El código se conserva hasta "
+                "que una reconciliación explícita lo cierre"
+            )
 
     def step(self, run: ProjectRun) -> ProjectRun:
         """Aplica **un** hito del proyecto y lo persiste.
@@ -570,36 +636,76 @@ class ProjectExecutionKernel:
         node: GraphNode,
         child: WorkflowRun,
     ) -> ProjectRun:
-        """Liquida el child cerrado: presupuesto, evidencia del nodo, revisión y veredicto."""
+        """Liquida el child cerrado tras el veredicto del parent sobre sus postcondiciones.
+
+        Invariante de F621-01: **child workflow COMPLETED no es project node ACEPTADO**. El nodo
+        solo
+        queda ``COMPLETED`` cuando el parent ha verificado todas sus postcondiciones; si alguna
+        falla,
+        el nodo queda ``BLOCKED`` con el código del parent y el ``child_status`` real conservado
+        como
+        evidencia histórica.
+
+        El orden es deliberado y es el arreglo del hallazgo: primero se **juzga** (gasto contra la
+        autorización, alcance, revisión demostrable, evidencia durable) y solo después se
+        **escribe**.
+        Antes se aceptaba el nodo, se publicaba su handoff y se contaba como completado, y el
+        rechazo
+        llegaba después: el checkpoint quedaba con un nodo ``COMPLETED`` que el parent había
+        rechazado,
+        y una reanudación genérica podía borrar la postcondición fallida. Ahora no hay ventana: el
+        veredicto y su registro se escriben juntos.
+
+        Lo que **siempre** ocurre, acepte o rechace: el gasto real se liquida (la reserva se libera
+        una
+        vez y el consumo del child se suma), porque el gasto ocurrió y esconderlo sería mentir sobre
+        el
+        presupuesto. Lo que solo ocurre si el parent acepta: el nodo queda ``COMPLETED``,
+        ``nodes_completed`` sube, se publica su handoff y la revisión aceptada avanza. Un nodo
+        rechazado **no** deja evidencia para sus dependientes y **no** mueve el linaje.
+        """
         usage = ChildUsage.from_workflow_usage(child.usage)
-        breach = settlement_breach(node_run, usage)
-        completed = child.status is TaskStatus.COMPLETED
+        child_completed = child.status is TaskStatus.COMPLETED
         revision_before = node_run.accepted_revision_before or run.workspace.accepted_revision
         results = self._developer_results(child)
-        violation = node_scope_violation(node, tuple(
-            change.path for result in results for change in result.files_changed
-        ))
-        revision_after = revision_before
+
+        # --- veredicto del parent: nada se acepta antes de conocerlo ----------
+        breach = settlement_breach(node_run, usage)
+        violation = node_scope_violation(
+            node, tuple(change.path for result in results for change in result.files_changed)
+        )
         revision_mismatch = ""
-        if completed and not violation:
-            candidate = self._accepted_revision(results, fallback=revision_before)
-            if candidate == revision_before:
-                revision_after = revision_before
-            else:
+        candidate_revision = revision_before
+        if child_completed and not violation:
+            candidate_revision = self._accepted_revision(results, fallback=revision_before)
+            if candidate_revision != revision_before:
                 try:
-                    self._lineage.assert_at(candidate)
+                    self._lineage.assert_at(candidate_revision)
                 except ProjectRevisionMismatchError as exc:
-                    # El árbol no demuestra la revisión que el child declara: no se acepta. Se
-                    # conserva la anterior —aceptar una revisión que nadie puede reproducir
-                    # dejaría a los nodos siguientes sobre un contenido inexistente— y se para.
                     revision_mismatch = str(exc)
-                else:
-                    revision_after = candidate
+                    candidate_revision = revision_before
+        missing_evidence = ""
+        if child_completed and self._developer_ref(child) is None:
+            missing_evidence = (
+                f"el child del nodo {node_run.node_id!r} terminó COMPLETED y no dejó el resultado "
+                "durable del Developer: sin esa evidencia el parent no puede afirmar qué árbol ni "
+                "qué archivos produjo el nodo"
+            )
+        rejection: _Rejection | None = None
+        if child_completed:
+            rejection = self._rejection(
+                node_run=node_run,
+                breach=breach,
+                violation=violation,
+                revision_mismatch=revision_mismatch,
+                missing_evidence=missing_evidence,
+            )
+        accepted = child_completed and rejection is None
+        revision_after = candidate_revision if accepted else revision_before
+
         settled = node_run.model_copy(
             update={
-                "status": (
-                    ProjectNodeStatus.COMPLETED if completed else _node_status(child.status)
-                ),
+                "status": _node_status(child.status, rejected=rejection is not None),
                 "accepted_revision_before": revision_before,
                 "accepted_revision_after": revision_after,
                 "result_ref": self._developer_ref(child),
@@ -611,11 +717,12 @@ class ProjectExecutionKernel:
                 "repairs": usage.repairs,
                 "child_status": child.status.value,
                 "completed_at": self._now(),
-                "failure_code": None if completed else _child_failure_code(child.status),
-                "failure_detail": "" if completed else _child_failure_detail(child),
+                "failure_code": _node_failure_code(child.status, rejection),
+                "failure_detail": _node_failure_detail(child, rejection),
+                "handoff_ref": None,
             }
         )
-        if completed:
+        if accepted:
             settled = settled.model_copy(
                 update={
                     "handoff_ref": publish_node_handoff(
@@ -628,12 +735,13 @@ class ProjectExecutionKernel:
                     )
                 }
             )
+        # --- liquidación del gasto real, acepte o rechace ---------------------
         run = settle_child(
             run,
             node=node_run,
             usage=usage,
             child_status=child.status.value,
-            completed=completed,
+            completed=accepted,
         )
         run = run.with_node(settled)
         run = run.model_copy(
@@ -642,7 +750,9 @@ class ProjectExecutionKernel:
                     update={
                         "accepted_revision": revision_after,
                         "last_completed_node_id": (
-                            node_run.node_id if completed else run.workspace.last_completed_node_id
+                            node_run.node_id
+                            if accepted
+                            else run.workspace.last_completed_node_id
                         ),
                     }
                 ),
@@ -657,24 +767,49 @@ class ProjectExecutionKernel:
         )
         self._store.save(run)
         self._audit_node_completed(run, settled, revision_before, revision_after)
-        if revision_mismatch:
-            return self._block(
-                run, ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH, revision_mismatch
-            )
+        if rejection is not None:
+            return self._block(run, rejection.code, rejection.detail)
+        if accepted:
+            return run
+        return self._stop_on_node(run, settled)
+
+    @staticmethod
+    def _rejection(
+        *,
+        node_run: ProjectNodeRun,
+        breach: ProjectBudgetCheck | None,
+        violation: tuple[str, ...],
+        revision_mismatch: str,
+        missing_evidence: str,
+    ) -> _Rejection | None:
+        """Primer motivo por el que el parent **rechaza** un child, en orden fijo.
+
+        El orden es determinista y está escrito para que dos ejecuciones del mismo caso informen del
+        mismo motivo: brecha de presupuesto, violación de alcance, revisión que el árbol no
+        demuestra
+        y evidencia durable incompleta. Ninguno se degrada a aviso: cada uno significa que el nodo
+        no
+        puede darse por aceptado ni servir de base a sus dependientes.
+        """
         if breach is not None:
-            return self._block(run, _code_of(breach), breach.detail)
+            return _Rejection(_code_of(breach), breach.detail)
         if violation:
-            return self._block(
-                run,
+            return _Rejection(
                 ProjectFailureCode.PROJECT_NODE_SCOPE_VIOLATION,
                 (
                     f"el child del nodo {node_run.node_id!r} cambió rutas fuera de su "
                     f"autorización: {', '.join(violation)}"
                 ),
             )
-        if completed:
-            return run
-        return self._stop_on_node(run, settled)
+        if revision_mismatch:
+            return _Rejection(
+                ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH, revision_mismatch
+            )
+        if missing_evidence:
+            return _Rejection(
+                ProjectFailureCode.PROJECT_COMPLETION_INCOMPLETE, missing_evidence
+            )
+        return None
 
     def _stop_on_node(self, run: ProjectRun, node_run: ProjectNodeRun) -> ProjectRun:
         """Detiene el proyecto por el veredicto de un nodo ya liquidado (fail-fast)."""
@@ -780,7 +915,15 @@ class ProjectExecutionKernel:
 
     # ------------------------------------------------------------------ interno
     def _completion_gaps(self, run: ProjectRun) -> tuple[str, ...]:
-        """Requisitos de cierre que faltan, en orden determinista."""
+        """Requisitos de cierre que faltan, en orden determinista.
+
+        Incluye la **defensa en profundidad** del hallazgo F621-01: un nodo marcado ``COMPLETED`` no
+        basta. Si además lleva un ``failure_code`` del parent —el estado incoherente que el defecto
+        producía—, o le falta el resultado/handoff durable que lo respalda, el proyecto **no**
+        cierra.
+        La regla de aceptación ya no puede producir ese estado; esta comprobación existe para que un
+        checkpoint manipulado o un defecto futuro tampoco lo consiga.
+        """
         gaps: list[str] = []
         pending = tuple(
             node.node_id
@@ -791,6 +934,21 @@ class ProjectExecutionKernel:
             gaps.append("el proyecto no tiene nodos")
         if pending:
             gaps.append(f"hay {len(pending)} nodo(s) sin completar: {', '.join(pending)}")
+        inconsistent = tuple(
+            node.node_id
+            for node in run.nodes
+            if node.status is ProjectNodeStatus.COMPLETED
+            and (
+                node.failure_code is not None
+                or node.handoff_ref is None
+                or node.result_ref is None
+            )
+        )
+        if inconsistent:
+            gaps.append(
+                "hay nodo(s) marcados COMPLETED sin aceptación coherente del parent "
+                f"(fallo declarado o falta de resultado/handoff): {', '.join(inconsistent)}"
+            )
         if run.active_node_id:
             gaps.append(f"el nodo {run.active_node_id!r} sigue activo")
         if run.active_child_workflow_id is not None:
@@ -1199,15 +1357,65 @@ def _code_of(check: ProjectBudgetCheck) -> ProjectFailureCode:
     return check.code or ProjectFailureCode.PROJECT_BUDGET_EXCEEDED
 
 
-def _node_status(status: TaskStatus) -> ProjectNodeStatus:
-    """Estado del nodo que corresponde al estado final del child."""
-    if status is TaskStatus.COMPLETED:
-        return ProjectNodeStatus.COMPLETED
+@dataclass(frozen=True, slots=True)
+class _Rejection:
+    """Motivo por el que el parent **rechaza** un child que se declaró ``COMPLETED``.
+
+    Es la pareja ``(código estable, detalle)`` que se escribe en el nodo y con la que se bloquea el
+    proyecto. Existe como tipo y no como tupla para que el veredicto no se pueda confundir con el
+    del
+    child: el del parent tiene su propio código, y un nodo rechazado nunca queda ``COMPLETED``.
+    """
+
+    code: ProjectFailureCode
+    detail: str
+
+
+def _node_status(status: TaskStatus, *, rejected: bool = False) -> ProjectNodeStatus:
+    """Estado del nodo que corresponde al cierre del child y al veredicto del parent.
+
+    ``rejected`` es el veredicto del parent: un child que se declaró ``COMPLETED`` pero violó una
+    postcondición (brecha, alcance, revisión, evidencia) queda ``BLOCKED``. El ``child_status`` se
+    conserva aparte como evidencia histórica —el child **sí** cerró ``COMPLETED``—, pero el nodo del
+    proyecto no está aceptado y no puede satisfacer dependencias.
+    """
     if status is TaskStatus.HUMAN_APPROVAL:
         return ProjectNodeStatus.HUMAN_APPROVAL
     if status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
         return ProjectNodeStatus.FAILED
+    if status is TaskStatus.COMPLETED:
+        return ProjectNodeStatus.BLOCKED if rejected else ProjectNodeStatus.COMPLETED
     return ProjectNodeStatus.BLOCKED
+
+
+def _node_failure_code(
+    status: TaskStatus, rejection: _Rejection | None
+) -> ProjectFailureCode | None:
+    """Código de fallo que queda escrito en el nodo.
+
+    Tres casos, y los tres importan: el parent rechazó un child que se declaró ``COMPLETED`` (gana
+    el código del parent), el child cerró sin completar (gana su propio código, que es la evidencia
+    de por qué no terminó) o el nodo está aceptado (ningún fallo).
+    """
+    if rejection is not None:
+        return rejection.code
+    if status is TaskStatus.COMPLETED:
+        return None
+    return _child_failure_code(status)
+
+
+def _node_failure_detail(child: WorkflowRun, rejection: _Rejection | None) -> str:
+    """Detalle de fallo que queda escrito en el nodo, con el motivo del child cuando lo hay.
+
+    El detalle del child es la evidencia real de por qué no terminó —el rol que se bloqueó y con
+    qué saldo, por ejemplo— y perderlo dejaría al proyecto bloqueado sin decir por qué. Solo se
+    sustituye cuando el parent rechaza un child que sí se declaró completado.
+    """
+    if rejection is not None:
+        return rejection.detail
+    if child.status is TaskStatus.COMPLETED:
+        return ""
+    return _child_failure_detail(child)
 
 
 def _child_failure_code(status: TaskStatus) -> ProjectFailureCode:
@@ -1231,12 +1439,14 @@ __all__ = [
     "CLOSED_CHILD_STATUSES",
     "PROGRESS_MARGIN",
     "PROJECT_HUMAN_GATE_KIND",
+    "RECONCILIATION_REQUIRED_CODES",
     "STEPS_PER_NODE",
     "ProjectApprovalProofInvalidError",
     "ProjectExecutionError",
     "ProjectExecutionKernel",
     "ProjectGraphUnavailableError",
     "ProjectHumanApprovalRequiredError",
+    "ProjectReconciliationRequiredError",
     "ProjectTerminalError",
     "child_references",
 ]

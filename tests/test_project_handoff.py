@@ -31,6 +31,7 @@ Lo que se comprueba, en el orden de la prueba:
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -285,7 +286,17 @@ def test_identidades_deterministas_y_distintas_por_nodo_y_proyecto() -> None:
 # 2. Petición del child
 # ---------------------------------------------------------------------------
 def test_node_request_deriva_la_peticion_del_nodo_y_es_determinista() -> None:
-    """El child recibe el contrato del nodo, acotado y sin un solo campo inventado."""
+    """El child recibe el contrato del nodo, acotado y sin un solo campo inventado.
+
+    El determinismo se comprueba con **igualdad total** de los dos objetos (``==``), no solo del
+    ``model_dump()``, y con una pausa real entre las dos llamadas:
+    ``WorkflowRequest.created_at`` usa
+    ``utc_now()`` por defecto, así que sin una marca durable la segunda petición salía con otro
+    microsegundo y dos llamadas con los mismos argumentos no eran iguales (hallazgo F621-02). La
+    petición del child tiene que ser idéntica entre procesos: de su huella depende la idempotencia,
+    y
+    dos objetos distintos con la misma clave son un conflicto, no una repetición.
+    """
     request = _request(context_summary="contexto declarado del proyecto")
     run = _run(request)
     node = _node(
@@ -300,11 +311,16 @@ def test_node_request_deriva_la_peticion_del_nodo_y_es_determinista() -> None:
     first = node_request(
         request=request, run=run, node=node, budget=budget, evidence_references=evidence
     )
+    time.sleep(0.02)
     second = node_request(
         request=request, run=run, node=node, budget=budget, evidence_references=evidence
     )
 
+    assert first == second, "los mismos argumentos producen la misma petición, objeto a objeto"
     assert first.model_dump() == second.model_dump()
+    assert first.created_at == request.created_at, (
+        "la marca de creación es la durable del proyecto, no el reloj del proceso"
+    )
     assert first.task_id == node_task_id(run.project_run_id, node.node_id)
     assert first.project_id == request.project_id
     assert first.objective == node.objective

@@ -256,8 +256,14 @@ def replan_harness(
     child_budget: WorkflowBudget | None = None,
     lineage: object | None = None,
     edges: dict[str, tuple[str, ...]] | None = None,
+    architecture: object | None = None,
 ) -> Harness:
-    """Montaje de la suite: mismo doble durable de 6.2, con presupuesto de replan autorizado."""
+    """Montaje de la suite: mismo doble durable de 6.2, con presupuesto de replan autorizado.
+
+    ``architecture`` es opcional: cuando se declara, el plan del proyecto lleva un
+    ``ArchitecturePlan`` real y el contrato deriva su baseline inmutable (ENGINE-6.3.2), que es lo
+    que permite probar la frontera fail-closed contra hechos de arquitectura de verdad.
+    """
     return harness(
         tmp_path,
         nodes=nodes,
@@ -267,6 +273,7 @@ def replan_harness(
         child_budget=child_budget if child_budget is not None else CHILD_BUDGET,
         lineage=lineage,
         edges=edges,
+        architecture=architecture,
     )
 
 

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid5
 
+from punto.architect.base import ArchitectureOutcome
 from punto.common import utc_now
 from punto.planner.base import PlanningOutcome
 from punto.policy.human_gate import HumanGate
@@ -41,9 +42,13 @@ from punto.schemas.execution import (
     ValidationResult,
 )
 from punto.schemas.planning import (
+    ArchitecturePlan,
+    ArchitectureProposal,
     ModelExecutionSummary,
     PlannedTask,
+    ProjectCapabilityProfile,
     ProjectPlanStatus,
+    ProjectSpec,
     Roadmap,
     TaskGraph,
 )
@@ -145,6 +150,27 @@ def planner_request(
     )
 
 
+def architecture_outcome(architecture: ArchitecturePlan) -> ArchitectureOutcome:
+    """Resultado del Architect que solo declara la **arquitectura**, para el baseline del contrato.
+
+    Existe para que una prueba pueda publicar un plan con arquitectura y comprobar la frontera
+    fail-closed de ENGINE-6.3.2 contra un baseline real (``postgres``, ``fly.io``, ``clerk``…), sin
+    montar el Architect entero: la especificación y el perfil son los mínimos válidos y no influyen
+    en el baseline, que sale de la arquitectura.
+    """
+    return ArchitectureOutcome(
+        status=ProjectPlanStatus.PASS,
+        proposal=ArchitectureProposal(
+            project_spec=ProjectSpec(
+                project_name=DEFAULT_OBJECTIVE[:60],
+                problem_statement=DEFAULT_OBJECTIVE,
+            ),
+            architecture=architecture,
+            capability_profile=ProjectCapabilityProfile(),
+        ),
+    )
+
+
 def publish_project_plan(
     store: ArtifactStore,
     graph: TaskGraph,
@@ -153,14 +179,20 @@ def publish_project_plan(
     task_id: UUID,
     project_id: UUID,
     objective: str = DEFAULT_OBJECTIVE,
+    architecture: ArchitecturePlan | None = None,
 ) -> ArtifactReference:
-    """Publica el plan durable del proyecto (el ``source_plan_ref``) y devuelve su referencia."""
+    """Publica el plan durable del proyecto (el ``source_plan_ref``) y devuelve su referencia.
+
+    ``architecture`` es opcional y, cuando se declara, viaja **dentro** del bundle del plan, que es
+    de donde el contrato del proyecto deriva su baseline inmutable de arquitectura.
+    """
     return publish_plan(
         store,
         request=planner_request(
             workflow_id=workflow_id, task_id=task_id, project_id=project_id, objective=objective
         ),
         outcome=planning_outcome(graph),
+        architecture=None if architecture is None else architecture_outcome(architecture),
     )
 
 
@@ -545,6 +577,7 @@ __all__ = [
     "FAKE_REVISION",
     "ChildOutcome",
     "FakeChildKernel",
+    "architecture_outcome",
     "graph_of",
     "planned",
     "planner_request",

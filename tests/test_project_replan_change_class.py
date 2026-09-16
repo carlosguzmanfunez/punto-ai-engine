@@ -316,7 +316,7 @@ def test_un_reemplazo_tactico_sigue_siendo_tactico(tmp_path: Path) -> None:
         classification = classify_replan_change(
             proposal(objective), contract=contract(), action="modify_file"
         )
-        assert classification.change_class is ReplanChangeClass.TACTICAL_ALLOWED, objective
+        assert classification.change_class is ReplanChangeClass.TACTICAL_PROVEN, objective
         assert classification.requires_human is False, objective
         assert classification.is_tactical is True, objective
 

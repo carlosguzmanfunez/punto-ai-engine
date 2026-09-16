@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -61,8 +61,14 @@ from punto.common import normalize_path
 from punto.policy.permissions import CONSTITUTIONAL_PROTECTED_PATHS, is_protected_path
 from punto.project.graph import FINGERPRINT_CHARS
 from punto.project.handoff import project_run_id_for
+from punto.schemas.planning import ArchitecturePlan
 from punto.schemas.project import ProjectRequest
-from punto.schemas.replan import MAX_REPLAN_COVERAGE, MAX_REPLAN_TEXT_CHARS, ProjectContract
+from punto.schemas.replan import (
+    MAX_REPLAN_COVERAGE,
+    MAX_REPLAN_SHORT_CHARS,
+    MAX_REPLAN_TEXT_CHARS,
+    ProjectContract,
+)
 from punto.schemas.workflow import ArtifactReference, RoleName
 from punto.workflow.artifacts import ArtifactStore
 from punto.workflow.errors import WorkflowError
@@ -111,6 +117,18 @@ _CONTRACT_TERM_FIELDS: Final[tuple[str, ...]] = (
     "risk_ceiling",
     "authority_ceiling",
     "initial_revision",
+    # Baseline de arquitectura (ENGINE-6.3.2): forma parte de los términos porque una propuesta que
+    # cambie el diseño autorizado tiene que verse como un cambio de contrato, no como una táctica.
+    "architecture_fingerprint",
+    "architecture_style",
+    "architecture_components",
+    "architecture_services",
+    "architecture_data_stores",
+    "architecture_integrations",
+    "architecture_interfaces",
+    "architecture_security",
+    "architecture_deployment",
+    "architecture_technology",
 )
 
 
@@ -168,12 +186,142 @@ def contract_fingerprint(contract: ProjectContract) -> str:
         {
             "acceptance_criteria": list(contract.acceptance_criteria),
             "acceptance_criterion_ids": list(contract.acceptance_criterion_ids),
+            "architecture_components": list(contract.architecture_components),
+            "architecture_data_stores": list(contract.architecture_data_stores),
+            "architecture_deployment": contract.architecture_deployment,
+            "architecture_fingerprint": contract.architecture_fingerprint,
+            "architecture_integrations": list(contract.architecture_integrations),
+            "architecture_interfaces": list(contract.architecture_interfaces),
+            "architecture_security": list(contract.architecture_security),
+            "architecture_services": list(contract.architecture_services),
+            "architecture_style": contract.architecture_style,
+            "architecture_technology": list(contract.architecture_technology),
             "authority_ceiling": int(contract.authority_ceiling),
             "authorized_scope": list(contract.authorized_scope),
             "initial_revision": contract.initial_revision,
             "original_goal": contract.original_goal,
             "protected_paths": list(contract.protected_paths),
             "risk_ceiling": int(contract.risk_ceiling),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:FINGERPRINT_CHARS]
+
+
+def architecture_baseline(architecture: ArchitecturePlan | None) -> dict[str, Any]:
+    """Hechos de arquitectura que la replanificación autónoma **no** puede cambiar (F632-01).
+
+    Se derivan del ``ArchitecturePlan`` durable que viaja con el plan aceptado —no del Planner, y no
+    de una síntesis vacía— y se acotan como el resto de colecciones del contrato: identificadores,
+    nombres y motores, sin copiar objetos ilimitados.
+
+    Si la arquitectura no se puede resolver, se devuelve un baseline **vacío y sin huella**: el
+    motor no fabrica conocimiento de arquitectura, y el clasificador tratará toda propuesta con
+    semántica de diseño como ambigua y exigirá una persona.
+
+    Args:
+        architecture: Arquitectura original del plan durable, o ``None`` si el plan no la trae.
+
+    Returns:
+        Diccionario con los campos del contrato que forman el baseline y su huella.
+    """
+    if architecture is None:
+        return {
+            "architecture_fingerprint": "",
+            "architecture_style": "",
+            "architecture_components": (),
+            "architecture_services": (),
+            "architecture_data_stores": (),
+            "architecture_integrations": (),
+            "architecture_interfaces": (),
+            "architecture_security": (),
+            "architecture_deployment": "",
+            "architecture_technology": (),
+        }
+    components = tuple(
+        _bounded(f"{component.id}:{component.name}", MAX_REPLAN_SHORT_CHARS)
+        for component in architecture.components
+    )[:MAX_REPLAN_COVERAGE]
+    data_stores = tuple(
+        _bounded(f"{store.id}:{store.name}:{store.engine}", MAX_REPLAN_SHORT_CHARS)
+        for store in architecture.data_stores
+    )[:MAX_REPLAN_COVERAGE]
+    integrations = tuple(
+        _bounded(
+            f"{item.id}:{item.name}:{item.protocol}:{item.auth}", MAX_REPLAN_SHORT_CHARS
+        )
+        for item in architecture.external_integrations
+    )[:MAX_REPLAN_COVERAGE]
+    interfaces = tuple(
+        _bounded(f"{item.id}:{item.name}:{item.kind.value}", MAX_REPLAN_SHORT_CHARS)
+        for item in architecture.interfaces
+    )[:MAX_REPLAN_COVERAGE]
+    security = tuple(
+        _bounded(f"{item.id}:{item.name}:{item.description}", MAX_REPLAN_SHORT_CHARS)
+        for item in architecture.security_boundaries
+    )[:MAX_REPLAN_COVERAGE]
+    technology = tuple(
+        _bounded(f"{choice.topic}:{choice.choice}", MAX_REPLAN_SHORT_CHARS)
+        for choice in architecture.technology_choices
+    )[:MAX_REPLAN_COVERAGE]
+    baseline: dict[str, Any] = {
+        "architecture_fingerprint": architecture_fingerprint(architecture),
+        "architecture_style": _bounded(
+            architecture.architecture_style, MAX_REPLAN_SHORT_CHARS
+        ),
+        "architecture_components": components,
+        "architecture_services": tuple(
+            _bounded(item, MAX_REPLAN_SHORT_CHARS) for item in architecture.services
+        )[:MAX_REPLAN_COVERAGE],
+        "architecture_data_stores": data_stores,
+        "architecture_integrations": integrations,
+        "architecture_interfaces": interfaces,
+        "architecture_security": security,
+        "architecture_deployment": _bounded(
+            architecture.deployment_topology, MAX_REPLAN_TEXT_CHARS
+        ),
+        "architecture_technology": technology,
+    }
+    return baseline
+
+
+def architecture_fingerprint(architecture: ArchitecturePlan) -> str:
+    """Huella canónica de la arquitectura autorizada, para atarla al contrato.
+
+    Incluye las dimensiones que una replanificación autónoma no puede cambiar —estilo, componentes,
+    servicios, almacenes con su motor, integraciones con su autenticación, interfaces, fronteras de
+    seguridad, topología de despliegue y elecciones tecnológicas—, de modo que dos arquitecturas
+    distintas no puedan compartir baseline por parecerse en el nombre.
+    """
+    material = json.dumps(
+        {
+            "architecture_style": architecture.architecture_style,
+            "components": sorted(
+                f"{item.id}:{item.name}:{item.kind.value}" for item in architecture.components
+            ),
+            "data_stores": sorted(
+                f"{item.id}:{item.name}:{item.engine}:{item.managed}"
+                for item in architecture.data_stores
+            ),
+            "deployment_topology": architecture.deployment_topology,
+            "external_integrations": sorted(
+                f"{item.id}:{item.name}:{item.protocol}:{item.auth}"
+                for item in architecture.external_integrations
+            ),
+            "interfaces": sorted(
+                f"{item.id}:{item.name}:{item.kind.value}" for item in architecture.interfaces
+            ),
+            "modules": sorted(architecture.modules),
+            "security_boundaries": sorted(
+                f"{item.id}:{item.name}:{item.description}"
+                for item in architecture.security_boundaries
+            ),
+            "services": sorted(architecture.services),
+            "technology_choices": sorted(
+                f"{item.topic}:{item.choice}" for item in architecture.technology_choices
+            ),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -233,6 +381,7 @@ def derive_contract(
         _declared(request, "acceptance_criteria", plan, "acceptance_criteria")
     )
     scope = _scope_paths(_declared(request, "changed_files", plan, "allowed_files"))
+    baseline = architecture_baseline(None if plan is None else plan.architecture)
     contract = ProjectContract(
         project_run_id=project_run_id,
         project_id=request.project_id,
@@ -244,6 +393,7 @@ def derive_contract(
         risk_ceiling=request.risk,
         authority_ceiling=request.authority,
         initial_revision=_bounded(initial_revision, _MAX_REVISION_CHARS),
+        **baseline,
     )
     return contract.model_copy(update={"contract_fingerprint": contract_fingerprint(contract)})
 
@@ -554,6 +704,8 @@ __all__ = [
     "CRITERION_ID_PREFIX",
     "PROJECT_CONTRACT_KIND",
     "ProjectContractError",
+    "architecture_baseline",
+    "architecture_fingerprint",
     "assert_contract_unchanged",
     "contract_fingerprint",
     "criterion_coverage",

@@ -1,98 +1,138 @@
-"""Barrera determinista contra las replanificaciones de alto impacto (ENGINE-6.3.1, F631-02).
+"""Prueba positiva de tacticidad de una replanificación (ENGINE-6.3.2, hallazgo F632-01).
 
-ENGINE-6.3 es replanificación **táctica**. Un fallo técnico admite otra estrategia dentro del mismo
-diseño —dividir un nodo, insertar un prerrequisito, reordenar lo pendiente, reemplazar un nodo no
-aceptado—, pero **no** admite que el motor cambie, por su cuenta, la arquitectura del proyecto: el
-stack, el motor de base de datos, el modelo de autenticación, la plataforma de despliegue, el
-proveedor de modelo o las reglas de negocio.
+ENGINE-6.3 es replanificación **táctica**: un fallo técnico admite otra estrategia de implementación
+dentro del mismo diseño, pero **no** admite que el motor cambie, por su cuenta, la arquitectura del
+proyecto. La primera versión de esta barrera (ENGINE-6.3.1) razonaba al revés: buscaba marcas
+conocidas de alto impacto y, cuando no encontraba ninguna, **autorizaba**. Ese razonamiento es
+inválido —«no lo reconozco como alto impacto» no es «he demostrado que es táctico»— y la auditoría
+independiente lo reprodujo con tecnologías que las listas no contenían:
 
-El hallazgo F631-02 demostró que la frontera anterior no lo garantizaba: ``pure_technical`` se
-derivaba solo de riesgo, autoridad, alcance y rutas protegidas, así que una propuesta cuyo objetivo
-era «Replace PostgreSQL with MongoDB and redesign authentication architecture», declarada ``LOW`` y
-``LEVEL_0_AUTONOMOUS`` y escribiendo en el mismo archivo, se adoptaba como si fuera táctica. La
-lección no es añadir otro campo a la declaración del Planner —el Planner tiene autoridad **cero**
-sobre el juicio—, sino que **el motor derive la clase de cambio** con sus propios medios.
+    «Replace the current relational engine with CockroachDB»
+    «Move the service from Vercel to Fly.io»
+    «Replace the current identity service with Clerk»
 
-Este módulo es esa derivación, y tiene tres propiedades deliberadas:
+Las tres se adoptaban en autonomía porque los nombres no estaban en ninguna lista. La lección no es
+añadir tres marcas más —el siguiente nombre desconocido volvería a pasar— sino invertir la carga de
+la prueba: **solo se adopta en autonomía lo que el motor puede demostrar táctico**.
 
-1. **Es del motor.** No lee ninguna declaración de impacto del modelo: la clase sale de la acción
-   declarada del proyecto (tabla del catálogo, que es del motor) y de los campos acotados de la
-   propuesta (título, objetivo, criterios y motivo de la operación), interpretados por patrones
-   estables de este módulo. El modelo no clasifica: es clasificado.
-2. **Es conservadora.** Ante la duda, alto impacto: un falso positivo cuesta una aprobación humana,
-   y un falso negativo cuesta una reescritura de arquitectura adoptada en autonomía. La asimetría es
-   el motivo de que los patrones miren cambios —dos motores de datos distintos, un verbo de cambio
-   junto a una frontera— y no menciones sueltas.
-3. **Es determinista y auditable.** La misma propuesta produce siempre la misma clase, el mismo
-   motivo y las mismas marcas; la clase viaja a la política y al Human Gate, de modo que una persona
-   aprueba sabiendo **qué** clase de cambio está aprobando.
+Este módulo implementa esa prueba, y tiene cuatro propiedades deliberadas:
+
+1. **Positiva y del motor.** El veredicto sale de hechos que PUNTO comprueba: la estructura de la
+   propuesta cabe en el contrato congelado (alcance, criterios, riesgo, autoridad, rutas protegidas)
+   y ningún hecho de arquitectura del **baseline** —estilo, almacenes, integraciones, fronteras de
+   seguridad, topología de despliegue, tecnología— se ve alterado. La ausencia de una marca conocida
+   no autoriza nada: deja el caso en ``UNKNOWN_OR_AMBIGUOUS``, que exige una persona.
+2. **Fail-closed por defecto.** Solo ``TACTICAL_PROVEN`` adopta sin persona. ``HIGH_IMPACT`` (cambio
+   de datos, identidad, despliegue, proveedor, arquitectura o reglas de negocio) y
+   ``UNKNOWN_OR_AMBIGUOUS`` (no se pudo demostrar) abren el Human Gate ligado a la propuesta.
+3. **Sin dependencia de listas de productos.** Las marcas conocidas existen como **aceleradores**
+   que
+   afinan el nombre de la clase, no como frontera: una tecnología nueva se detecta por su **forma**
+   (nombre propio, dígitos, dominio, jerga de sustitución) y por el **contrato del vocabulario
+   genérico** —motor, almacén, servicio de identidad, alojamiento, plataforma, proveedor, marco de
+   trabajo—, de modo que «ExampleDB9000» y «CockroachDB» caen por el mismo sitio.
+4. **Conservadora y auditable.** Ante la duda, persona. El veredicto viaja con las marcas que lo
+   demuestran, las dimensiones tocadas, las tecnologías no reconocidas y la **prueba** de tacticidad
+   (los hechos verificados), de modo que un revisor pueda discutir el veredicto y no solo sufrirlo.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from punto.schemas.replan import MAX_REPLAN_SHORT_CHARS
 from punto.workflow.policy import action_impact
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Sequence
 
     from punto.schemas.replan import ProjectContract, ProjectReplanProposal, ReplanNodeSpec
 
-#: Máximo de marcas y de campos inspeccionados que el veredicto enumera.
-#:
-#: El tope protege el informe y la auditoría: una propuesta hostil (ocho nodos, treinta y dos
-#: criterios, textos de dos mil caracteres) no puede hacer crecer el detalle sin límite. No afecta
-#: al veredicto: la clase ya está decidida con la primera marca.
+#: Máximo de marcas, dimensiones y tecnologías no reconocidas que el veredicto enumera.
 MAX_CHANGE_MATCHES: Final[int] = 12
 
 #: Caracteres máximos de cada marca citada en el detalle.
 CHANGE_MATCH_CHARS: Final[int] = 80
 
+#: Longitud mínima de una palabra para considerarla señal léxica.
+MIN_TOKEN_CHARS: Final[int] = 3
+
 
 class ReplanChangeClass(StrEnum):
     """Clase de cambio que el motor deriva de una propuesta.
 
-    ``TACTICAL_ALLOWED`` es la única que se puede adoptar en autonomía; cualquier otra exige una
-    persona, porque cambia algo que el contrato del proyecto no autorizó a reescribir.
+    ``TACTICAL_PROVEN`` es la única que se adopta en autonomía: es la única que el motor puede
+    **demostrar**. Cualquier otra exige una persona, y ``UNKNOWN_OR_AMBIGUOUS`` es el veredicto por
+    defecto cuando la demostración no se puede completar.
     """
 
-    TACTICAL_ALLOWED = "TACTICAL_ALLOWED"
-    ARCHITECTURE_CHANGE = "ARCHITECTURE_CHANGE"
-    AUTH_MODEL_CHANGE = "AUTH_MODEL_CHANGE"
+    TACTICAL_PROVEN = "TACTICAL_PROVEN"
     DATASTORE_CHANGE = "DATASTORE_CHANGE"
+    AUTH_MODEL_CHANGE = "AUTH_MODEL_CHANGE"
     DEPLOYMENT_CHANGE = "DEPLOYMENT_CHANGE"
-    BUSINESS_RULE_CHANGE = "BUSINESS_RULE_CHANGE"
     PROVIDER_CHANGE = "PROVIDER_CHANGE"
+    BUSINESS_RULE_CHANGE = "BUSINESS_RULE_CHANGE"
+    ARCHITECTURE_CHANGE = "ARCHITECTURE_CHANGE"
     UNKNOWN_HIGH_IMPACT = "UNKNOWN_HIGH_IMPACT"
+    UNKNOWN_OR_AMBIGUOUS = "UNKNOWN_OR_AMBIGUOUS"
 
     @property
     def is_tactical(self) -> bool:
-        """``True`` solo para la clase que el motor puede adoptar sin persona."""
-        return self is ReplanChangeClass.TACTICAL_ALLOWED
+        """``True`` solo para la clase **demostrada** táctica."""
+        return self is ReplanChangeClass.TACTICAL_PROVEN
 
     @property
     def requires_human(self) -> bool:
         """``True`` si la clase está por encima de lo táctico y exige autorización humana."""
         return not self.is_tactical
 
+    @property
+    def is_high_impact(self) -> bool:
+        """``True`` si la clase nombra un cambio de diseño concreto."""
+        return self in _HIGH_IMPACT_CLASSES
+
+    @property
+    def is_ambiguous(self) -> bool:
+        """``True`` si el motor no pudo demostrar ni el cambio ni la tacticidad."""
+        return self is ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS
+
+
+#: Clases que nombran un cambio de diseño concreto (frente a la ambigüedad).
+_HIGH_IMPACT_CLASSES: Final[frozenset[ReplanChangeClass]] = frozenset(
+    {
+        ReplanChangeClass.DATASTORE_CHANGE,
+        ReplanChangeClass.AUTH_MODEL_CHANGE,
+        ReplanChangeClass.DEPLOYMENT_CHANGE,
+        ReplanChangeClass.PROVIDER_CHANGE,
+        ReplanChangeClass.BUSINESS_RULE_CHANGE,
+        ReplanChangeClass.ARCHITECTURE_CHANGE,
+        ReplanChangeClass.UNKNOWN_HIGH_IMPACT,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ReplanChangeClassification:
-    """Veredicto determinista: la clase de cambio, sus marcas y el motivo legible."""
+    """Veredicto determinista: clase, prueba de tacticidad y hechos que la sostienen.
+
+    ``proof`` no es decorativo: es la lista de hechos que el motor **verificó** para poder declarar
+    ``TACTICAL_PROVEN``. Si la lista no está completa, la clase no puede ser táctica, y esa es la
+    diferencia entre demostrar y no encontrar marcas conocidas.
+    """
 
     change_class: ReplanChangeClass
     detail: str
     matches: tuple[str, ...] = ()
+    dimensions: tuple[str, ...] = ()
+    unknown_tokens: tuple[str, ...] = ()
+    proof: tuple[str, ...] = ()
 
     @property
     def is_tactical(self) -> bool:
-        """``True`` si el cambio es táctico y puede seguir el camino autónomo."""
+        """``True`` si el cambio es táctico **demostrado** y puede seguir el camino autónomo."""
         return self.change_class.is_tactical
 
     @property
@@ -106,162 +146,299 @@ class ReplanChangeClassification:
         return f"REPLAN_CHANGE_{self.change_class.value}"
 
 
-#: Verbos de cambio: lo que convierte una mención en una **sustitución**.
-_CHANGE_VERB: Final[str] = (
-    r"(?:replace|replacing|replacement|swap|swapping|migrat\w*|move|moving|port|porting|rewrite|"
-    r"rewriting|redesign\w*|re-?architect\w*|change|changing|switch\w*|convert\w*|drop|rework\w*|"
-    r"sustitu\w*|reempla\w*|cambia\w*|migra\w*|mover|reescrib\w*|redise\w*|rehacer|reconver\w*|"
-    r"rehacer)"
+#: Patrones genéricos de **intención de sustitución**. No son marcas de producto: describen que la
+#: propuesta propone cambiar algo por otra cosa, y por eso solo son peligrosos cuando el objeto del
+#: cambio pertenece a una dimensión de arquitectura.
+_CHANGE_INTENT: Final[str] = (
+    r"\b(?:replace|replacing|replacement|swap\w*|exchange|migrat\w*|move|moving|"
+    r"port|ports|ported|porting|"
+    r"switch\w*|convert\w*|transition\w*|adopt\w*|introduc\w*|instead of|in place of|"
+    r"rather than|change|changes|changed|changing|modif\w*|updat\w*|revis\w*|"
+    r"alter|alters|altered|altering|"
+    r"rework\w*|redefin\w*|restructur\w*|reorganiz\w*|re-?architect\w*|rewrite|rewriting|"
+    r"reimplement\w*|redesign\w*|upgrade to|drop|"
+    r"sustitu\w*|reempla\w*|cambia\w*|migra\w*|mover|mueve|adopta\w*|introduc\w*|"
+    r"en lugar de|en vez de|reescrib\w*|redise\w*|rehacer|anadir|añadir|incorpora\w*)\b"
 )
 
-#: Motores de datos conocidos: dos distintos en el mismo campo es un cambio de motor.
-_DATASTORE_ENGINES: Final[tuple[str, ...]] = (
-    "postgres",
-    "postgresql",
-    "mysql",
-    "mariadb",
-    "sqlite",
-    "oracle",
-    "sql server",
-    "mongodb",
-    "mongo",
-    "dynamodb",
-    "cassandra",
-    "redis",
-    "neo4j",
-    "elasticsearch",
-    "nosql",
-)
-
-#: Proveedores de modelo conocidos: dos distintos, o uno con verbo de cambio, es un cambio de
-#: proveedor (lo que la fase prohíbe expresamente).
-_PROVIDERS: Final[tuple[str, ...]] = (
-    "deepseek",
-    "anthropic",
-    "claude",
-    "openai",
-    "gpt",
-    "gemini",
-    "mistral",
-    "llama",
-    "bedrock",
-    "vertex",
-    "azure openai",
-)
-
-#: Patrones por clase, en el orden en que se evalúan (el más específico primero).
-#:
-#: Cada patrón se aplica sobre el texto **normalizado** (minúsculas y sin acentos) de un campo
-#: acotado. El orden fija la clase que gana cuando varias coinciden: «Replace deployment
-#: architecture» es un cambio de despliegue antes que uno de arquitectura, y así el informe dice lo
-#: más específico que el motor pudo demostrar.
-_HIGH_IMPACT_PATTERNS: Final[tuple[tuple[ReplanChangeClass, tuple[str, ...]], ...]] = (
+#: Conceptos genéricos por dimensión. Es vocabulario de **concepto**, no de producto: «motor»,
+#: «almacén», «identidad», «alojamiento»… Un nombre de marca nuevo no necesita estar aquí para que
+#: la frontera funcione; lo que hace que la frontera funcione es que la sustitución de un concepto
+#: de arquitectura exige prueba de compatibilidad con el baseline.
+_DIMENSIONS: Final[tuple[tuple[str, ReplanChangeClass, tuple[str, ...]], ...]] = (
     (
+        "datastore",
         ReplanChangeClass.DATASTORE_CHANGE,
         (
-            r"\b(?:datastore|data store|database engine|database architecture|persistence strategy|"
-            r"motor de base de datos|arquitectura de base de datos|estrategia de persistencia|"
-            r"almacen de datos)\b",
-            r"\b(?:sql|relacional|relational)\b[^.]{0,40}\b(?:to|a|por|hacia)\b[^.]{0,40}"
-            r"\b(?:nosql|no sql|documental|document)\b",
-            rf"{_CHANGE_VERB}\b[^.]{{0,60}}\b(?:database|base de datos|datastore|persistencia)\b",
+            r"\b(?:database|databases|datastore|data store|db engine|database engine|"
+            r"relational engine|storage engine|storage backend|persistence backend|"
+            r"persistence layer|persistence|sql|nosql|no sql|schema|records|tables|"
+            r"almacen de datos|base de datos|motor relacional|motor de datos|"
+            r"capa de persistencia|persistencia|esquema|registros|tablas|cache)\b",
         ),
     ),
     (
+        "identity",
         ReplanChangeClass.AUTH_MODEL_CHANGE,
         (
-            r"\b(?:auth|authentication|authorization|autenticacion|autorizacion)\b[^.]{0,40}"
-            r"\b(?:architecture|architectural|model|scheme|strategy|provider|flow|tenant|"
-            r"arquitectura|modelo|esquema|estrategia|proveedor|flujo)\b",
-            r"\b(?:architecture|architectural|model|scheme|strategy|arquitectura|modelo|esquema|"
-            r"estrategia)\b[^.]{0,40}"
-            r"\b(?:auth|authentication|authorization|autenticacion|autorizacion|oauth|sso|jwt|saml)\b",
-            r"\b(?:oauth|sso|saml|jwt|identity provider|proveedor de identidad)\b",
-            rf"{_CHANGE_VERB}\b[^.]{{0,40}}"
-            r"\b(?:auth|authentication|authorization|autenticacion|autorizacion|login|sesion)\b",
+            r"\b(?:auth|authentication|authorization|identity|identity service|identity system|"
+            r"identity provider|login|session|sessions|oauth|oidc|sso|jwt|saml|rbac|permissions|"
+            r"autenticacion|autorizacion|identidad|servicio de identidad|proveedor de identidad|"
+            r"sesion|sesiones|permisos)\b",
         ),
     ),
     (
+        "deployment",
         ReplanChangeClass.DEPLOYMENT_CHANGE,
         (
-            r"\b(?:deploy\w*|despliegue|desplegar|kubernetes|k8s|helm|terraform|docker[- ]compose|"
-            r"serverless|infrastructure as code|infraestructura como codigo)\b[^.]{0,40}"
-            r"\b(?:architecture|architectural|platform|strategy|target|topology|arquitectura|"
-            r"plataforma|estrategia|destino|topologia)\b",
-            r"\b(?:architecture|architectural|platform|strategy|arquitectura|plataforma|estrategia)"
-            r"\b[^.]{0,40}\b(?:deploy\w*|despliegue|kubernetes|k8s|terraform|serverless)\b",
-            rf"{_CHANGE_VERB}\b[^.]{{0,40}}\b(?:deploy\w*|despliegue|hosting|alojamiento)\b",
+            r"\b(?:deploy|deploys|deployment|hosting|host|platform|platforms|runtime platform|"
+            r"infrastructure|cloud|kubernetes|k8s|containers|orchestration|serverless|region|"
+            r"topology|ci/cd|server|servers|cluster|despliegue|desplegar|alojamiento|plataforma|"
+            r"infraestructura|nube|contenedores|orquestacion|servidor|servidores|topologia)\b",
         ),
     ),
     (
+        "integration",
         ReplanChangeClass.PROVIDER_CHANGE,
         (
-            r"\b(?:provider|proveedor|model provider|proveedor de modelo|proveedor de ia)\b"
-            r"[^.]{0,40}\b(?:replace\w*|swap\w*|migrat\w*|change|switch\w*|sustitu\w*|reempla\w*|"
-            r"cambia\w*)\b",
-            r"\b(?:replace\w*|swap\w*|migrat\w*|change|switch\w*|sustitu\w*|reempla\w*|cambia\w*)"
-            r"\b[^.]{0,40}\b(?:provider|proveedor|model provider|proveedor de modelo)\b",
+            r"\b(?:integration|integrations|external service|provider|providers|vendor|"
+            r"third party|third-party|gateway|api gateway|sdk|broker|queue|messaging|webhook|"
+            r"message bus|model provider|integracion|integraciones|servicio externo|proveedor|"
+            r"proveedores|terceros|pasarela|cola|mensajeria)\b",
         ),
     ),
     (
-        ReplanChangeClass.BUSINESS_RULE_CHANGE,
-        (
-            r"\b(?:business rules?|reglas? de negocio|business model|modelo de negocio|"
-            r"business logic|logica de negocio|domain model|modelo de dominio|pricing|"
-            r"billing|facturacion|monetization|monetizacion|contrato comercial)\b",
-        ),
-    ),
-    (
+        "architecture",
         ReplanChangeClass.ARCHITECTURE_CHANGE,
         (
-            r"\b(?:architecture|architectural|arquitectura|arquitectonico)\b",
-            r"\b(?:tech stack|technology stack|stack tecnologico|monolith|monolito|microservice\w*|"
-            r"microservicio\w*|re-?architect\w*)\b",
-            rf"{_CHANGE_VERB}\b[^.]{{0,40}}\b(?:stack|framework|monolito|monolith)\b",
+            r"\b(?:architecture|architectural|component|components|module|modules|service|"
+            r"services|layer|layers|boundary|boundaries|monolith|microservice|microservices|"
+            r"stack|framework|frameworks|pattern|patterns|arquitectura|arquitectonico|"
+            r"componente|componentes|modulo|modulos|servicio|servicios|capa|capas|frontera|"
+            r"monolito|microservicio|microservicios|patron|patrones)\b",
         ),
     ),
     (
-        ReplanChangeClass.UNKNOWN_HIGH_IMPACT,
+        "business",
+        ReplanChangeClass.BUSINESS_RULE_CHANGE,
         (
-            r"\b(?:security architecture|arquitectura de seguridad|persistence|persistencia|"
-            r"storage strategy|estrategia de almacenamiento|data model|modelo de datos|"
-            r"schema migration|migracion de esquema|topology|topologia|platform migration|"
-            r"migracion de plataforma)\b",
-            rf"{_CHANGE_VERB}\b[^.]{{0,40}}\b(?:infrastructure|infraestructura|persistence|"
-            r"persistencia|security|seguridad)\b",
+            r"\b(?:business rules?|business rule|business model|business logic|domain model|"
+            r"pricing|billing|invoicing|monetization|reglas? de negocio|modelo de negocio|"
+            r"logica de negocio|modelo de dominio|facturacion|monetizacion|tarifas|precios)\b",
         ),
     ),
 )
 
+#: Aceleradores: marcas conocidas que **afinan el nombre** de la clase. Nunca son la frontera: una
+#: marca que no esté aquí cae igual —por dimensión o por forma del nombre— y una que esté aquí no
+#: autoriza nada por sí sola.
+_KNOWN_BRANDS: Final[tuple[tuple[str, str], ...]] = (
+    ("postgres", "datastore"),
+    ("postgresql", "datastore"),
+    ("mysql", "datastore"),
+    ("mariadb", "datastore"),
+    ("sqlite", "datastore"),
+    ("oracle", "datastore"),
+    ("sql server", "datastore"),
+    ("mongodb", "datastore"),
+    ("mongo", "datastore"),
+    ("dynamodb", "datastore"),
+    ("cassandra", "datastore"),
+    ("redis", "datastore"),
+    ("neo4j", "datastore"),
+    ("elasticsearch", "datastore"),
+    ("cockroachdb", "datastore"),
+    ("surrealdb", "datastore"),
+    ("planetscale", "datastore"),
+    ("supabase", "datastore"),
+    ("firebase", "datastore"),
+    ("turso", "datastore"),
+    ("neon", "datastore"),
+    ("auth0", "identity"),
+    ("okta", "identity"),
+    ("keycloak", "identity"),
+    ("cognito", "identity"),
+    ("clerk", "identity"),
+    ("vercel", "deployment"),
+    ("netlify", "deployment"),
+    ("heroku", "deployment"),
+    ("fly.io", "deployment"),
+    ("railway", "deployment"),
+    ("render", "deployment"),
+    ("deepseek", "integration"),
+    ("anthropic", "integration"),
+    ("claude", "integration"),
+    ("openai", "integration"),
+    ("gemini", "integration"),
+    ("mistral", "integration"),
+    ("bedrock", "integration"),
+    ("vertex", "integration"),
+)
 
-#: Prioridad determinista de las clases: el índice del patrón decide cuál manda cuando varias
-#: coinciden. Lo más específico primero (un cambio de motor de datos es un cambio de datos antes que
-#: de arquitectura), y lo indeterminado al final.
-_CLASS_PRIORITY: Final[dict[ReplanChangeClass, int]] = {
-    change_class: index for index, (change_class, _) in enumerate(_HIGH_IMPACT_PATTERNS)
-}
+#: Palabras que **no** son señal de tecnología aunque se escriban con mayúscula inicial o contengan
+#: dígitos: es un filtro de ruido para que el detector de nombres propios no marque cada sustantivo
+#: en inglés del encargo. No es la frontera —lo que no se reconoce cae igual en ambiguo si aparece
+#: junto a una dimensión o a una intención de sustitución—, sino el cepillo que evita falsos
+#: positivos groseros sobre texto corriente.
+_GENERIC_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "add",
+        "alternative",
+        "anadir",
+        "approach",
+        "archivo",
+        "alcance",
+        "build",
+        "change",
+        "check",
+        "clase",
+        "code",
+        "config",
+        "conservar",
+        "contract",
+        "contrato",
+        "criterio",
+        "criteria",
+        "criterion",
+        "current",
+        "deterministic",
+        "documentation",
+        "ejecutar",
+        "es",
+        "este",
+        "existing",
+        "fichero",
+        "file",
+        "files",
+        "fix",
+        "funcion",
+        "function",
+        "helper",
+        "implementation",
+        "issue",
+        "javascript",
+        "mantener",
+        "nodo",
+        "nodos",
+        "node",
+        "nodes",
+        "objective",
+        "objetivo",
+        "paso",
+        "pasos",
+        "plan",
+        "preparar",
+        "prerrequisito",
+        "proceso",
+        "project",
+        "proyecto",
+        "prueba",
+        "python",
+        "readme",
+        "reintentar",
+        "reparacion",
+        "resultado",
+        "retry",
+        "revision",
+        "riesgo",
+        "risk",
+        "run",
+        "same",
+        "scope",
+        "software",
+        "hardware",
+        "step",
+        "steps",
+        "strategy",
+        "estrategia",
+        "tarea",
+        "tareas",
+        "task",
+        "tasks",
+        "test",
+        "tests",
+        "the",
+        "utility",
+        "validacion",
+        "verificacion",
+        "verificar",
+        "verify",
+        "workflow",
+    }
+)
+
+#: Sufijos y formas que delatan un nombre de tecnología sin conocer la marca.
+#:
+#: La **forma** es la parte que no depende de ninguna lista: un nombre con mayúscula interna
+#: (``CockroachDB``, ``SurrealDB``), con dígitos (``ExampleDB9000``), con dominio (``Fly.io``) o con
+#: jerga tecnológica (``…db``, ``…sql``, ``…cloud``) es un candidato a tecnología aunque nadie lo
+#: haya catalogado. Una palabra capitalizada suelta (``Clerk``, ``Vercel``) también lo es: es la
+#: forma más común de un nombre de producto, y detectarla es lo que evita que «Use Clerk» pase por
+#: táctico solo porque no aparece ninguna palabra de dimensión.
+_PRODUCT_FORMS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"[a-z][A-Z]"),
+    re.compile(r"\d"),
+    re.compile(r"\.(?:io|ai|com|dev|cloud|co|net|org|sh|xyz)\b"),
+    re.compile(r"(?:db|sql|cloud|hub|stack|api|sdk|ops|kit|box|flow|ware)$"),
+    re.compile(r"^[A-Z][a-z]+$"),
+)
+
+#: Identificadores del proyecto (``AC-1``, ``R-2``, ``N4``): no son tecnologías, son nombres de
+#: criterio o de paso.
+_IDENTIFIER_FORM: Final[re.Pattern[str]] = re.compile(r"^[A-Z]{1,4}-?\d+$")
+
+#: Extensiones de archivo y marcas de ruta que **no** son nombres de tecnología.
+#:
+#: Un criterio de aceptación que habla de ``app.py`` no introduce ninguna tecnología: es un archivo
+#: del proyecto. Sin esta exclusión, cada ruta con extensión de dos o tres letras se leería como un
+#: nombre propio desconocido y cualquier propuesta táctica quedaría ambigua.
+_FILE_SUFFIXES: Final[frozenset[str]] = frozenset(
+    {
+        "bat",
+        "cfg",
+        "cpp",
+        "cs",
+        "css",
+        "csv",
+        "env",
+        "go",
+        "h",
+        "html",
+        "ini",
+        "java",
+        "js",
+        "json",
+        "jsx",
+        "lock",
+        "md",
+        "ps1",
+        "py",
+        "rb",
+        "rs",
+        "sh",
+        "sql",
+        "toml",
+        "ts",
+        "tsx",
+        "txt",
+        "xml",
+        "yaml",
+        "yml",
+    }
+)
+
+_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.+@-]+")
 
 
 def _normalize(text: str) -> str:
-    """Texto comparable: minúsculas, sin acentos y con espacios colapsados.
-
-    La normalización existe para que los patrones sean estables en español y en inglés sin duplicar
-    cada variante acentuada, y para que un texto con saltos de línea no rompa una ventana de
-    proximidad.
-    """
+    """Texto comparable: minúsculas, sin acentos y con espacios colapsados."""
     decomposed = unicodedata.normalize("NFKD", text.casefold())
     plain = "".join(char for char in decomposed if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", plain).strip()
 
 
 def _fields(proposal: ProjectReplanProposal) -> tuple[tuple[str, str], ...]:
-    """Campos acotados que el motor inspecciona, con su nombre para el motivo.
-
-    Es la superficie entera de la propuesta que puede describir un cambio: el título, el objetivo
-    y los criterios de cada nodo nuevo, y el motivo de cada operación, más el resultado esperado. No
-    se inspecciona ningún texto libre adicional —no existe en el contrato de la propuesta— ni nada
-    que el modelo pueda hacer crecer por encima de las cotas del esquema.
-    """
+    """Campos acotados que el motor inspecciona, con su nombre para el motivo."""
     items: list[tuple[str, str]] = []
     for operation in proposal.operations:
         if operation.reason:
@@ -286,34 +463,136 @@ def _spec_fields(spec: ReplanNodeSpec) -> tuple[tuple[str, str], ...]:
     return tuple(items)
 
 
-def _distinct_mentions(text: str, needles: Sequence[str]) -> tuple[str, ...]:
-    """Marcas distintas de la lista que aparecen en el texto, en el orden de la lista."""
-    return tuple(needle for needle in needles if re.search(rf"\b{re.escape(needle)}\b", text))
+def _dimensions_in(text: str) -> tuple[str, ...]:
+    """Dimensiones de arquitectura que el texto menciona, en el orden declarado."""
+    return tuple(
+        name
+        for name, _, concepts in _DIMENSIONS
+        if any(re.search(concept, text) for concept in concepts)
+    )
 
 
-def _engine_swap(text: str, needles: Sequence[str]) -> tuple[str, ...]:
-    """Marcas de un cambio de motor: dos distintos en el campo, o uno con verbo de cambio.
+def _has_change_intent(text: str) -> bool:
+    """``True`` si el texto propone sustituir, migrar, adoptar o introducir algo."""
+    return bool(re.search(_CHANGE_INTENT, text))
 
-    La distinción es deliberada: mencionar un motor no es cambiarlo —una tarea táctica puede tocar
-    una consulta—, pero proponer **dos** motores en el mismo campo, o uno junto a un verbo de
-    sustitución, es un cambio de motor.
+
+def _brands_in(text: str) -> tuple[tuple[str, str], ...]:
+    """Marcas conocidas presentes en el texto, con su dimensión."""
+    return tuple(
+        (brand, dimension)
+        for brand, dimension in _KNOWN_BRANDS
+        if re.search(rf"\b{re.escape(brand)}\b", text)
+    )
+
+
+def _looks_like_product(token: str) -> bool:
+    """``True`` si el token tiene **forma** de nombre de tecnología, sin conocer la marca."""
+    if len(token) < MIN_TOKEN_CHARS or token.casefold() in _GENERIC_WORDS:
+        return False
+    if "/" in token or "\\" in token:
+        return False
+    if _IDENTIFIER_FORM.match(token):
+        return False
+    if token.rsplit(".", 1)[-1].casefold() in _FILE_SUFFIXES:
+        return False
+    return any(form.search(token) for form in _PRODUCT_FORMS)
+
+
+def _technology_tokens(text: str) -> tuple[str, ...]:
+    """Tokens con forma de tecnología, sin repetir y conservando el orden.
+
+    El primer token de cada campo se descarta como candidato: en una frase en inglés o en español la
+    primera palabra va en mayúscula por ortografía, no por ser un nombre propio, y marcarla sería
+    ruido constante.
     """
-    found = _distinct_mentions(text, needles)
-    if len(found) >= 2:
-        return found
-    if found and re.search(rf"{_CHANGE_VERB}\b", text):
-        return found
-    return ()
+    tokens = _TOKEN_PATTERN.findall(text)
+    found: list[str] = []
+    for index, token in enumerate(tokens):
+        if index == 0:
+            continue
+        if _looks_like_product(token) and token not in found:
+            found.append(token)
+    return tuple(found)
 
 
-def _semantic_matches(text: str) -> tuple[ReplanChangeClass, tuple[str, ...]] | None:
-    """Primera clase de alto impacto que el texto demuestra, con sus marcas."""
-    for change_class, patterns in _HIGH_IMPACT_PATTERNS:
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match is not None:
-                return change_class, (match.group(0)[:CHANGE_MATCH_CHARS],)
-    return None
+def _baseline_tokens(contract: ProjectContract) -> frozenset[str]:
+    """Vocabulario del baseline de arquitectura, normalizado, para comparar propuestas.
+
+    Incluye los tokens del texto de cada campo y las palabras del vocabulario genérico que el
+    baseline contiene: un almacén ``postgres`` autoriza a hablar de «postgres», y un estilo
+    ``monolito modular`` autoriza a hablar de «monolito».
+    """
+    material = " ".join(
+        [
+            contract.architecture_fingerprint,
+            contract.architecture_style,
+            contract.architecture_deployment,
+            *contract.architecture_components,
+            *contract.architecture_services,
+            *contract.architecture_data_stores,
+            *contract.architecture_integrations,
+            *contract.architecture_interfaces,
+            *contract.architecture_security,
+            *contract.architecture_technology,
+        ]
+    )
+    normalized = _normalize(material)
+    tokens = {
+        token
+        for token in _TOKEN_PATTERN.findall(normalized)
+        if len(token) >= MIN_TOKEN_CHARS
+    }
+    return frozenset(tokens)
+
+
+def _structural_proof(
+    proposal: ProjectReplanProposal, contract: ProjectContract
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Hechos estructurales verificados y los que **no** se pudieron verificar.
+
+    Devuelve ``(probados, fallos)``. Cada hecho es una frase legible: la prueba de tacticidad tiene
+    que poder leerse y discutirse, no ser un booleano opaco.
+    """
+    proven: list[str] = []
+    failures: list[str] = []
+    scope = set(contract.authorized_scope)
+    criterion_ids = set(contract.acceptance_criterion_ids)
+    for operation in proposal.operations:
+        proven.append(f"operacion {operation.index} declarada ({operation.kind.value})")
+    for operation in proposal.operations:
+        for spec in operation.nodes:
+            outside = tuple(path for path in spec.allowed_files if scope and path not in scope)
+            if outside:
+                failures.append(
+                    f"el nodo {spec.label!r} escribe fuera del alcance autorizado del contrato "
+                    f"({', '.join(outside)})"
+                )
+            else:
+                proven.append(f"alcance del nodo {spec.label!r} dentro del contrato")
+            invented = tuple(
+                item for item in spec.acceptance_criterion_ids if item not in criterion_ids
+            )
+            if invented:
+                failures.append(
+                    f"el nodo {spec.label!r} declara criterios que el contrato no tiene "
+                    f"({', '.join(invented)})"
+                )
+            else:
+                proven.append(f"criterios del nodo {spec.label!r} son del contrato")
+            if spec.risk > contract.risk_ceiling:
+                failures.append(
+                    f"el nodo {spec.label!r} sube el riesgo por encima del techo del contrato"
+                )
+            else:
+                proven.append(f"riesgo del nodo {spec.label!r} dentro del techo")
+            if spec.authority > contract.authority_ceiling:
+                failures.append(
+                    f"el nodo {spec.label!r} sube la autoridad por encima del techo del contrato"
+                )
+            else:
+                proven.append(f"autoridad del nodo {spec.label!r} dentro del techo")
+    return tuple(proven), tuple(failures)
 
 
 def classify_replan_change(
@@ -322,31 +601,37 @@ def classify_replan_change(
     contract: ProjectContract,
     action: str = "",
 ) -> ReplanChangeClassification:
-    """Deriva, **en el motor**, la clase de cambio de una propuesta de replanificación.
+    """Deriva, **en el motor**, si una propuesta está **demostrada** táctica (F632-01).
 
-    El orden de las evidencias es el de la fuerza:
+    El orden de las comprobaciones es el de la fuerza, y el resultado por defecto es exigir una
+    persona:
 
-    1. **Evidencia estructurada del motor**: el impacto de la acción declarada del proyecto, que
-       sale de la tabla del catálogo —no de la propuesta—; una acción con impacto en producción,
-       legal o de negocio no es un cambio táctico, venga como venga el texto;
-    2. **Evidencia estructurada de la propuesta**: dos motores de datos distintos, o dos proveedores
-       distintos, propuestos en el mismo campo;
-    3. **Guardia semántica conservadora** sobre los campos acotados de la propuesta (título,
-       objetivo, criterios, motivo de operación y resultado esperado), con los patrones estables de
-       este módulo.
-
-    Un texto que no demuestra ninguna de las clases de alto impacto se declara ``TACTICAL_ALLOWED``:
-    la ausencia de marcas no es una autorización —el guard, el contrato y la política siguen
-    juzgando—, sino la constatación de que el motor no encontró un cambio de diseño en lo que se le
-    propone.
+    1. **Reglas de negocio**: el contrato del proyecto *es* el contrato de negocio; una propuesta
+       que
+       hable de reglas, modelo o lógica de negocio no es táctica, la mencione como la mencione;
+    2. **Dimensión + intención de cambio**: sustituir, migrar, mover, adoptar o introducir un
+       concepto de arquitectura —motor, almacén, identidad, alojamiento, plataforma, integración,
+       componente, marco de trabajo— es un cambio de diseño, aunque el nombre del producto sea
+       desconocido y aunque el Planner lo declare ``LOW``;
+    3. **Marca conocida**: si además aparece una marca del catálogo, la clase se nombra con su
+       dimensión (acelerador, nunca frontera);
+    4. **Tecnología no reconocida**: un nombre con forma de tecnología que el baseline no contiene
+       —o cualquiera, si el baseline no se pudo resolver— deja el caso en ``UNKNOWN_OR_AMBIGUOUS``:
+       el motor no puede demostrar que esté dentro del diseño;
+    5. **Hechos estructurales**: alcance, criterios, riesgo y autoridad de cada nodo nuevo tienen
+       que
+       caber en el contrato congelado; si no, tampoco hay prueba de tacticidad;
+    6. **Tacticidad demostrada**: sin cambio de dimensión, sin tecnología ajena y con la estructura
+       probada, la propuesta es ``TACTICAL_PROVEN``.
 
     Args:
         proposal: Propuesta tipada del Planner, con sus textos acotados.
-        contract: Contrato inmutable del proyecto, para el motivo legible.
-        action: Acción canónica del proyecto, si se conoce; su impacto se consulta al catálogo.
+        contract: Contrato inmutable del proyecto, con su baseline de arquitectura.
+        action: Acción canónica del proyecto; su impacto se consulta al catálogo del motor.
 
     Returns:
-        La clase de cambio con su motivo y las marcas que la demuestran.
+        La clase de cambio con su motivo, sus marcas, las dimensiones tocadas, las tecnologías no
+        reconocidas y la prueba de tacticidad.
     """
     impact = action_impact(action) if action else None
     if impact is not None and (impact.production or impact.legal or impact.business):
@@ -359,89 +644,205 @@ def classify_replan_change(
             (f"accion={action}",),
         )
     matches: list[str] = []
-    found: dict[ReplanChangeClass, list[str]] = {}
+    dimensions: list[str] = []
+    unknown: list[str] = []
+    high_impact: dict[ReplanChangeClass, list[str]] = {}
+    known_brands: list[tuple[str, str]] = []
+    baseline = _baseline_tokens(contract)
     for name, text in _fields(proposal):
         if not text.strip():
             continue
         normalized = _normalize(text)
-        swap = _engine_swap(normalized, _DATASTORE_ENGINES)
-        if len(swap) >= 2:
-            candidate, marks = ReplanChangeClass.DATASTORE_CHANGE, swap
-        else:
-            providers = _engine_swap(normalized, _PROVIDERS)
-            if len(providers) >= 2:
-                candidate, marks = ReplanChangeClass.PROVIDER_CHANGE, providers
-            else:
-                semantic = _semantic_matches(normalized)
-                if semantic is None:
-                    continue
-                candidate, marks = semantic
-        found.setdefault(candidate, []).extend(f"{name}: {mark}" for mark in marks)
-        if sum(len(items) for items in found.values()) >= MAX_CHANGE_MATCHES:
-            break
-    if not found:
+        intent = _has_change_intent(normalized)
+        touched = _dimensions_in(normalized)
+        for dimension in touched:
+            if dimension not in dimensions:
+                dimensions.append(dimension)
+        known_brands.extend(_brands_in(normalized) if intent else ())
+        if intent:
+            for _, dimension in _brands_in(normalized):
+                if dimension not in dimensions:
+                    dimensions.append(dimension)
+        for token in _technology_tokens(text):
+            normalized_token = _normalize(token)
+            if normalized_token not in baseline and token not in unknown:
+                unknown.append(token)
+        for dimension in touched:
+            if not intent:
+                continue
+            target = _class_of_dimension(dimension)
+            entry = high_impact.setdefault(target, [])
+            if len(entry) < MAX_CHANGE_MATCHES:
+                entry.append(f"{name}: {dimension}")
+        if "business" in touched:
+            entry = high_impact.setdefault(ReplanChangeClass.BUSINESS_RULE_CHANGE, [])
+            if not entry:
+                entry.append(f"{name}: reglas de negocio")
+    for brand, dimension in known_brands:
+        target = _class_of_dimension(dimension)
+        entry = high_impact.setdefault(target, [])
+        if len(entry) < MAX_CHANGE_MATCHES:
+            entry.append(f"marca conocida: {brand}")
+    if high_impact:
+        ordered = sorted(high_impact, key=lambda item: _CLASS_PRIORITY[item])
+        chosen = ordered[0]
+        for candidate in ordered:
+            matches.extend(high_impact[candidate])
+        bounded = tuple(matches[:MAX_CHANGE_MATCHES])
         return ReplanChangeClassification(
-            ReplanChangeClass.TACTICAL_ALLOWED,
+            chosen,
             (
-                f"la propuesta no cambia el diseño del proyecto {contract.original_goal[:80]!r}: "
-                "ninguna marca de cambio de arquitectura, datos, autenticación, despliegue, "
-                "proveedor o reglas de negocio"
+                f"la propuesta cambia {chosen.value} fuera de lo táctico ({len(bounded)} "
+                "marca(s)): el contrato del proyecto no autoriza reescribir el diseño en autonomía"
             ),
+            bounded,
+            tuple(dimensions),
+            tuple(unknown[:MAX_CHANGE_MATCHES]),
         )
-    # La clase que manda es la más específica según el orden fijo de patrones, **no** la que
-    # aparezca en el primer campo: así el veredicto no depende de si el modelo escribió la
-    # sustitución en el título o en el objetivo.
-    ordered = sorted(found, key=lambda item: _CLASS_PRIORITY[item])
-    found_class = ordered[0]
-    for candidate in ordered:
-        matches.extend(found[candidate])
-    bounded = tuple(matches[:MAX_CHANGE_MATCHES])
+    if unknown:
+        return ReplanChangeClassification(
+            ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS,
+            (
+                f"la propuesta introduce {len(unknown)} tecnología(s) que el baseline de "
+                "arquitectura del proyecto no contiene"
+                if contract.has_architecture
+                else (
+                    "el proyecto no tiene baseline de arquitectura resuelto y la propuesta "
+                    "introduce tecnologías: el motor no puede demostrar que estén dentro del diseño"
+                )
+            ),
+            tuple(f"tecnologia no reconocida: {token}" for token in unknown[:MAX_CHANGE_MATCHES]),
+            tuple(dimensions),
+            tuple(unknown[:MAX_CHANGE_MATCHES]),
+        )
+    proven, failures = _structural_proof(proposal, contract)
+    if failures:
+        return ReplanChangeClassification(
+            ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS,
+            "la tacticidad no se puede demostrar: " + "; ".join(failures),
+            tuple(failures),
+            tuple(dimensions),
+            (),
+            proven,
+        )
     return ReplanChangeClassification(
-        found_class,
+        ReplanChangeClass.TACTICAL_PROVEN,
         (
-            f"la propuesta declara un cambio de {found_class.value} fuera de lo táctico "
-            f"({len(bounded)} marca(s)): el contrato del proyecto no autoriza reescribir el diseño "
-            "en autonomía"
+            "tacticidad demostrada: la propuesta no cambia ninguna dimensión de arquitectura, no "
+            "introduce tecnología ajena al baseline y su estructura cabe en el contrato congelado"
         ),
-        bounded,
+        (),
+        (),
+        (),
+        proven,
     )
 
 
-def change_classes_of(proposal: ProjectReplanProposal) -> tuple[str, ...]:
-    """Clases de alto impacto que la propuesta demuestra, sin decidir cuál gana.
+def _class_of_dimension(dimension: str) -> ReplanChangeClass:
+    """Clase de alto impacto que corresponde a una dimensión."""
+    for name, change_class, _ in _DIMENSIONS:
+        if name == dimension:
+            return change_class
+    return ReplanChangeClass.UNKNOWN_HIGH_IMPACT
 
-    Es la vista para la auditoría: el veredicto dice la clase que manda, y esto dice todo lo que el
-    motor vio. Se calcula con la misma guardia semántica, así que no puede discrepar del veredicto.
+
+#: Prioridad determinista entre dimensiones: lo más específico primero, lo indeterminado al final.
+_CLASS_PRIORITY: Final[dict[ReplanChangeClass, int]] = {
+    ReplanChangeClass.DATASTORE_CHANGE: 0,
+    ReplanChangeClass.AUTH_MODEL_CHANGE: 1,
+    ReplanChangeClass.DEPLOYMENT_CHANGE: 2,
+    ReplanChangeClass.PROVIDER_CHANGE: 3,
+    ReplanChangeClass.BUSINESS_RULE_CHANGE: 4,
+    ReplanChangeClass.ARCHITECTURE_CHANGE: 5,
+    ReplanChangeClass.UNKNOWN_HIGH_IMPACT: 6,
+    ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS: 7,
+    ReplanChangeClass.TACTICAL_PROVEN: 8,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Facts:
+    """Hechos acotados que el motor extrae de una propuesta, para la vista de auditoría."""
+
+    dimensions: tuple[str, ...] = ()
+    unknown_tokens: tuple[str, ...] = ()
+    brands: tuple[str, ...] = ()
+    change_intent: bool = False
+    fields: tuple[str, ...] = field(default=())
+
+
+def replan_change_facts(
+    proposal: ProjectReplanProposal, *, contract: ProjectContract | None = None
+) -> _Facts:
+    """Hechos acotados de la propuesta, para auditoría y pruebas.
+
+    Es la vista que permite explicar un veredicto sin repetir la lógica: qué dimensiones menciona,
+    qué tecnologías no reconoce el baseline, qué marcas aceleradoras aparecen y si propone sustituir
+    algo.
     """
-    found: list[str] = []
+    dimensions: list[str] = []
+    unknown: list[str] = []
+    brands: list[str] = []
+    intent = False
+    baseline = _baseline_tokens(contract) if contract is not None else frozenset()
     for _, text in _fields(proposal):
         if not text.strip():
             continue
         normalized = _normalize(text)
-        if len(_engine_swap(normalized, _DATASTORE_ENGINES)) >= 2:
-            found.append(ReplanChangeClass.DATASTORE_CHANGE.value)
-            continue
-        if len(_engine_swap(normalized, _PROVIDERS)) >= 2:
-            found.append(ReplanChangeClass.PROVIDER_CHANGE.value)
-            continue
-        semantic = _semantic_matches(normalized)
-        if semantic is not None:
-            found.append(semantic[0].value)
-    return tuple(dict.fromkeys(found))
+        for dimension in _dimensions_in(normalized):
+            if dimension not in dimensions:
+                dimensions.append(dimension)
+        if _has_change_intent(normalized):
+            intent = True
+        for brand, dimension in _brands_in(normalized):
+            if brand not in brands:
+                brands.append(brand)
+            if intent and dimension not in dimensions:
+                dimensions.append(dimension)
+        for token in _technology_tokens(text):
+            if contract is not None and _normalize(token) in baseline:
+                continue
+            if token not in unknown:
+                unknown.append(token)
+    return _Facts(
+        dimensions=tuple(dimensions),
+        unknown_tokens=tuple(unknown[:MAX_CHANGE_MATCHES]),
+        brands=tuple(brands),
+        change_intent=intent,
+        fields=tuple(name for name, _ in _fields(proposal)),
+    )
 
 
-def high_impact_labels(classes: Iterable[str]) -> str:
+def change_classes_of(
+    proposal: ProjectReplanProposal, *, contract: ProjectContract | None = None
+) -> tuple[str, ...]:
+    """Clases de alto impacto que la propuesta demuestra, para la vista de auditoría.
+
+    El veredicto elige **una** clase (la de mayor prioridad); esto enumera todo lo que el motor vio,
+    que es lo que un auditor necesita para discutir el caso. Se calcula con los mismos hechos que el
+    veredicto, así que no puede discrepar de él.
+    """
+    facts = replan_change_facts(proposal, contract=contract)
+    classes = [_class_of_dimension(dimension).value for dimension in facts.dimensions]
+    if facts.unknown_tokens:
+        classes.append(ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS.value)
+    return tuple(dict.fromkeys(classes))
+
+
+def high_impact_labels(classes: Sequence[str]) -> str:
     """Texto legible y acotado de una lista de clases, para el detalle de la decisión."""
     joined = ", ".join(sorted(dict.fromkeys(classes)))
-    return joined[:MAX_REPLAN_SHORT_CHARS]
+    return joined[:CHANGE_MATCH_CHARS * 4]
 
 
 __all__ = [
     "CHANGE_MATCH_CHARS",
     "MAX_CHANGE_MATCHES",
+    "MIN_TOKEN_CHARS",
     "ReplanChangeClass",
     "ReplanChangeClassification",
     "change_classes_of",
     "classify_replan_change",
     "high_impact_labels",
+    "replan_change_facts",
 ]

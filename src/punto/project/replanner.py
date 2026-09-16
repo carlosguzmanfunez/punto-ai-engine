@@ -61,9 +61,13 @@ from punto.project.replan import REPLAN_FINGERPRINT_CHARS, operation_touches
 from punto.schemas.enums import AuthorityLevel, RiskLevel
 from punto.schemas.planning import (
     ArchitecturePlan,
+    DataStore,
+    ExternalIntegration,
     ProjectCapabilityProfile,
     ProjectIntent,
     ProjectSpec,
+    SecurityBoundary,
+    TechnologyChoice,
 )
 from punto.schemas.replan import (
     MAX_REPLAN_OPERATION_NODES,
@@ -686,10 +690,54 @@ def _planner_request(
     )
 
 
+def _architecture_lines(contract: ProjectContract) -> list[str]:
+    """Líneas del encargo que declaran la arquitectura **congelada** (ENGINE-6.3.2, F632-01).
+
+    La replanificación es táctica: el modelo tiene que saber qué diseño no puede cambiar y con qué
+    hechos se le va a juzgar. Se imprime lo que el baseline del contrato contiene —derivado del
+    ``ArchitecturePlan`` durable, no de una síntesis vacía— y, si no se pudo resolver, se dice
+    explícitamente que no hay arquitectura demostrada, que es exactamente lo que hará que el motor
+    exija una persona ante cualquier propuesta con semántica de diseño.
+    """
+    if not contract.has_architecture:
+        return [
+            "",
+            "ARQUITECTURA CONGELADA:",
+            "- (no resuelta: no hay ArchitecturePlan durable para este proyecto; cualquier",
+            "  propuesta que introduzca o sustituya tecnología, almacén, identidad, despliegue,",
+            "  integración o componente exigirá autorización humana)",
+        ]
+    lines = ["", "ARQUITECTURA CONGELADA (no se puede cambiar en autonomía):"]
+    lines.append(f"- Estilo: {contract.architecture_style or '(sin declarar)'}")
+    if contract.architecture_data_stores:
+        lines.append(f"- Almacenes: {', '.join(contract.architecture_data_stores)}")
+    if contract.architecture_integrations:
+        lines.append(f"- Integraciones: {', '.join(contract.architecture_integrations)}")
+    if contract.architecture_security:
+        lines.append(f"- Fronteras de seguridad: {', '.join(contract.architecture_security)}")
+    if contract.architecture_services:
+        lines.append(f"- Servicios: {', '.join(contract.architecture_services)}")
+    if contract.architecture_technology:
+        lines.append(f"- Tecnología elegida: {', '.join(contract.architecture_technology)}")
+    if contract.architecture_deployment:
+        lines.append(f"- Despliegue: {contract.architecture_deployment}")
+    lines.append(
+        "- Una propuesta táctica cambia la **estrategia de implementación** de un nodo, nunca "
+        "estos hechos: si hay que cambiarlos, lo decide una persona."
+    )
+    return lines
+
+
 def _context_for(
     request: ReplanRequest, *, stamp: datetime
 ) -> tuple[ProjectIntent, ProjectSpec, ArchitecturePlan, ProjectCapabilityProfile]:
-    """Contexto determinista del Planner: intención, especificación, arquitectura y perfil."""
+    """Contexto determinista del Planner: intención, especificación, arquitectura y perfil.
+
+    La arquitectura que se le presenta al modelo **no** es una síntesis vacía: desde ENGINE-6.3.2 se
+    reconstruye desde el baseline inmutable del contrato —el ``ArchitecturePlan`` que el proyecto ya
+    aceptó— para que el Planificador trabaje sobre el diseño real y para que el motor juzgue contra
+    él. Si el baseline no se pudo resolver, el contexto lo declara vacío y sin inventar nada.
+    """
     contract = request.contract
     brief = _replan_brief(request)
     name = _project_name(request)
@@ -712,12 +760,63 @@ def _context_for(
             out_of_scope=tuple(contract.protected_paths),
             success_criteria=tuple(contract.acceptance_criteria),
         ),
-        ArchitecturePlan(
-            id=_context_id(request, "architecture"),
-            created_at=stamp,
-            architecture_style=_ARCHITECTURE_STYLE,
-        ),
+        _architecture_context(request, stamp=stamp),
         ProjectCapabilityProfile(),
+    )
+
+
+def _architecture_context(request: ReplanRequest, *, stamp: datetime) -> ArchitecturePlan:
+    """``ArchitecturePlan`` del contexto, reconstruido del baseline inmutable del contrato.
+
+    Cada campo se parsea del texto acotado que el contrato guarda (``id:nombre[:...]``) y **nada**
+    se inventa: si una entrada no se puede reconstruir con sus campos obligatorios, se omite. Un
+    contexto con la arquitectura real es lo que hace que el encargo al modelo y el juicio del motor
+    hablen del mismo diseño.
+    """
+    contract = request.contract
+    stores: list[DataStore] = []
+    for raw in contract.architecture_data_stores:
+        parts = raw.split(":")
+        if len(parts) >= 3 and parts[0] and parts[1] and parts[2]:
+            stores.append(DataStore(id=parts[0], name=parts[1], engine=parts[2]))
+    integrations: list[ExternalIntegration] = []
+    for raw in contract.architecture_integrations:
+        parts = raw.split(":")
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            integrations.append(
+                ExternalIntegration(
+                    id=parts[0],
+                    name=parts[1],
+                    protocol=parts[2] if len(parts) > 2 else "",
+                    auth=parts[3] if len(parts) > 3 else "",
+                )
+            )
+    boundaries: list[SecurityBoundary] = []
+    for raw in contract.architecture_security:
+        parts = raw.split(":", 2)
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            boundaries.append(
+                SecurityBoundary(
+                    id=parts[0],
+                    name=parts[1],
+                    description=parts[2] if len(parts) > 2 else "",
+                )
+            )
+    technology: list[TechnologyChoice] = []
+    for raw in contract.architecture_technology:
+        parts = raw.split(":", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            technology.append(TechnologyChoice(topic=parts[0], choice=parts[1]))
+    return ArchitecturePlan(
+        id=_context_id(request, "architecture"),
+        created_at=stamp,
+        architecture_style=contract.architecture_style or _ARCHITECTURE_STYLE,
+        services=tuple(contract.architecture_services),
+        data_stores=tuple(stores),
+        external_integrations=tuple(integrations),
+        security_boundaries=tuple(boundaries),
+        deployment_topology=contract.architecture_deployment,
+        technology_choices=tuple(technology),
     )
 
 
@@ -778,6 +877,7 @@ def _replan_brief(request: ReplanRequest) -> str:
         f"- Techos: riesgo <= {contract.risk_ceiling.name}, "
         f"autoridad <= {contract.authority_ceiling.name}"
     )
+    lines.extend(_architecture_lines(contract))
     lines.extend(("", "GRAFO VIGENTE:"))
     for node in request.current_nodes:
         status = "COMPLETED" if node.node_id in completed else "PENDIENTE"

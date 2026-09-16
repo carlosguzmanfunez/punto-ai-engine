@@ -70,6 +70,7 @@ class Harness:
         default: ChildOutcome | None = None,
         gate: HumanGate | None = None,
         edges: dict[str, tuple[str, ...]] | None = None,
+        architecture: object | None = None,
     ) -> None:
         self.workspace = root / "workspace"
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,7 @@ class Harness:
             workflow_id=PLAN_WORKFLOW_ID,
             task_id=PLAN_TASK_ID,
             project_id=PROJECT_ID,
+            architecture=architecture,
         )
         self.request = project_request(
             plan_ref=plan_ref,
@@ -135,6 +137,7 @@ def harness(
     default: ChildOutcome | None = None,
     gate: HumanGate | None = None,
     edges: dict[str, tuple[str, ...]] | None = None,
+    architecture: object | None = None,
 ) -> Harness:
     """Montaje de una prueba sobre su propio directorio temporal."""
     return Harness(
@@ -147,6 +150,7 @@ def harness(
         default=default,
         gate=gate,
         edges=edges,
+        architecture=architecture,
     )
 
 

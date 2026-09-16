@@ -167,8 +167,33 @@ class ProjectContract(BaseModel):
     risk_ceiling: RiskLevel = Field(default=RiskLevel.LOW)
     authority_ceiling: AuthorityLevel = Field(default=AuthorityLevel.LEVEL_0_AUTONOMOUS)
     initial_revision: str = Field(default="", max_length=64)
+    # --- Baseline de arquitectura inmutable (ENGINE-6.3.2, hallazgo F632-01) --------------------
+    #
+    # La replanificación autónoma es **táctica**: puede cambiar la estrategia de implementación de
+    # un nodo, nunca el diseño del proyecto. Para poder demostrarlo —en vez de deducirlo de la
+    # ausencia de palabras conocidas— el contrato guarda los hechos de arquitectura que se
+    # autorizaron, derivados del ``ArchitecturePlan`` durable del plan. El Planner **no** define
+    # este baseline: se deriva de lo que ya se aceptó, y no se fabrica si no se puede resolver.
+    #
+    # ``architecture_fingerprint`` vacío significa «no se pudo resolver la arquitectura original»:
+    # el motor no inventa conocimiento y toda propuesta con semántica de diseño exige una persona.
+    architecture_fingerprint: str = Field(default="", max_length=64)
+    architecture_style: str = Field(default="", max_length=MAX_REPLAN_SHORT_CHARS)
+    architecture_components: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_services: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_data_stores: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_integrations: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_interfaces: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_security: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    architecture_deployment: str = Field(default="", max_length=MAX_REPLAN_TEXT_CHARS)
+    architecture_technology: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
     contract_fingerprint: str = Field(default="", max_length=64)
     created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def has_architecture(self) -> bool:
+        """``True`` si el contrato conserva un baseline de arquitectura resuelto."""
+        return bool(self.architecture_fingerprint)
 
     def criterion_text(self, criterion_id: str) -> str:
         """Texto del criterio con esa identidad, o cadena vacía si no existe."""

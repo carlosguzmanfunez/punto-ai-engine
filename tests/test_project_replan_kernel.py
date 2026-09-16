@@ -57,6 +57,7 @@ from punto.project.workspace import (
 )
 from punto.schemas.audit import AuditEventType
 from punto.schemas.enums import TaskStatus
+from punto.schemas.planning import PlannedTask
 from punto.schemas.project import (
     ProjectBudget,
     ProjectFailureCode,
@@ -257,12 +258,14 @@ def replan_harness(
     lineage: object | None = None,
     edges: dict[str, tuple[str, ...]] | None = None,
     architecture: object | None = None,
+    tasks: tuple[PlannedTask, ...] | None = None,
 ) -> Harness:
     """Montaje de la suite: mismo doble durable de 6.2, con presupuesto de replan autorizado.
 
     ``architecture`` es opcional: cuando se declara, el plan del proyecto lleva un
     ``ArchitecturePlan`` real y el contrato deriva su baseline inmutable (ENGINE-6.3.2), que es lo
     que permite probar la frontera fail-closed contra hechos de arquitectura de verdad.
+    ``tasks`` permite declarar los nodos con sus capacidades y su alcance exactos (ENGINE-6.3.R1).
     """
     return harness(
         tmp_path,
@@ -274,6 +277,7 @@ def replan_harness(
         lineage=lineage,
         edges=edges,
         architecture=architecture,
+        tasks=tasks,
     )
 
 

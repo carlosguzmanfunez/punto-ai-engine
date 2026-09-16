@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
@@ -72,6 +73,10 @@ from punto.project.budget import (
     reserve_project_budget,
     settle_child,
     settlement_breach,
+)
+from punto.project.containment import (
+    ContainmentVerdict,
+    evaluate_replan_containment,
 )
 from punto.project.generations import (
     ProjectGenerationError,
@@ -114,6 +119,12 @@ from punto.project.replan import (
     trigger_is_valid,
 )
 from punto.project.replan_change import ReplanChangeClassification, classify_replan_change
+from punto.project.resources import (
+    ResourceSet,
+    contract_resources,
+    expansion_report,
+    resources_from_diff,
+)
 from punto.project.state_machine import ProjectStateMachine
 from punto.project.workspace import (
     ProjectRevisionMismatchError,
@@ -328,6 +339,9 @@ RECONCILIATION_REQUIRED_CODES: Final[frozenset[ProjectFailureCode]] = frozenset(
         # Una persona **rechazó** el plan: es una decisión tomada, y una reanudación genérica no
         # puede borrarla (ENGINE-6.3.1, PART Y).
         ProjectFailureCode.PROJECT_REPLAN_HUMAN_REJECTED,
+        # Una violación de arquitectura post-hoc es una frontera: no la borra una reanudación
+        # genérica ni la «arregla» una replanificación (ENGINE-6.3.R1, hermano de F621-01).
+        ProjectFailureCode.PROJECT_NODE_ARCHITECTURE_VIOLATION,
     }
 )
 
@@ -965,6 +979,20 @@ class ProjectExecutionKernel:
                 "durable del Developer: sin esa evidencia el parent no puede afirmar qué árbol ni "
                 "qué archivos produjo el nodo"
             )
+        # --- T6: verificación post-hoc de recursos observados (ENGINE-6.3.R1) ------------------
+        #
+        # Lo que la implementación **introdujo de verdad** se mide en el diff —manifiestos y
+        # configuración de infraestructura— y se compara con el envelope autorizado del nodo y del
+        # proyecto. Es la mitad que ninguna declaración del Planner puede satisfacer: aunque declare
+        # ``uses_data_stores = postgres`` y el diff añada un driver de Mongo, el nodo no se acepta.
+        # La evidencia que no se puede resolver (un manifiesto sin parser soportado) tampoco se
+        # acepta: ``UNRESOLVED`` nunca se degrada a «no introdujo nada».
+        observed_expansion: tuple[str, ...] = ()
+        observed_unresolved: tuple[str, ...] = ()
+        if child_completed:
+            observed_expansion, observed_unresolved = self._observed_resource_expansion(
+                run, node, results
+            )
         rejection: _Rejection | None = None
         if child_completed:
             rejection = self._rejection(
@@ -973,7 +1001,16 @@ class ProjectExecutionKernel:
                 violation=violation,
                 revision_mismatch=revision_mismatch,
                 missing_evidence=missing_evidence,
+                resource_expansion=observed_expansion,
+                resource_unresolved=observed_unresolved,
             )
+            if (
+                rejection is not None
+                and rejection.code is ProjectFailureCode.PROJECT_NODE_ARCHITECTURE_VIOLATION
+            ):
+                self._audit_node_architecture_violation(
+                    run, node_run, observed_expansion, observed_unresolved, rejection.detail
+                )
         accepted = child_completed and rejection is None
         revision_after = candidate_revision if accepted else revision_before
 
@@ -1062,15 +1099,16 @@ class ProjectExecutionKernel:
         violation: tuple[str, ...],
         revision_mismatch: str,
         missing_evidence: str,
+        resource_expansion: tuple[str, ...] = (),
+        resource_unresolved: tuple[str, ...] = (),
     ) -> _Rejection | None:
         """Primer motivo por el que el parent **rechaza** un child, en orden fijo.
 
         El orden es determinista y está escrito para que dos ejecuciones del mismo caso informen del
         mismo motivo: brecha de presupuesto, violación de alcance, revisión que el árbol no
-        demuestra
-        y evidencia durable incompleta. Ninguno se degrada a aviso: cada uno significa que el nodo
-        no
-        puede darse por aceptado ni servir de base a sus dependientes.
+        demuestra, evidencia durable incompleta y —desde ENGINE-6.3.R1— expansión de recursos
+        observados. Ninguno se degrada a aviso: cada uno significa que el nodo no puede darse por
+        aceptado ni servir de base a sus dependientes.
         """
         if breach is not None:
             return _Rejection(_code_of(breach), breach.detail)
@@ -1082,6 +1120,25 @@ class ProjectExecutionKernel:
                     f"autorización: {', '.join(violation)}"
                 ),
             )
+        if resource_expansion:
+            return _Rejection(
+                ProjectFailureCode.PROJECT_NODE_ARCHITECTURE_VIOLATION,
+                (
+                    f"el child del nodo {node_run.node_id!r} introdujo recursos de arquitectura no "
+                    f"autorizados: {', '.join(resource_expansion)}. El envelope autorizado no se "
+                    "amplía con la implementación"
+                ),
+            )
+        if resource_unresolved:
+            return _Rejection(
+                ProjectFailureCode.PROJECT_NODE_ARCHITECTURE_VIOLATION,
+                (
+                    f"el child del nodo {node_run.node_id!r} cambió recursos de arquitectura y la "
+                    "evidencia no se pudo resolver: "
+                    + "; ".join(resource_unresolved)
+                    + ". Sin resolución no se demuestra contención y el nodo no se acepta"
+                ),
+            )
         if revision_mismatch:
             return _Rejection(
                 ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH, revision_mismatch
@@ -1091,6 +1148,51 @@ class ProjectExecutionKernel:
                 ProjectFailureCode.PROJECT_COMPLETION_INCOMPLETE, missing_evidence
             )
         return None
+
+    def _observed_resource_expansion(
+        self,
+        run: ProjectRun,
+        node: GraphNode,
+        results: Sequence[DeveloperExecutionResult],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Recursos que el diff introdujo fuera del envelope autorizado, y lo que no se resolvió.
+
+        Se inspeccionan los ficheros que el child declaró haber cambiado y se leen del **workspace**
+        en el momento de la liquidación —el árbol está en la revisión que el child demostró—, porque
+        el resultado durable del Developer no transporta el contenido de los archivos. Lo que no se
+        pueda leer o interpretar se devuelve como razón sin resolver, nunca como ausencia de
+        recursos.
+
+        Returns:
+            ``(recursos expandidos, razones sin resolver)``.
+        """
+        paths = tuple(change.path for result in results for change in result.files_changed)
+        if not paths:
+            return (), ()
+        workspace = self._workspace_path(run)
+        base = Path(workspace) if workspace else None
+
+        def read(relative: str) -> str | None:
+            if base is None:
+                return None
+            try:
+                return (base / relative).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return None
+
+        observed, unresolved = resources_from_diff(paths, read)
+        if observed.is_empty and not unresolved:
+            return (), ()
+        contract = self._contract_for_replan(run) if run.contract_ref is not None else None
+        allowed = ResourceSet.of(node.resources)
+        if contract is not None:
+            allowed = allowed.union(contract_resources(contract))
+        report = expansion_report(observed, allowed)
+        return report.expanded, unresolved
+
+    def _workspace_path(self, run: ProjectRun) -> str:
+        """Ruta del workspace declarada por el proyecto, si la hay."""
+        return str(getattr(run.request, "workspace_path", "") or "")
 
     def _stop_on_node(self, run: ProjectRun, node_run: ProjectNodeRun) -> ProjectRun:
         """Detiene el proyecto por el veredicto de un nodo ya liquidado (fail-fast).
@@ -1408,18 +1510,22 @@ class ProjectExecutionKernel:
                 run, proposal, ProjectFailureCode.PROJECT_REPLAN_GUARD_REJECTED, detail
             )
 
-        # --- 7. autorización humana: la clase de cambio y la política deciden -----
+        # --- 7. autoridad estructural (T1-T7), sospecha semántica y política ---------
         #
-        # Desde ENGINE-6.3.1 hay **dos** motivos por los que una propuesta válida no se adopta en
-        # autonomía, y los dos abren el mismo Human Gate ligado a la propuesta exacta:
-        #
-        # - el motor deriva una clase de cambio por encima de lo táctico (F631-02): un cambio de
-        #   arquitectura, datos, autenticación, despliegue, proveedor o reglas de negocio no se
-        #   adopta porque el Planner lo declare ``LOW`` y ``LEVEL_0_AUTONOMOUS``;
-        # - la política exige persona (``REQUIRE_HUMAN`` / ``ALLOW_WITH_REVIEW``), que es el caso
-        #   que el hallazgo F631-03 encontró terminando en un bloqueo sin salida.
+        # Desde ENGINE-6.3.R1 la autonomía **no** la concede ningún texto: la demuestra la
+        # contención estructural (T1-T7). El clasificador semántico queda degradado a escalado de un
+        # solo sentido —puede mandar a una persona, nunca autorizar— y la política juzga hechos
+        # estructurados derivados por el motor. Los tres motivos abren el **mismo** Human Gate
+        # ligado a la propuesta exacta de F631-03; no hay un segundo sistema de aprobación.
         change = classify_replan_change(proposal, contract=contract, action=run.request.action)
         self._audit_replan_change_class(run, proposal.proposal_id, change)
+        containment = evaluate_replan_containment(
+            run=run,
+            contract=contract,
+            proposal=proposal,
+            current_nodes=current_nodes,
+        )
+        self._audit_replan_containment(run, proposal.proposal_id, containment)
         authorized = run.active_replan_approval
         if authorized is not None and authorized.authorized:
             # Una persona ya autorizó **esta** propuesta exacta: no se vuelve a juzgar con la
@@ -1434,8 +1540,13 @@ class ProjectExecutionKernel:
                 current_nodes,
                 verdict.resulting_nodes,
                 classification=change,
+                containment=containment,
             )
-            if policy_verdict.requires_human or change.requires_human:
+            if (
+                policy_verdict.requires_human
+                or change.requires_human
+                or containment.requires_human
+            ):
                 return self._open_replan_approval(
                     run,
                     node_run,
@@ -1443,6 +1554,7 @@ class ProjectExecutionKernel:
                     verdict,
                     policy_verdict.decision_id,
                     change,
+                    containment,
                 )
             policy_decision_id = policy_verdict.decision_id
 
@@ -1799,6 +1911,7 @@ class ProjectExecutionKernel:
         resulting_nodes: Sequence[GraphNode],
         *,
         classification: ReplanChangeClassification,
+        containment: ContainmentVerdict | None = None,
     ) -> _PolicyVerdict:
         """Evalúa la **acción** de la replanificación con la frontera de política inyectada.
 
@@ -1877,6 +1990,20 @@ class ProjectExecutionKernel:
             replan_operation_kinds=tuple(
                 operation.kind.value for operation in proposal.operations
             ),
+            architecture_compatibility=(
+                "" if containment is None else containment.compatibility.value
+            ),
+            expanded_resources=() if containment is None else containment.expanded_resources,
+            expanded_dimensions=() if containment is None else containment.expanded_dimensions,
+            scope_delta=() if containment is None else containment.scope_delta,
+            criteria_delta=() if containment is None else containment.criteria_delta,
+            risk_delta=0 if containment is None else containment.risk_delta,
+            authority_delta=0 if containment is None else containment.authority_delta,
+            node_count_delta=0 if containment is None else containment.node_count_delta,
+            has_architecture_baseline=(
+                False if containment is None else containment.has_architecture_baseline
+            ),
+            replan_attempt=run.usage.replans_attempted + 1,
         )
         decision = self._policy.engine.evaluate(
             action_request, PolicyEvaluationContext(actor=RoleName.PLANNER.value)
@@ -1906,6 +2033,7 @@ class ProjectExecutionKernel:
         verdict: ReplanGuardResult,
         policy_decision_id: UUID,
         classification: ReplanChangeClassification,
+        containment: ContainmentVerdict | None = None,
     ) -> ProjectRun:
         """Abre el Human Gate de la replanificación, ligado a **esta** propuesta (PART Y).
 
@@ -1930,6 +2058,7 @@ class ProjectExecutionKernel:
         autorice.
         """
         existing = run.active_replan_approval
+        contract = self._contract_for_replan(run)
         graph_ref = publish_graph_bundle(
             self._artifacts,
             request=run.request,
@@ -1965,6 +2094,10 @@ class ProjectExecutionKernel:
                     f"la replanificación del proyecto {run.project_run_id} exige autorización "
                     f"humana: {classification.detail}"
                 )[:MAX_REPLAN_TEXT_CHARS],
+                contract_fingerprint=contract.contract_fingerprint,
+                resource_delta_fingerprint=(
+                    "" if containment is None else containment.fingerprint
+                ),
             )
             approval_id = approval.id
             binding = ReplanApprovalBinding(
@@ -1979,6 +2112,10 @@ class ProjectExecutionKernel:
                 change_class=classification.change_class.value,
                 resulting_graph_ref=graph_ref,
                 resulting_graph_fingerprint=verdict.resulting_fingerprint,
+                contract_fingerprint=contract.contract_fingerprint,
+                resource_delta_fingerprint=(
+                    "" if containment is None else containment.fingerprint
+                ),
             )
         gate_ref = self._publish_replan_gate(run, binding)
         run = run.model_copy(
@@ -2847,6 +2984,8 @@ class ProjectExecutionKernel:
                 "generación de origen y la decisión de política son los del vínculo durable"
             ),
             approval_id=binding.approval_id,
+            contract_fingerprint=binding.contract_fingerprint,
+            resource_delta_fingerprint=binding.resource_delta_fingerprint,
         )
 
     def _resume_replan_gate(
@@ -2949,6 +3088,27 @@ class ProjectExecutionKernel:
             deny("la acción del proyecto cambió desde que se aprobó la propuesta")
         if proof.resulting_graph_fingerprint != binding.resulting_graph_fingerprint:
             deny("la prueba autoriza otro grafo resultante")
+        if proof.contract_fingerprint != binding.contract_fingerprint:
+            deny("la prueba autoriza otro contrato")
+        if proof.resource_delta_fingerprint != binding.resource_delta_fingerprint:
+            deny("la prueba autoriza otro delta estructural de recursos")
+        current = self._contract_for_replan(run)
+        if binding.contract_fingerprint and (
+            current.contract_fingerprint != binding.contract_fingerprint
+        ):
+            deny("el contrato del proyecto cambió desde que se aprobó la propuesta")
+        if binding.resource_delta_fingerprint:
+            recomputed = evaluate_replan_containment(
+                run=run,
+                contract=current,
+                proposal=proposal,
+                current_nodes=resolve_active_nodes(self._artifacts, run),
+                prefix_ok=True,
+                criteria_ok=True,
+                budget_ok=True,
+            )
+            if recomputed.fingerprint != binding.resource_delta_fingerprint:
+                deny("el delta estructural de la propuesta cambió desde que se aprobó")
         try:
             frozen = resolve_graph_bundle(self._artifacts, binding.resulting_graph_ref)
         except ProjectHandoffError as exc:
@@ -3570,6 +3730,54 @@ class ProjectExecutionKernel:
             detail=detail,
         )
 
+    def _audit_node_architecture_violation(
+        self,
+        run: ProjectRun,
+        node_run: ProjectNodeRun,
+        expanded: tuple[str, ...],
+        unresolved: tuple[str, ...],
+        detail: str,
+    ) -> None:
+        """Audita que la implementación de un nodo introdujo recursos no autorizados (6.3.R1)."""
+        if self._audit is None:
+            return
+        self._audit.log_project_node_architecture_violation(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            node_id=node_run.node_id,
+            child_workflow_id=node_run.child_workflow_id,
+            expanded_resources=expanded,
+            unresolved=unresolved,
+            detail=detail,
+        )
+
+    def _audit_replan_containment(
+        self, run: ProjectRun, proposal_id: UUID, containment: ContainmentVerdict
+    ) -> None:
+        """Audita la contención estructural de una propuesta (ENGINE-6.3.R1).
+
+        Deja escrito el veredicto que **gobierna la autonomía**: la compatibilidad, los predicados
+        demostrados, la expansión detectada y lo que no se pudo resolver. Sin este evento, una
+        adopción autónoma no podría distinguirse de una que el motor dejó pasar sin mirar.
+        """
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_containment(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            proposal_id=proposal_id,
+            compatibility=containment.compatibility.value,
+            operation_kinds=containment.operation_kinds,
+            expanded_resources=containment.expanded_resources,
+            expanded_dimensions=containment.expanded_dimensions,
+            proofs=containment.proofs,
+            failures=containment.failures,
+            unresolved=containment.unresolved,
+            has_architecture_baseline=containment.has_architecture_baseline,
+            delta_fingerprint=containment.fingerprint,
+            autonomous=containment.allows_autonomous,
+        )
+
     def _audit_replan_change_class(
         self,
         run: ProjectRun,
@@ -3584,7 +3792,7 @@ class ProjectExecutionKernel:
             project_id=run.project_id,
             proposal_id=proposal_id,
             change_class=classification.change_class.value,
-            tactical=classification.is_tactical,
+            tactical=not classification.escalates,
             detail=classification.detail,
             matches=classification.matches,
         )

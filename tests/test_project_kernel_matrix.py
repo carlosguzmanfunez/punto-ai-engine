@@ -38,6 +38,7 @@ from punto.project.kernel import (
 from punto.project.store import FileProjectStore
 from punto.project.workspace import FixedLineage
 from punto.schemas.enums import RiskLevel, TaskStatus
+from punto.schemas.planning import PlannedTask
 from punto.schemas.project import (
     ProjectBudget,
     ProjectFailureCode,
@@ -71,6 +72,7 @@ class Harness:
         gate: HumanGate | None = None,
         edges: dict[str, tuple[str, ...]] | None = None,
         architecture: object | None = None,
+        tasks: tuple[PlannedTask, ...] | None = None,
     ) -> None:
         self.workspace = root / "workspace"
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -86,9 +88,12 @@ class Harness:
         )
         self.lineage = lineage if lineage is not None else FollowProjectLineage()
         declared = edges or {}
-        graph = graph_of(
-            *(planned(name, dependencies=declared.get(name, ())) for name in nodes)
-        )
+        if tasks is not None:
+            graph = graph_of(*tasks)
+        else:
+            graph = graph_of(
+                *(planned(name, dependencies=declared.get(name, ())) for name in nodes)
+            )
         plan_ref = publish_project_plan(
             self.artifacts,
             graph,
@@ -138,6 +143,7 @@ def harness(
     gate: HumanGate | None = None,
     edges: dict[str, tuple[str, ...]] | None = None,
     architecture: object | None = None,
+    tasks: tuple[PlannedTask, ...] | None = None,
 ) -> Harness:
     """Montaje de una prueba sobre su propio directorio temporal."""
     return Harness(
@@ -151,6 +157,7 @@ def harness(
         gate=gate,
         edges=edges,
         architecture=architecture,
+        tasks=tasks,
     )
 
 

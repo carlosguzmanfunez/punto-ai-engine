@@ -98,8 +98,13 @@ def planned(
     checks: Sequence[str] = ("python -m pytest -q",),
     risk: RiskLevel = RiskLevel.LOW,
     authority: AuthorityLevel = AuthorityLevel.LEVEL_0_AUTONOMOUS,
+    capabilities: Sequence[str] = (),
 ) -> PlannedTask:
-    """Tarea planificada con la forma que el Planner produce, para publicar un plan real."""
+    """Tarea planificada con la forma que el Planner produce, para publicar un plan real.
+
+    ``capabilities`` son las capacidades que la tarea **declara necesitar**; entran en el grafo
+    congelado y, con ellas, en el envelope de recursos del nodo (ENGINE-6.3.R1).
+    """
     return PlannedTask(
         id=identifier,
         title=identifier,
@@ -111,6 +116,7 @@ def planned(
         validation_checks=tuple(checks),
         risk_level=risk,
         authority_level=authority,
+        required_capabilities=tuple(capabilities),
     )
 
 

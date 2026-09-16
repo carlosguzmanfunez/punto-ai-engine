@@ -206,6 +206,9 @@ class AuditEventType(StrEnum):
     PROJECT_REPLAN_REJECTED = "PROJECT_REPLAN_REJECTED"
     PROJECT_REPLAN_GENERATION_ADOPTED = "PROJECT_REPLAN_GENERATION_ADOPTED"
     PROJECT_REPLAN_RECONCILED = "PROJECT_REPLAN_RECONCILED"
+    #: El árbol volvió a la revisión aceptada al adoptar una generación nueva: efecto material, con
+    #: las dos revisiones (de dónde venía y a cuál se volvió) y si hubo que moverlo.
+    PROJECT_REPLAN_WORKSPACE_RESTORED = "PROJECT_REPLAN_WORKSPACE_RESTORED"
     #: Un nodo fue sustituido por una replanificación: conserva su historia y su gasto.
     PROJECT_NODE_SUPERSEDED = "PROJECT_NODE_SUPERSEDED"
 

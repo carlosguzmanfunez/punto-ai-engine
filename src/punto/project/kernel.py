@@ -112,7 +112,11 @@ from punto.project.replan import (
     trigger_is_valid,
 )
 from punto.project.state_machine import ProjectStateMachine
-from punto.project.workspace import ProjectRevisionMismatchError, WorkspaceLineage
+from punto.project.workspace import (
+    ProjectRevisionMismatchError,
+    WorkspaceLineage,
+    WorkspaceReconciliation,
+)
 from punto.schemas.decision import ActionRequest
 from punto.schemas.enums import RiskLevel, TaskStatus
 from punto.schemas.execution import DeveloperExecutionResult
@@ -1390,14 +1394,18 @@ class ProjectExecutionKernel:
         2. se persiste la ``ProjectGraphGeneration``, que ya lleva la referencia del bundle y su
            huella: a partir de aquí la adopción es **reconciliable**, porque un proceso nuevo
            encuentra la generación pendiente y la activa por su huella;
-        3. solo entonces se activa (``active_generation``, ``task_graph_ref`` y
+        3. se devuelve el **árbol** a la revisión aceptada: adoptar un plan alternativo descarta el
+           intento sustituido, y el primer nodo del plan nuevo solo puede empezar desde la revisión
+           que el proyecto aceptó (sin este paso el proyecto se bloquearía con
+           ``PROJECT_WORKSPACE_REVISION_MISMATCH`` en cuanto fuera a arrancar ese nodo);
+        4. solo entonces se activa (``active_generation``, ``task_graph_ref`` y
         ``graph_fingerprint``
            apuntan al grafo nuevo);
-        4. se marcan ``SUPERSEDED`` los nodos sustituidos, conservando su historia y su gasto;
-        5. se añaden los ``ProjectNodeRun`` de los nodos nuevos, con identidad **del motor**
+        5. se marcan ``SUPERSEDED`` los nodos sustituidos, conservando su historia y su gasto;
+        6. se añaden los ``ProjectNodeRun`` de los nodos nuevos, con identidad **del motor**
            (``assign_node_ids``) y sin child: el child se reserva cuando el proyecto arranque el
            nodo;
-        6. se liquida el intento y se vuelve a ``RUNNING``.
+        7. se liquida el intento y se vuelve a ``RUNNING``.
 
         Si el proceso muere entre 2 y 3, el paso 3 en adelante lo completa
         :meth:`_continue_replan` con la misma generación. El identificador de la generación nueva no
@@ -1453,6 +1461,10 @@ class ProjectExecutionKernel:
         superseded = tuple(node_id for node_id in previous_ids if node_id not in resulting_ids)
         new_nodes = tuple(node for node in resulting if node.node_id not in previous_ids)
 
+        reconciled = self._reconcile_replan_workspace(run, generation)
+        if reconciled is not None:
+            return reconciled
+
         run = run.model_copy(
             update={
                 "active_generation": generation,
@@ -1488,6 +1500,43 @@ class ProjectExecutionKernel:
         for node_id in superseded:
             self._audit_node_superseded(run, node_id)
         return run
+
+    def _reconcile_replan_workspace(
+        self, run: ProjectRun, generation: ProjectGraphGeneration
+    ) -> ProjectRun | None:
+        """Devuelve el árbol a la revisión aceptada antes de que gobierne la generación nueva.
+
+        El trabajo de un nodo no aceptado **sí** vive en el árbol: su child commiteó antes de que el
+        parent lo rechazara, así que ``HEAD`` avanzó aunque ``accepted_revision`` no. Mientras el
+        proyecto se quedaba bloqueado eso no molestaba a nadie; en cuanto puede continuar con un
+        plan alternativo, molesta al primer nodo nuevo: ``_start_node`` exige que el árbol esté
+        exactamente en la revisión aceptada, y un nodo no puede empezar sobre contenido que el
+        proyecto no aceptó.
+
+        Adoptar una generación es justamente la decisión de **descartar** ese intento, así que la
+        vuelta del árbol se hace aquí, una sola vez, en el hito de la adopción, y no en cada
+        arranque de nodo: el descarte es parte de la replanificación, no de la ejecución normal, y
+        así el bloqueo por revisión de ``_start_node`` sigue siendo lo que era —la frontera que
+        detecta que el árbol cambió por debajo del proyecto—.
+
+        Devuelve ``None`` si el árbol quedó donde debe —lo normal: no había nada que descartar— o el
+        ``run`` ya bloqueado si la vuelta falla. Una vuelta fallida **no** activa la generación: se
+        falla cerrado con ``PROJECT_WORKSPACE_REVISION_MISMATCH`` y el proyecto queda esperando
+        reconciliación explícita.
+        """
+        try:
+            reconciliation = self._lineage.restore(run.workspace.accepted_revision)
+        except ProjectRevisionMismatchError as exc:
+            return self._block(
+                run,
+                ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH,
+                (
+                    f"la generación {generation.generation_index} no puede gobernar el proyecto: "
+                    f"{exc}"
+                ),
+            )
+        self._audit_replan_workspace_restored(run, generation, reconciliation)
+        return None
 
     def _reserve_replan_invocation(
         self,
@@ -3090,6 +3139,36 @@ class ProjectExecutionKernel:
                 "la generación estaba publicada y persistida pero no activada: se adopta por su "
                 "huella en vez de volver a llamar al Planner"
             ),
+        )
+
+    def _audit_replan_workspace_restored(
+        self,
+        run: ProjectRun,
+        generation: ProjectGraphGeneration,
+        reconciliation: WorkspaceReconciliation,
+    ) -> None:
+        """Audita la vuelta del árbol a la revisión aceptada al adoptar la generación nueva.
+
+        El evento se registra siempre —también cuando no hubo nada que descartar—: lo que se quiere
+        poder auditar es que, con la generación ``n`` gobernando, el árbol quedó exactamente en la
+        revisión aceptada, y de qué revisión se venía.
+        """
+        if self._audit is None:
+            return
+        detail = (
+            f"la generación {generation.generation_index} descarta el árbol del intento "
+            "sustituido: el primer nodo del plan nuevo solo puede empezar en la revisión aceptada"
+            if reconciliation.restored
+            else "el árbol ya estaba en la revisión aceptada: no había nada que descartar"
+        )
+        self._audit.log_project_replan_workspace_restored(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            generation_index=generation.generation_index,
+            accepted_revision=reconciliation.requested_revision,
+            previous_revision=reconciliation.previous_revision,
+            restored=reconciliation.restored,
+            detail=detail,
         )
 
     def _audit_node_superseded(self, run: ProjectRun, node_id: str) -> None:

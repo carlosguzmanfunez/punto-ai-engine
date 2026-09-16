@@ -4074,6 +4074,43 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_project_replan_workspace_restored(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        generation_index: int,
+        accepted_revision: str,
+        previous_revision: str,
+        restored: bool,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el árbol volvió a la revisión aceptada al adoptar una generación nueva.
+
+        Es un efecto **material** sobre el workspace —se descarta el árbol del intento sustituido—,
+        así que se audita con sus dos revisiones: de dónde venía el árbol y a cuál se volvió.
+        ``restored=False`` significa que ya estaba en la revisión aceptada y no hubo nada que
+        descartar. La evidencia del nodo sustituido no se pierde: su child, su gasto y su fallo
+        siguen en el checkpoint, y este evento no los toca.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_WORKSPACE_RESTORED,
+            action="project_replan_workspace_restored",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="RESTORED" if restored else "ALREADY_AT_REVISION",
+            result=AuditResult.PENDING,
+            detail=detail,
+            metadata={
+                "generation_index": generation_index,
+                "accepted_revision": accepted_revision,
+                "previous_revision": previous_revision,
+                "restored": restored,
+            },
+            actor=actor,
+        )
+
     def log_project_node_superseded(
         self,
         *,

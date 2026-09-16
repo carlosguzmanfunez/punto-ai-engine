@@ -30,6 +30,7 @@ from uuid import UUID, uuid5
 from punto.common import utc_now
 from punto.planner.base import PlanningOutcome
 from punto.policy.human_gate import HumanGate
+from punto.project.workspace import WorkspaceReconciliation
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskStatus
 from punto.schemas.execution import (
     DeveloperExecutionResult,
@@ -491,11 +492,21 @@ class FollowProjectLineage:
     def __init__(self, revision: str = FAKE_REVISION) -> None:
         self._revision = revision
         self.checked: list[str] = []
+        self.restored: list[WorkspaceReconciliation] = []
 
     @property
     def revision(self) -> str:
         """Revisión que el linaje declara ahora."""
         return self._revision
+
+    def move_to(self, revision: str) -> None:
+        """Mueve el árbol a ``revision`` **sin** que el proyecto la acepte.
+
+        Simula lo que deja un child no aceptado: sus commits están en el árbol y la revisión
+        aceptada del proyecto no se movió. Es el estado desde el que una adopción tiene que devolver
+        el árbol.
+        """
+        self._revision = revision
 
     def head_revision(self) -> str:
         """Revisión declarada: la que el proyecto aceptó la última vez que la comprobó."""
@@ -506,6 +517,21 @@ class FollowProjectLineage:
         self.checked.append(revision)
         if revision:
             self._revision = revision
+
+    def restore(self, revision: str) -> WorkspaceReconciliation:
+        """Acepta la vuelta del árbol y deja constancia de la petición.
+
+        El doble **sigue** al proyecto, así que su revisión ya es la aceptada: la vuelta es un
+        no-op. Se registra igual porque lo que la matriz del kernel quiere poder afirmar es que el
+        proyecto **pidió** devolver el árbol en el hito de la adopción, no que el árbol se moviera
+        (eso lo mide el E2E real, con Git de verdad).
+        """
+        if revision and self._revision != revision:
+            self.restored.append(WorkspaceReconciliation(revision, self._revision, True))
+            self._revision = revision
+        else:
+            self.restored.append(WorkspaceReconciliation(revision, self._revision, False))
+        return self.restored[-1]
 
 
 def unused_task_graph_limit() -> int:

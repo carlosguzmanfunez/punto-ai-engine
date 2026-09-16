@@ -28,7 +28,7 @@ from uuid import UUID
 
 import pytest
 
-from project_support import FAKE_REVISION, ChildOutcome
+from project_support import FAKE_REVISION, ChildOutcome, FollowProjectLineage
 from punto.audit.logger import AuditLogger
 from punto.planner.base import PlannerLimits
 from punto.policy.config_loader import find_config_dir
@@ -50,7 +50,11 @@ from punto.project.replanner import (
     ReplanRequest,
     proposal_fingerprint,
 )
-from punto.project.workspace import FixedLineage
+from punto.project.workspace import (
+    FixedLineage,
+    ProjectRevisionMismatchError,
+    WorkspaceReconciliation,
+)
 from punto.schemas.audit import AuditEventType
 from punto.schemas.enums import TaskStatus
 from punto.schemas.project import (
@@ -96,6 +100,10 @@ CHILD_BUDGET = WorkflowBudget(max_model_calls=5, max_total_tokens=50_000, max_re
 #: ``PROJECT_CHILD_BLOCKED``, que es el fallo de 6.2.1 que la replanificación acotada viene a
 #: resolver cuando está autorizada.
 TECHNICAL_CHILD_CODE = WorkflowFailureCode.WORKFLOW_ROLE_FAILED
+
+#: Revisión del intento que el parent **rechazó**: el child commiteó y el árbol quedó en ella, pero
+#: el proyecto nunca la aceptó. Es la revisión que la adopción de una generación nueva descarta.
+REVISION_RECHAZADA = "c" * 40
 
 
 class SimulatedCrash(RuntimeError):
@@ -475,6 +483,7 @@ def test_replan_aceptado_adopta_una_generacion_nueva_y_continua(tmp_path: Path) 
         AuditEventType.PROJECT_REPLAN_POLICY_EVALUATED,
         AuditEventType.PROJECT_REPLAN_ACCEPTED,
         AuditEventType.PROJECT_REPLAN_GENERATION_ADOPTED,
+        AuditEventType.PROJECT_REPLAN_WORKSPACE_RESTORED,
         AuditEventType.PROJECT_NODE_SUPERSEDED,
     ):
         assert expected_event in types, f"falta el evento {expected_event.value}"
@@ -759,6 +768,111 @@ def test_caida_tras_publicar_el_bundle_reconcilia_la_misma_generacion(
     assert resumed.node("A").status is ProjectNodeStatus.SUPERSEDED
     assert AuditEventType.PROJECT_REPLAN_RECONCILED in event_types(audit)
     assert result_of(resumed).graph_generations_count == 2
+
+
+# ---------------------------------------------------------------------------
+# OBLIGATORIO 5B - el árbol vuelve a la revisión aceptada al adoptar la generación
+# ---------------------------------------------------------------------------
+def crash_al_activar_la_generacion(*_: object, **__: object) -> ProjectRun:
+    """Caída simulada entre persistir la generación nueva y activarla.
+
+    Es la frontera reconciliable de la adopción, y la forma de dejar el proyecto con la generación
+    **pendiente** para observar, en un proceso nuevo, el hito que la activa.
+    """
+    raise SimulatedCrash("caída entre persistir la generación y activarla")
+
+
+def adoptar_tras_una_caida(
+    h: Harness, replanner: FakeReplanner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Conduce el proyecto hasta dejar la generación nueva persistida y **sin** activar."""
+    monkeypatch.setattr(
+        ProjectExecutionKernel, "_activate_generation", crash_al_activar_la_generacion
+    )
+    with pytest.raises(SimulatedCrash):
+        replan_kernel(h, replanner).run_all(h.request)
+    monkeypatch.undo()
+
+
+def test_la_adopcion_devuelve_el_arbol_a_la_revision_aceptada(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adoptar una generación descarta el árbol del intento sustituido y el proyecto continúa.
+
+    Es el defecto D-1 convertido en invariante: el child de un nodo no aceptado **sí** dejó su
+    commit en el árbol, y el primer nodo del plan nuevo no puede empezar sobre contenido que el
+    proyecto nunca aceptó. La adopción devuelve el árbol a la revisión aceptada —una sola vez, en su
+    propio hito y auditada con sus dos revisiones— y a partir de ahí el proyecto sigue solo.
+    """
+    replanner = FakeReplanner()
+    lineage = FollowProjectLineage()
+    h = replan_harness(
+        tmp_path, outcomes={"A": blocked_child()}, lineage=lineage, default=ChildOutcome()
+    )
+
+    adoptar_tras_una_caida(h, replanner, monkeypatch)
+    # El intento sustituido dejó su commit en el árbol: la revisión aceptada no se movió.
+    lineage.move_to(REVISION_RECHAZADA)
+
+    audit = AuditLogger()
+    resumed = replan_kernel(h, replanner, audit=audit).run_all(h.request)
+
+    assert lineage.restored == [
+        WorkspaceReconciliation(FAKE_REVISION, REVISION_RECHAZADA, True)
+    ], "la adopción devuelve el árbol a la revisión aceptada antes de que gobierne el plan nuevo"
+    assert resumed.status is ProjectState.COMPLETED
+    assert lineage.revision == resumed.workspace.accepted_revision, (
+        "y el árbol termina exactamente en la revisión que el proyecto aceptó"
+    )
+    assert resumed.active_generation is not None
+    assert resumed.active_generation.generation_index == 1
+    restored_events = audit.by_type(AuditEventType.PROJECT_REPLAN_WORKSPACE_RESTORED)
+    assert len(restored_events) == 1, "la vuelta del árbol se audita una vez por adopción"
+    metadata = restored_events[0].metadata_dict
+    assert metadata["previous_revision"] == REVISION_RECHAZADA
+    assert metadata["accepted_revision"] == FAKE_REVISION
+    assert metadata["restored"] is True
+
+
+def test_si_el_arbol_no_vuelve_la_generacion_nueva_no_gobierna(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Una vuelta fallida del árbol no activa la generación: se falla cerrado y queda pendiente.
+
+    El proyecto no puede gobernar un grafo nuevo sobre un árbol que no es el aceptado, así que el
+    fallo lleva el mismo código de siempre —``PROJECT_WORKSPACE_REVISION_MISMATCH``— y la generación
+    se queda **sin activar** y sin nodos nuevos en el run: la ventana sigue siendo reconciliable
+    cuando el árbol se pueda devolver de verdad.
+    """
+
+    def fallo_al_devolver(revision: str) -> None:
+        raise ProjectRevisionMismatchError(f"el árbol no se puede devolver a {revision}")
+
+    replanner = FakeReplanner()
+    lineage = FixedLineage(FAKE_REVISION, on_restore=fallo_al_devolver)
+    h = replan_harness(tmp_path, outcomes={"A": blocked_child()}, lineage=lineage)
+
+    adoptar_tras_una_caida(h, replanner, monkeypatch)
+    lineage.move_to(REVISION_RECHAZADA)
+
+    audit = AuditLogger()
+    blocked = replan_kernel(h, replanner, audit=audit).run_all(h.request)
+
+    assert blocked.status is ProjectState.BLOCKED
+    assert blocked.failure_code is ProjectFailureCode.PROJECT_WORKSPACE_REVISION_MISMATCH
+    assert blocked.active_generation is not None
+    assert blocked.active_generation.generation_index == 0, "la generación nueva no gobierna"
+    pending = blocked.generations[-1]
+    assert pending.generation_index == 1, "la generación sigue persistida y sin activar"
+    project_run_id = replan_kernel(h, replanner).project_run_id_for(h.request)
+    new_node_id = assign_node_ids(
+        project_run_id=project_run_id,
+        generation_index=1,
+        proposal_fingerprint=replanner.proposals[0].proposal_fingerprint,
+        labels=(REPLAN_LABEL,),
+    )[REPLAN_LABEL]
+    assert blocked.node(new_node_id) is None, "sin activación no hay nodos nuevos en el run"
+    assert AuditEventType.PROJECT_REPLAN_WORKSPACE_RESTORED not in event_types(audit)
 
 
 # ---------------------------------------------------------------------------

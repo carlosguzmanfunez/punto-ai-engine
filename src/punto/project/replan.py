@@ -89,8 +89,12 @@ class ReplanCategory(StrEnum):
 
 #: Códigos del **nodo** que significan parada: no se replanifican, se declaran.
 #:
-#: Son las postcondiciones del parent (F621-01), la corrupción del grafo y la evidencia incompleta.
-#: Replanificar cualquiera de ellos sería usar otra estrategia para tapar una violación.
+#: Son las postcondiciones del parent (F621-01), la corrupción del grafo, la evidencia incompleta y
+#: —desde ENGINE-6.3.1— las fronteras de **confianza**: una prueba humana inválida, un gasto sin
+#: reconciliar y una brecha de presupuesto sin reconciliar son problemas del **estado o de la
+#: evidencia**, no una estrategia técnica agotada: otro plan no los arregla y el motor no los
+#: rodea. La lista es explícita para que el código aparezca en la auditoría con su categoría, en vez
+#: de caer en el «no está catalogado» genérico.
 NODE_STOP_CODES: Final[dict[ProjectFailureCode, tuple[ReplanCategory, ReplanEligibility]]] = {
     ProjectFailureCode.PROJECT_BUDGET_BREACH: (
         ReplanCategory.BUDGET_BREACH,
@@ -124,17 +128,42 @@ NODE_STOP_CODES: Final[dict[ProjectFailureCode, tuple[ReplanCategory, ReplanElig
         ReplanCategory.EVIDENCE_INCOMPLETE,
         ReplanEligibility.EVIDENCE_BLOCKED,
     ),
+    # --- Fronteras de confianza (ENGINE-6.3.1, hallazgo F631-01) --------------------------------
+    ProjectFailureCode.PROJECT_HUMAN_APPROVAL_REQUIRED: (
+        ReplanCategory.HUMAN_GATE,
+        ReplanEligibility.HUMAN_REPLAN_REQUIRED,
+    ),
+    ProjectFailureCode.PROJECT_APPROVAL_PROOF_INVALID: (
+        ReplanCategory.SECURITY,
+        ReplanEligibility.SECURITY_STOP,
+    ),
+    ProjectFailureCode.PROJECT_REPLAN_PROOF_INVALID: (
+        ReplanCategory.SECURITY,
+        ReplanEligibility.SECURITY_STOP,
+    ),
+    ProjectFailureCode.PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED: (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
 }
 
-#: Códigos del **child** que significan parada por seguridad, política o infraestructura.
+#: Códigos del **child** que significan parada: seguridad, política, Human Gate, presupuesto,
+#: infraestructura, evidencia, instantáneas e idempotencia del estado durable.
+#:
+#: Todo lo que en el workflow significa «el estado o la evidencia no son de fiar» está aquí. La
+#: replanificación no reconcilia ni sustituye corrupción de evidencia, evidencia incompleta,
+#: instantáneas inválidas, checkpoints inválidos, efectos desconocidos ni gasto desconocido: los
+#: declara y para. Un código que no esté ni aquí ni en la allowlist técnica **falla cerrado**.
 CHILD_STOP_CODES: Final[dict[str, tuple[ReplanCategory, ReplanEligibility]]] = {
     "WORKFLOW_PROVIDER_UNAVAILABLE": (
         ReplanCategory.INFRASTRUCTURE,
         ReplanEligibility.INFRASTRUCTURE_BLOCKED,
     ),
     "WORKFLOW_POLICY_REJECTED": (ReplanCategory.POLICY, ReplanEligibility.SECURITY_STOP),
-    "WORKFLOW_HUMAN_APPROVAL_REQUIRED": (ReplanCategory.HUMAN_GATE,
-    ReplanEligibility.HUMAN_REPLAN_REQUIRED),
+    "WORKFLOW_HUMAN_APPROVAL_REQUIRED": (
+        ReplanCategory.HUMAN_GATE,
+        ReplanEligibility.HUMAN_REPLAN_REQUIRED,
+    ),
     "WORKFLOW_BUDGET_EXCEEDED": (ReplanCategory.BUDGET_EXHAUSTED, ReplanEligibility.BUDGET_STOP),
     "WORKFLOW_REPAIR_BUDGET_EXHAUSTED": (
         ReplanCategory.REPAIR_EXHAUSTED,
@@ -144,9 +173,56 @@ CHILD_STOP_CODES: Final[dict[str, tuple[ReplanCategory, ReplanEligibility]]] = {
         ReplanCategory.EVIDENCE_INCOMPLETE,
         ReplanEligibility.EVIDENCE_BLOCKED,
     ),
-    "WORKFLOW_RESUME_FAILED": (ReplanCategory.EVIDENCE_INCOMPLETE,
-    ReplanEligibility.EVIDENCE_BLOCKED),
+    "WORKFLOW_RESUME_FAILED": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
     "WORKFLOW_CHECKPOINT_INVALID": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    # --- Fronteras de confianza (ENGINE-6.3.1, hallazgo F631-01) --------------------------------
+    #
+    # Los dos códigos que el hallazgo encontró mal clasificados: la reparación se detuvo porque su
+    # **evidencia** era insuficiente o su **instantánea** no permitía deshacerla. Replanificar eso
+    # era usar otro plan para tapar una frontera de confianza y podía terminar en `COMPLETED`.
+    "WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    "WORKFLOW_REPAIR_SNAPSHOT_INVALID": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    "WORKFLOW_REPAIR_RECONCILIATION_REQUIRED": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    "WORKFLOW_REPAIR_SCOPE_VIOLATION": (
+        ReplanCategory.SCOPE_VIOLATION,
+        ReplanEligibility.NON_REPLANNABLE,
+    ),
+    "WORKFLOW_EFFECT_RECONCILIATION_REQUIRED": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    "WORKFLOW_BUDGET_RECONCILIATION_REQUIRED": (
+        ReplanCategory.BUDGET_EXHAUSTED,
+        ReplanEligibility.BUDGET_STOP,
+    ),
+    "WORKFLOW_MODEL_SPEND_RECONCILIATION_REQUIRED": (
+        ReplanCategory.EVIDENCE_INCOMPLETE,
+        ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    "WORKFLOW_BUDGET_RECONCILIATION_DENIED": (
+        ReplanCategory.SECURITY,
+        ReplanEligibility.SECURITY_STOP,
+    ),
+    "WORKFLOW_APPROVAL_PROOF_INVALID": (
+        ReplanCategory.SECURITY,
+        ReplanEligibility.SECURITY_STOP,
+    ),
+    "WORKFLOW_IDEMPOTENCY_CONFLICT": (
         ReplanCategory.EVIDENCE_INCOMPLETE,
         ReplanEligibility.EVIDENCE_BLOCKED,
     ),
@@ -154,16 +230,17 @@ CHILD_STOP_CODES: Final[dict[str, tuple[ReplanCategory, ReplanEligibility]]] = {
 
 #: Códigos del **child** que sí describen una estrategia técnica agotada: son replanificables.
 #:
-# : Es una lista explícita y corta: lo que no está aquí no se replanifica solo. Añadir un código
-# exige
-#: justificar que el problema es técnico, reversible y que no amplía el contrato.
+#: Es una **allowlist corta y cerrada**, no una inferencia: lo que no está aquí no se replanifica
+#: solo. Los tres describen un trabajo técnico que no llegó a término —un rol falló, un rol se
+#: bloqueó, el bucle de reparación no progresó— sin tocar ninguna frontera de confianza. Cualquier
+#: código nuevo del workflow **no** hereda esta autorización: entra por defecto en el fail-closed, y
+#: añadirlo aquí exige justificar por qué el problema es técnico, reversible y no amplía el contrato
+#: (y actualizar la prueba exhaustiva que fija esta lista).
 CHILD_TECHNICAL_CODES: Final[frozenset[str]] = frozenset(
     {
         "WORKFLOW_ROLE_FAILED",
         "WORKFLOW_ROLE_BLOCKED",
         "WORKFLOW_REPAIR_NO_PROGRESS",
-        "WORKFLOW_REPAIR_EVIDENCE_INCOMPLETE",
-        "WORKFLOW_REPAIR_SNAPSHOT_INVALID",
     }
 )
 

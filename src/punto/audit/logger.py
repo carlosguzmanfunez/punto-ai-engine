@@ -4111,6 +4111,172 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_project_replan_change_classified(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        proposal_id: UUID,
+        change_class: str,
+        tactical: bool,
+        detail: str = "",
+        matches: Sequence[str] = (),
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la clase de cambio que **el motor** derivó para una propuesta (F631-02).
+
+        Es la traza de la barrera: deja escrito qué clase se derivó, si era táctica, y —cuando no
+        lo era— las marcas acotadas que lo demuestran. Sin este evento, una adopción autónoma no
+        podría distinguirse de una que el motor dejó pasar por no haber mirado.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_CHANGE_CLASSIFIED,
+            action="project_replan_change_classified",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="TACTICAL" if tactical else "HIGH_IMPACT",
+            detail=detail,
+            metadata={
+                "proposal_id": str(proposal_id),
+                "change_class": change_class,
+                "tactical": tactical,
+                "matches": list(matches),
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_approval_requested(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        approval_id: UUID,
+        proposal_id: UUID,
+        trigger_id: UUID,
+        source_generation_id: UUID,
+        policy_decision_id: UUID,
+        change_class: str = "",
+        action: str = "",
+        resulting_graph_fingerprint: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que la replanificación espera una decisión humana ligada a **esa** propuesta.
+
+        Es el hito que convierte «hace falta una persona» en un estado con salida: el proyecto queda
+        en ``HUMAN_APPROVAL`` con el vínculo exacto escrito, y quien aprueba sabe qué propuesta,
+        qué disparador, qué generación, qué decisión de política y qué grafo resultante está
+        autorizando.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_APPROVAL_REQUESTED,
+            action="project_replan_approval_requested",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="HUMAN_APPROVAL",
+            result=AuditResult.PENDING,
+            detail=detail,
+            metadata={
+                "approval_id": str(approval_id),
+                "proposal_id": str(proposal_id),
+                "trigger_id": str(trigger_id),
+                "source_generation_id": str(source_generation_id),
+                "policy_decision_id": str(policy_decision_id),
+                "change_class": change_class,
+                "action": action,
+                "resulting_graph_fingerprint": resulting_graph_fingerprint,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_approved(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        approval_id: UUID,
+        proposal_id: UUID,
+        proof_id: UUID,
+        change_class: str = "",
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que una prueba humana válida autorizó esa propuesta: la adopción continúa."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_APPROVED,
+            action="project_replan_approved",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="APPROVED",
+            detail=detail,
+            metadata={
+                "approval_id": str(approval_id),
+                "proposal_id": str(proposal_id),
+                "proof_id": str(proof_id),
+                "change_class": change_class,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_approval_denied(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        approval_id: UUID,
+        proposal_id: UUID,
+        reason: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que una prueba presentada **no** correspondía al vínculo: no se adopta nada.
+
+        El evento es la evidencia de un intento de autorización fallido. No cambia el estado del
+        proyecto: la aprobación pendiente sigue pendiente, de modo que una prueba incorrecta no
+        puede dejar al proyecto sin salida.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_APPROVAL_DENIED,
+            action="project_replan_approval_denied",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="DENIED",
+            result=AuditResult.FAILURE,
+            detail=detail,
+            metadata={
+                "approval_id": str(approval_id),
+                "proposal_id": str(proposal_id),
+                "reason": reason,
+            },
+            actor=actor,
+        )
+
+    def log_project_replan_human_rejected(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        approval_id: UUID,
+        proposal_id: UUID,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que una persona **rechazó** la propuesta: el plan no se adopta y se declara."""
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_HUMAN_REJECTED,
+            action="project_replan_human_rejected",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status="REJECTED",
+            result=AuditResult.FAILURE,
+            detail=detail,
+            metadata={
+                "approval_id": str(approval_id),
+                "proposal_id": str(proposal_id),
+            },
+            actor=actor,
+        )
+
     def log_project_node_superseded(
         self,
         *,

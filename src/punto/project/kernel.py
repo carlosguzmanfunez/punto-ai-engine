@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from punto.common import utc_now
+from punto.policy.human_gate import HumanApprovalProof, ReplanApprovalProof
 from punto.policy.policy_engine import PolicyEvaluationContext
 from punto.project.budget import (
     ChildUsage,
@@ -90,6 +91,7 @@ from punto.project.graph import (
 )
 from punto.project.handoff import (
     ProjectDependencyEvidenceError,
+    ProjectHandoffError,
     dependency_references,
     node_idempotency_key,
     node_request,
@@ -111,6 +113,7 @@ from punto.project.replan import (
     publish_trigger,
     trigger_is_valid,
 )
+from punto.project.replan_change import ReplanChangeClassification, classify_replan_change
 from punto.project.state_machine import ProjectStateMachine
 from punto.project.workspace import (
     ProjectRevisionMismatchError,
@@ -141,6 +144,7 @@ from punto.schemas.replan import (
     ProjectReplanDecision,
     ProjectReplanProposal,
     ProjectReplanTrigger,
+    ReplanApprovalBinding,
     ReplanInvocationAuthorization,
 )
 from punto.schemas.workflow import ArtifactReference, RoleName, WorkflowRequest, WorkflowRun
@@ -156,7 +160,6 @@ if TYPE_CHECKING:
 
     from punto.audit.logger import AuditLogger
     from punto.planner.base import PlannerLimits
-    from punto.policy.human_gate import HumanApprovalProof
     from punto.project.replan_guard import ProjectReplanGuard, ReplanGuardResult
     from punto.project.replanner import ProjectReplanner, ReplanRequest
     from punto.project.store import ProjectStore
@@ -203,6 +206,18 @@ PROJECT_REPLAN_DECISION_KIND: Final[str] = "PROJECT_REPLAN_DECISION"
 #: Etiqueta legible del artefacto de la decisión del motor.
 PROJECT_REPLAN_DECISION_LABEL: Final[str] = "decisión del motor sobre la propuesta de replan"
 
+#: Tipo y etiqueta del artefacto que registra la aprobación humana **pendiente** de una
+#: replanificación (ENGINE-6.3.1).
+#:
+#: Es el binding legible de PART Y: qué propuesta, qué disparador, qué generación de origen, qué
+#: decisión de política y qué grafo resultante espera una firma humana. El vínculo operativo vive en
+#: el checkpoint; este artefacto existe para que quien aprueba lea exactamente qué está autorizando
+#: (y para que la historia del proyecto lo conserve).
+PROJECT_REPLAN_GATE_KIND: Final[str] = "PROJECT_REPLAN_GATE"
+
+#: Etiqueta legible del artefacto de la aprobación pendiente de replanificación.
+PROJECT_REPLAN_GATE_LABEL: Final[str] = "aprobación humana pendiente de la replanificación"
+
 #: Caracteres por token de la estimación conservadora de la entrada de una invocación del replanner.
 #:
 #: El kernel no compone el prompt (lo hace el replanner), así que no puede medirlo: mide el material
@@ -245,6 +260,17 @@ class ProjectHumanApprovalRequiredError(ProjectExecutionError):
 
 class ProjectApprovalProofInvalidError(ProjectExecutionError):
     """La prueba de aprobación no corresponde al child activo de **este** proyecto."""
+
+
+class ProjectReplanProofInvalidError(ProjectExecutionError):
+    """La prueba humana no autoriza **esta** propuesta de replanificación (ENGINE-6.3.1).
+
+    Es la frontera de PART Y: una prueba de otra propuesta, de otro disparador, de otra generación,
+    de otro proyecto, de otra decisión de política o de otro grafo resultante no adopta nada. El
+    proyecto **no** cambia de estado al recibirla —la aprobación pendiente sigue pendiente—, de modo
+    que una prueba incorrecta no puede dejar al proyecto sin salida: se rechaza el intento de
+    adopción y se deja constancia en la auditoría.
+    """
 
 
 class ProjectReconciliationRequiredError(ProjectExecutionError):
@@ -299,6 +325,9 @@ RECONCILIATION_REQUIRED_CODES: Final[frozenset[ProjectFailureCode]] = frozenset(
         ProjectFailureCode.PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED,
         ProjectFailureCode.PROJECT_REPLAN_INVALID_PROPOSAL,
         ProjectFailureCode.PROJECT_GRAPH_GENERATION_MISSING,
+        # Una persona **rechazó** el plan: es una decisión tomada, y una reanudación genérica no
+        # puede borrarla (ENGINE-6.3.1, PART Y).
+        ProjectFailureCode.PROJECT_REPLAN_HUMAN_REJECTED,
     }
 )
 
@@ -323,6 +352,21 @@ class _ReplanRefusal(Exception):
         self.run = run
         self.code = code
         self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyVerdict:
+    """Veredicto de política de un intento de replanificación.
+
+    Separa las dos cosas que el kernel necesita saber: qué decisión ampara el intento —su
+    identificador, que viaja al vínculo del Human Gate y a la decisión del motor— y si esa decisión
+    deja continuar en autonomía o exige una persona. Antes, «exige persona» era un rechazo; desde
+    ENGINE-6.3.1 es la entrada del Human Gate ligado a la propuesta (hallazgo F631-03).
+    """
+
+    decision_id: UUID
+    requires_human: bool
+    outcome: str
 
 
 def child_references(run: WorkflowRun) -> tuple[ArtifactReference, ...]:
@@ -542,20 +586,29 @@ class ProjectExecutionKernel:
         self,
         project_run_id: UUID,
         *,
-        proof: HumanApprovalProof | None = None,
+        proof: HumanApprovalProof | ReplanApprovalProof | None = None,
         max_steps: int | None = None,
     ) -> ProjectRun:
         """Reanuda un proyecto pausado desde su último snapshot confirmado.
 
-        En ``HUMAN_APPROVAL`` la prueba es **obligatoria** y se entrega al child activo: es el child
-        quien valida que la aprobación corresponde a su propio Human Gate, a su tarea y a su acción.
-        Una prueba de otro nodo, de otro child o de otro proyecto no pasa esa validación, y el
-        proyecto se bloquea con ``PROJECT_APPROVAL_PROOF_INVALID`` sin ejecutar nada.
+        En ``HUMAN_APPROVAL`` la prueba es **obligatoria**, pero hay **dos** esperas distintas y no
+        se confunden (ENGINE-6.3.1, PART Y):
+
+        - la del **child activo**: la prueba es un ``HumanApprovalProof`` y se entrega al child, que
+          valida que la aprobación corresponde a su propio Human Gate, a su tarea y a su acción; una
+          prueba de otro nodo, de otro child o de otro proyecto no pasa esa validación y el proyecto
+          se bloquea con ``PROJECT_APPROVAL_PROOF_INVALID``;
+        - la de la **replanificación**: el proyecto guarda el vínculo exacto de la propuesta y la
+          prueba es un ``ReplanApprovalProof`` ligado a ese vínculo; se valida contra el estado
+          durable —propuesta, huella, disparador, generación de origen, decisión de política,
+          acción y grafo resultante— y, si no coincide, se rechaza sin adoptar nada y sin cambiar el
+          estado.
 
         Raises:
             ProjectTerminalError: si el proyecto ya está cerrado.
             ProjectHumanApprovalRequiredError: si espera aprobación y no se entrega prueba.
             ProjectApprovalProofInvalidError: si la prueba no corresponde al child activo.
+            ProjectReplanProofInvalidError: si la prueba no corresponde a la propuesta pendiente.
         """
         run = self._store.load(project_run_id)
         if run.is_terminal:
@@ -563,7 +616,11 @@ class ProjectExecutionKernel:
                 f"el proyecto {project_run_id} está en {run.status.value} y no se reanuda"
             )
         if run.status is ProjectState.HUMAN_APPROVAL:
-            run = self._resume_human_gate(run, proof)
+            if run.pending_replan_gate_ref is not None or run.active_replan_approval is not None:
+                run = self._resume_replan_gate(run, proof)
+            else:
+                child_proof = proof if isinstance(proof, HumanApprovalProof) else None
+                run = self._resume_human_gate(run, child_proof)
         elif self._machine.is_resumable(run.status):
             self._assert_resumable(run)
             run = self._transition(run, ProjectState.RUNNING)
@@ -1351,10 +1408,43 @@ class ProjectExecutionKernel:
                 run, proposal, ProjectFailureCode.PROJECT_REPLAN_GUARD_REJECTED, detail
             )
 
-        # --- 7. política ------------------------------------------------------
-        policy_decision_id = self._evaluate_replan_policy(
-            run, node_run, proposal, current_nodes, verdict.resulting_nodes
-        )
+        # --- 7. autorización humana: la clase de cambio y la política deciden -----
+        #
+        # Desde ENGINE-6.3.1 hay **dos** motivos por los que una propuesta válida no se adopta en
+        # autonomía, y los dos abren el mismo Human Gate ligado a la propuesta exacta:
+        #
+        # - el motor deriva una clase de cambio por encima de lo táctico (F631-02): un cambio de
+        #   arquitectura, datos, autenticación, despliegue, proveedor o reglas de negocio no se
+        #   adopta porque el Planner lo declare ``LOW`` y ``LEVEL_0_AUTONOMOUS``;
+        # - la política exige persona (``REQUIRE_HUMAN`` / ``ALLOW_WITH_REVIEW``), que es el caso
+        #   que el hallazgo F631-03 encontró terminando en un bloqueo sin salida.
+        change = classify_replan_change(proposal, contract=contract, action=run.request.action)
+        self._audit_replan_change_class(run, proposal.proposal_id, change)
+        authorized = run.active_replan_approval
+        if authorized is not None and authorized.authorized:
+            # Una persona ya autorizó **esta** propuesta exacta: no se vuelve a juzgar con la
+            # política ni a pedir permiso. La decisión que ampara la adopción es la que el vínculo
+            # fijó, y la prueba que la autorizó ya se validó al reanudar.
+            policy_decision_id = authorized.policy_decision_id
+        else:
+            policy_verdict = self._evaluate_replan_policy(
+                run,
+                node_run,
+                proposal,
+                current_nodes,
+                verdict.resulting_nodes,
+                classification=change,
+            )
+            if policy_verdict.requires_human or change.requires_human:
+                return self._open_replan_approval(
+                    run,
+                    node_run,
+                    proposal,
+                    verdict,
+                    policy_verdict.decision_id,
+                    change,
+                )
+            policy_decision_id = policy_verdict.decision_id
 
         # --- 8. decisión del motor -------------------------------------------
         decision = ProjectReplanDecision(
@@ -1651,6 +1741,10 @@ class ProjectExecutionKernel:
                     "active_replan_authorization": None,
                     "active_replan_proposal_ref": None,
                     "active_replan_decision_ref": None,
+                    # El intento terminó: la aprobación humana (si la hubo) ya cumplió su función y
+                    # su historia vive en la generación y en la auditoría.
+                    "active_replan_approval": None,
+                    "pending_replan_gate_ref": None,
                 }
             )
         return run.model_copy(update=update)
@@ -1703,13 +1797,19 @@ class ProjectExecutionKernel:
         proposal: ProjectReplanProposal,
         current_nodes: Sequence[GraphNode],
         resulting_nodes: Sequence[GraphNode],
-    ) -> UUID | None:
+        *,
+        classification: ReplanChangeClassification,
+    ) -> _PolicyVerdict:
         """Evalúa la **acción** de la replanificación con la frontera de política inyectada.
 
         Qué se evalúa y por qué así:
 
         - la **acción** es la canónica del proyecto (``request.action``): la replanificación no
           ejecuta una acción nueva, reescribe el plan de la misma acción;
+        - además viaja la **semántica del replan** que el motor derivó —la clase de cambio y los
+          tipos de operación—, porque la acción original no describe lo que la propuesta reescribe y
+          una política que solo viera ``modify_file`` podría autorizar en autonomía un cambio de
+          arquitectura (hallazgo F631-02). La acción original **no** se sustituye: se acompaña;
         - los **recursos** son las rutas que los nodos nuevos van a poder escribir, que es lo que un
           revisor tiene que poder ver;
         - el **riesgo** es el máximo entre el declarado por el proyecto y el de los nodos nuevos: la
@@ -1720,17 +1820,18 @@ class ProjectExecutionKernel:
           No hay una tabla paralela aquí, y una acción que no esté en ella se resuelve como *default
           deny*.
 
-        El veredicto se mapea **sin reinterpretarlo**: ``REJECT`` rechaza; ``REQUIRE_HUMAN`` y
-        ``ALLOW_WITH_REVIEW`` exigen persona —una replanificación autónoma no puede saltarse una
-        revisión—; ``ALLOW`` es lo único que deja seguir. Sin frontera de política inyectada no hay
-        autorización posible: se declara ``PROJECT_REPLAN_HUMAN_REQUIRED`` en vez de autorizar a
-        ciegas.
+        El veredicto se mapea **sin reinterpretarlo**: ``REJECT`` (o «no permitida») rechaza el
+        intento; ``REQUIRE_HUMAN``, ``ALLOW_WITH_REVIEW`` y ``requires_human`` **no** bloquean el
+        proyecto: se devuelven como «hace falta persona» para que el llamante abra el Human Gate
+        ligado a esta propuesta (ENGINE-6.3.1, PART Y); ``ALLOW`` es lo único que deja seguir en
+        autonomía. Sin frontera de política inyectada no hay autorización posible ni gate al que
+        preguntar: se declara ``PROJECT_REPLAN_HUMAN_REQUIRED`` y el proyecto se detiene.
 
         Returns:
-            El identificador de la decisión de política que ampara la replanificación.
+            El identificador de la decisión de política y si su veredicto exige una persona.
 
         Raises:
-            _ReplanRefusal: si la política rechaza la acción, exige una persona o no hay frontera.
+            _ReplanRefusal: si la política rechaza la acción o no hay frontera de política.
         """
         if self._policy is None:
             detail = (
@@ -1769,9 +1870,13 @@ class ProjectExecutionKernel:
             files_changed=list(files),
             description=(
                 f"replanificación acotada del proyecto: {len(new_nodes)} nodo(s) nuevo(s) dentro "
-                "del contrato autorizado"
+                f"del contrato autorizado (clase de cambio {classification.change_class.value})"
             )[:MAX_REPLAN_TEXT_CHARS],
             task_id=str(run.project_run_id),
+            replan_change_class=classification.change_class.value,
+            replan_operation_kinds=tuple(
+                operation.kind.value for operation in proposal.operations
+            ),
         )
         decision = self._policy.engine.evaluate(
             action_request, PolicyEvaluationContext(actor=RoleName.PLANNER.value)
@@ -1783,20 +1888,108 @@ class ProjectExecutionKernel:
             self._reject_proposal(
                 run, proposal, ProjectFailureCode.PROJECT_REPLAN_POLICY_REJECTED, detail
             )
-        if decision.requires_human or decision.outcome in (
+        human_required = decision.requires_human or decision.outcome in (
             PolicyOutcome.REQUIRE_HUMAN,
             PolicyOutcome.ALLOW_WITH_REVIEW,
-        ):
-            detail = (
-                f"el Policy Engine devolvió {decision.outcome.value} para la acción {action!r}: "
-                "una replanificación autónoma no puede saltarse una revisión ni una aprobación "
-                "humana"
+        )
+        return _PolicyVerdict(
+            decision_id=decision.id,
+            requires_human=human_required,
+            outcome=decision.outcome.value,
+        )
+
+    def _open_replan_approval(
+        self,
+        run: ProjectRun,
+        node_run: ProjectNodeRun,
+        proposal: ProjectReplanProposal,
+        verdict: ReplanGuardResult,
+        policy_decision_id: UUID,
+        classification: ReplanChangeClassification,
+    ) -> ProjectRun:
+        """Abre el Human Gate de la replanificación, ligado a **esta** propuesta (PART Y).
+
+        Es idempotente por estado durable: si el vínculo ya existe (caída después de escribirlo y
+        antes de la transición), se reutiliza la misma solicitud en vez de crear otra; el humano no
+        ve dos aprobaciones para el mismo plan.
+
+        Lo que se persiste, y por qué cada cosa:
+
+        - el **vínculo** completo en el checkpoint, para que un proceso nuevo valide una prueba sin
+          reconstruir el intento;
+        - su copia legible como artefacto (``pending_replan_gate_ref``), para que quien aprueba lea
+          qué propuesta, qué disparador, qué generación y qué grafo está autorizando;
+        - el **grafo resultante congelado** (``publish_graph_bundle``) y su huella: la persona
+          aprueba un objetivo inmutable, y la adopción posterior no vuelve a juzgar la propuesta
+          para reconstruirlo;
+        - la transición ``REPLANNING`` → ``HUMAN_APPROVAL``, que es el estado que dice «espera una
+          persona» sin declarar un fallo.
+
+        El intento **no** se liquida aquí: el gasto del replanner ya ocurrió y se liquidará cuando
+        el humano decida. Tampoco se publica una decisión aceptada: no la hay hasta que la persona
+        autorice.
+        """
+        existing = run.active_replan_approval
+        graph_ref = publish_graph_bundle(
+            self._artifacts,
+            request=run.request,
+            nodes=verdict.resulting_nodes,
+            fingerprint=verdict.resulting_fingerprint,
+        )
+        if existing is not None:
+            binding = existing
+            approval_id = binding.approval_id
+        else:
+            gate = self._policy.gate if self._policy is not None else None
+            if gate is None:  # pragma: no cover - sin frontera de política no se llega aquí
+                self._refuse(
+                    run,
+                    ProjectFailureCode.PROJECT_REPLAN_HUMAN_REQUIRED,
+                    (
+                        "la replanificación exige una persona y el kernel no tiene Human Gate "
+                        "inyectado: no hay a quién pedirle la aprobación"
+                    ),
+                )
+            approval = gate.request_replan_approval(
+                project_run_id=run.project_run_id,
+                trigger_id=proposal.trigger_id,
+                proposal_id=proposal.proposal_id,
+                proposal_fingerprint=proposal.proposal_fingerprint,
+                source_generation_id=proposal.source_generation_id,
+                policy_decision_id=policy_decision_id,
+                action=run.request.action,
+                change_class=classification.change_class.value,
+                resulting_graph_fingerprint=verdict.resulting_fingerprint,
+                risk=run.request.risk,
+                reason=(
+                    f"la replanificación del proyecto {run.project_run_id} exige autorización "
+                    f"humana: {classification.detail}"
+                )[:MAX_REPLAN_TEXT_CHARS],
             )
-            self._audit_replan_human_required(run, node_run, decision.outcome.value, detail)
-            self._reject_proposal(
-                run, proposal, ProjectFailureCode.PROJECT_REPLAN_HUMAN_REQUIRED, detail
+            approval_id = approval.id
+            binding = ReplanApprovalBinding(
+                project_run_id=run.project_run_id,
+                approval_id=approval_id,
+                trigger_id=proposal.trigger_id,
+                proposal_id=proposal.proposal_id,
+                proposal_fingerprint=proposal.proposal_fingerprint,
+                source_generation_id=proposal.source_generation_id,
+                policy_decision_id=policy_decision_id,
+                action=run.request.action,
+                change_class=classification.change_class.value,
+                resulting_graph_ref=graph_ref,
+                resulting_graph_fingerprint=verdict.resulting_fingerprint,
             )
-        return decision.id
+        gate_ref = self._publish_replan_gate(run, binding)
+        run = run.model_copy(
+            update={
+                "active_replan_approval": binding,
+                "pending_replan_gate_ref": gate_ref,
+            }
+        )
+        run = self._transition(run, ProjectState.HUMAN_APPROVAL)
+        self._audit_replan_approval_requested(run, node_run, proposal, binding)
+        return run
 
     # ------------------------------------------------- auxiliares del replan
     def _attach_contract(self, run: ProjectRun) -> ProjectRun:
@@ -2579,6 +2772,212 @@ class ProjectExecutionKernel:
             data=payload,
         )
 
+    def _publish_replan_gate(
+        self, run: ProjectRun, binding: ReplanApprovalBinding
+    ) -> ArtifactReference:
+        """Publica el vínculo legible de la aprobación de replanificación pendiente (PART Y).
+
+        Es un artefacto de auditoría, no una autorización: la autoridad es la prueba del Human Gate,
+        y el vínculo operativo vive en el checkpoint. Lo que este artefacto consigue es que quien
+        aprueba —y quien audita después— lea exactamente qué propuesta, qué disparador, qué
+        generación de origen, qué decisión de política y qué grafo resultante se está autorizando.
+        """
+        payload = json.dumps(
+            {
+                "binding_id": str(binding.binding_id),
+                "approval_id": str(binding.approval_id),
+                "project_run_id": str(binding.project_run_id),
+                "trigger_id": str(binding.trigger_id),
+                "proposal_id": str(binding.proposal_id),
+                "proposal_fingerprint": binding.proposal_fingerprint,
+                "source_generation_id": str(binding.source_generation_id),
+                "policy_decision_id": str(binding.policy_decision_id),
+                "action": binding.action,
+                "change_class": binding.change_class,
+                "resulting_graph_fingerprint": binding.resulting_graph_fingerprint,
+                "resulting_graph_ref": binding.resulting_graph_ref.reference,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return self._artifacts.put(
+            workflow_id=run.project_run_id,
+            role=RoleName.PLANNER,
+            step_index=len(run.nodes),
+            kind=PROJECT_REPLAN_GATE_KIND,
+            label=PROJECT_REPLAN_GATE_LABEL,
+            data=payload,
+        )
+
+    def _replan_gate_request(self, binding: ReplanApprovalBinding) -> object | None:
+        """Solicitud de aprobación del gate, si este proceso la conoce."""
+        if self._policy is None:
+            return None
+        return self._policy.gate.get(binding.approval_id)
+
+    def _restore_replan_gate_request(
+        self, run: ProjectRun, binding: ReplanApprovalBinding
+    ) -> None:
+        """Reconstruye en el gate la solicitud pendiente que un proceso nuevo no conoce.
+
+        El ``HumanGate`` vive en memoria por diseño (ENGINE-0), así que un proceso nuevo no hereda
+        la solicitud pendiente. Lo que sí hereda es el **vínculo** durable, y con él puede volver a
+        registrar la misma solicitud —con el **mismo** identificador, para que la prueba que se
+        emita después siga siendo válida— en vez de inventar una aprobación nueva: el humano que
+        aprueba tras un reinicio aprueba exactamente la propuesta que el proyecto esperaba.
+        """
+        if self._policy is None:  # pragma: no cover - sin gate no hay espera que restaurar
+            return
+        gate = self._policy.gate
+        if gate.get(binding.approval_id) is not None:
+            return
+        gate.request_replan_approval(
+            project_run_id=binding.project_run_id,
+            trigger_id=binding.trigger_id,
+            proposal_id=binding.proposal_id,
+            proposal_fingerprint=binding.proposal_fingerprint,
+            source_generation_id=binding.source_generation_id,
+            policy_decision_id=binding.policy_decision_id,
+            action=binding.action,
+            change_class=binding.change_class,
+            resulting_graph_fingerprint=binding.resulting_graph_fingerprint,
+            risk=run.request.risk,
+            reason=(
+                "aprobación restaurada tras un reinicio: la propuesta, el disparador, la "
+                "generación de origen y la decisión de política son los del vínculo durable"
+            ),
+            approval_id=binding.approval_id,
+        )
+
+    def _resume_replan_gate(
+        self, run: ProjectRun, proof: HumanApprovalProof | ReplanApprovalProof | None
+    ) -> ProjectRun:
+        """Reanuda el proyecto que espera la aprobación de **una propuesta** (PART Y).
+
+        Tres desenlaces, y los tres dejan el estado coherente:
+
+        - **rechazo humano**: la propuesta queda rechazada con su código estable, el intento se
+          liquida (el gasto ocurrió) y el proyecto se bloquea; no se adopta ningún grafo y no se
+          llama a ningún proveedor;
+        - **sin prueba**: la aprobación sigue pendiente y el proyecto no avanza
+          (``ProjectHumanApprovalRequiredError``); la solicitud se restaura en el gate si un proceso
+          nuevo no la conocía;
+        - **prueba válida**: se marca el vínculo como autorizado —hito durable, de modo que una
+          caída inmediatamente después continúe la adopción sin volver a pedir permiso— y el
+          proyecto vuelve a ``REPLANNING`` para terminar el intento que ya estaba juzgado.
+        """
+        binding = run.active_replan_approval
+        if binding is None:  # pragma: no cover - el ref y el vínculo se escriben juntos
+            raise ProjectReplanProofInvalidError(
+                f"el proyecto {run.project_run_id} declara una aprobación de replanificación "
+                "pendiente y no conserva su vínculo: sin vínculo no hay nada que autorizar"
+            )
+        self._restore_replan_gate_request(run, binding)
+        approval = self._replan_gate_request(binding)
+        rejected = approval is not None and getattr(approval, "is_rejected", False)
+        if rejected:
+            return self._reject_replan_by_human(run, binding)
+        if not isinstance(proof, ReplanApprovalProof):
+            raise ProjectHumanApprovalRequiredError(
+                f"el proyecto {run.project_run_id} espera la aprobación humana de la propuesta "
+                f"{binding.proposal_id} (aprobación {binding.approval_id}): sin una prueba ligada "
+                "a esa propuesta exacta no se reanuda"
+            )
+        self._validate_replan_proof(run, binding, proof)
+        run = run.model_copy(
+            update={
+                "active_replan_approval": binding.with_authorized(
+                    proof_id=proof.proof_id, authorized_at=self._now()
+                )
+            }
+        )
+        self._store.save(run)
+        self._audit_replan_approved(run, binding, proof)
+        return self._transition(run, ProjectState.REPLANNING)
+
+    def _validate_replan_proof(
+        self,
+        run: ProjectRun,
+        binding: ReplanApprovalBinding,
+        proof: ReplanApprovalProof,
+    ) -> None:
+        """Valida la prueba contra el vínculo **y** contra el estado durable actual.
+
+        La prueba acredita que una persona aprobó; esta comprobación acredita que lo aprobado sigue
+        siendo lo que hay: la misma propuesta (por identidad **y** por huella recalculada), el mismo
+        disparador, la misma generación de origen, la misma decisión de política, la misma acción,
+        el mismo grafo resultante y la misma revisión aceptada. Cualquier desviación se rechaza con
+        ``ProjectReplanProofInvalidError`` y queda auditada; el proyecto no cambia de estado.
+        """
+        from punto.project.replanner import proposal_fingerprint
+
+        def deny(reason: str) -> NoReturn:
+            self._audit_replan_approval_denied(run, binding, reason)
+            raise ProjectReplanProofInvalidError(
+                f"la prueba de replanificación no autoriza la propuesta pendiente del proyecto "
+                f"{run.project_run_id}: {reason}"
+            )
+
+        if proof.project_run_id != run.project_run_id:
+            deny("la prueba pertenece a otro proyecto")
+        if proof.approval_id != binding.approval_id:
+            deny("la prueba se emitió para otra solicitud de aprobación")
+        if proof.trigger_id != binding.trigger_id:
+            deny("la prueba autoriza otro disparador")
+        trigger = run.active_replan_trigger
+        if trigger is None or trigger.trigger_id != binding.trigger_id:
+            deny("el proyecto ya no conserva el disparador que la aprobación autorizó")
+        if proof.proposal_id != binding.proposal_id:
+            deny("la prueba autoriza otra propuesta")
+        if proof.proposal_fingerprint != binding.proposal_fingerprint:
+            deny("la prueba autoriza otra huella de propuesta")
+        proposal = self._durable_replan_proposal(run)
+        if proposal is None:
+            deny("la propuesta durable ya no se puede resolver")
+        if proposal.proposal_id != binding.proposal_id:
+            deny("la propuesta durable no es la que la aprobación autorizó")
+        if proposal_fingerprint(proposal) != binding.proposal_fingerprint:
+            deny("la propuesta cambió después de aprobarse")
+        if proof.source_generation_id != binding.source_generation_id:
+            deny("la prueba autoriza otra generación de origen")
+        active = run.active_generation
+        if active is None or active.generation_id != binding.source_generation_id:
+            deny("la generación activa cambió desde que se aprobó la propuesta")
+        if proof.policy_decision_id != binding.policy_decision_id:
+            deny("la prueba autoriza otra decisión de política")
+        if proof.action != binding.action or binding.action != run.request.action:
+            deny("la acción del proyecto cambió desde que se aprobó la propuesta")
+        if proof.resulting_graph_fingerprint != binding.resulting_graph_fingerprint:
+            deny("la prueba autoriza otro grafo resultante")
+        try:
+            frozen = resolve_graph_bundle(self._artifacts, binding.resulting_graph_ref)
+        except ProjectHandoffError as exc:
+            deny(f"el grafo aprobado no se puede resolver: {exc}")
+        if frozen is None or frozen.fingerprint != binding.resulting_graph_fingerprint:
+            deny("el grafo aprobado ya no es el que la aprobación congeló")
+        if trigger is not None and trigger.accepted_revision != run.workspace.accepted_revision:
+            deny("la revisión aceptada cambió desde que se creó el disparador")
+
+    def _reject_replan_by_human(
+        self, run: ProjectRun, binding: ReplanApprovalBinding
+    ) -> ProjectRun:
+        """Cierra el intento cuando una persona **rechazó** el plan: nada se adopta.
+
+        El rechazo se declara con su código estable (``PROJECT_REPLAN_HUMAN_REJECTED``), el intento
+        se liquida —el gasto del replanner ocurrió y esconderlo sería mentir sobre el presupuesto— y
+        el proyecto queda bloqueado. Los nodos no aceptados conservan su estado y su historia: el
+        rechazo de la persona no borra el trabajo que ya existía.
+        """
+        detail = (
+            f"una persona rechazó la propuesta {binding.proposal_id} del proyecto "
+            f"{run.project_run_id} (aprobación {binding.approval_id}): el plan no se adopta y la "
+            "decisión queda escrita"
+        )
+        self._audit_replan_human_rejected(run, binding, detail)
+        run = self._liquidate_replan_attempt(run, accepted=False)
+        self._store.save(run)
+        return self._block(run, ProjectFailureCode.PROJECT_REPLAN_HUMAN_REJECTED, detail)
+
     def _resume_human_gate(
         self, run: ProjectRun, proof: HumanApprovalProof | None
     ) -> ProjectRun:
@@ -3168,6 +3567,104 @@ class ProjectExecutionKernel:
             accepted_revision=reconciliation.requested_revision,
             previous_revision=reconciliation.previous_revision,
             restored=reconciliation.restored,
+            detail=detail,
+        )
+
+    def _audit_replan_change_class(
+        self,
+        run: ProjectRun,
+        proposal_id: UUID,
+        classification: ReplanChangeClassification,
+    ) -> None:
+        """Audita la clase de cambio que el motor derivó para la propuesta (F631-02)."""
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_change_classified(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            proposal_id=proposal_id,
+            change_class=classification.change_class.value,
+            tactical=classification.is_tactical,
+            detail=classification.detail,
+            matches=classification.matches,
+        )
+
+    def _audit_replan_approval_requested(
+        self,
+        run: ProjectRun,
+        node_run: ProjectNodeRun,
+        proposal: ProjectReplanProposal,
+        binding: ReplanApprovalBinding,
+    ) -> None:
+        """Audita que la replanificación espera una decisión humana ligada a esa propuesta."""
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_approval_requested(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            approval_id=binding.approval_id,
+            proposal_id=proposal.proposal_id,
+            trigger_id=binding.trigger_id,
+            source_generation_id=binding.source_generation_id,
+            policy_decision_id=binding.policy_decision_id,
+            change_class=binding.change_class,
+            action=binding.action,
+            resulting_graph_fingerprint=binding.resulting_graph_fingerprint,
+            detail=(
+                f"la propuesta {proposal.proposal_id} del nodo {node_run.node_id!r} exige una "
+                f"persona (clase de cambio {binding.change_class}): el proyecto espera la "
+                "aprobación de esa propuesta exacta"
+            ),
+        )
+
+    def _audit_replan_approved(
+        self, run: ProjectRun, binding: ReplanApprovalBinding, proof: ReplanApprovalProof
+    ) -> None:
+        """Audita que una prueba válida autorizó esa propuesta y la adopción continúa."""
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_approved(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            approval_id=binding.approval_id,
+            proposal_id=binding.proposal_id,
+            proof_id=proof.proof_id,
+            change_class=binding.change_class,
+            detail=(
+                f"la prueba {proof.proof_id} autorizó la propuesta {binding.proposal_id} del "
+                f"proyecto {run.project_run_id}: el intento continúa con el grafo aprobado"
+            ),
+        )
+
+    def _audit_replan_approval_denied(
+        self, run: ProjectRun, binding: ReplanApprovalBinding, reason: str
+    ) -> None:
+        """Audita que una prueba presentada no correspondía al vínculo: no se adopta nada."""
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_approval_denied(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            approval_id=binding.approval_id,
+            proposal_id=binding.proposal_id,
+            reason=reason,
+            detail=(
+                f"la prueba presentada no autoriza la propuesta {binding.proposal_id}: {reason}. "
+                "El proyecto no cambia de estado y la aprobación sigue pendiente"
+            ),
+        )
+
+    def _audit_replan_human_rejected(
+        self, run: ProjectRun, binding: ReplanApprovalBinding, detail: str
+    ) -> None:
+        """Audita que una persona rechazó la propuesta: el plan no se adopta."""
+        if self._audit is None:
+            return
+        self._audit.log_project_replan_human_rejected(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            approval_id=binding.approval_id,
+            proposal_id=binding.proposal_id,
             detail=detail,
         )
 

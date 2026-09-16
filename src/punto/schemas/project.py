@@ -39,6 +39,7 @@ from punto.schemas.replan import (
     MAX_PROJECT_GENERATIONS,
     ProjectGraphGeneration,
     ProjectReplanTrigger,
+    ReplanApprovalBinding,
     ReplanInvocationAuthorization,
 )
 from punto.schemas.workflow import ArtifactReference, WorkflowBudget
@@ -214,6 +215,9 @@ class ProjectFailureCode(StrEnum):
     PROJECT_GRAPH_GENERATION_MISSING = "PROJECT_GRAPH_GENERATION_MISSING"
     #: La prueba humana autoriza otra propuesta, no esta.
     PROJECT_REPLAN_PROOF_INVALID = "PROJECT_REPLAN_PROOF_INVALID"
+    #: Una persona **rechazó** la propuesta de replanificación: el plan no se adopta y el motivo
+    #: queda escrito (ENGINE-6.3.1, PART Y). Es un veredicto humano, no un fallo del motor.
+    PROJECT_REPLAN_HUMAN_REJECTED = "PROJECT_REPLAN_HUMAN_REJECTED"
     #: El proyecto no puede cerrarse: falta algún requisito de cierre.
     PROJECT_COMPLETION_INCOMPLETE = "PROJECT_COMPLETION_INCOMPLETE"
 
@@ -502,6 +506,18 @@ class ProjectRun(BaseModel):
     active_replan_authorization: ReplanInvocationAuthorization | None = Field(default=None)
     active_replan_proposal_ref: ArtifactReference | None = Field(default=None)
     active_replan_decision_ref: ArtifactReference | None = Field(default=None)
+    #: Aprobación humana pendiente de una **replanificación** (ENGINE-6.3.1, PART Y).
+    #:
+    #: Es una espera distinta de ``pending_human_gate_ref``: aquella pertenece al child activo y la
+    #: resuelve el workflow; esta pertenece a la propuesta de replanificación y la resuelve el
+    #: kernel. Se guardan por separado precisamente para que una aprobación de child no pueda
+    #: confundirse con una aprobación de plan.
+    pending_replan_gate_ref: ArtifactReference | None = Field(default=None)
+    #: Vínculo exacto que autoriza la aprobación pendiente: proyecto, disparador, propuesta, huella
+    #: de la propuesta, generación de origen, decisión de política, acción, clase de cambio y grafo
+    #: resultante. Viaja en el checkpoint para que un proceso nuevo pueda validar una prueba sin
+    #: reconstruir el intento.
+    active_replan_approval: ReplanApprovalBinding | None = Field(default=None)
     #: Huellas de los replanes **ya intentados** (trigger, propuesta o grafo), acotadas a
     #: ``MAX_PROJECT_GENERATIONS``.
     #:

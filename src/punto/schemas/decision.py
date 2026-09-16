@@ -104,6 +104,24 @@ class ActionRequest(BaseModel):
         default=None,
         description="Identificador de la tarea a la que pertenece la acción, si existe.",
     )
+    #: Semántica de replanificación que el **motor** derivó, cuando la acción evaluada es la de una
+    #: replanificación (ENGINE-6.3.1). Vacía en cualquier otra acción: no la declara quien pide.
+    #:
+    #: Existe porque la acción original del proyecto —``modify_file``, por ejemplo— no describe lo
+    #: que la propuesta reescribe, y una política que solo viera la acción original podría autorizar
+    #: en autonomía un cambio de arquitectura heredando una autorización de nivel 0.
+    replan_change_class: str = Field(
+        default="",
+        max_length=60,
+        description="Clase de cambio derivada por el motor para una replanificación, o vacío.",
+    )
+    #: Operaciones que la propuesta de replanificación ejecuta, para que la política vea **qué** se
+    #: reescribe (dividir, insertar un prerrequisito, reordenar, reemplazar).
+    replan_operation_kinds: tuple[str, ...] = Field(
+        default=(),
+        max_length=8,
+        description="Tipos de operación de la propuesta de replanificación, si la hay.",
+    )
 
     @field_validator("action")
     @classmethod

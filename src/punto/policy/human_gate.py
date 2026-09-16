@@ -137,6 +137,68 @@ class BudgetReconciliationProof:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplanApprovalProof:
+    """Autorización de una persona para adoptar **una** propuesta de replanificación exacta.
+
+    ENGINE-6.3.1 (PART Y) cierra el hueco del hallazgo F631-03: hasta ahora, una replanificación que
+    la política mandaba a una persona terminaba en un bloqueo genérico, sin aprobación ligada a
+    nada y sin camino de continuación. Esta prueba es el eslabón que faltaba: la emite
+    **exclusivamente** :meth:`HumanGate.authorize_replan`, sobre una solicitud ``APPROVED`` y solo
+    si lo que se pide adoptar coincide campo a campo con lo que la solicitud fijó al crearse.
+
+    Va ligada a lo que autoriza —proyecto, disparador, propuesta, huella de la propuesta, generación
+    de origen, decisión de política, acción, clase de cambio y huella del grafo resultante— para que
+    una prueba de otra propuesta, de otro disparador, de otra generación o de otro proyecto no
+    sirva. El constructor exige el mismo centinela privado que el resto de pruebas del gate, así que
+    no puede fabricarse desde código ordinario; y ``nonce`` e ``issued_at`` dejan la repetición
+    detectable por quien la consume.
+    """
+
+    proof_id: UUID
+    approval_id: UUID
+    project_run_id: UUID
+    trigger_id: UUID
+    proposal_id: UUID
+    proposal_fingerprint: str
+    source_generation_id: UUID
+    policy_decision_id: UUID
+    action: str
+    change_class: str
+    resulting_graph_fingerprint: str
+    nonce: UUID
+    issued_at: datetime
+    issuer: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.issuer is not _PROOF_ISSUER:
+            msg = (
+                "ReplanApprovalProof solo puede ser emitido por HumanGate.authorize_replan(); una "
+                "autorización de replanificación no puede fabricarse a mano."
+            )
+            raise HumanGateError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplanApprovalBinding:
+    """Lo que una solicitud de aprobación de replanificación autoriza, fijado al crearla.
+
+    Se guarda en el gate y no en la solicitud pública porque lo que el humano aprueba sigue siendo
+    la solicitud: el ``HumanGate`` es quien sabe exactamente a qué propuesta, disparador, generación
+    y grafo resultante se refería.
+    """
+
+    project_run_id: UUID
+    trigger_id: UUID
+    proposal_id: UUID
+    proposal_fingerprint: str
+    source_generation_id: UUID
+    policy_decision_id: UUID
+    action: str
+    change_class: str
+    resulting_graph_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ReconciliationBinding:
     """Lo que una solicitud de reconciliación autoriza, fijado al crearla.
 
@@ -162,6 +224,8 @@ class HumanGate:
         self._by_task: dict[UUID, list[UUID]] = {}
         #: Brecha exacta que autoriza cada solicitud de reconciliación (hallazgo N6-01).
         self._reconciliations: dict[UUID, _ReconciliationBinding] = {}
+        #: Propuesta exacta que autoriza cada solicitud de replanificación (ENGINE-6.3.1).
+        self._replans: dict[UUID, _ReplanApprovalBinding] = {}
 
     # ------------------------------------------------------------------ create
     def request(
@@ -174,6 +238,7 @@ class HumanGate:
         resume_status: TaskStatus = TaskStatus.IN_PROGRESS,
         policy_outcome: str | None = None,
         policy_decision_id: UUID | None = None,
+        approval_id: UUID | None = None,
     ) -> HumanApprovalRequest:
         """Crea una solicitud de aprobación pendiente.
 
@@ -187,6 +252,12 @@ class HumanGate:
             policy_decision_id: Identificador de la ``PolicyDecision`` que originó
                 la solicitud. Vincula la aprobación a la decisión exacta, de modo
                 que resolverla nunca dependa del historial global de decisiones.
+            approval_id: Identificador explícito de la solicitud. Solo lo usa la
+                restauración de una aprobación durable tras un reinicio
+                (ENGINE-6.3.1): volver a registrar la **misma** solicitud con el
+                **mismo** identificador es lo que permite que la prueba emitida
+                después siga siendo válida para el vínculo que el proyecto
+                conserva.
 
         Returns:
             La solicitud creada, en estado ``PENDING``.
@@ -199,6 +270,7 @@ class HumanGate:
             raise HumanGateError(msg)
 
         approval = HumanApprovalRequest(
+            id=approval_id if approval_id is not None else uuid4(),
             task_id=task_id,
             action=action,
             risk=risk,
@@ -526,6 +598,201 @@ class HumanGate:
             issuer=_PROOF_ISSUER,
         )
 
+    # ------------------------------------------------- replanificación (F631-03)
+    def request_replan_approval(
+        self,
+        *,
+        project_run_id: UUID,
+        trigger_id: UUID,
+        proposal_id: UUID,
+        proposal_fingerprint: str,
+        source_generation_id: UUID,
+        policy_decision_id: UUID,
+        action: str,
+        change_class: str,
+        resulting_graph_fingerprint: str,
+        risk: RiskLevel,
+        reason: str,
+        task_id: UUID | None = None,
+        approval_id: UUID | None = None,
+    ) -> HumanApprovalRequest:
+        """Pide aprobación humana para adoptar **una** propuesta de replanificación concreta.
+
+        La propuesta se fija aquí, al crear la solicitud: lo que la persona aprueba es esa
+        propuesta, con ese disparador, esa generación de origen, esa decisión de política y ese
+        grafo resultante. Una autorización posterior para otra propuesta no existirá nunca, porque
+        el gate no la emite (ENGINE-6.3.1, PART Y).
+
+        Args:
+            project_run_id: Proyecto cuya replanificación se somete a decisión humana.
+            trigger_id: Disparador durable del intento.
+            proposal_id: Propuesta exacta que se aprobaría.
+            proposal_fingerprint: Huella canónica de esa propuesta.
+            source_generation_id: Generación sobre la que la propuesta se calculó.
+            policy_decision_id: Decisión de política que exigió la persona.
+            action: Acción canónica del proyecto.
+            change_class: Clase de cambio que el **motor** derivó para la propuesta.
+            resulting_graph_fingerprint: Huella del grafo que se adoptaría al aprobar.
+            risk: Riesgo efectivo de la replanificación, calculado por la política.
+            reason: Motivo legible de la solicitud.
+            task_id: Tarea dueña, si la hay; por defecto, el propio proyecto.
+            approval_id: Identificador explícito, para restaurar tras un reinicio la misma
+                solicitud que el proyecto conserva en su vínculo.
+
+        Returns:
+            La solicitud pendiente, lista para ``approve``/``reject``.
+        """
+        approval = self.request(
+            task_id=project_run_id if task_id is None else task_id,
+            action=action,
+            risk=risk,
+            reason=reason,
+            policy_outcome="REPLAN",
+            policy_decision_id=policy_decision_id,
+            approval_id=approval_id,
+        )
+        self._replans[approval.id] = _ReplanApprovalBinding(
+            project_run_id=project_run_id,
+            trigger_id=trigger_id,
+            proposal_id=proposal_id,
+            proposal_fingerprint=proposal_fingerprint,
+            source_generation_id=source_generation_id,
+            policy_decision_id=policy_decision_id,
+            action=action,
+            change_class=change_class,
+            resulting_graph_fingerprint=resulting_graph_fingerprint,
+        )
+        return approval
+
+    def replan_binding(self, approval_id: UUID) -> _ReplanApprovalBinding | None:
+        """Vínculo exacto de una solicitud de replanificación, o ``None`` si no lo es."""
+        return self._replans.get(approval_id)
+
+    def authorize_replan(
+        self,
+        approval_id: UUID,
+        *,
+        project_run_id: UUID,
+        trigger_id: UUID,
+        proposal_id: UUID,
+        proposal_fingerprint: str,
+        source_generation_id: UUID,
+        policy_decision_id: UUID,
+        action: str = "",
+        resulting_graph_fingerprint: str = "",
+    ) -> ReplanApprovalProof:
+        """Emite la prueba de adopción de una propuesta de replanificación aprobada (F631-03).
+
+        Es el **único** punto de emisión. Exige que lo que se pretende adoptar sea exactamente lo
+        que la solicitud aprobó: proyecto, disparador, propuesta, huella de la propuesta, generación
+        de origen y decisión de política tienen que coincidir, y la acción y el grafo resultante se
+        comprueban cuando se declaran. Una prueba «parecida» no sirve, y una prueba de una propuesta
+        anterior tampoco.
+
+        Args:
+            approval_id: Solicitud aprobada.
+            project_run_id: Proyecto que pretende adoptar.
+            trigger_id: Disparador del intento que se pretende continuar.
+            proposal_id: Propuesta que se pretende adoptar.
+            proposal_fingerprint: Huella de esa propuesta.
+            source_generation_id: Generación sobre la que se calculó.
+            policy_decision_id: Decisión de política vigente con la que se pide.
+            action: Acción del proyecto, si se quiere comprobar también.
+            resulting_graph_fingerprint: Huella del grafo a adoptar, si se quiere comprobar.
+
+        Returns:
+            La prueba ligada a esa propuesta exacta.
+
+        Raises:
+            HumanGateNotApprovedError: si la solicitud no existe o no está ``APPROVED``.
+            HumanGateError: si la solicitud no es de replanificación, no declara decisión de
+                política o no coincide con lo aprobado.
+        """
+        approval = self.assert_executable(approval_id)
+        binding = self._replans.get(approval_id)
+        if binding is None:
+            msg = (
+                f"La solicitud {approval_id} no autoriza ninguna replanificación: solo una "
+                "solicitud creada con request_replan_approval puede emitirla."
+            )
+            raise HumanGateError(msg)
+        if approval.policy_decision_id is None:
+            msg = (
+                f"La solicitud {approval_id} no está vinculada a ninguna PolicyDecision: no puede "
+                "autorizar una replanificación."
+            )
+            raise HumanGateError(msg)
+        if binding.project_run_id != project_run_id:
+            msg = (
+                f"La solicitud {approval_id} autoriza el proyecto {binding.project_run_id} y se "
+                f"pide {project_run_id}: una aprobación de un proyecto no ampara otro."
+            )
+            raise HumanGateError(msg)
+        if binding.trigger_id != trigger_id:
+            msg = (
+                f"La solicitud {approval_id} autoriza el disparador {binding.trigger_id} y se pide "
+                f"{trigger_id}: una aprobación de un intento no ampara otro."
+            )
+            raise HumanGateError(msg)
+        if binding.proposal_id != proposal_id:
+            msg = (
+                f"La solicitud {approval_id} autoriza la propuesta {binding.proposal_id} y se pide "
+                f"{proposal_id}: una aprobación de una propuesta no ampara otra."
+            )
+            raise HumanGateError(msg)
+        if binding.proposal_fingerprint != proposal_fingerprint:
+            msg = (
+                f"La solicitud {approval_id} autoriza la propuesta con huella "
+                f"{binding.proposal_fingerprint!r} y se pide {proposal_fingerprint!r}: la "
+                "propuesta cambió después de aprobarse."
+            )
+            raise HumanGateError(msg)
+        if binding.source_generation_id != source_generation_id:
+            msg = (
+                f"La solicitud {approval_id} autoriza la generación de origen "
+                f"{binding.source_generation_id} y se pide {source_generation_id}: la aprobación "
+                "no ampara otra generación."
+            )
+            raise HumanGateError(msg)
+        if binding.policy_decision_id != policy_decision_id:
+            msg = (
+                f"La solicitud {approval_id} se aprobó contra la decisión "
+                f"{binding.policy_decision_id} y se pide contra {policy_decision_id}: una "
+                "autorización de una decisión no ampara otra."
+            )
+            raise HumanGateError(msg)
+        if action and binding.action != action:
+            msg = (
+                f"La solicitud {approval_id} autoriza la acción {binding.action!r} y se pide "
+                f"{action!r}: la acción no cambia al emitir la prueba."
+            )
+            raise HumanGateError(msg)
+        if resulting_graph_fingerprint and (
+            binding.resulting_graph_fingerprint != resulting_graph_fingerprint
+        ):
+            msg = (
+                f"La solicitud {approval_id} autoriza el grafo "
+                f"{binding.resulting_graph_fingerprint!r} y se pide "
+                f"{resulting_graph_fingerprint!r}: el plan aprobado no es el que se adopta."
+            )
+            raise HumanGateError(msg)
+        return ReplanApprovalProof(
+            proof_id=uuid4(),
+            approval_id=approval.id,
+            project_run_id=binding.project_run_id,
+            trigger_id=binding.trigger_id,
+            proposal_id=binding.proposal_id,
+            proposal_fingerprint=binding.proposal_fingerprint,
+            source_generation_id=binding.source_generation_id,
+            policy_decision_id=binding.policy_decision_id,
+            action=binding.action,
+            change_class=binding.change_class,
+            resulting_graph_fingerprint=binding.resulting_graph_fingerprint,
+            nonce=uuid4(),
+            issued_at=utc_now(),
+            issuer=_PROOF_ISSUER,
+        )
+
     # ------------------------------------------------------------------ utils
     def audit_result_for(self, approval_id: UUID) -> AuditResult:
         """Resultado de auditoría correspondiente al estado de una solicitud."""
@@ -543,6 +810,7 @@ class HumanGate:
         self._requests.clear()
         self._by_task.clear()
         self._reconciliations.clear()
+        self._replans.clear()
 
     def extend(self, requests: Iterable[HumanApprovalRequest]) -> None:
         """Reinserta solicitudes (uso en pruebas y restauración de estado)."""
@@ -559,4 +827,5 @@ __all__ = [
     "HumanGateError",
     "HumanGateNotApprovedError",
     "HumanGateNotFoundError",
+    "ReplanApprovalProof",
 ]

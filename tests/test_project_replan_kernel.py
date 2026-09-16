@@ -917,13 +917,13 @@ def test_sin_frontera_de_politica_la_replanificacion_exige_humano(tmp_path: Path
 
 
 def test_politica_de_nivel_uno_exige_humano_y_no_adopta(tmp_path: Path) -> None:
-    """``ALLOW_WITH_REVIEW`` no autoriza una replanificación autónoma: exige una persona.
+    """``ALLOW_WITH_REVIEW`` no autoriza una replanificación autónoma: abre un Human Gate.
 
     La acción del proyecto en el nivel 1 (``install_dependency``) la permite el Policy Engine real
     **con revisión obligatoria**. El replan no reinterpreta ese veredicto: una revisión obligatoria
-    no se puede saltar en autonomía, así que el intento se rechaza con
-    ``PROJECT_REPLAN_HUMAN_REQUIRED`` después de haber pasado el guard, y **no** se adopta ninguna
-    generación.
+    no se puede saltar en autonomía, así que el proyecto pasa a ``HUMAN_APPROVAL`` con una
+    aprobación ligada a la propuesta exacta (ENGINE-6.3.1, PART Y) y **no** adopta ninguna
+    generación mientras espera.
     """
     audit = AuditLogger()
     replanner = FakeReplanner()
@@ -933,16 +933,20 @@ def test_politica_de_nivel_uno_exige_humano_y_no_adopta(tmp_path: Path) -> None:
 
     run = kernel.run_all(h.request)
 
-    assert run.status is ProjectState.BLOCKED
-    assert run.failure_code is ProjectFailureCode.PROJECT_REPLAN_HUMAN_REQUIRED
+    assert run.status is ProjectState.HUMAN_APPROVAL
+    assert run.failure_code is None, "esperar a una persona no es un fallo del proyecto"
+    assert run.pending_replan_gate_ref is not None, "el gate de replan está pendiente"
+    assert run.active_replan_approval is not None
     assert run.active_generation is not None
     assert run.active_generation.generation_index == 0, "la generación nueva no gobierna"
     assert len(run.generations) == 1, "la propuesta no se adopta: no hay generación nueva"
+    assert run.active_replan_decision_ref is None, "no hay decisión aceptada que adoptar"
     assert len(replanner.calls) == 1, "la propuesta se pidió —y se pagó— antes de la política"
+    assert run.usage.replans_attempted == 0, "el intento sigue abierto esperando a la persona"
     types = event_types(audit)
     assert AuditEventType.PROJECT_REPLAN_GUARD_PASSED in types, "el guard sí la dejó pasar"
     assert AuditEventType.PROJECT_REPLAN_POLICY_EVALUATED in types
-    assert AuditEventType.PROJECT_REPLAN_HUMAN_REQUIRED in types
+    assert AuditEventType.PROJECT_REPLAN_APPROVAL_REQUESTED in types
     assert AuditEventType.PROJECT_REPLAN_GENERATION_ADOPTED not in types
 
 

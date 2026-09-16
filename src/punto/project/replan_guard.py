@@ -91,6 +91,9 @@ REPLAN_GUARD_BYPASS_POSTCONDITION: Final[str] = "REPLAN_GUARD_BYPASS_POSTCONDITI
 REPLAN_GUARD_NOT_ELIGIBLE: Final[str] = "REPLAN_GUARD_NOT_ELIGIBLE"
 REPLAN_GUARD_HUMAN_GATE: Final[str] = "REPLAN_GUARD_HUMAN_GATE"
 REPLAN_GUARD_BUDGET: Final[str] = "REPLAN_GUARD_BUDGET"
+#: El reemplazo o la división de un nodo no conserva los criterios del nodo sustituido
+#: (ENGINE-6.3.1, endurecimiento estructural del hallazgo F631-02).
+REPLAN_GUARD_OPERATION_CRITERIA: Final[str] = "REPLAN_GUARD_OPERATION_CRITERIA"
 
 #: Marcadores que identifican una categoría de trigger nacida de una **postcondición** del parent.
 #:
@@ -772,22 +775,69 @@ def _check_criteria_coverage(context: _GuardContext, log: _ReasonLog) -> None:
         )
 
 
+def _check_operation_criteria(context: _GuardContext, log: _ReasonLog) -> None:
+    """8. Un reemplazo o una división conservan los criterios del nodo que sustituyen.
+
+    Endurecimiento estructural del hallazgo F631-02: si el nodo que desaparece demostraba un
+    criterio, los nodos que lo sustituyen tienen que seguir demostrándolo. Sin esta regla, una
+    propuesta podía repartir un nodo en dos y dejar fuera un criterio **declarado** del nodo
+    sustituido, apoyándose en que otro nodo del grafo lo cubría: el trabajo aceptado se conserva,
+    pero la cobertura declarada del nodo no se puede perder por el camino.
+
+    Se compara por **texto** de criterio, que es lo que el grafo congelado guarda, y contra el nodo
+    objetivo de la operación (``supersedes_node_id`` o ``target_node_id``), no contra la unión de
+    todo lo retenido.
+    """
+    existing: dict[str, GraphNode] = {}
+    for node in context.current_nodes:
+        existing.setdefault(node.node_id, node)
+    for operation in context.proposal.operations:
+        if operation.kind not in (
+            ReplanOperationKind.REPLACE_UNACCEPTED_NODE,
+            ReplanOperationKind.SPLIT_NODE,
+        ):
+            continue
+        targets: list[str] = []
+        if operation.target_node_id:
+            targets.append(operation.target_node_id)
+        targets.extend(
+            node.supersedes_node_id for node in operation.nodes if node.supersedes_node_id
+        )
+        covered = {
+            text for node in operation.nodes for text in node.acceptance_criteria if text.strip()
+        }
+        for target in dict.fromkeys(targets):
+            original = existing.get(target)
+            if original is None:
+                continue
+            lost = tuple(
+                text for text in original.acceptance_criteria if text and text not in covered
+            )
+            if lost:
+                log.add(
+                    REPLAN_GUARD_OPERATION_CRITERIA,
+                    f"la operación {operation.index} ({operation.kind.value}) sustituye el nodo "
+                    f"{target!r} y no conserva {len(lost)} criterio(s) suyo(s): "
+                    f"{'; '.join(text[:60] for text in lost)}",
+                )
+
+
 def _check_scope(context: _GuardContext, log: _ReasonLog) -> None:
     """8. El alcance nuevo no amplía lo autorizado.
 
-    Sustituir o reordenar nodos solo puede moverse dentro de lo que esos nodos (o los retenidos)
-    ya podían tocar: una división no es una excusa para escribir en otro sitio. Un prerrequisito
-    insertado, que no sustituye a nadie, tiene que caber en el alcance autorizado del contrato.
+    Sustituir o reordenar nodos solo puede moverse dentro de lo que esos nodos ya podían tocar: una
+    división no es una excusa para escribir en otro sitio. Un prerrequisito insertado, que no
+    sustituye a nadie, tiene que caber en el alcance autorizado del contrato.
+
+    Desde ENGINE-6.3.1 (hallazgo F631-02) el alcance de un reemplazo o de una división se mide
+    **contra el nodo sustituido**, no contra la unión con los nodos retenidos: un nodo no puede
+    prestarse el alcance de otro nodo que sigue vivo para ampliar el suyo. El alcance de los
+    retenidos no es una bolsa común; es el de cada nodo.
     """
     contract = context.contract
     existing: dict[str, GraphNode] = {}
     for node in context.current_nodes:
         existing.setdefault(node.node_id, node)
-    retained_scope: set[str] = set()
-    for node_id in context.proposal.retained_node_ids:
-        retained = existing.get(node_id)
-        if retained is not None:
-            retained_scope.update(retained.allowed_files)
     for item in context.plan.new_nodes:
         if item.kind is ReplanOperationKind.INSERT_PREREQUISITE:
             authorized = set(contract.authorized_scope)
@@ -799,18 +849,27 @@ def _check_scope(context: _GuardContext, log: _ReasonLog) -> None:
                     "del alcance autorizado del contrato",
                 )
             continue
-        reference = set(retained_scope)
+        reference: set[str] = set()
         for node_id in item.affected_node_ids:
             affected = existing.get(node_id)
             if affected is not None:
                 reference.update(affected.allowed_files)
+        replaced = _replaced_nodes(existing, item)
+        if not reference and not replaced:
+            reference.update(contract.authorized_scope)
         extra = tuple(path for path in item.spec.allowed_files if path not in reference)
         if extra:
-            log.add(
-                REPLAN_GUARD_SCOPE_EXPANSION,
-                f"el nodo {item.node_id!r} amplía el alcance a {', '.join(extra)}, fuera de los "
-                "nodos que sustituye o retiene",
-            )
+            if replaced:
+                detail = (
+                    f"el nodo {item.node_id!r} amplía el alcance a {', '.join(extra)}, fuera del "
+                    f"nodo que sustituye ({', '.join(node.node_id for node in replaced)})"
+                )
+            else:
+                detail = (
+                    f"el nodo {item.node_id!r} amplía el alcance a {', '.join(extra)}, fuera de "
+                    "los nodos sobre los que opera"
+                )
+            log.add(REPLAN_GUARD_SCOPE_EXPANSION, detail)
 
 
 def _check_protected_paths(context: _GuardContext, log: _ReasonLog) -> None:
@@ -1052,6 +1111,7 @@ _CHECKS: Final[tuple[_Check, ...]] = (
     _check_goal,
     _check_criteria_texts,
     _check_criteria_coverage,
+    _check_operation_criteria,
     _check_scope,
     _check_protected_paths,
     _check_authority,
@@ -1083,6 +1143,7 @@ __all__ = [
     "REPLAN_GUARD_NOT_ELIGIBLE",
     "REPLAN_GUARD_NO_PARALLEL",
     "REPLAN_GUARD_NO_PROGRESS",
+    "REPLAN_GUARD_OPERATION_CRITERIA",
     "REPLAN_GUARD_PROTECTED_PATH",
     "REPLAN_GUARD_REVISION_CHANGED",
     "REPLAN_GUARD_RISK_EXPANSION",

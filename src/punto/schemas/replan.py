@@ -382,6 +382,52 @@ class ProjectReplanDecision(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ReplanApprovalBinding(BaseModel):
+    """Lo que una aprobación humana de replanificación autoriza, exactamente (ENGINE-6.3.1).
+
+    Es el vínculo durable de PART Y: cuando la política exige una persona —o cuando el motor deriva
+    una clase de cambio por encima de lo táctico—, el proyecto **no** adopta nada y **no** se
+    bloquea genéricamente: abre una aprobación ligada a la propuesta concreta. Lo que se aprueba es
+    esta tupla, y una prueba de otra propuesta, de otro disparador, de otra generación o de otra
+    decisión de política no la satisface.
+
+    El vínculo vive en el checkpoint (y su copia legible se publica como artefacto) porque un
+    proceso nuevo tiene que poder **validar** una prueba tras una caída sin reconstruir el intento:
+    si el vínculo y la prueba no coinciden campo a campo, no se adopta.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    binding_id: UUID = Field(default_factory=uuid4)
+    project_run_id: UUID = Field(...)
+    #: Solicitud de aprobación del ``HumanGate`` que el humano resuelve.
+    approval_id: UUID = Field(...)
+    trigger_id: UUID = Field(...)
+    proposal_id: UUID = Field(...)
+    proposal_fingerprint: str = Field(default="", max_length=64)
+    source_generation_id: UUID = Field(...)
+    policy_decision_id: UUID = Field(...)
+    action: str = Field(..., min_length=1, max_length=120)
+    #: Clase de cambio que el **motor** derivó para la propuesta (ENGINE-6.3.1, F631-02).
+    change_class: str = Field(default="", max_length=60)
+    #: Grafo resultante exacto que la aprobación autoriza, congelado antes de la decisión humana.
+    resulting_graph_ref: ArtifactReference = Field(...)
+    resulting_graph_fingerprint: str = Field(..., min_length=1, max_length=64)
+    #: ``True`` solo cuando una prueba válida autorizó este vínculo exacto. Es el hito durable que
+    #: permite que un proceso nuevo continúe la adopción sin volver a pedir permiso ni volver a
+    #: llamar al proveedor.
+    authorized: bool = Field(default=False)
+    authorized_at: datetime | None = Field(default=None)
+    proof_id: UUID | None = Field(default=None)
+    created_at: datetime = Field(default_factory=utc_now)
+
+    def with_authorized(self, *, proof_id: UUID, authorized_at: datetime) -> ReplanApprovalBinding:
+        """Copia marcada como autorizada por la prueba que la validó."""
+        return self.model_copy(
+            update={"authorized": True, "proof_id": proof_id, "authorized_at": authorized_at}
+        )
+
+
 class ReplanCoverageEntry(BaseModel):
     """Cobertura de un criterio global: qué trabajo lo demuestra o qué nodos activos lo cubren."""
 
@@ -408,6 +454,7 @@ __all__ = [
     "ProjectReplanDecision",
     "ProjectReplanProposal",
     "ProjectReplanTrigger",
+    "ReplanApprovalBinding",
     "ReplanCoverageEntry",
     "ReplanEligibility",
     "ReplanInvocationAuthorization",

@@ -209,6 +209,16 @@ class AuditEventType(StrEnum):
     #: El árbol volvió a la revisión aceptada al adoptar una generación nueva: efecto material, con
     #: las dos revisiones (de dónde venía y a cuál se volvió) y si hubo que moverlo.
     PROJECT_REPLAN_WORKSPACE_RESTORED = "PROJECT_REPLAN_WORKSPACE_RESTORED"
+    #: Human Gate de replanificación (ENGINE-6.3.1, PART Y): se pidió una aprobación ligada a una
+    #: propuesta concreta, se concedió con una prueba válida, se denegó una prueba que no
+    #: correspondía o una persona rechazó el plan.
+    PROJECT_REPLAN_APPROVAL_REQUESTED = "PROJECT_REPLAN_APPROVAL_REQUESTED"
+    PROJECT_REPLAN_APPROVED = "PROJECT_REPLAN_APPROVED"
+    PROJECT_REPLAN_APPROVAL_DENIED = "PROJECT_REPLAN_APPROVAL_DENIED"
+    PROJECT_REPLAN_HUMAN_REJECTED = "PROJECT_REPLAN_HUMAN_REJECTED"
+    #: El motor derivó la clase de cambio de una propuesta de replanificación (ENGINE-6.3.1,
+    #: hallazgo F631-02): qué clase, si es táctica y qué marcas la demuestran.
+    PROJECT_REPLAN_CHANGE_CLASSIFIED = "PROJECT_REPLAN_CHANGE_CLASSIFIED"
     #: Un nodo fue sustituido por una replanificación: conserva su historia y su gasto.
     PROJECT_NODE_SUPERSEDED = "PROJECT_NODE_SUPERSEDED"
 

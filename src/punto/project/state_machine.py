@@ -63,20 +63,31 @@ PROJECT_TRANSITIONS: Final[dict[ProjectState, frozenset[ProjectState]]] = {
             ProjectState.CANCELLED,
         }
     ),
-    #: Desde ``REPLANNING`` solo se sale a ``RUNNING`` (replan adoptado y proyecto continuando), a
-    #: ``BLOCKED`` (trigger obsoleto, propuesta inválida, guard o política en contra, gasto sin
-    #: reconciliar, tope agotado), a ``FAILED`` (fallo duro) o a ``CANCELLED``. No hay camino a
-    #: ``COMPLETED``: cerrar el proyecto exige nodos aceptados, y eso se decide en ``RUNNING``.
+    #: Desde ``REPLANNING`` se sale a ``RUNNING`` (replan adoptado y proyecto continuando), a
+    #: ``HUMAN_APPROVAL`` (la propuesta exige una persona: política o clase de cambio de alto
+    #: impacto, hallazgos F631-02/F631-03), a ``BLOCKED`` (trigger obsoleto, propuesta inválida,
+    #: guard o política en contra, gasto sin reconciliar, tope agotado), a ``FAILED`` (fallo duro) o
+    #: a ``CANCELLED``. No hay camino a ``COMPLETED``: cerrar el proyecto exige nodos aceptados, y
+    #: eso se decide en ``RUNNING``.
     ProjectState.REPLANNING: frozenset(
         {
             ProjectState.RUNNING,
+            ProjectState.HUMAN_APPROVAL,
             ProjectState.BLOCKED,
             ProjectState.FAILED,
             ProjectState.CANCELLED,
         }
     ),
+    #: ``HUMAN_APPROVAL`` vuelve a ``REPLANNING`` cuando la persona autoriza una propuesta (el
+    #: intento continúa donde estaba), además de a ``RUNNING`` para el gate del child.
     ProjectState.HUMAN_APPROVAL: frozenset(
-        {ProjectState.RUNNING, ProjectState.BLOCKED, ProjectState.FAILED, ProjectState.CANCELLED}
+        {
+            ProjectState.RUNNING,
+            ProjectState.REPLANNING,
+            ProjectState.BLOCKED,
+            ProjectState.FAILED,
+            ProjectState.CANCELLED,
+        }
     ),
     ProjectState.BLOCKED: frozenset(
         {ProjectState.RUNNING, ProjectState.FAILED, ProjectState.CANCELLED}

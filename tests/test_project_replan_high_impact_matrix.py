@@ -1,13 +1,15 @@
-"""Matriz adversarial de alto impacto contra la prueba positiva de tacticidad (ENGINE-6.3.2).
+"""Matriz adversarial de alto impacto contra el escalado semántico (6.3.2 → 6.3.R1).
 
 El hallazgo F632-01 demostró que la barrera anterior —buscar marcas conocidas de alto impacto y
 autorizar cuando no encontraba ninguna— era inválida: «no lo reconozco como alto impacto» no es
 «he demostrado que es táctico». La auditoría independiente la reprodujo con tecnologías que las
 listas no contenían («Replace the current relational engine with CockroachDB», «Move the service
 from Vercel to Fly.io», «Replace the current identity service with Clerk»), y la corrección
-invirtió la carga de la prueba: ``classify_replan_change`` solo devuelve ``TACTICAL_PROVEN``
-cuando **demuestra** que la propuesta no toca ninguna dimensión de arquitectura, no introduce
-tecnología ajena al baseline inmutable del contrato y su estructura cabe en el contrato congelado.
+inviertió la carga de la prueba: ``classify_replan_change`` solo devuelve
+``NO_SEMANTIC_SUSPICION`` cuando no encuentra ninguna sospecha, y desde ENGINE-6.3.R1 esa ausencia
+**no concede autonomía**: la demuestra la contención estructural (T1-T7) en
+``punto.project.containment``. Lo que esta suite fija es la mitad semántica: ninguna propuesta de
+alto impacto puede quedar sin escalar.
 
 Esta suite somete esa prueba a una **matriz adversarial acotada y parametrizada**, y lo hace con dos
 asertos que se necesitan mutuamente:
@@ -22,9 +24,9 @@ asertos que se necesitan mutuamente:
    **ambas** variantes del contrato: con baseline de arquitectura resuelto y sin él.
 2. **El control positivo** (``CONTROL_TACTICO``): seis textos tácticos legítimos —cambiar la
    estrategia de implementación de un nodo, reintentar un paso, insertar un prerrequisito técnico
-   interno— que **sí** deben seguir siendo ``TACTICAL_PROVEN``, también con y sin baseline. Sin este
-   control, la matriz se aprobaría sola si alguien convirtiera el clasificador en un muro que exige
-   una persona para todo: la prueba de tacticidad dejaría de distinguir y la regresión no se vería.
+   interno— que **no** deben escalar, también con y sin baseline. Sin este control, la matriz se
+   aprobaría sola si alguien convirtiera el clasificador en un muro que exige una persona para
+   todo: la ausencia de sospecha dejaría de distinguir y la regresión no se vería.
 
 No hay proveedor real, ni red, ni reloj, ni azar: el contrato, la propuesta y los textos son
 deterministas, y las marcas inventadas no existen en ninguna lista de productos del motor —ese es
@@ -258,19 +260,23 @@ def test_la_matriz_de_alto_impacto_no_es_tactica(
 ) -> None:
     """Ningún texto de la matriz es táctico ni adopta en autonomía, con baseline y sin él.
 
-    El aserto no se rebaja: la matriz solo admite propuestas de alto impacto, así que un
-    ``TACTICAL_PROVEN`` aquí sería un agujero de la barrera, no un caso a reclasificar. La detección
-    se acepta por las dos vías legítimas del motor: la dimensión esperada entre las dimensiones
-    tocadas, o tecnologías que el baseline no contiene (``unknown_tokens``), que es lo que hace caer
+    El aserto no se rebaja: la matriz solo admite propuestas de alto impacto, así que una
+    ``NO_SEMANTIC_SUSPICION`` aquí sería un agujero de la barrera, no un caso a reclasificar. La
+    detección se acepta por las dos vías legítimas del motor: la dimensión esperada entre las
+    dimensiones tocadas, o tecnologías que el baseline no contiene (``unknown_tokens``), que es lo
+    que hace caer
     a las marcas que ninguna lista conoce.
     """
     classification = classify_replan_change(
         propuesta(texto), contract=contrato(con_baseline=con_baseline), action="modify_file"
     )
 
-    assert classification.is_tactical is False, (categoria, texto)
+    assert classification.escalates is True, (categoria, texto)
     assert classification.requires_human is True, (categoria, texto)
-    assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN, (categoria, texto)
+    assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION, (
+        categoria,
+        texto,
+    )
     assert classification.change_class.is_high_impact or classification.change_class.is_ambiguous
     detectado = dimension in classification.dimensions or bool(classification.unknown_tokens)
     assert detectado, (
@@ -291,8 +297,8 @@ def test_las_marcas_inventadas_no_dependen_de_listas_de_productos(
     productos— y aun así el veredicto no puede ser táctico. La prueba fija las dos mitades: los
     hechos del motor enumeran la marca como tecnología no contenida en el baseline
     (``unknown_tokens`` no está vacío y cita la marca exacta), y la clase derivada nunca es
-    ``TACTICAL_PROVEN``. Si mañana alguien ampliara el catálogo con estas siete marcas, la prueba
-    seguiría pasando por la vía de la dimensión: la frontera no es la lista.
+    ``NO_SEMANTIC_SUSPICION``. Si mañana alguien ampliara el catálogo con estas siete marcas, la
+    prueba seguiría pasando por la vía de la dimensión: la frontera no es la lista.
     """
     facts = replan_change_facts(propuesta(texto), contract=contrato(con_baseline=con_baseline))
     classification = classify_replan_change(
@@ -301,7 +307,10 @@ def test_las_marcas_inventadas_no_dependen_de_listas_de_productos(
 
     assert facts.unknown_tokens, f"{marca} debería ser una tecnología no reconocida"
     assert marca in facts.unknown_tokens, (marca, facts.unknown_tokens)
-    assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN, (marca, texto)
+    assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION, (
+        marca,
+        texto,
+    )
     assert classification.requires_human is True, (marca, texto)
     assert dimension in facts.dimensions or bool(facts.unknown_tokens), (marca, texto)
 
@@ -311,22 +320,23 @@ def test_las_marcas_inventadas_no_dependen_de_listas_de_productos(
 def test_el_control_positivo_tactico_sigue_siendo_tactico(
     texto: str, *, con_baseline: bool
 ) -> None:
-    """La barrera no es un muro: el trabajo táctico legítimo se sigue adoptando en autonomía.
+    """La barrera no es un muro: el trabajo táctico legítimo no añade ninguna sospecha.
 
     Sin este control, la matriz de alto impacto se aprobaría sola el día que alguien hiciera que el
     clasificador exigiera una persona para todo. Estos seis textos —otra estrategia de
     implementación del mismo nodo, un reintento, un prerrequisito técnico interno— no tocan ninguna
     dimensión de arquitectura, no introducen tecnología ajena y su estructura cabe en el contrato,
-    así que el motor los demuestra tácticos con la prueba de tacticidad completa y sin marcas.
+    así que **no escalan**. La autonomía de estos nodos la demuestra la contención estructural, no
+    esta ausencia de sospecha.
     """
     classification = classify_replan_change(
         propuesta(texto), contract=contrato(con_baseline=con_baseline), action="modify_file"
     )
 
-    assert classification.change_class is ReplanChangeClass.TACTICAL_PROVEN, texto
-    assert classification.is_tactical is True, texto
+    assert classification.change_class is ReplanChangeClass.NO_SEMANTIC_SUSPICION, texto
+    assert classification.escalates is False, texto
     assert classification.requires_human is False, texto
-    assert classification.proof, "la tacticidad se demuestra con hechos verificados, no por defecto"
+    assert classification.proof, "los hechos verificados quedan como evidencia de auditoría"
     assert classification.matches == (), texto
     assert classification.unknown_tokens == (), texto
 

@@ -230,7 +230,7 @@ def test_postgres_a_mongo_no_es_tactico() -> None:
     )
 
     assert classification.change_class is ReplanChangeClass.DATASTORE_CHANGE
-    assert classification.is_tactical is False
+    assert classification.escalates is True
     assert classification.requires_human is True
     assert classification.reason_code == "REPLAN_CHANGE_DATASTORE_CHANGE"
     assert classification.matches, "la clase tiene que citar las marcas que la demuestran"
@@ -278,7 +278,7 @@ def test_cambiar_el_despliegue_no_es_tactico() -> None:
 
     assert classification.change_class is ReplanChangeClass.DEPLOYMENT_CHANGE
     assert classification.requires_human is True
-    assert classification.is_tactical is False
+    assert classification.escalates is True
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +298,7 @@ def test_cambiar_las_reglas_de_negocio_no_es_tactico() -> None:
 
     assert classification.change_class is ReplanChangeClass.BUSINESS_RULE_CHANGE
     assert classification.requires_human is True
-    assert classification.is_tactical is False
+    assert classification.escalates is True
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +316,9 @@ def test_un_reemplazo_tactico_sigue_siendo_tactico(tmp_path: Path) -> None:
         classification = classify_replan_change(
             proposal(objective), contract=contract(), action="modify_file"
         )
-        assert classification.change_class is ReplanChangeClass.TACTICAL_PROVEN, objective
+        assert classification.change_class is ReplanChangeClass.NO_SEMANTIC_SUSPICION, objective
         assert classification.requires_human is False, objective
-        assert classification.is_tactical is True, objective
+        assert classification.escalates is False, objective
 
     replanner = FakeReplanner()
     h = replan_harness(tmp_path, outcomes={"A": blocked_child()}, default=ChildOutcome())

@@ -166,7 +166,7 @@ def test_l_politica_allow_with_review_exige_aprobacion_ligada(tmp_path: Path) ->
 
     assert binding.project_run_id == run.project_run_id
     assert binding.action == run.request.action == "install_dependency"
-    assert binding.change_class == "TACTICAL_PROVEN", binding.change_class
+    assert binding.change_class == "NO_SEMANTIC_SUSPICION", binding.change_class
     assert binding.proposal_fingerprint, "la propuesta aprobada no tiene huella"
     assert binding.resulting_graph_fingerprint, "el grafo aprobado no tiene huella"
 
@@ -414,7 +414,7 @@ def test_w_la_prueba_no_se_puede_fabricar() -> None:
             source_generation_id=uuid4(),
             policy_decision_id=uuid4(),
             action="install_dependency",
-            change_class="TACTICAL_PROVEN",
+            change_class="NO_SEMANTIC_SUSPICION",
             resulting_graph_fingerprint="b" * 64,
             nonce=uuid4(),
             issued_at=utc_now(),

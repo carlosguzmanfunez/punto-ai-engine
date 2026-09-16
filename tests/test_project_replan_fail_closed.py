@@ -1,20 +1,21 @@
-"""La replanificación solo adopta lo que **demuestra** táctico (ENGINE-6.3.2, hallazgo F632-01).
+"""La replanificación solo adopta lo que **demuestra** contención estructural (6.3.2 → 6.3.R1).
 
-La barrera anterior (ENGINE-6.3.1) razonaba al revés: buscaba marcas conocidas de alto impacto y,
-cuando no encontraba ninguna, devolvía ``TACTICAL_ALLOWED``. La auditoría independiente lo reprodujo
-con tecnologías que las listas no contenían —«Replace the current relational engine with
-CockroachDB», «Move the service from Vercel to Fly.io», «Replace the current identity service with
-Clerk»— y las tres se adoptaron en autonomía. La lección no es añadir tres marcas más —el siguiente
-nombre desconocido volvería a pasar— sino invertir la carga de la prueba: **el motor solo adopta en
-autonomía lo que puede demostrar táctico**, y el veredicto por defecto exige una persona.
+La barrera de ENGINE-6.3.1 razonaba al revés: buscaba marcas conocidas de alto impacto y, cuando no
+encontraba ninguna, devolvía ``TACTICAL_ALLOWED``. La auditoría independiente lo reprodujo con
+tecnologías que las listas no contenían —«Replace the current relational engine with CockroachDB»,
+«Move the service from Vercel to Fly.io», «Replace the current identity service with Clerk»— y las
+tres se adoptaron en autonomía. ENGINE-6.3.2 invirtió la carga de la prueba dentro del clasificador;
+desde ENGINE-6.3.R1 la carga ya no está en el texto: el clasificador **solo puede escalar** —nunca
+conceder, ``NO_SEMANTIC_SUSPICION`` significa «el texto no añade sospecha»— y la adopción la
+demuestra la contención estructural (T1-T7) contra el envelope autorizado del contrato.
 
-Esta suite fija las dos caras de esa inversión:
+Esta suite fija las dos caras de esa frontera:
 
 1. **El clasificador** (``classify_replan_change``), sobre propuestas construidas a mano: sustituir
    un motor de datos, un servicio de identidad, una plataforma de despliegue o cualquier concepto
-   de arquitectura no es táctico aunque la marca sea nueva (``ExampleDB9000`` cae por el mismo
-   sitio que ``CockroachDB``); sin baseline de arquitectura no se fabrica conocimiento; y una
-   propuesta que declara hechos que el contrato no autoriza tampoco demuestra tacticidad.
+   de arquitectura sigue escalando a una persona aunque la marca sea nueva (``ExampleDB9000`` cae
+   por el mismo sitio que ``CockroachDB``); sin baseline de arquitectura no se fabrica conocimiento;
+   y una propuesta que declara hechos que el contrato no autoriza tampoco deja de escalar.
 2. **El kernel completo**, con el ``ArchitecturePlan`` durable dentro del plan y el baseline
    derivado del contrato: el cambio de motor, de despliegue y de identidad termina en
    ``HUMAN_APPROVAL`` con el gate ligado a **esta** propuesta, sin generación nueva y sin decisión
@@ -145,8 +146,8 @@ def proposal(
 
     Sustituye un nodo no aceptado declarando ``LOW`` y ``LEVEL_0_AUTONOMOUS`` y escribiendo el
     mismo archivo que el contrato autoriza: es exactamente la declaración con la que el hallazgo
-    F632-01 se colaba, así que lo único que puede frenarla es la prueba de tacticidad del motor,
-    nunca lo que el Planner dice de sí mismo.
+    F632-01 se colaba, así que lo único que puede frenarla es la frontera del motor —el escalado
+    semántico y la contención estructural—, nunca lo que el Planner dice de sí mismo.
     """
     spec = ReplanNodeSpec(
         label="P",
@@ -266,10 +267,10 @@ def test_a_motor_relacional_con_marca_desconocida_no_es_tactico() -> None:
     """«Replace the current relational engine with CockroachDB» no es táctico, ni sin baseline.
 
     Es la reproducción literal del hallazgo F632-01: la barrera anterior no reconocía la marca, así
-    que autorizaba la adopción. La prueba positiva invierte la carga —el texto sustituye un concepto
-    de arquitectura, el motor relacional, y eso es un cambio de datos— y el caso se repite sin
-    baseline de arquitectura porque su ausencia tampoco autoriza nada: el motor no puede demostrar
-    que la tecnología nueva esté dentro del diseño, así que tiene que exigir una persona igual.
+    que autorizaba la adopción. El escalado semántico sigue cazándola —el texto sustituye un
+    concepto de arquitectura, el motor relacional, y eso es un cambio de datos— y el caso se repite
+    sin baseline de arquitectura porque su ausencia tampoco autoriza nada: el motor no puede
+    demostrar que la tecnología nueva esté dentro del diseño, así que tiene que exigir una persona.
     """
     for with_baseline in (True, False):
         classification = classify_replan_change(
@@ -278,8 +279,10 @@ def test_a_motor_relacional_con_marca_desconocida_no_es_tactico() -> None:
             action="modify_file",
         )
 
-        assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN, with_baseline
-        assert classification.is_tactical is False, with_baseline
+        assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION, (
+            with_baseline
+        )
+        assert classification.escalates is True, with_baseline
         assert classification.requires_human is True, with_baseline
         assert "datastore" in classification.dimensions, with_baseline
 
@@ -298,8 +301,8 @@ def test_b_mover_el_servicio_entre_plataformas_no_es_tactico() -> None:
         proposal(PLATFORM_MOVE_OBJECTIVE), contract=contract(), action="modify_file"
     )
 
-    assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN
-    assert classification.is_tactical is False
+    assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION
+    assert classification.escalates is True
     assert classification.requires_human is True
     assert "deployment" in classification.dimensions
 
@@ -317,8 +320,8 @@ def test_c_servicio_de_identidad_desconocido_no_es_tactico() -> None:
         proposal(IDENTITY_SERVICE_OBJECTIVE), contract=contract(), action="modify_file"
     )
 
-    assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN
-    assert classification.is_tactical is False
+    assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION
+    assert classification.escalates is True
     assert classification.requires_human is True
     assert "identity" in classification.dimensions
 
@@ -338,8 +341,8 @@ def test_d_registros_a_un_motor_desconocido_no_es_tactico() -> None:
         action="modify_file",
     )
 
-    assert classification.change_class is not ReplanChangeClass.TACTICAL_PROVEN
-    assert classification.is_tactical is False
+    assert classification.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION
+    assert classification.escalates is True
     assert classification.requires_human is True
     assert "datastore" in classification.dimensions
 
@@ -455,13 +458,13 @@ def test_h_kernel_no_adopta_un_cambio_de_identidad(tmp_path: Path) -> None:
 # I) control positivo: lo táctico real sigue siendo autónomo
 # ---------------------------------------------------------------------------
 def test_i_control_positivo_tactico_sigue_siendo_autonomo(tmp_path: Path) -> None:
-    """La barrera no es un muro: el texto táctico real sigue demostrando tacticidad y se adopta.
+    """La barrera no es un muro: el texto táctico real no añade sospecha y la contención lo adopta.
 
     Un reintento del mismo nodo con otra estrategia técnica —el texto real del replanner doble, en
     inglés y en español— no toca ninguna dimensión de arquitectura ni introduce tecnología ajena,
-    así que el motor puede **demostrarlo** y enumera sus hechos, con baseline y sin él. Con el
-    kernel completo, el proyecto adopta la generación 1 y cierra ``COMPLETED`` con una sola
-    llamada.
+    así que el clasificador no escala y sus hechos verificados quedan como evidencia de auditoría,
+    mientras la contención estructural (T1-T7) lo demuestra, con baseline y sin él. Con el kernel
+    completo, el proyecto adopta la generación 1 y cierra ``COMPLETED`` con una sola llamada.
     """
     for objective in TACTICAL_OBJECTIVES:
         for with_baseline in (True, False):
@@ -471,10 +474,10 @@ def test_i_control_positivo_tactico_sigue_siendo_autonomo(tmp_path: Path) -> Non
                 action="modify_file",
             )
 
-            assert classification.change_class is ReplanChangeClass.TACTICAL_PROVEN, objective
-            assert classification.is_tactical is True, objective
+            assert classification.change_class is ReplanChangeClass.NO_SEMANTIC_SUSPICION, objective
+            assert classification.escalates is False, objective
             assert classification.requires_human is False, objective
-            assert classification.proof, "la tacticidad demostrada enumera sus hechos"
+            assert classification.proof, "los hechos verificados quedan como evidencia de auditoría"
 
     replanner = FakeReplanner()
     h = replan_harness(
@@ -531,7 +534,7 @@ def test_j_baseline_ausente_no_se_fabrica() -> None:
         action="modify_file",
     )
 
-    assert design.change_class is not ReplanChangeClass.TACTICAL_PROVEN
+    assert design.change_class is not ReplanChangeClass.NO_SEMANTIC_SUSPICION
     assert design.requires_human is True
     # La dimensión con intención de cambio nombra la clase aunque no haya baseline que contrastar:
     # «identidad» es una dimensión de arquitectura y el motor la ve en el texto.
@@ -582,15 +585,15 @@ def test_k_el_baseline_se_deriva_del_plan_durable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# L) una estructura incumplida no es prueba de tacticidad
+# L) una estructura incumplida no se puede demostrar contenida
 # ---------------------------------------------------------------------------
 def test_l_estructura_incumplida_no_es_prueba_de_tacticidad() -> None:
-    """Un texto táctico con hechos que el contrato no autoriza no demuestra tacticidad.
+    """Un texto táctico con hechos que el contrato no autoriza no se puede demostrar contenido.
 
-    La prueba positiva no es solo léxica: la propuesta tiene que caber en el contrato congelado.
-    Escribir fuera del alcance autorizado, subir el riesgo por encima del techo o declarar criterios
-    que el contrato no tiene deja el caso en ``UNKNOWN_OR_AMBIGUOUS``, y el detalle nombra el hecho
-    que el motor no pudo verificar.
+    La frontera no es solo léxica ni solo de recursos: la propuesta tiene que caber en el contrato
+    congelado. Escribir fuera del alcance autorizado, subir el riesgo por encima del techo o
+    declarar criterios que el contrato no tiene deja el caso en ``UNKNOWN_OR_AMBIGUOUS``, y el
+    detalle nombra el hecho que el motor no pudo verificar.
     """
     casos = (
         ("alcance", {"allowed_files": ("fuera_del_alcance.py",)}),
@@ -603,26 +606,27 @@ def test_l_estructura_incumplida_no_es_prueba_de_tacticidad() -> None:
         )
 
         assert classification.change_class is ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS, palabra
-        assert classification.is_tactical is False, palabra
+        assert classification.escalates is True, palabra
         assert classification.requires_human is True, palabra
         assert palabra in classification.detail, classification.detail
 
 
 # ---------------------------------------------------------------------------
-# M) la prueba de tacticidad enumera los hechos verificados
+# M) el veredicto enumera los hechos verificados
 # ---------------------------------------------------------------------------
 def test_m_la_prueba_de_tacticidad_enumera_los_hechos() -> None:
-    """Declarar táctica una propuesta exige enumerar los hechos, no un booleano opaco.
+    """No escalar exige enumerar los hechos comprobados, no un booleano opaco.
 
-    La prueba de tacticidad tiene que poder leerse y discutirse: el veredicto viaja con el alcance,
-    los criterios, el riesgo y la autoridad que el motor comprobó nodo a nodo dentro del contrato.
+    La evidencia tiene que poder leerse y discutirse: el veredicto viaja con el alcance, los
+    criterios, el riesgo y la autoridad que el motor comprobó nodo a nodo dentro del contrato. La
+    decisión de adoptar la toma después la contención estructural, no esta lista de hechos.
     """
     classification = classify_replan_change(
         proposal(TACTICAL_OBJECTIVE), contract=contract(), action="modify_file"
     )
     hechos = " ".join(classification.proof)
 
-    assert classification.change_class is ReplanChangeClass.TACTICAL_PROVEN
+    assert classification.change_class is ReplanChangeClass.NO_SEMANTIC_SUSPICION
     assert len(classification.proof) >= 4, classification.proof
     for palabra in ("alcance", "criterios", "riesgo", "autoridad"):
         assert palabra in hechos, hechos

@@ -449,6 +449,36 @@ _GENERIC_URI_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 #: Forma de una URI/DSN con esquema: ``mongodb://``, ``amqp://``, ``redis://``, ``postgres://``…
 _URI_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b([a-z][a-z0-9+.\-]{1,31})://")
 
+#: URI absoluta con destino: esquema y host. Es lo que hay que juzgar contra la autoridad: la
+#: existencia de ``http://`` o ``https://`` no es segura ni peligrosa por sí misma (ENGINE-6.3.R3).
+_URL_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b([a-z][a-z0-9+.\-]{1,31})://([^\s'\"`)\],;]+)"
+)
+
+#: Hosts locales: no introducen una integración externa nueva.
+_LOCAL_HOSTS: Final[frozenset[str]] = frozenset(
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
+)
+
+#: Llamadas que ejecutan un proceso: su efecto **no** es demostrable por el contenido del fichero.
+_SHELL_CALLS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(
+        r"\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|os\.(?:system|popen|exec[lv]p?e?)"
+        r"|pty\.spawn)\s*\("
+    ),
+)
+
+#: Ejecutables que el motor ya considera acotados en su propia frontera de ejecución
+#: (``developer.context.DEFAULT_ALLOWED_COMMANDS``). Una llamada a uno de ellos es una operación
+#: acotada; cualquier otro ejecutable, o un comando dinámico, queda sin resolver.
+_BOUNDED_COMMANDS: Final[frozenset[str]] = frozenset({"git", "mypy", "pytest", "python", "ruff"})
+
+#: Literales de comando dentro de una llamada de shell: lista/tupla o cadena.
+_COMMAND_LITERALS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"[\[(]\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"['\"]([^'\"]+)['\"]"),
+)
+
 #: Módulos cuya presencia, por sí sola, **no** puede cambiar la arquitectura autorizada: cálculo,
 #: texto, estructuras, serialización y utilidades de proceso.
 #:
@@ -495,6 +525,7 @@ _INERT_MODULES: Final[frozenset[str]] = frozenset(
         "pathlib",
         "pprint",
         "pydoc",
+        "pytest",
         "random",
         "re",
         "shlex",
@@ -502,6 +533,7 @@ _INERT_MODULES: Final[frozenset[str]] = frozenset(
         "statistics",
         "string",
         "struct",
+        "subprocess",
         "sys",
         "tempfile",
         "textwrap",
@@ -539,6 +571,48 @@ def module_roots(line: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def url_host(url: str) -> str:
+    """Host de una URI absoluta, en minúsculas y sin puerto ni credenciales."""
+    remainder = url.split("://", 1)[-1]
+    authority = re.split(r"[/?#]", remainder, maxsplit=1)[0]
+    return authority.rsplit("@", 1)[-1].split(":")[0].strip().casefold()
+
+
+def _host_is_authorized(host: str, names: set[str]) -> bool:
+    """``True`` si el destino de la URI ya está autorizado por el envelope.
+
+    No hay lista de dominios: se compara contra **los nombres que el contrato autorizó**
+    (integraciones, servicios, tecnología). Un host local o un host dinámico (plantilla o variable)
+    no introduce por sí mismo una integración externa nueva.
+    """
+    if not host or host in _LOCAL_HOSTS:
+        return True
+    if any(marker in host for marker in ("{", "}", "$", "%", "<", ">")):
+        return True
+    for name in names:
+        if len(name) < 4:
+            continue
+        if host == name or host.endswith(f".{name}") or host.startswith(f"{name}.") or name in host:
+            return True
+    return False
+
+
+def shell_invocation(line: str) -> str | None:
+    """Comando que una línea ejecuta, si ejecuta un proceso.
+
+    Returns:
+        El ejecutable literal (``"pytest"``), ``""`` si la llamada es dinámica, o ``None`` si la
+        línea no ejecuta ningún proceso.
+    """
+    if not any(pattern.search(line) for pattern in _SHELL_CALLS):
+        return None
+    for pattern in _COMMAND_LITERALS:
+        match = pattern.search(line)
+        if match:
+            return match.group(1).strip().split()[0].rsplit("/", 1)[-1].casefold()
+    return ""
+
+
 def unproven_effect(
     *,
     added_lines: Iterable[str],
@@ -554,7 +628,11 @@ def unproven_effect(
 
     - un módulo importado que no está en el envelope autorizado, no es un módulo local del
       proyecto y no está en la allowlist cerrada de módulos inertes;
-    - una URI/DSN cuyo esquema el envelope no contiene (salvo transporte genérico).
+    - una URI cuyo esquema o cuyo **destino** el envelope no autoriza: ``http``/``https`` no son
+      seguros ni peligrosos por sí mismos, se juzgan contra la autoridad concedida;
+    - una llamada que ejecuta un proceso (``subprocess``, ``os.system``…) cuyo comando no sea uno
+      de los que el motor ya considera acotados: el efecto de un comando no se demuestra leyendo
+      el fichero.
 
     No hay lista de tecnologías: hay una allowlist de lo demostrablemente inocuo y un defecto
     **fail-closed**. Que el motor no conozca una tecnología es exactamente el caso que debe caer.
@@ -568,6 +646,11 @@ def unproven_effect(
         Razones legibles, una por hallazgo.
     """
     authorized_tokens = set(authorized.tokens)
+    known_names = {
+        token.split(":", 1)[1].casefold()
+        for token in authorized_tokens
+        if ":" in token and token.split(":", 1)[1]
+    }
     known_packages = {
         token.split(":", 1)[1].split(":")[0]
         for token in authorized_tokens
@@ -587,9 +670,16 @@ def unproven_effect(
                 f"el diff importa {root!r}: el motor no puede demostrar que esa dependencia quede "
                 "dentro de la arquitectura autorizada"
             )
-        for match in _URI_PATTERN.finditer(line):
+        for match in _URL_PATTERN.finditer(line):
             scheme = match.group(1).casefold()
+            host = url_host(match.group(0))
             if scheme in _GENERIC_URI_SCHEMES:
+                if not _host_is_authorized(host, known_names):
+                    reasons.append(
+                        f"el diff introduce la URI {scheme}://{host}: el envelope autorizado no "
+                        "contiene ese destino, así que el motor no puede demostrar que la "
+                        "integración externa quede dentro del diseño"
+                    )
                 continue
             if scheme in authorized_tokens or any(
                 token.rsplit(":", 1)[-1] == scheme for token in authorized_tokens
@@ -598,6 +688,12 @@ def unproven_effect(
             reasons.append(
                 f"el diff introduce una URI con esquema {scheme!r} que el envelope autorizado no "
                 "contiene; el motor no puede demostrar que el cambio quede dentro del diseño"
+            )
+        command = shell_invocation(line)
+        if command is not None and command not in _BOUNDED_COMMANDS:
+            reasons.append(
+                f"el diff ejecuta un proceso ({command or 'dinamico'}): el efecto de un comando no "
+                "se puede demostrar contenido con el contenido del fichero"
             )
     return tuple(dict.fromkeys(reasons))
 
@@ -886,6 +982,8 @@ __all__ = [
     "resource_envelope_fingerprint",
     "resource_token",
     "resources_from_diff",
+    "shell_invocation",
     "unannounced_surfaces",
     "unproven_effect",
+    "url_host",
 ]

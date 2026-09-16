@@ -1221,27 +1221,37 @@ class ProjectExecutionKernel:
             except OSError:
                 return None
 
-        observed, unresolved = resources_from_diff(paths, read)
-        contract = self._contract_for_replan(run) if run.contract_ref is not None else None
-        allowed = ResourceSet.of(node.resources)
-        if contract is not None:
-            allowed = allowed.union(contract_resources(contract))
-        # Superficies que pueden cambiar arquitectura y que los manifiestos no cubren (código,
-        # configuración, migraciones, secretos): se declaran sin resolver en vez de suponerlas
-        # inocuas (ENGINE-6.3.R2, AUD-6.3R1-03).
-        unresolved = (*unresolved, *unannounced_surfaces(paths, read, allowed))
-        # Y el **efecto** que la implementación escribió de verdad dentro de esos ficheros: un
-        # fichero autorizado puede cambiar el almacén, el proveedor o el entorno de ejecución, así
-        # que se juzga el contenido añadido del diff real contra el envelope autorizado
-        # (ENGINE-6.3.R3, AUD-R2-02). Lo que no se puede demostrar contenido queda sin resolver.
-        unresolved = (
-            *unresolved,
-            *unproven_effect(
-                added_lines=actual_lines,
-                authorized=allowed,
-                local_roots=self._local_module_roots(run),
-            ),
-        )
+        observed: ResourceSet = ResourceSet()
+        unresolved: tuple[str, ...] = ()
+        allowed: ResourceSet = ResourceSet()
+        try:
+            contract = self._contract_for_replan(run) if run.contract_ref is not None else None
+            allowed = ResourceSet.of(node.resources)
+            if contract is not None:
+                allowed = allowed.union(contract_resources(contract))
+            observed, unresolved = resources_from_diff(paths, read)
+            # Superficies que pueden cambiar arquitectura y que los manifiestos no cubren (código,
+            # configuración, migraciones, secretos): se declaran sin resolver en vez de suponerlas
+            # inocuas (ENGINE-6.3.R2, AUD-6.3R1-03).
+            unresolved = (*unresolved, *unannounced_surfaces(paths, read, allowed))
+            # Y el **efecto** que la implementación escribió de verdad dentro de esos ficheros: un
+            # fichero autorizado puede cambiar el almacén, el proveedor o el entorno de ejecución,
+            # así que se juzga el contenido añadido del diff real contra el envelope autorizado
+            # (ENGINE-6.3.R3, AUD-R2-02). Lo que no se puede demostrar contenido queda sin
+            # resolver.
+            unresolved = (
+                *unresolved,
+                *unproven_effect(
+                    added_lines=actual_lines,
+                    authorized=allowed,
+                    local_roots=self._local_module_roots(run),
+                ),
+            )
+        except Exception as exc:
+            # Un control de autoridad que no puede ejecutarse es autoridad irresoluble: falla
+            # cerrado, nunca deja pasar el nodo (control de fallo del encargo terminal).
+            reason = f"la inspección del efecto real falló y no se pudo demostrar contención: {exc}"
+            return (), (reason,), undeclared
         if observed.is_empty and not unresolved:
             return (), (), undeclared
         report = expansion_report(observed, allowed)

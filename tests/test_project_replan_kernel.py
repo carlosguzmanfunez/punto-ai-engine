@@ -916,6 +916,36 @@ def test_sin_frontera_de_politica_la_replanificacion_exige_humano(tmp_path: Path
     assert run.active_generation.generation_index == 0, "no se adopta nada sin juicio de política"
 
 
+def test_politica_de_nivel_uno_exige_humano_y_no_adopta(tmp_path: Path) -> None:
+    """``ALLOW_WITH_REVIEW`` no autoriza una replanificación autónoma: exige una persona.
+
+    La acción del proyecto en el nivel 1 (``install_dependency``) la permite el Policy Engine real
+    **con revisión obligatoria**. El replan no reinterpreta ese veredicto: una revisión obligatoria
+    no se puede saltar en autonomía, así que el intento se rechaza con
+    ``PROJECT_REPLAN_HUMAN_REQUIRED`` después de haber pasado el guard, y **no** se adopta ninguna
+    generación.
+    """
+    audit = AuditLogger()
+    replanner = FakeReplanner()
+    h = replan_harness(tmp_path, outcomes={"A": blocked_child()})
+    h.request = h.request.model_copy(update={"action": "install_dependency"})
+    kernel = replan_kernel(h, replanner, audit=audit)
+
+    run = kernel.run_all(h.request)
+
+    assert run.status is ProjectState.BLOCKED
+    assert run.failure_code is ProjectFailureCode.PROJECT_REPLAN_HUMAN_REQUIRED
+    assert run.active_generation is not None
+    assert run.active_generation.generation_index == 0, "la generación nueva no gobierna"
+    assert len(run.generations) == 1, "la propuesta no se adopta: no hay generación nueva"
+    assert len(replanner.calls) == 1, "la propuesta se pidió —y se pagó— antes de la política"
+    types = event_types(audit)
+    assert AuditEventType.PROJECT_REPLAN_GUARD_PASSED in types, "el guard sí la dejó pasar"
+    assert AuditEventType.PROJECT_REPLAN_POLICY_EVALUATED in types
+    assert AuditEventType.PROJECT_REPLAN_HUMAN_REQUIRED in types
+    assert AuditEventType.PROJECT_REPLAN_GENERATION_ADOPTED not in types
+
+
 def test_propuesta_invalida_del_replanner_bloquea_con_su_codigo(tmp_path: Path) -> None:
     """Un replanner que falla bloquea con ``INVALID_PROPOSAL`` y el gasto queda contabilizado."""
     replanner = FakeReplanner(fail=True)

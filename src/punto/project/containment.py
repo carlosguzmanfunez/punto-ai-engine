@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Final
 
 from punto.project.graph import GraphNode
 from punto.project.resources import (
+    AuthorityEnvelope,
     ResourceSet,
     contract_resources,
     expansion_report,
@@ -91,14 +92,22 @@ class ContainmentVerdict:
     authority_delta: int = 0
     has_architecture_baseline: bool = False
     operation_kinds: tuple[str, ...] = ()
+    #: Autoridad explícita del nodo: qué superficie y qué recursos se autorizaron (ENGINE-6.3.R3).
+    authority: AuthorityEnvelope = field(default_factory=AuthorityEnvelope)
 
     @property
     def allows_autonomous(self) -> bool:
-        """``True`` solo si la contención está demostrada por completo."""
+        """``True`` si la contención está demostrada y la autoridad es explícita (ENGINE-6.3.R3).
+
+        Además de T1-T7, la autonomía exige que el motor pueda decir **qué** se autorizó. Un
+        envelope sin superficie y con trabajo nuevo no es autoridad: es ausencia de información,
+        y la ausencia de información no autoriza.
+        """
         return (
             self.compatibility is ArchitectureCompatibility.CONTAINED
             and not self.failures
             and not self.unresolved
+            and self.authority.explicit
         )
 
     @property
@@ -309,6 +318,21 @@ def evaluate_replan_containment(
     node_count_delta = sum(len(operation.nodes) for operation in proposal.operations) - len(
         proposal.superseded_node_ids
     )
+    authority = AuthorityEnvelope(
+        files=tuple(
+            dict.fromkeys(
+                path for operation in proposal.operations for spec in operation.nodes
+                for path in spec.allowed_files
+            )
+        )[:MAX_CONTAINMENT_ITEMS],
+        resources=authorized.tokens[:MAX_CONTAINMENT_ITEMS],
+        dimensions=authorized.dimensions(),
+        source="contrato y operaciones de la propuesta",
+        explicit=bool(
+            any(spec.allowed_files for operation in proposal.operations for spec in operation.nodes)
+        )
+        or not any(operation.nodes for operation in proposal.operations),
+    )
     if failures or expanded:
         compatibility = ArchitectureCompatibility.EXPANDED
     elif unresolved:
@@ -329,6 +353,7 @@ def evaluate_replan_containment(
         authority_delta=authority_delta,
         has_architecture_baseline=baseline,
         operation_kinds=tuple(kinds),
+        authority=authority,
     )
 
 

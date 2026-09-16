@@ -449,6 +449,184 @@ _GENERIC_URI_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 #: Forma de una URI/DSN con esquema: ``mongodb://``, ``amqp://``, ``redis://``, ``postgres://``…
 _URI_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b([a-z][a-z0-9+.\-]{1,31})://")
 
+#: Módulos cuya presencia, por sí sola, **no** puede cambiar la arquitectura autorizada: cálculo,
+#: texto, estructuras, serialización y utilidades de proceso.
+#:
+#: La lista es **cerrada e inmutable**, y esa es la propiedad que importa: lo que no está aquí
+#: —cualquier tecnología futura, y también un módulo de la biblioteca estándar que introduce
+#: almacenamiento, red, concurrencia o criptografía— queda ``UNRESOLVED``. No es una lista de
+#: tecnologías conocidas: es la allowlist de lo que el motor puede **demostrar** inocuo, y su
+#: ausencia nunca concede nada (ENGINE-6.3.R3, AUD-R2-02).
+_INERT_MODULES: Final[frozenset[str]] = frozenset(
+    {
+        "__future__",
+        "abc",
+        "argparse",
+        "array",
+        "ast",
+        "base64",
+        "bisect",
+        "calendar",
+        "collections",
+        "contextlib",
+        "copy",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "difflib",
+        "enum",
+        "fnmatch",
+        "fractions",
+        "functools",
+        "glob",
+        "hashlib",
+        "heapq",
+        "html",
+        "inspect",
+        "io",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "numbers",
+        "operator",
+        "os",
+        "pathlib",
+        "pprint",
+        "pydoc",
+        "random",
+        "re",
+        "shlex",
+        "shutil",
+        "statistics",
+        "string",
+        "struct",
+        "sys",
+        "tempfile",
+        "textwrap",
+        "time",
+        "traceback",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "uuid",
+        "warnings",
+        "zipfile",
+    }
+)
+
+#: Formas con las que un fichero importa un módulo. Se busca la **raíz** del módulo, que es lo que
+#: identifica la tecnología (``pymongo`` en ``pymongo.MongoClient``).
+_IMPORT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"^\s*import\s+([A-Za-z_][\w.]*)"),
+    re.compile(r"^\s*from\s+([A-Za-z_][\w.]*)\s+import"),
+    re.compile(r"__import__\(\s*['\"]([A-Za-z_][\w.]*)['\"]"),
+    re.compile(r"import_module\(\s*['\"]([A-Za-z_][\w.]*)['\"]"),
+    re.compile(r"(?:require|load)\(\s*['\"]([A-Za-z_@][\w./@-]*)['\"]"),
+)
+
+
+def module_roots(line: str) -> tuple[str, ...]:
+    """Raíces de los módulos que una línea importa, sin repetir."""
+    found: list[str] = []
+    for pattern in _IMPORT_PATTERNS:
+        for match in pattern.finditer(line):
+            root = match.group(1).split(".")[0].split("/")[0].lstrip("@")
+            if root and root not in found:
+                found.append(root)
+    return tuple(found)
+
+
+def unproven_effect(
+    *,
+    added_lines: Iterable[str],
+    authorized: ResourceSet,
+    local_roots: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Razones sin resolver por un efecto arquitectónico en el **contenido real** del diff.
+
+    Conocer el camino no demuestra nada sobre el efecto (ENGINE-6.3.R3, AUD-R2-02): un fichero
+    autorizado puede cambiar el almacén, el proveedor o el entorno de ejecución del proyecto. Aquí
+    se mira lo que la implementación **escribió de verdad** —las líneas añadidas del diff real— y
+    se declara sin resolver todo lo que el motor no puede demostrar contenido:
+
+    - un módulo importado que no está en el envelope autorizado, no es un módulo local del
+      proyecto y no está en la allowlist cerrada de módulos inertes;
+    - una URI/DSN cuyo esquema el envelope no contiene (salvo transporte genérico).
+
+    No hay lista de tecnologías: hay una allowlist de lo demostrablemente inocuo y un defecto
+    **fail-closed**. Que el motor no conozca una tecnología es exactamente el caso que debe caer.
+
+    Args:
+        added_lines: líneas añadidas por el diff real (todas las rutas cambiadas).
+        authorized: envelope autorizado del proyecto (recursos).
+        local_roots: raíces de módulos propios del proyecto (ficheros/paquetes del workspace).
+
+    Returns:
+        Razones legibles, una por hallazgo.
+    """
+    authorized_tokens = set(authorized.tokens)
+    known_packages = {
+        token.split(":", 1)[1].split(":")[0]
+        for token in authorized_tokens
+        if token.startswith("package:") or token.startswith("technology:")
+    }
+    inert = _INERT_MODULES | local_roots
+    reasons: list[str] = []
+    for raw in added_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for root in module_roots(line):
+            name = root.casefold().replace("-", "_")
+            if name in inert or root in known_packages or name in known_packages:
+                continue
+            reasons.append(
+                f"el diff importa {root!r}: el motor no puede demostrar que esa dependencia quede "
+                "dentro de la arquitectura autorizada"
+            )
+        for match in _URI_PATTERN.finditer(line):
+            scheme = match.group(1).casefold()
+            if scheme in _GENERIC_URI_SCHEMES:
+                continue
+            if scheme in authorized_tokens or any(
+                token.rsplit(":", 1)[-1] == scheme for token in authorized_tokens
+            ):
+                continue
+            reasons.append(
+                f"el diff introduce una URI con esquema {scheme!r} que el envelope autorizado no "
+                "contiene; el motor no puede demostrar que el cambio quede dentro del diseño"
+            )
+    return tuple(dict.fromkeys(reasons))
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityEnvelope:
+    """Qué está autorizado a cambiar un nodo: superficie, recursos y dimensiones (ENGINE-6.3.R3).
+
+    Responde a la pregunta «¿qué se autorizó exactamente?» con hechos del motor —los ficheros que el
+    nodo puede escribir, el envelope de recursos del contrato y sus dimensiones—, y viaja con la
+    decisión y con el vínculo humano. No es una lista de lo prohibido: es la superficie dentro de la
+    cual el efecto real tiene que poder demostrarse.
+    """
+
+    files: tuple[str, ...] = ()
+    resources: tuple[str, ...] = ()
+    dimensions: tuple[str, ...] = ()
+    source: str = ""
+    #: ``True`` si el motor pudo enunciar la autoridad: superficie concreta, o una operación que
+    #: **no introduce trabajo nuevo** (un reordenamiento no autoriza a escribir nada). Un envelope
+    #: sin superficie y con trabajo nuevo no es autoridad: es ausencia de información.
+    explicit: bool = False
+
+    def detail(self) -> str:
+        """Descripción legible y acotada del envelope."""
+        files = ", ".join(self.files[:6]) or "sin superficie declarada"
+        dimensions = ", ".join(self.dimensions[:6]) or "sin dimensiones autorizadas"
+        return f"superficie [{files}] · dimensiones [{dimensions}] · origen {self.source or 'n/d'}"
+
 
 def parser_for(path: str) -> Callable[[str], tuple[str, ...]] | None:
     """Parser soportado para una ruta, o ``None`` si no hay ninguno."""
@@ -693,6 +871,7 @@ __all__ = [
     "DEPENDENCY_DIMENSIONS",
     "MAX_RESOURCE_NAME_CHARS",
     "MAX_RESOURCE_TOKENS",
+    "AuthorityEnvelope",
     "ExpansionReport",
     "ResourceDimension",
     "ResourceSet",
@@ -700,6 +879,7 @@ __all__ = [
     "contract_resources",
     "expansion_report",
     "is_resource_relevant",
+    "module_roots",
     "parser_for",
     "project_resource_envelope",
     "request_resources",
@@ -707,4 +887,5 @@ __all__ = [
     "resource_token",
     "resources_from_diff",
     "unannounced_surfaces",
+    "unproven_effect",
 ]

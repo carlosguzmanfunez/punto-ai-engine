@@ -90,6 +90,10 @@ class WorkspaceLineage(Protocol):
         """Rutas que cambiaron entre ``base`` y ``head``, según el repositorio."""
         ...
 
+    def diff_added_lines(self, base: str, head: str) -> tuple[str, ...]:
+        """Líneas **añadidas** del diff real entre ``base`` y ``head``."""
+        ...
+
 
 class GitWorkspaceLineage:
     """Linaje real, leído con el ``GitWorkspace`` del motor sobre el árbol del proyecto."""
@@ -215,6 +219,29 @@ class GitWorkspaceLineage:
                 f"{head}: {exc}"
             ) from exc
 
+    def diff_added_lines(self, base: str, head: str) -> tuple[str, ...]:
+        """Líneas añadidas del diff real, leídas de Git (autoridad del **efecto**).
+
+        Args:
+            base: revisión desde la que el nodo arrancó.
+            head: revisión que el child dejó publicada.
+
+        Returns:
+            Líneas añadidas, en el orden del diff; vacío si no hay rango que comparar.
+
+        Raises:
+            ProjectRevisionMismatchError: si Git no puede responder. El llamante **no** debe
+                interpretar ese fallo como «no cambió nada»: es autoridad irresoluble y falla
+                cerrado.
+        """
+        try:
+            return self._git.added_lines(self._git.diff_range(base, head))
+        except (DeveloperExecutionError, OSError) as exc:
+            raise ProjectRevisionMismatchError(
+                f"no se pudo leer el contenido del diff real del workspace {self._workspace} entre "
+                f"{base} y {head}: {exc}"
+            ) from exc
+
 
 class FixedLineage:
     """Linaje determinista de prueba: una revisión fija y un interruptor para simular deriva.
@@ -235,12 +262,14 @@ class FixedLineage:
         on_mismatch: Callable[[str], None] | None = None,
         on_restore: Callable[[str], None] | None = None,
         changed: tuple[str, ...] = (),
+        added_lines: tuple[str, ...] = (),
         on_changed: Callable[[str, str], None] | None = None,
     ) -> None:
         self._revision = revision
         self._on_mismatch = on_mismatch
         self._on_restore = on_restore
         self._changed = tuple(changed)
+        self._added = tuple(added_lines)
         self._on_changed = on_changed
         self.reads = 0
         self.checked: list[str] = []
@@ -305,6 +334,14 @@ class FixedLineage:
         if not base or not head or base == head:
             return ()
         return self._changed
+
+    def diff_added_lines(self, base: str, head: str) -> tuple[str, ...]:
+        """Líneas añadidas que el doble declara, con el mismo contrato que el linaje real."""
+        if self._on_changed is not None:
+            self._on_changed(base, head)
+        if not base or not head or base == head:
+            return ()
+        return self._added
 
 
 __all__ = [

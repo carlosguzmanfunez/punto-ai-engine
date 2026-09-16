@@ -148,6 +148,31 @@ class GitWorkspace:
         )
         return tuple(dict.fromkeys(line.strip() for line in output.splitlines() if line.strip()))
 
+    def diff_range(self, base: str, head: str) -> str:
+        """Diff unificado entre dos revisiones, tal cual lo da Git.
+
+        Es el **contenido** del diff real: conocer la ruta no demuestra nada sobre el efecto, así
+        que el motor lee lo que se escribió de verdad (ENGINE-6.3.R3, AUD-R2-02).
+        """
+        if not base or not head or base == head:
+            return ""
+        return self._run("diff_range", ["diff", f"{base}..{head}"], "git diff")
+
+    @staticmethod
+    def added_lines(diff_text: str) -> tuple[str, ...]:
+        """Líneas **añadidas** de un diff unificado, sin las cabeceras.
+
+        Se descartan las cabeceras ``+++``/``---`` y se conserva el contenido añadido tal cual, para
+        poder juzgar el efecto y no solo la ruta.
+        """
+        added: list[str] = []
+        for raw in diff_text.splitlines():
+            if raw.startswith("+++") or raw.startswith("---"):
+                continue
+            if raw.startswith("+"):
+                added.append(raw[1:])
+        return tuple(added)
+
     def add(self, paths: Sequence[str] = ()) -> None:
         """Añade rutas al índice. Sin rutas, añade todo el workspace."""
         args = ["add", "-A"] if not paths else ["add", "--", *paths]

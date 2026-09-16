@@ -4161,13 +4161,17 @@ class AuditLogger:
         has_architecture_baseline: bool = False,
         delta_fingerprint: str = "",
         autonomous: bool = False,
+        authority_files: Sequence[str] = (),
+        authority_dimensions: Sequence[str] = (),
         actor: str | None = None,
     ) -> AuditEvent:
         """Registra la contención estructural de una propuesta (ENGINE-6.3.R1).
 
         Es el evento que explica **por qué** una replanificación se adoptó sola o por qué fue a una
         persona: la compatibilidad (``CONTAINED`` / ``EXPANDED`` / ``UNRESOLVED``), los predicados
-        demostrados, los recursos que se salían del envelope y lo que no se pudo resolver. No lleva
+        demostrados, los recursos que se salían del envelope y lo que no se pudo resolver. Desde
+        ENGINE-6.3.R3 incluye además la **autoridad explícita** del nodo —qué superficie y qué
+        dimensiones se autorizaron—, que es la pregunta «¿qué se autorizó exactamente?». No lleva
         textos del modelo: hechos, códigos y cifras.
         """
         return self._project_event(
@@ -4193,6 +4197,8 @@ class AuditLogger:
                 "operation_kinds": list(operation_kinds),
                 "proofs": list(proofs),
                 "unresolved": list(unresolved),
+                "authority_files": list(authority_files),
+                "authority_dimensions": list(authority_dimensions),
             },
             actor=actor,
         )

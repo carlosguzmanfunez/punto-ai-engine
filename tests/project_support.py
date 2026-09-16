@@ -539,6 +539,7 @@ class FollowProjectLineage:
         #: doble no aporta diff»: el motor inspecciona entonces solo lo que el Developer declaró,
         #: que es el comportamiento de los casos anteriores a ENGINE-6.3.R2.
         self.actual_paths: tuple[str, ...] = ()
+        self.actual_added_lines: tuple[str, ...] = ()
         self.changed_reads: list[tuple[str, str]] = []
         self.checked: list[str] = []
         self.restored: list[WorkspaceReconciliation] = []
@@ -551,6 +552,15 @@ class FollowProjectLineage:
         if not base or not head or base == head:
             return ()
         return self.actual_paths
+
+    def diff_added_lines(self, base: str, head: str) -> tuple[str, ...]:
+        """Contenido añadido que el doble declara como diff real (ENGINE-6.3.R3)."""
+        self.changed_reads.append((base, head))
+        if self._on_changed is not None:
+            self._on_changed(base, head)
+        if not base or not head or base == head:
+            return ()
+        return self.actual_added_lines
 
     @property
     def revision(self) -> str:

@@ -125,6 +125,7 @@ from punto.project.resources import (
     expansion_report,
     resources_from_diff,
     unannounced_surfaces,
+    unproven_effect,
 )
 from punto.project.state_machine import ProjectStateMachine
 from punto.project.workspace import (
@@ -996,12 +997,28 @@ class ProjectExecutionKernel:
             actual_paths, diff_failure = self._actual_changed_paths(
                 revision_before, candidate_revision
             )
+            actual_lines, lines_failure = self._actual_added_lines(
+                revision_before, candidate_revision
+            )
             observed_expansion, observed_unresolved, undeclared_paths = (
-                self._observed_resource_expansion(run, node, results, actual_paths=actual_paths)
+                self._observed_resource_expansion(
+                    run, node, results, actual_paths=actual_paths, actual_lines=actual_lines
+                )
             )
             if diff_failure:
                 # El motor no pudo leer el diff real: autoridad irresoluble, falla cerrado.
                 observed_unresolved = (*observed_unresolved, diff_failure)
+            if lines_failure:
+                # Sin el contenido del diff no se puede demostrar el efecto: falla cerrado.
+                observed_unresolved = (*observed_unresolved, lines_failure)
+            elif actual_paths and not actual_lines:
+                # El repositorio dice que cambiaron rutas y no hay contenido añadido que juzgar
+                # (borrado, binario o diff ilegible): sin contenido no hay prueba del efecto.
+                observed_unresolved = (
+                    *observed_unresolved,
+                    f"el diff real cambió {len(actual_paths)} ruta(s) y su contenido añadido no se "
+                    "pudo leer: el efecto no se puede demostrar contenido",
+                )
         rejection: _Rejection | None = None
         if child_completed:
             rejection = self._rejection(
@@ -1171,6 +1188,7 @@ class ProjectExecutionKernel:
         results: Sequence[DeveloperExecutionResult],
         *,
         actual_paths: tuple[str, ...] = (),
+        actual_lines: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Recursos que el diff introdujo fuera del envelope, lo no resuelto y lo no declarado.
 
@@ -1212,10 +1230,41 @@ class ProjectExecutionKernel:
         # configuración, migraciones, secretos): se declaran sin resolver en vez de suponerlas
         # inocuas (ENGINE-6.3.R2, AUD-6.3R1-03).
         unresolved = (*unresolved, *unannounced_surfaces(paths, read, allowed))
+        # Y el **efecto** que la implementación escribió de verdad dentro de esos ficheros: un
+        # fichero autorizado puede cambiar el almacén, el proveedor o el entorno de ejecución, así
+        # que se juzga el contenido añadido del diff real contra el envelope autorizado
+        # (ENGINE-6.3.R3, AUD-R2-02). Lo que no se puede demostrar contenido queda sin resolver.
+        unresolved = (
+            *unresolved,
+            *unproven_effect(
+                added_lines=actual_lines,
+                authorized=allowed,
+                local_roots=self._local_module_roots(run),
+            ),
+        )
         if observed.is_empty and not unresolved:
             return (), (), undeclared
         report = expansion_report(observed, allowed)
         return report.expanded, unresolved, undeclared
+
+    def _local_module_roots(self, run: ProjectRun) -> frozenset[str]:
+        """Raíces de los módulos propios del proyecto, para no confundirlos con tecnologías.
+
+        Un import que resuelve a un fichero o paquete del workspace es trabajo del propio proyecto;
+        lo que no resuelve dentro y no está autorizado es exactamente lo que hay que declarar sin
+        resolver. La lectura es superficial y acotada: el listado del primer nivel del workspace.
+        """
+        workspace = self._workspace_path(run)
+        if not workspace:
+            return frozenset()
+        base = Path(workspace)
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            return frozenset()
+        roots = {entry.stem for entry in entries if entry.is_file() and entry.suffix == ".py"}
+        roots |= {entry.name for entry in entries if entry.is_dir()}
+        return frozenset(roots)
 
     def _actual_changed_paths(
         self, base_revision: str, head_revision: str
@@ -1235,6 +1284,25 @@ class ProjectExecutionKernel:
             return self._lineage.changed_paths(base_revision, head_revision), ""
         except ProjectRevisionMismatchError as exc:
             return (), f"no se pudo derivar el diff real del nodo: {exc}"
+
+    def _actual_added_lines(
+        self, base_revision: str, head_revision: str
+    ) -> tuple[tuple[str, ...], str]:
+        """Líneas añadidas del diff real, y el fallo si no se pudieron leer.
+
+        Es la autoridad del **efecto** (ENGINE-6.3.R3, AUD-R2-02): la ruta no demuestra nada sobre
+        lo que se hizo dentro del fichero. Igual que con las rutas, no poder leerlas es
+        ``UNRESOLVED``.
+
+        Returns:
+            ``(líneas añadidas, motivo_de_fallo)``.
+        """
+        if not head_revision or base_revision == head_revision:
+            return (), ""
+        try:
+            return self._lineage.diff_added_lines(base_revision, head_revision), ""
+        except ProjectRevisionMismatchError as exc:
+            return (), f"no se pudo derivar el contenido del diff real del nodo: {exc}"
 
     def _workspace_path(self, run: ProjectRun) -> str:
         """Ruta del workspace declarada por el proyecto, si la hay."""
@@ -3853,6 +3921,8 @@ class ProjectExecutionKernel:
             has_architecture_baseline=containment.has_architecture_baseline,
             delta_fingerprint=containment.fingerprint,
             autonomous=containment.allows_autonomous,
+            authority_files=containment.authority.files,
+            authority_dimensions=containment.authority.dimensions,
         )
 
     def _audit_replan_change_class(

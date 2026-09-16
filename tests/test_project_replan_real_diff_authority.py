@@ -48,17 +48,21 @@ def escenario(
     declarado: tuple[str, ...],
     real: tuple[str, ...],
     manifiesto: str = "",
+    contenido: str = "",
     on_changed: Callable[[str, str], None] | None = None,
 ) -> tuple[Harness, AuditLogger, object]:
     """Monta el proyecto con un diff real distinto del declarado y conduce el nodo A.
 
     ``real`` es lo que el repositorio demuestra que cambió; ``declarado`` lo que el resultado del
-    Developer dice. El manifiesto se escribe en el workspace porque es de ahí de donde el parent lee
-    el contenido al liquidar.
+    Developer dice. ``contenido`` es el contenido añadido que el repositorio reporta (el motor
+    juzga el efecto, no solo la ruta, desde ENGINE-6.3.R3). El manifiesto se escribe en el
+    workspace porque es de ahí de donde el parent lee el contenido al liquidar.
     """
     audit = AuditLogger()
     lineage = FollowProjectLineage(on_changed=on_changed)
     lineage.actual_paths = real
+    lineage.actual_added_lines = tuple(contenido.splitlines())
+    codigo = "def slug(valor):\n    return valor.strip()\n"
     h = replan_harness(
         tmp_path,
         outcomes={"A": ChildOutcome(files=declarado)},
@@ -69,7 +73,7 @@ def escenario(
     )
     if manifiesto:
         escribir(h, MANIFIESTO, manifiesto)
-    escribir(h, ARCHIVO, "def slug(valor):\n    return valor.strip()\n")
+    escribir(h, ARCHIVO, codigo)
     kernel = replan_kernel(h, FakeReplanner(), audit=audit)
     return h, audit, kernel.run_all(h.request)
 
@@ -113,6 +117,7 @@ def test_declarado_igual_al_real_es_el_comportamiento_normal(tmp_path: Path) -> 
         declarado=(ARCHIVO, MANIFIESTO),
         real=(ARCHIVO, MANIFIESTO),
         manifiesto=PYPROJECT_CON_PSYCOPG,
+        contenido="def slug(valor):\n    return valor.strip()\n",
     )
     node = run.node("A")
 
@@ -132,6 +137,7 @@ def test_lo_no_declarado_pero_contenido_no_es_violacion_y_queda_auditado(tmp_pat
         declarado=(ARCHIVO,),
         real=(ARCHIVO, MANIFIESTO),
         manifiesto=PYPROJECT_CON_PSYCOPG,
+        contenido="def slug(valor):\n    return valor.strip()\n",
     )
     node = run.node("A")
 

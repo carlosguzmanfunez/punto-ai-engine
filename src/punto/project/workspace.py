@@ -67,7 +67,12 @@ class WorkspaceReconciliation:
 
 
 class WorkspaceLineage(Protocol):
-    """Puerto del linaje: revisión actual, comprobación exacta y vuelta a una revisión aceptada."""
+    """Puerto del linaje: revisión actual, comprobación exacta, vuelta y diff real.
+
+    Desde ENGINE-6.3.R2 el puerto también responde **qué cambió de verdad** entre dos revisiones: es
+    la fuente de autoridad de la verificación post-ejecución (lo que declara el agente no autoriza
+    nada por sí mismo).
+    """
 
     def head_revision(self) -> str:
         """SHA de la revisión actual del workspace."""
@@ -79,6 +84,10 @@ class WorkspaceLineage(Protocol):
 
     def restore(self, revision: str) -> WorkspaceReconciliation:
         """Devuelve el árbol a ``revision``, descartando lo que se hubiera acumulado encima."""
+        ...
+
+    def changed_paths(self, base: str, head: str) -> tuple[str, ...]:
+        """Rutas que cambiaron entre ``base`` y ``head``, según el repositorio."""
         ...
 
 
@@ -183,6 +192,29 @@ class GitWorkspaceLineage:
             )
         return WorkspaceReconciliation(revision, previous, True)
 
+    def changed_paths(self, base: str, head: str) -> tuple[str, ...]:
+        """Rutas cambiadas entre dos revisiones, leídas de Git (fuente de autoridad).
+
+        Args:
+            base: revisión desde la que el nodo arrancó.
+            head: revisión que el child dejó publicada.
+
+        Returns:
+            Rutas relativas al repositorio; vacío si no hay rango que comparar.
+
+        Raises:
+            ProjectRevisionMismatchError: si Git no puede responder. El llamante **no** debe
+                interpretar ese fallo como «no cambió nada»: es autoridad irresoluble y falla
+                cerrado.
+        """
+        try:
+            return self._git.diff_names(base, head)
+        except (DeveloperExecutionError, OSError) as exc:
+            raise ProjectRevisionMismatchError(
+                f"no se pudo leer el diff real del workspace {self._workspace} entre {base} y "
+                f"{head}: {exc}"
+            ) from exc
+
 
 class FixedLineage:
     """Linaje determinista de prueba: una revisión fija y un interruptor para simular deriva.
@@ -202,10 +234,14 @@ class FixedLineage:
         *,
         on_mismatch: Callable[[str], None] | None = None,
         on_restore: Callable[[str], None] | None = None,
+        changed: tuple[str, ...] = (),
+        on_changed: Callable[[str, str], None] | None = None,
     ) -> None:
         self._revision = revision
         self._on_mismatch = on_mismatch
         self._on_restore = on_restore
+        self._changed = tuple(changed)
+        self._on_changed = on_changed
         self.reads = 0
         self.checked: list[str] = []
         self.restored: list[WorkspaceReconciliation] = []
@@ -257,6 +293,18 @@ class FixedLineage:
             self._revision = revision
         self.restored.append(reconciliation)
         return reconciliation
+
+    def changed_paths(self, base: str, head: str) -> tuple[str, ...]:
+        """Rutas declaradas como cambiadas por el doble, con el mismo contrato que el linaje real.
+
+        ``on_changed`` permite simular un linaje que **no puede** responder al diff real: ahí el
+        llamante tiene que fallar cerrado en vez de suponer que no cambió nada.
+        """
+        if self._on_changed is not None:
+            self._on_changed(base, head)
+        if not base or not head or base == head:
+            return ()
+        return self._changed
 
 
 __all__ = [

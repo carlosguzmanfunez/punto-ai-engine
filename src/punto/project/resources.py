@@ -429,7 +429,25 @@ _INFRASTRUCTURE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"(^|/)\.env"),
     re.compile(r"(^|/)(requirements[^/]*\.txt|Pipfile|Gemfile|pom\.xml|build\.gradle[^/]*)$"),
     re.compile(r"(^|/)(tsconfig\.json|\.nvmrc|runtime\.txt)$"),
+    # Superficies que también pueden cambiar arquitectura y que el motor no interpreta todavía
+    # (ENGINE-6.3.R2, AUD-6.3R1-03). La política es la misma: lo que no se sabe leer **no** se
+    # supone inocuo. No es una lista de tecnologías: es una lista de **superficies**.
+    re.compile(r"\.sql$"),
+    re.compile(r"(^|/)(migrations?|alembic|prisma|drizzle|flyway|liquibase)/"),
+    re.compile(r"(^|/)(config|conf|settings|deploy|deployment|infra|infrastructure|k8s|kubernetes)/"),
+    re.compile(
+        r"(^|/)(settings|config|configuration|constants|local_settings)[^/]*\.py$"
+    ),
+    re.compile(r"\.(?:ini|cfg|conf|properties|tf|tfvars|service|env|toml|ya?ml)$"),
+    re.compile(r"(^|/)(Procfile|Caddyfile|nginx\.conf|supervisord\.conf|systemd/)$"),
+    re.compile(r"(^|/)(secrets?|credentials?|vault|keyring)"),
 )
+
+#: Esquemas de URI que son transporte genérico, no una tecnología de arquitectura.
+_GENERIC_URI_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
+
+#: Forma de una URI/DSN con esquema: ``mongodb://``, ``amqp://``, ``redis://``, ``postgres://``…
+_URI_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b([a-z][a-z0-9+.\-]{1,31})://")
 
 
 def parser_for(path: str) -> Callable[[str], tuple[str, ...]] | None:
@@ -447,6 +465,53 @@ def is_resource_relevant(path: str) -> bool:
     if parser_for(normalized) is not None:
         return True
     return any(pattern.search(normalized) for pattern in _INFRASTRUCTURE_PATTERNS)
+
+
+def unannounced_surfaces(
+    paths: Sequence[str],
+    read: Callable[[str], str | None],
+    authorized: ResourceSet,
+) -> tuple[str, ...]:
+    """Razones sin resolver por arquitectura detectada en ficheros que no son manifiestos.
+
+    La cobertura post-ejecución no puede depender de conocer el nombre de cada tecnología
+    (ENGINE-6.3.R2, AUD-6.3R1-03): lo que se busca es una **forma**, no un producto. Un fichero de
+    código o de configuración que introduce una URI/DSN con un esquema que el envelope autorizado no
+    contiene está tocando una superficie de arquitectura que el motor no puede demostrar
+    contenida, y por eso queda ``UNRESOLVED`` —nunca «no introdujo nada»—. ``http``/``https`` se
+    tratan como transporte genérico: su significado arquitectónico está en el destino, que se
+    declara en las superficies de configuración (que ya se resuelven o fallan cerrado arriba).
+
+    Args:
+        paths: rutas cambiadas.
+        read: lector del contenido; ``None`` si no existe.
+        authorized: envelope autorizado del proyecto.
+
+    Returns:
+        Razones legibles, una por hallazgo.
+    """
+    authorized_tokens = set(authorized.tokens)
+    reasons: list[str] = []
+    for path in dict.fromkeys(paths):
+        normalized = path.replace("\\", "/")
+        if is_resource_relevant(normalized):
+            continue
+        content = _read_text(path, read)
+        if content is None:
+            continue
+        for match in _URI_PATTERN.finditer(content):
+            scheme = match.group(1).casefold()
+            if scheme in _GENERIC_URI_SCHEMES:
+                continue
+            if scheme in authorized_tokens or any(
+                token.rsplit(":", 1)[-1] == scheme for token in authorized_tokens
+            ):
+                continue
+            reasons.append(
+                f"{path}: introduce una URI con esquema {scheme!r} que el envelope autorizado no "
+                "contiene; el motor no puede demostrar que el cambio quede dentro del diseño"
+            )
+    return tuple(reasons)
 
 
 def resources_from_diff(
@@ -641,4 +706,5 @@ __all__ = [
     "resource_envelope_fingerprint",
     "resource_token",
     "resources_from_diff",
+    "unannounced_surfaces",
 ]

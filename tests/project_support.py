@@ -76,7 +76,7 @@ from punto.workflow.errors import WorkflowError
 from punto.workflow.handoff import publish_developer, publish_plan
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 #: Espacio propio del kernel de child de prueba, para que su ``workflow_id`` sea determinista.
 FAKE_CHILD_NAMESPACE: UUID = UUID("7c2f5a91-4e6d-4b18-9f27-8a1d3c5e7b60")
@@ -527,10 +527,30 @@ class FollowProjectLineage:
     existe.
     """
 
-    def __init__(self, revision: str = FAKE_REVISION) -> None:
+    def __init__(
+        self,
+        revision: str = FAKE_REVISION,
+        *,
+        on_changed: Callable[[str, str], None] | None = None,
+    ) -> None:
         self._revision = revision
+        self._on_changed = on_changed
+        #: Rutas que el doble declara como **diff real** entre dos revisiones. Vacío significa «el
+        #: doble no aporta diff»: el motor inspecciona entonces solo lo que el Developer declaró,
+        #: que es el comportamiento de los casos anteriores a ENGINE-6.3.R2.
+        self.actual_paths: tuple[str, ...] = ()
+        self.changed_reads: list[tuple[str, str]] = []
         self.checked: list[str] = []
         self.restored: list[WorkspaceReconciliation] = []
+
+    def changed_paths(self, base: str, head: str) -> tuple[str, ...]:
+        """Diff real que el doble declara entre dos revisiones, con el contrato del linaje real."""
+        self.changed_reads.append((base, head))
+        if self._on_changed is not None:
+            self._on_changed(base, head)
+        if not base or not head or base == head:
+            return ()
+        return self.actual_paths
 
     @property
     def revision(self) -> str:

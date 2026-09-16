@@ -124,6 +124,7 @@ from punto.project.resources import (
     contract_resources,
     expansion_report,
     resources_from_diff,
+    unannounced_surfaces,
 )
 from punto.project.state_machine import ProjectStateMachine
 from punto.project.workspace import (
@@ -989,10 +990,18 @@ class ProjectExecutionKernel:
         # acepta: ``UNRESOLVED`` nunca se degrada a «no introdujo nada».
         observed_expansion: tuple[str, ...] = ()
         observed_unresolved: tuple[str, ...] = ()
+        undeclared_paths: tuple[str, ...] = ()
+        actual_paths: tuple[str, ...] = ()
         if child_completed:
-            observed_expansion, observed_unresolved = self._observed_resource_expansion(
-                run, node, results
+            actual_paths, diff_failure = self._actual_changed_paths(
+                revision_before, candidate_revision
             )
+            observed_expansion, observed_unresolved, undeclared_paths = (
+                self._observed_resource_expansion(run, node, results, actual_paths=actual_paths)
+            )
+            if diff_failure:
+                # El motor no pudo leer el diff real: autoridad irresoluble, falla cerrado.
+                observed_unresolved = (*observed_unresolved, diff_failure)
         rejection: _Rejection | None = None
         if child_completed:
             rejection = self._rejection(
@@ -1010,6 +1019,12 @@ class ProjectExecutionKernel:
             ):
                 self._audit_node_architecture_violation(
                     run, node_run, observed_expansion, observed_unresolved, rejection.detail
+                )
+            if undeclared_paths:
+                # Una discrepancia entre lo declarado y el diff real nunca se ignora en silencio
+                # (ENGINE-6.3.R2, AUD-6.3R1-02): se registra con las dos listas, haya o no rechazo.
+                self._audit_node_undeclared_change(
+                    run, node_run, results, actual_paths, undeclared_paths
                 )
         accepted = child_completed and rejection is None
         revision_after = candidate_revision if accepted else revision_before
@@ -1154,21 +1169,29 @@ class ProjectExecutionKernel:
         run: ProjectRun,
         node: GraphNode,
         results: Sequence[DeveloperExecutionResult],
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Recursos que el diff introdujo fuera del envelope autorizado, y lo que no se resolvió.
+        *,
+        actual_paths: tuple[str, ...] = (),
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """Recursos que el diff introdujo fuera del envelope, lo no resuelto y lo no declarado.
 
-        Se inspeccionan los ficheros que el child declaró haber cambiado y se leen del **workspace**
-        en el momento de la liquidación —el árbol está en la revisión que el child demostró—, porque
-        el resultado durable del Developer no transporta el contenido de los archivos. Lo que no se
-        pueda leer o interpretar se devuelve como razón sin resolver, nunca como ausencia de
-        recursos.
+        Las rutas que se inspeccionan son la **unión** del diff real que el motor deriva del
+        repositorio y de lo que declara el resultado del Developer (ENGINE-6.3.R2, AUD-6.3R1-02): lo
+        declarado sirve para diagnóstico y para no perder evidencia histórica, pero **no** es la
+        fuente de autoridad —un resultado que oculta un manifiesto no puede decidir qué se
+        inspecciona—. Se leen del **workspace** en el momento de la liquidación (el árbol está en la
+        revisión que el child demostró), porque el resultado durable del Developer no transporta el
+        contenido de los archivos. Lo que no se pueda leer, interpretar o resolver se devuelve como
+        razón sin resolver, nunca como ausencia de recursos.
 
         Returns:
-            ``(recursos expandidos, razones sin resolver)``.
+            ``(recursos expandidos, razones sin resolver, rutas no declaradas)``.
         """
-        paths = tuple(change.path for result in results for change in result.files_changed)
+        declared = tuple(change.path for result in results for change in result.files_changed)
+        declared_set = set(declared)
+        undeclared = tuple(path for path in actual_paths if path not in declared_set)
+        paths = tuple(dict.fromkeys((*declared, *actual_paths)))
         if not paths:
-            return (), ()
+            return (), (), undeclared
         workspace = self._workspace_path(run)
         base = Path(workspace) if workspace else None
 
@@ -1181,14 +1204,37 @@ class ProjectExecutionKernel:
                 return None
 
         observed, unresolved = resources_from_diff(paths, read)
-        if observed.is_empty and not unresolved:
-            return (), ()
         contract = self._contract_for_replan(run) if run.contract_ref is not None else None
         allowed = ResourceSet.of(node.resources)
         if contract is not None:
             allowed = allowed.union(contract_resources(contract))
+        # Superficies que pueden cambiar arquitectura y que los manifiestos no cubren (código,
+        # configuración, migraciones, secretos): se declaran sin resolver en vez de suponerlas
+        # inocuas (ENGINE-6.3.R2, AUD-6.3R1-03).
+        unresolved = (*unresolved, *unannounced_surfaces(paths, read, allowed))
+        if observed.is_empty and not unresolved:
+            return (), (), undeclared
         report = expansion_report(observed, allowed)
-        return report.expanded, unresolved
+        return report.expanded, unresolved, undeclared
+
+    def _actual_changed_paths(
+        self, base_revision: str, head_revision: str
+    ) -> tuple[tuple[str, ...], str]:
+        """Rutas que cambiaron de verdad, leídas del repositorio, y el fallo si no se pudo.
+
+        Es la autoridad del diff (ENGINE-6.3.R2, AUD-6.3R1-02). Un linaje que no puede responder no
+        autoriza nada: devuelve una razón de fallo que el parent trata como ``UNRESOLVED`` y rechaza
+        el nodo, en vez de suponer que no hubo cambios.
+
+        Returns:
+            ``(rutas, motivo_de_fallo)``; el motivo va vacío cuando la lectura fue posible.
+        """
+        if not head_revision or base_revision == head_revision:
+            return (), ""
+        try:
+            return self._lineage.changed_paths(base_revision, head_revision), ""
+        except ProjectRevisionMismatchError as exc:
+            return (), f"no se pudo derivar el diff real del nodo: {exc}"
 
     def _workspace_path(self, run: ProjectRun) -> str:
         """Ruta del workspace declarada por el proyecto, si la hay."""
@@ -3749,6 +3795,37 @@ class ProjectExecutionKernel:
             expanded_resources=expanded,
             unresolved=unresolved,
             detail=detail,
+        )
+
+    def _audit_node_undeclared_change(
+        self,
+        run: ProjectRun,
+        node_run: ProjectNodeRun,
+        results: Sequence[DeveloperExecutionResult],
+        actual_paths: tuple[str, ...],
+        undeclared_paths: tuple[str, ...],
+    ) -> None:
+        """Audita que el diff real trajo rutas que el Developer no declaró (ENGINE-6.3.R2).
+
+        La discrepancia no decide por sí sola: lo que decide es la inspección del diff real. Pero no
+        se permite que pase en silencio, así que las dos listas quedan en la auditoría.
+        """
+        if self._audit is None:
+            return
+        declared = tuple(change.path for result in results for change in result.files_changed)
+        self._audit.log_project_node_undeclared_change(
+            project_run_id=run.project_run_id,
+            project_id=run.project_id,
+            node_id=node_run.node_id,
+            child_workflow_id=node_run.child_workflow_id,
+            declared_paths=declared,
+            actual_paths=actual_paths,
+            undeclared_paths=undeclared_paths,
+            detail=(
+                f"el diff real del nodo {node_run.node_id!r} cambió "
+                f"{len(undeclared_paths)} ruta(s) que el resultado del Developer no declaró: "
+                + ", ".join(undeclared_paths[:8])
+            ),
         )
 
     def _audit_replan_containment(

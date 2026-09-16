@@ -226,6 +226,10 @@ class AuditEventType(StrEnum):
     #: La implementación de un nodo introdujo recursos de arquitectura no autorizados, o su
     #: evidencia no se pudo resolver: el parent no lo acepta (ENGINE-6.3.R1).
     PROJECT_NODE_ARCHITECTURE_VIOLATION = "PROJECT_NODE_ARCHITECTURE_VIOLATION"
+    #: El diff real del nodo incluyó rutas que el resultado del Developer **no** declaró
+    #: (ENGINE-6.3.R2, AUD-6.3R1-02): la verificación post-ejecución se hace sobre el diff real,
+    #: y la discrepancia queda registrada aunque el efecto esté dentro de la autoridad.
+    PROJECT_NODE_UNDECLARED_CHANGE = "PROJECT_NODE_UNDECLARED_CHANGE"
     #: Un nodo fue sustituido por una replanificación: conserva su historia y su gasto.
     PROJECT_NODE_SUPERSEDED = "PROJECT_NODE_SUPERSEDED"
 

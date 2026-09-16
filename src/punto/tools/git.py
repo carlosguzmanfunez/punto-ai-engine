@@ -131,6 +131,23 @@ class GitWorkspace:
             args.append("--cached")
         return self._run("diff_stat", args, "git diff --stat").strip()
 
+    def diff_names(self, base: str, head: str) -> tuple[str, ...]:
+        """Rutas cambiadas entre dos revisiones, leídas del repositorio.
+
+        Es la fuente **de autoridad** del diff real (ENGINE-6.3.R2, AUD-6.3R1-02): lo que el motor
+        verifica no es lo que un agente dice haber cambiado, sino lo que el repositorio demuestra
+        que cambió. Una revisión vacía o idéntica a la otra no tiene diff.
+
+        Returns:
+            Rutas relativas a la raíz del repositorio, sin repetir y en orden estable.
+        """
+        if not base or not head or base == head:
+            return ()
+        output = self._run(
+            "diff_names", ["diff", "--name-only", f"{base}..{head}"], "git diff --name-only"
+        )
+        return tuple(dict.fromkeys(line.strip() for line in output.splitlines() if line.strip()))
+
     def add(self, paths: Sequence[str] = ()) -> None:
         """Añade rutas al índice. Sin rutas, añade todo el workspace."""
         args = ["add", "-A"] if not paths else ["add", "--", *paths]

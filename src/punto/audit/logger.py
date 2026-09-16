@@ -4231,6 +4231,43 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_project_node_undeclared_change(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        declared_paths: Sequence[str] = (),
+        actual_paths: Sequence[str] = (),
+        undeclared_paths: Sequence[str] = (),
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el diff real del nodo trajo rutas que el Developer no declaró.
+
+        No es por sí sola una violación: el efecto puede seguir dentro de la autoridad. Lo que no se
+        permite es la discrepancia **silenciosa** (ENGINE-6.3.R2, AUD-6.3R1-02): el motor verifica
+        el diff real y deja las dos listas en la auditoría para reconstruir qué pasó.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_UNDECLARED_CHANGE,
+            action="project_node_undeclared_change",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status="DIVERGENCE",
+            result=AuditResult.FAILURE,
+            detail=detail,
+            metadata={
+                "declared_paths": list(declared_paths),
+                "actual_paths": list(actual_paths),
+                "undeclared_paths": list(undeclared_paths),
+            },
+            actor=actor,
+        )
+
     def log_project_replan_approval_requested(
         self,
         *,

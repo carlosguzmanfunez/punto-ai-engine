@@ -186,7 +186,7 @@ _DIMENSIONS: Final[tuple[tuple[str, ReplanChangeClass, tuple[str, ...]], ...]] =
         ReplanChangeClass.DATASTORE_CHANGE,
         (
             r"\b(?:database|databases|datastore|data store|db engine|database engine|"
-            r"relational engine|storage engine|storage backend|persistence backend|"
+            r"relational engine|storage|persistence backend|"
             r"persistence layer|persistence|sql|nosql|no sql|schema|records|tables|"
             r"almacen de datos|base de datos|motor relacional|motor de datos|"
             r"capa de persistencia|persistencia|esquema|registros|tablas|cache)\b",
@@ -396,6 +396,28 @@ _PRODUCT_FORMS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\.(?:io|ai|com|dev|cloud|co|net|org|sh|xyz)\b"),
     re.compile(r"(?:db|sql|cloud|hub|stack|api|sdk|ops|kit|box|flow|ware)$"),
     re.compile(r"^[A-Z][a-z]+$"),
+    # Un nombre de producto puede escribirse entero en mayúsculas (``NATS``, ``SQS``, ``KAFKA``).
+    # Sin esta forma, una marca desconocida en mayúsculas no producía ningún token sin reconocer y
+    # pasaba la frontera semántica (hallazgo de auditoría AUD-6.3R1-05).
+    re.compile(r"^[A-Z][A-Z0-9]{2,}$"),
+)
+
+#: Vocabulario de la **prueba positiva** de tacticidad: la estrategia se declara como reparación o
+#: reintento acotado de algo que ya existe. Es una allowlist cerrada a propósito: desde
+#: ENGINE-6.3.R2 la autonomía exige prueba, y lo que no se puede leer como prueba **no se
+#: demuestra** —la carga de la prueba está invertida respecto de la versión anterior, donde la
+#: ausencia de sospecha bastaba—.
+_TACTICAL_PROOF: Final[str] = (
+    r"\b(?:retry|retries|retrying|reintent\w*|repair|repairs|repairing|repar\w*|fix|fixes|fixing|"
+    r"corrig\w*|correg\w*|correct\w*|arregl\w*|adjust\w*|ajust\w*|reajust\w*|bounded|acotad\w*)\b"
+)
+
+#: Afirmación explícita de **preservación** del diseño: es la otra prueba positiva aceptada. Exige
+#: nombrar lo que se conserva (arquitectura, diseño, stack, contrato), no solo decir «sin cambios».
+_PRESERVATION_PROOF: Final[str] = (
+    r"(?:preserv\w*|manten\w*|mantien\w*|conserv\w*|keeping|keep|same|mism\w*|sin cambiar|"
+    r"without changing)[^.]{0,48}?"
+    r"(?:architectur\w*|arquitectur\w*|design|dise[nñ]o|stack|contract|contrato|criteria|criterios)"
 )
 
 #: Identificadores del proyecto (``AC-1``, ``R-2``, ``N4``): no son tecnologías, son nombres de
@@ -490,6 +512,22 @@ def _dimensions_in(text: str) -> tuple[str, ...]:
 def _has_change_intent(text: str) -> bool:
     """``True`` si el texto propone sustituir, migrar, adoptar o introducir algo."""
     return bool(re.search(_CHANGE_INTENT, text))
+
+
+def tactical_proof(text: str) -> tuple[str, ...]:
+    """Hechos que **demuestran** que la estrategia es un trabajo acotado sobre lo existente.
+
+    Es la prueba positiva que exige ENGINE-6.3.R2 para conceder autonomía. Devuelve las pruebas
+    encontradas —reparación acotada o preservación explícita del diseño— y una tupla vacía cuando no
+    hay ninguna. Una tupla vacía **no** es «táctico»: es «no demostrado», y eso exige una persona.
+    """
+    proofs: list[str] = []
+    normalized = _normalize(text)
+    if re.search(_TACTICAL_PROOF, normalized):
+        proofs.append("reparacion o reintento acotado de lo existente")
+    if re.search(_PRESERVATION_PROOF, normalized):
+        proofs.append("preservacion explicita del diseno autorizado")
+    return tuple(proofs)
 
 
 def _brands_in(text: str) -> tuple[tuple[str, str], ...]:
@@ -660,7 +698,9 @@ def classify_replan_change(
         )
     matches: list[str] = []
     dimensions: list[str] = []
+    unproven: list[str] = []
     unknown: list[str] = []
+    tactical: list[str] = []
     high_impact: dict[ReplanChangeClass, list[str]] = {}
     known_brands: list[tuple[str, str]] = []
     baseline = _baseline_tokens(contract)
@@ -670,9 +710,17 @@ def classify_replan_change(
         normalized = _normalize(text)
         intent = _has_change_intent(normalized)
         touched = _dimensions_in(normalized)
+        # La prueba tiene que estar **en el mismo enunciado** que nombra la dimensión: un título de
+        # trámite («reintento de A») no puede demostrar nada sobre lo que la estrategia declara.
+        proofs = tactical_proof(text)
         for dimension in touched:
             if dimension not in dimensions:
                 dimensions.append(dimension)
+            if not proofs and dimension not in unproven:
+                unproven.append(dimension)
+        for proof in proofs:
+            if proof not in tactical:
+                tactical.append(proof)
         known_brands.extend(_brands_in(normalized) if intent else ())
         if intent:
             for _, dimension in _brands_in(normalized):
@@ -738,6 +786,30 @@ def classify_replan_change(
             tuple(failures),
             tuple(dimensions),
             (),
+            proven,
+        )
+    if unproven:
+        # ENGINE-6.3.R2 (AUD-6.3R1-01): nombrar una dimensión de arquitectura **obliga** a
+        # demostrar, en el mismo enunciado, que la estrategia sigue siendo un trabajo acotado dentro
+        # de lo autorizado. Antes bastaba con que no apareciera un verbo de sustitución del
+        # vocabulario para que el caso quedara en «sin sospecha» y obtuviera autonomía: eso era
+        # inferir tacticidad de la ausencia de señal, que es justo lo que no se puede hacer.
+        return ReplanChangeClassification(
+            ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS,
+            (
+                "la propuesta nombra "
+                + ", ".join(unproven[:4])
+                + " sin aportar ninguna prueba positiva, en el mismo enunciado, de que la "
+                "estrategia sea un trabajo acotado sobre lo existente: sin prueba no hay "
+                "autonomía. Tocar arquitectura hay que demostrarlo (reparación o reintento "
+                "acotado, o preservación explícita del diseño autorizado) o decidirlo una persona"
+            ),
+            tuple(
+                f"dimension sin prueba positiva: {item}"
+                for item in unproven[:MAX_CHANGE_MATCHES]
+            ),
+            tuple(dimensions),
+            tuple(unknown[:MAX_CHANGE_MATCHES]),
             proven,
         )
     return ReplanChangeClassification(
@@ -861,4 +933,5 @@ __all__ = [
     "classify_replan_change",
     "high_impact_labels",
     "replan_change_facts",
+    "tactical_proof",
 ]

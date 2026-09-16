@@ -68,6 +68,12 @@ MAX_REPLAN_SHORT_CHARS: Final[int] = 400
 #: Máximo de generaciones que el ``ProjectRun`` conserva en su historia acotada.
 MAX_PROJECT_GENERATIONS: Final[int] = 8
 
+#: Máximo de recursos canónicos que el envelope autorizado del contrato puede declarar.
+MAX_AUTHORIZED_RESOURCES: Final[int] = 200
+
+#: Máximo de recursos que un nodo propuesto puede **pedir** (``uses_*``).
+MAX_NODE_RESOURCE_REQUESTS: Final[int] = 32
+
 
 class ReplanEligibility(StrEnum):
     """Veredicto **determinista** sobre si un fallo admite replanificación.
@@ -187,6 +193,14 @@ class ProjectContract(BaseModel):
     architecture_security: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
     architecture_deployment: str = Field(default="", max_length=MAX_REPLAN_TEXT_CHARS)
     architecture_technology: tuple[str, ...] = Field(default=(), max_length=MAX_REPLAN_COVERAGE)
+    #: Recursos autorizados del proyecto (ENGINE-6.3.R1): tokens canónicos ``dimension:nombre``
+    #: derivados de la arquitectura y del perfil de capacidades **aceptados**. Es el envelope
+    #: estructural contra el que se mide toda petición y todo recurso observado; el Planner no
+    #: participa en su construcción ni puede ampliarlo.
+    authorized_resources: tuple[str, ...] = Field(
+        default=(), max_length=MAX_AUTHORIZED_RESOURCES
+    )
+    resource_envelope_fingerprint: str = Field(default="", max_length=64)
     contract_fingerprint: str = Field(default="", max_length=64)
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -291,6 +305,19 @@ class ReplanNodeSpec(BaseModel):
     # : Declaración del Planner de que el nodo es puramente técnico. El guard la comprueba, no la
     # cree.
     pure_technical: bool = Field(default=True)
+    # --- Peticiones estructuradas de recursos (ENGINE-6.3.R1) -----------------------------------
+    #
+    # Son **peticiones**, no autorizaciones: el Planner tiene autoridad cero. El motor las compara
+    # con el envelope autorizado del proyecto (y, en un reemplazo, con el del nodo sustituido) y
+    # rechaza o escala a una persona cuando piden algo que no está autorizado. Ninguna declaración
+    # de texto («same architecture», «pure technical», «LOW») amplía este conjunto.
+    uses_resources: tuple[str, ...] = Field(
+        default=(), max_length=MAX_NODE_RESOURCE_REQUESTS
+    )
+    uses_capabilities: tuple[str, ...] = Field(
+        default=(), max_length=MAX_NODE_RESOURCE_REQUESTS
+    )
+    deployment_target: str = Field(default="", max_length=MAX_REPLAN_SHORT_CHARS)
 
 
 class ReplanOperation(BaseModel):
@@ -438,6 +465,12 @@ class ReplanApprovalBinding(BaseModel):
     #: Grafo resultante exacto que la aprobación autoriza, congelado antes de la decisión humana.
     resulting_graph_ref: ArtifactReference = Field(...)
     resulting_graph_fingerprint: str = Field(..., min_length=1, max_length=64)
+    #: Huella del contrato vigente al abrir la aprobación (ENGINE-6.3.R1): si el contrato cambia, la
+    #: aprobación deja de amparar la adopción.
+    contract_fingerprint: str = Field(default="", max_length=64)
+    #: Huella del **delta estructural** que la persona autoriza (expansión de recursos, predicados y
+    #: operaciones). Una aprobación ampara esa expansión exacta, no una categoría genérica.
+    resource_delta_fingerprint: str = Field(default="", max_length=64)
     #: ``True`` solo cuando una prueba válida autorizó este vínculo exacto. Es el hito durable que
     #: permite que un proceso nuevo continúe la adopción sin volver a pedir permiso ni volver a
     #: llamar al proveedor.
@@ -464,6 +497,8 @@ class ReplanCoverageEntry(BaseModel):
 
 
 __all__ = [
+    "MAX_AUTHORIZED_RESOURCES",
+    "MAX_NODE_RESOURCE_REQUESTS",
     "MAX_PROJECT_GENERATIONS",
     "MAX_REPLAN_COVERAGE",
     "MAX_REPLAN_EVIDENCE",

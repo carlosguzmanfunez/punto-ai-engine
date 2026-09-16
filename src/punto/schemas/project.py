@@ -218,6 +218,11 @@ class ProjectFailureCode(StrEnum):
     #: Una persona **rechazó** la propuesta de replanificación: el plan no se adopta y el motivo
     #: queda escrito (ENGINE-6.3.1, PART Y). Es un veredicto humano, no un fallo del motor.
     PROJECT_REPLAN_HUMAN_REJECTED = "PROJECT_REPLAN_HUMAN_REJECTED"
+    #: La implementación aceptada introdujo recursos de arquitectura **no autorizados**, o la
+    #: evidencia para demostrar que no lo hizo no se pudo resolver (ENGINE-6.3.R1). Es una
+    #: violación de frontera, hermana de la brecha de presupuesto y de la violación de alcance: no
+    #: la borra una reanudación genérica y no la «arregla» una replanificación.
+    PROJECT_NODE_ARCHITECTURE_VIOLATION = "PROJECT_NODE_ARCHITECTURE_VIOLATION"
     #: El proyecto no puede cerrarse: falta algún requisito de cierre.
     PROJECT_COMPLETION_INCOMPLETE = "PROJECT_COMPLETION_INCOMPLETE"
 

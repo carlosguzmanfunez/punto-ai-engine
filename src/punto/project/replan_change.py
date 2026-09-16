@@ -1,4 +1,4 @@
-"""Prueba positiva de tacticidad de una replanificación (ENGINE-6.3.2, hallazgo F632-01).
+"""Escalado semántico de un solo sentido en la replanificación (6.3.2 → 6.3.R1, F632-01).
 
 ENGINE-6.3 es replanificación **táctica**: un fallo técnico admite otra estrategia de implementación
 dentro del mismo diseño, pero **no** admite que el motor cambie, por su cuenta, la arquitectura del
@@ -13,18 +13,24 @@ independiente lo reprodujo con tecnologías que las listas no contenían:
 
 Las tres se adoptaban en autonomía porque los nombres no estaban en ninguna lista. La lección no es
 añadir tres marcas más —el siguiente nombre desconocido volvería a pasar— sino invertir la carga de
-la prueba: **solo se adopta en autonomía lo que el motor puede demostrar táctico**.
+la prueba. Desde **ENGINE-6.3.R1** esa carga ya no la lleva un texto: el clasificador **solo puede
+escalar** —manda el caso a una persona o no añade sospecha, nunca concede— y la autonomía la
+demuestra la contención estructural (T1-T7) contra el envelope autorizado del contrato.
 
-Este módulo implementa esa prueba, y tiene cuatro propiedades deliberadas:
+Este módulo implementa el escalado, y tiene cuatro propiedades deliberadas:
 
-1. **Positiva y del motor.** El veredicto sale de hechos que PUNTO comprueba: la estructura de la
-   propuesta cabe en el contrato congelado (alcance, criterios, riesgo, autoridad, rutas protegidas)
-   y ningún hecho de arquitectura del **baseline** —estilo, almacenes, integraciones, fronteras de
-   seguridad, topología de despliegue, tecnología— se ve alterado. La ausencia de una marca conocida
-   no autoriza nada: deja el caso en ``UNKNOWN_OR_AMBIGUOUS``, que exige una persona.
-2. **Fail-closed por defecto.** Solo ``TACTICAL_PROVEN`` adopta sin persona. ``HIGH_IMPACT`` (cambio
-   de datos, identidad, despliegue, proveedor, arquitectura o reglas de negocio) y
-   ``UNKNOWN_OR_AMBIGUOUS`` (no se pudo demostrar) abren el Human Gate ligado a la propuesta.
+1. **Derivada del motor.** El veredicto sale de hechos que PUNTO comprueba: la estructura de la
+   propuesta contra el contrato congelado (alcance, criterios, riesgo, autoridad, rutas protegidas)
+   y los hechos de arquitectura del **baseline** —estilo, almacenes, integraciones, fronteras de
+   seguridad, topología de despliegue, tecnología—. Una estructura que no cabe en el contrato deja
+   el caso en ``UNKNOWN_OR_AMBIGUOUS``, que exige una persona; una estructura que sí cabe y ningún
+   indicio de diseño deja el caso en ``NO_SEMANTIC_SUSPICION``, que **no** concede nada por sí.
+2. **Escalado de un solo sentido.** Una sospecha semántica —``HIGH_IMPACT`` (cambio de datos,
+   identidad, despliegue, proveedor, arquitectura o reglas de negocio) o ``UNKNOWN_OR_AMBIGUOUS``—
+   manda el caso a una persona. Nunca ocurre lo contrario: **ninguna clase de este módulo concede
+   autonomía**, y ``NO_SEMANTIC_SUSPICION`` solo significa «el texto no aporta ninguna razón para
+   escalar». La autonomía la demuestra la contención estructural (T1-T7) en
+   :mod:`punto.project.containment`.
 3. **Sin dependencia de listas de productos.** Las marcas conocidas existen como **aceleradores**
    que
    afinan el nombre de la clase, no como frontera: una tecnología nueva se detecta por su **forma**
@@ -62,14 +68,18 @@ MIN_TOKEN_CHARS: Final[int] = 3
 
 
 class ReplanChangeClass(StrEnum):
-    """Clase de cambio que el motor deriva de una propuesta.
+    """Sospecha semántica que el motor deriva de una propuesta (ENGINE-6.3.R1).
 
-    ``TACTICAL_PROVEN`` es la única que se adopta en autonomía: es la única que el motor puede
-    **demostrar**. Cualquier otra exige una persona, y ``UNKNOWN_OR_AMBIGUOUS`` es el veredicto por
-    defecto cuando la demostración no se puede completar.
+    Desde ENGINE-6.3.R1 este vocabulario **no concede autonomía**: la autonomía la demuestra la
+    contención estructural (:mod:`punto.project.containment`). Lo que este módulo aporta es
+    **escalado de un solo sentido**: si el texto de la propuesta suena a cambio de diseño, se manda
+    a una persona; si no suena a nada, no autoriza nada — simplemente no añade una sospecha.
+
+    ``NO_SEMANTIC_SUSPICION`` no significa «táctico demostrado»: significa «el texto no aporta
+    ninguna razón para escalar». La demostración vive en T1-T7.
     """
 
-    TACTICAL_PROVEN = "TACTICAL_PROVEN"
+    NO_SEMANTIC_SUSPICION = "NO_SEMANTIC_SUSPICION"
     DATASTORE_CHANGE = "DATASTORE_CHANGE"
     AUTH_MODEL_CHANGE = "AUTH_MODEL_CHANGE"
     DEPLOYMENT_CHANGE = "DEPLOYMENT_CHANGE"
@@ -80,14 +90,19 @@ class ReplanChangeClass(StrEnum):
     UNKNOWN_OR_AMBIGUOUS = "UNKNOWN_OR_AMBIGUOUS"
 
     @property
-    def is_tactical(self) -> bool:
-        """``True`` solo para la clase **demostrada** táctica."""
-        return self is ReplanChangeClass.TACTICAL_PROVEN
+    def escalates(self) -> bool:
+        """``True`` si la sospecha obliga a que decida una persona.
+
+        Es la **única** autoridad de este módulo, y es de un solo sentido: puede restringir, nunca
+        conceder. Un falso positivo cuesta una revisión humana; un falso negativo no concede nada,
+        porque sin contención estructural demostrada no hay adopción autónoma.
+        """
+        return self is not ReplanChangeClass.NO_SEMANTIC_SUSPICION
 
     @property
     def requires_human(self) -> bool:
-        """``True`` si la clase está por encima de lo táctico y exige autorización humana."""
-        return not self.is_tactical
+        """Alias explícito de :attr:`escalates`, para el código que ya preguntaba por él."""
+        return self.escalates
 
     @property
     def is_high_impact(self) -> bool:
@@ -96,7 +111,7 @@ class ReplanChangeClass(StrEnum):
 
     @property
     def is_ambiguous(self) -> bool:
-        """``True`` si el motor no pudo demostrar ni el cambio ni la tacticidad."""
+        """``True`` si el motor no pudo demostrar ni el cambio ni la ausencia de sospecha."""
         return self is ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS
 
 
@@ -116,11 +131,11 @@ _HIGH_IMPACT_CLASSES: Final[frozenset[ReplanChangeClass]] = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class ReplanChangeClassification:
-    """Veredicto determinista: clase, prueba de tacticidad y hechos que la sostienen.
+    """Sospecha determinista: clase, evidencia de auditoría y hechos que la sostienen.
 
-    ``proof`` no es decorativo: es la lista de hechos que el motor **verificó** para poder declarar
-    ``TACTICAL_PROVEN``. Si la lista no está completa, la clase no puede ser táctica, y esa es la
-    diferencia entre demostrar y no encontrar marcas conocidas.
+    ``proof`` es la lista de hechos que el motor **verificó** mientras miraba el texto; desde
+    ENGINE-6.3.R1 es evidencia de auditoría, no una autorización: la autonomía sale de la contención
+    estructural (T1-T7), no de esta lista.
     """
 
     change_class: ReplanChangeClass
@@ -131,14 +146,14 @@ class ReplanChangeClassification:
     proof: tuple[str, ...] = ()
 
     @property
-    def is_tactical(self) -> bool:
-        """``True`` si el cambio es táctico **demostrado** y puede seguir el camino autónomo."""
-        return self.change_class.is_tactical
+    def escalates(self) -> bool:
+        """``True`` si la sospecha semántica exige que decida una persona."""
+        return self.change_class.escalates
 
     @property
     def requires_human(self) -> bool:
-        """``True`` si el cambio exige una persona antes de adoptarse."""
-        return self.change_class.requires_human
+        """Alias de :attr:`escalates`: la sospecha nunca concede, solo restringe."""
+        return self.escalates
 
     @property
     def reason_code(self) -> str:
@@ -551,8 +566,8 @@ def _structural_proof(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Hechos estructurales verificados y los que **no** se pudieron verificar.
 
-    Devuelve ``(probados, fallos)``. Cada hecho es una frase legible: la prueba de tacticidad tiene
-    que poder leerse y discutirse, no ser un booleano opaco.
+    Devuelve ``(probados, fallos)``. Cada hecho es una frase legible: el veredicto tiene que poder
+    leerse y discutirse, no ser un booleano opaco.
     """
     proven: list[str] = []
     failures: list[str] = []
@@ -619,10 +634,10 @@ def classify_replan_change(
        —o cualquiera, si el baseline no se pudo resolver— deja el caso en ``UNKNOWN_OR_AMBIGUOUS``:
        el motor no puede demostrar que esté dentro del diseño;
     5. **Hechos estructurales**: alcance, criterios, riesgo y autoridad de cada nodo nuevo tienen
-       que
-       caber en el contrato congelado; si no, tampoco hay prueba de tacticidad;
-    6. **Tacticidad demostrada**: sin cambio de dimensión, sin tecnología ajena y con la estructura
-       probada, la propuesta es ``TACTICAL_PROVEN``.
+       que caber en el contrato congelado; si no, tampoco hay ausencia de sospecha;
+    6. **Sin sospecha**: sin cambio de dimensión, sin tecnología ajena y con la estructura
+       comprobada, la propuesta queda en ``NO_SEMANTIC_SUSPICION`` — que **no** es autonomía, solo
+       ausencia de una razón para escalar.
 
     Args:
         proposal: Propuesta tipada del Planner, con sus textos acotados.
@@ -631,7 +646,7 @@ def classify_replan_change(
 
     Returns:
         La clase de cambio con su motivo, sus marcas, las dimensiones tocadas, las tecnologías no
-        reconocidas y la prueba de tacticidad.
+        reconocidas y los hechos estructurales verificados.
     """
     impact = action_impact(action) if action else None
     if impact is not None and (impact.production or impact.legal or impact.business):
@@ -726,10 +741,11 @@ def classify_replan_change(
             proven,
         )
     return ReplanChangeClassification(
-        ReplanChangeClass.TACTICAL_PROVEN,
+        ReplanChangeClass.NO_SEMANTIC_SUSPICION,
         (
-            "tacticidad demostrada: la propuesta no cambia ninguna dimensión de arquitectura, no "
-            "introduce tecnología ajena al baseline y su estructura cabe en el contrato congelado"
+            "sin sospecha semántica: el texto no menciona ningún cambio de dimensión de "
+            "arquitectura ni tecnología ajena al baseline. Esto **no** concede autonomía: la "
+            "demuestra la contención estructural (T1-T7)"
         ),
         (),
         (),
@@ -756,7 +772,7 @@ _CLASS_PRIORITY: Final[dict[ReplanChangeClass, int]] = {
     ReplanChangeClass.ARCHITECTURE_CHANGE: 5,
     ReplanChangeClass.UNKNOWN_HIGH_IMPACT: 6,
     ReplanChangeClass.UNKNOWN_OR_AMBIGUOUS: 7,
-    ReplanChangeClass.TACTICAL_PROVEN: 8,
+    ReplanChangeClass.NO_SEMANTIC_SUSPICION: 8,
 }
 
 

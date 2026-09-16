@@ -4145,6 +4145,92 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_project_replan_containment(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        proposal_id: UUID,
+        compatibility: str,
+        operation_kinds: Sequence[str] = (),
+        expanded_resources: Sequence[str] = (),
+        expanded_dimensions: Sequence[str] = (),
+        proofs: Sequence[str] = (),
+        failures: Sequence[str] = (),
+        unresolved: Sequence[str] = (),
+        has_architecture_baseline: bool = False,
+        delta_fingerprint: str = "",
+        autonomous: bool = False,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la contención estructural de una propuesta (ENGINE-6.3.R1).
+
+        Es el evento que explica **por qué** una replanificación se adoptó sola o por qué fue a una
+        persona: la compatibilidad (``CONTAINED`` / ``EXPANDED`` / ``UNRESOLVED``), los predicados
+        demostrados, los recursos que se salían del envelope y lo que no se pudo resolver. No lleva
+        textos del modelo: hechos, códigos y cifras.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_REPLAN_CONTAINMENT_EVALUATED,
+            action="project_replan_containment_evaluated",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            status=compatibility,
+            detail=(
+                f"contención {compatibility}: {len(tuple(proofs))} predicado(s) demostrados, "
+                f"{len(tuple(expanded_resources))} recurso(s) fuera del envelope, "
+                f"{len(tuple(unresolved))} sin resolver"
+            ),
+            metadata={
+                "proposal_id": str(proposal_id),
+                "compatibility": compatibility,
+                "autonomous": autonomous,
+                "delta_fingerprint": delta_fingerprint,
+                "expanded_dimensions": list(expanded_dimensions),
+                "expanded_resources": list(expanded_resources),
+                "failures": list(failures),
+                "has_architecture_baseline": has_architecture_baseline,
+                "operation_kinds": list(operation_kinds),
+                "proofs": list(proofs),
+                "unresolved": list(unresolved),
+            },
+            actor=actor,
+        )
+
+    def log_project_node_architecture_violation(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        child_workflow_id: UUID | None = None,
+        expanded_resources: Sequence[str] = (),
+        unresolved: Sequence[str] = (),
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que la implementación de un nodo introdujo recursos no autorizados.
+
+        El nodo **no** se acepta: no hay handoff, la revisión aceptada no avanza y el gasto se
+        contabiliza una sola vez. Es una violación de frontera, hermana de la brecha de presupuesto.
+        """
+        return self._project_event(
+            AuditEventType.PROJECT_NODE_ARCHITECTURE_VIOLATION,
+            action="project_node_architecture_violation",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            child_workflow_id=child_workflow_id,
+            status="VIOLATION",
+            result=AuditResult.FAILURE,
+            detail=detail,
+            metadata={
+                "expanded_resources": list(expanded_resources),
+                "unresolved": list(unresolved),
+            },
+            actor=actor,
+        )
+
     def log_project_replan_approval_requested(
         self,
         *,

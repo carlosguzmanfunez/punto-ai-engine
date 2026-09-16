@@ -79,6 +79,8 @@ class ReplanCategory(StrEnum):
     REVISION_MISMATCH = "REVISION_MISMATCH"
     GRAPH_CORRUPTED = "GRAPH_CORRUPTED"
     EVIDENCE_INCOMPLETE = "EVIDENCE_INCOMPLETE"
+    #: La implementación aceptada introdujo recursos de arquitectura no autorizados (ENGINE-6.3.R1).
+    ARCHITECTURE_VIOLATION = "ARCHITECTURE_VIOLATION"
     REPAIR_EXHAUSTED = "REPAIR_EXHAUSTED"
     INFRASTRUCTURE = "INFRASTRUCTURE"
     SECURITY = "SECURITY"
@@ -144,6 +146,13 @@ NODE_STOP_CODES: Final[dict[ProjectFailureCode, tuple[ReplanCategory, ReplanElig
     ProjectFailureCode.PROJECT_REPLAN_SPEND_RECONCILIATION_REQUIRED: (
         ReplanCategory.EVIDENCE_INCOMPLETE,
         ReplanEligibility.EVIDENCE_BLOCKED,
+    ),
+    #: Una violación de arquitectura post-hoc (ENGINE-6.3.R1): la implementación introdujo recursos
+    #: no autorizados. Como la brecha de presupuesto o la violación de alcance, **no** se
+    #: replanifica: otra estrategia no convierte en autorizado lo que ya se introdujo.
+    ProjectFailureCode.PROJECT_NODE_ARCHITECTURE_VIOLATION: (
+        ReplanCategory.ARCHITECTURE_VIOLATION,
+        ReplanEligibility.NON_REPLANNABLE,
     ),
 }
 

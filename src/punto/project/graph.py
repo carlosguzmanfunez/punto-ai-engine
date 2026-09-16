@@ -27,6 +27,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from punto.project.resources import request_resources
 from punto.schemas.enums import AuthorityLevel, RiskLevel
 from punto.schemas.project import (
     MAX_PROJECT_DEPENDENCIES,
@@ -69,6 +70,13 @@ class GraphNode:
     risk: RiskLevel
     authority: AuthorityLevel
     order: int
+    #: Capacidades que la tarea declaró necesitar y recursos autorizados del nodo (ENGINE-6.3.R1).
+    #:
+    #: Entran en la vista canónica —y por tanto en la **huella**— porque son parte del contrato de
+    #: trabajo que el proyecto congela: si un nodo cambia de capacidades, lo que el proyecto
+    #: autorizó ya no es lo que hay. Se derivan del plan aceptado, nunca del Planner.
+    capabilities: tuple[str, ...] = ()
+    resources: tuple[str, ...] = ()
 
     def canonical(self) -> str:
         """Representación canónica del nodo para la huella, sin nada dependiente del entorno.
@@ -89,6 +97,8 @@ class GraphNode:
             f"deps={'|'.join(sorted(self.dependencies))}",
             f"risk={int(self.risk)}",
             f"authority={int(self.authority)}",
+            f"capabilities={'|'.join(sorted(self.capabilities))}",
+            f"resources={'|'.join(sorted(self.resources))}",
         )
         return ";".join(parts)
 
@@ -127,6 +137,7 @@ def canonical_nodes(
     """
     nodes: list[GraphNode] = []
     for order, task in enumerate(graph.tasks[:max_nodes]):
+        capabilities = tuple(task.required_capabilities)
         nodes.append(
             GraphNode(
                 node_id=task.id,
@@ -140,6 +151,10 @@ def canonical_nodes(
                 risk=task.risk_level,
                 authority=task.authority_level,
                 order=order,
+                capabilities=capabilities,
+                resources=request_resources(
+                    uses_capabilities=capabilities
+                ).tokens,
             )
         )
     return tuple(nodes)

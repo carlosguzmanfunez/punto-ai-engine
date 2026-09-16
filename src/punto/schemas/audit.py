@@ -219,6 +219,13 @@ class AuditEventType(StrEnum):
     #: El motor derivó la clase de cambio de una propuesta de replanificación (ENGINE-6.3.1,
     #: hallazgo F631-02): qué clase, si es táctica y qué marcas la demuestran.
     PROJECT_REPLAN_CHANGE_CLASSIFIED = "PROJECT_REPLAN_CHANGE_CLASSIFIED"
+    #: El motor demostró —o no— la contención estructural de una propuesta (ENGINE-6.3.R1): la
+    #: compatibilidad de arquitectura, los predicados T1-T7, la expansión de recursos detectada y lo
+    #: que quedó sin resolver. Es el veredicto que **gobierna la autonomía**.
+    PROJECT_REPLAN_CONTAINMENT_EVALUATED = "PROJECT_REPLAN_CONTAINMENT_EVALUATED"
+    #: La implementación de un nodo introdujo recursos de arquitectura no autorizados, o su
+    #: evidencia no se pudo resolver: el parent no lo acepta (ENGINE-6.3.R1).
+    PROJECT_NODE_ARCHITECTURE_VIOLATION = "PROJECT_NODE_ARCHITECTURE_VIOLATION"
     #: Un nodo fue sustituido por una replanificación: conserva su historia y su gasto.
     PROJECT_NODE_SUPERSEDED = "PROJECT_NODE_SUPERSEDED"
 

@@ -61,6 +61,10 @@ from punto.common import normalize_path
 from punto.policy.permissions import CONSTITUTIONAL_PROTECTED_PATHS, is_protected_path
 from punto.project.graph import FINGERPRINT_CHARS
 from punto.project.handoff import project_run_id_for
+from punto.project.resources import (
+    project_resource_envelope,
+    resource_envelope_fingerprint,
+)
 from punto.schemas.planning import ArchitecturePlan
 from punto.schemas.project import ProjectRequest
 from punto.schemas.replan import (
@@ -129,6 +133,10 @@ _CONTRACT_TERM_FIELDS: Final[tuple[str, ...]] = (
     "architecture_security",
     "architecture_deployment",
     "architecture_technology",
+    # Envelope de recursos (ENGINE-6.3.R1): la autorización estructural del proyecto forma parte de
+    # los términos; una propuesta que pida recursos fuera de él no es una táctica.
+    "authorized_resources",
+    "resource_envelope_fingerprint",
 )
 
 
@@ -196,11 +204,13 @@ def contract_fingerprint(contract: ProjectContract) -> str:
             "architecture_services": list(contract.architecture_services),
             "architecture_style": contract.architecture_style,
             "architecture_technology": list(contract.architecture_technology),
+            "authorized_resources": list(contract.authorized_resources),
             "authority_ceiling": int(contract.authority_ceiling),
             "authorized_scope": list(contract.authorized_scope),
             "initial_revision": contract.initial_revision,
             "original_goal": contract.original_goal,
             "protected_paths": list(contract.protected_paths),
+            "resource_envelope_fingerprint": contract.resource_envelope_fingerprint,
             "risk_ceiling": int(contract.risk_ceiling),
         },
         ensure_ascii=False,
@@ -382,6 +392,10 @@ def derive_contract(
     )
     scope = _scope_paths(_declared(request, "changed_files", plan, "allowed_files"))
     baseline = architecture_baseline(None if plan is None else plan.architecture)
+    envelope = project_resource_envelope(
+        None if plan is None else plan.architecture,
+        capability_entries=_capability_entries(plan),
+    )
     contract = ProjectContract(
         project_run_id=project_run_id,
         project_id=request.project_id,
@@ -393,9 +407,23 @@ def derive_contract(
         risk_ceiling=request.risk,
         authority_ceiling=request.authority,
         initial_revision=_bounded(initial_revision, _MAX_REVISION_CHARS),
+        authorized_resources=envelope.tokens,
+        resource_envelope_fingerprint=resource_envelope_fingerprint(envelope),
         **baseline,
     )
     return contract.model_copy(update={"contract_fingerprint": contract_fingerprint(contract)})
+
+
+def _capability_entries(plan: DurablePlan | None) -> tuple[tuple[str, str], ...]:
+    """Pares ``(familia, valor)`` del perfil de capacidades aceptado, para el envelope.
+
+    El perfil lo produce la etapa de arquitectura y viaja en el plan durable; si el plan no lo trae,
+    el envelope se deriva solo de la arquitectura. Nunca se toma del Planner de la replanificación.
+    """
+    profile = None if plan is None else plan.capability_profile
+    if profile is None:
+        return ()
+    return tuple((kind.value, value) for kind, value in profile.entries())
 
 
 def publish_contract(

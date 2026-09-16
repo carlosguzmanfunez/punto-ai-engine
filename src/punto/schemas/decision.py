@@ -122,6 +122,44 @@ class ActionRequest(BaseModel):
         max_length=8,
         description="Tipos de operación de la propuesta de replanificación, si la hay.",
     )
+    # --- Hechos estructurales derivados por el motor (ENGINE-6.3.R1) -----------------------------
+    #
+    # La política **no** interpreta lenguaje libre para decidir esta frontera: recibe hechos que el
+    # motor ya calculó (contención de recursos, deltas estructurales y compatibilidad) y decide
+    # sobre ellos. Ninguno de estos campos lo declara el modelo.
+    architecture_compatibility: str = Field(
+        default="",
+        max_length=40,
+        description="CONTAINED / EXPANDED / UNRESOLVED de la contención estructural, si aplica.",
+    )
+    expanded_resources: tuple[str, ...] = Field(
+        default=(),
+        max_length=32,
+        description="Recursos que la propuesta pide y el envelope no autoriza.",
+    )
+    expanded_dimensions: tuple[str, ...] = Field(
+        default=(), max_length=16, description="Dimensiones de los recursos expandidos."
+    )
+    scope_delta: tuple[str, ...] = Field(
+        default=(), max_length=32, description="Rutas de archivo que la propuesta añade al alcance."
+    )
+    criteria_delta: tuple[str, ...] = Field(
+        default=(), max_length=32, description="Criterios que la propuesta dejaría de demostrar."
+    )
+    risk_delta: int = Field(default=0, ge=0, description="Cuánto sube el riesgo respecto al techo.")
+    authority_delta: int = Field(
+        default=0, ge=0, description="Cuánto sube la autoridad respecto al techo."
+    )
+    node_count_delta: int = Field(
+        default=0, description="Diferencia entre nodos nuevos y nodos sustituidos."
+    )
+    has_architecture_baseline: bool = Field(
+        default=False,
+        description="True si el proyecto tiene arquitectura autorizada contra la que comparar.",
+    )
+    replan_attempt: int = Field(
+        default=0, ge=0, description="Número de intento de replanificación, para la auditoría."
+    )
 
     @field_validator("action")
     @classmethod

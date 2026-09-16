@@ -168,6 +168,9 @@ class ReplanApprovalProof:
     nonce: UUID
     issued_at: datetime
     issuer: object = field(repr=False, compare=False)
+    #: Huella del contrato y huella del delta estructural que esta prueba ampara (ENGINE-6.3.R1).
+    contract_fingerprint: str = ""
+    resource_delta_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if self.issuer is not _PROOF_ISSUER:
@@ -184,7 +187,9 @@ class _ReplanApprovalBinding:
 
     Se guarda en el gate y no en la solicitud pública porque lo que el humano aprueba sigue siendo
     la solicitud: el ``HumanGate`` es quien sabe exactamente a qué propuesta, disparador, generación
-    y grafo resultante se refería.
+    y grafo resultante se refería. Desde ENGINE-6.3.R1 la solicitud también fija el **contrato** y
+    el **delta estructural** (expansión de recursos) que autoriza: una aprobación ampara esa
+    expansión exacta, no una categoría genérica.
     """
 
     project_run_id: UUID
@@ -196,6 +201,8 @@ class _ReplanApprovalBinding:
     action: str
     change_class: str
     resulting_graph_fingerprint: str
+    contract_fingerprint: str = ""
+    resource_delta_fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,6 +622,8 @@ class HumanGate:
         reason: str,
         task_id: UUID | None = None,
         approval_id: UUID | None = None,
+        contract_fingerprint: str = "",
+        resource_delta_fingerprint: str = "",
     ) -> HumanApprovalRequest:
         """Pide aprobación humana para adoptar **una** propuesta de replanificación concreta.
 
@@ -638,6 +647,8 @@ class HumanGate:
             task_id: Tarea dueña, si la hay; por defecto, el propio proyecto.
             approval_id: Identificador explícito, para restaurar tras un reinicio la misma
                 solicitud que el proyecto conserva en su vínculo.
+            contract_fingerprint: Huella del contrato vigente al pedir la aprobación.
+            resource_delta_fingerprint: Huella del delta estructural que se somete a decisión.
 
         Returns:
             La solicitud pendiente, lista para ``approve``/``reject``.
@@ -661,6 +672,8 @@ class HumanGate:
             action=action,
             change_class=change_class,
             resulting_graph_fingerprint=resulting_graph_fingerprint,
+            contract_fingerprint=contract_fingerprint,
+            resource_delta_fingerprint=resource_delta_fingerprint,
         )
         return approval
 
@@ -680,6 +693,8 @@ class HumanGate:
         policy_decision_id: UUID,
         action: str = "",
         resulting_graph_fingerprint: str = "",
+        contract_fingerprint: str = "",
+        resource_delta_fingerprint: str = "",
     ) -> ReplanApprovalProof:
         """Emite la prueba de adopción de una propuesta de replanificación aprobada (F631-03).
 
@@ -776,6 +791,22 @@ class HumanGate:
                 f"{resulting_graph_fingerprint!r}: el plan aprobado no es el que se adopta."
             )
             raise HumanGateError(msg)
+        if contract_fingerprint and binding.contract_fingerprint != contract_fingerprint:
+            msg = (
+                f"La solicitud {approval_id} autoriza el contrato "
+                f"{binding.contract_fingerprint!r} y se pide {contract_fingerprint!r}: el contrato "
+                "cambió después de aprobarse."
+            )
+            raise HumanGateError(msg)
+        if resource_delta_fingerprint and (
+            binding.resource_delta_fingerprint != resource_delta_fingerprint
+        ):
+            msg = (
+                f"La solicitud {approval_id} autoriza el delta estructural "
+                f"{binding.resource_delta_fingerprint!r} y se pide "
+                f"{resource_delta_fingerprint!r}: la expansión aprobada no es la que se adopta."
+            )
+            raise HumanGateError(msg)
         return ReplanApprovalProof(
             proof_id=uuid4(),
             approval_id=approval.id,
@@ -788,6 +819,8 @@ class HumanGate:
             action=binding.action,
             change_class=binding.change_class,
             resulting_graph_fingerprint=binding.resulting_graph_fingerprint,
+            contract_fingerprint=binding.contract_fingerprint,
+            resource_delta_fingerprint=binding.resource_delta_fingerprint,
             nonce=uuid4(),
             issued_at=utc_now(),
             issuer=_PROOF_ISSUER,

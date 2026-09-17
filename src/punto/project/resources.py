@@ -330,16 +330,80 @@ def _tokens_from_lockfile(text: str) -> tuple[str, ...]:
     return tuple(found)
 
 
-def _tokens_from_go_mod(text: str) -> tuple[str, ...]:
-    """Módulos requeridos en ``go.mod``."""
-    found: list[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("module", "go ", ")", "//")):
+#: Versiones de Go (``v1.13.0``, ``v0.0.0-20230101``): no son rutas de módulo.
+_GO_VERSION: Final[re.Pattern[str]] = re.compile(r"^v?\d+(?:\.\d+)*(?:[-+][\w.\-]+)?$")
+
+#: Directivas de ``go.mod`` que no declaran módulos.
+_GO_DIRECTIVES: Final[frozenset[str]] = frozenset(
+    {"module", "go", "toolchain", "godebug", "retract", "ignore", ")"}
+)
+
+
+def _go_module_path(parts: Sequence[str]) -> str:
+    """Ruta de módulo de una línea de ``go.mod``, o ``""`` si la línea no declara ninguna.
+
+    Una ruta de módulo tiene barra (``go.mongodb.org/mongo-driver``) o un dominio (``example.com``);
+    una versión (``v1.13.0``) no es una ruta y no se confunde con ella.
+    """
+    for part in parts:
+        token = part.strip().strip(",")
+        if not token or token.startswith(("(", ")", "//", "=>")):
             continue
-        parts = line.split()
-        if len(parts) >= 2 and "/" in parts[0]:
-            found.append(resource_token(ResourceDimension.PACKAGE, parts[0]))
+        if _GO_VERSION.match(token):
+            continue
+        if "/" in token or "." in token:
+            return token
+    return ""
+
+
+def _tokens_from_go_mod(text: str) -> tuple[str, ...]:
+    """Módulos requeridos en ``go.mod``, en sus **dos** formas válidas.
+
+    Go admite ``require <módulo> <versión>`` en una línea y ``require ( ... )`` en bloque. Las dos
+    formas declaran lo mismo y tienen que producir el mismo hecho: la forma de una línea no puede
+    quedar en «sin dependencias» (AUD-T-01). Si el fichero declara ``require`` y el motor no
+    consigue extraer ningún módulo, el veredicto es ``UNRESOLVED``: un manifiesto relevante que
+    añade una dependencia no puede producir el conjunto vacío en silencio.
+    """
+    found: list[str] = []
+    declared = False
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if in_block:
+            if line.startswith(")"):
+                in_block = False
+                continue
+            module = _go_module_path(line.split())
+            if module:
+                found.append(resource_token(ResourceDimension.PACKAGE, module))
+            continue
+        head = line.split(None, 1)[0]
+        if head == "require":
+            declared = True
+            rest = line[len("require") :].strip()
+            if rest.startswith("("):
+                in_block = True
+                continue
+            module = _go_module_path(rest.split())
+            if module:
+                found.append(resource_token(ResourceDimension.PACKAGE, module))
+            continue
+        if head in {"replace", "exclude"}:
+            for half in line.split("=>"):
+                module = _go_module_path(half.replace(head, "", 1).split())
+                if module:
+                    found.append(resource_token(ResourceDimension.PACKAGE, module))
+            continue
+        if head in _GO_DIRECTIVES:
+            continue
+        module = _go_module_path(line.split())
+        if module:
+            found.append(resource_token(ResourceDimension.PACKAGE, module))
+    if declared and not found:
+        raise _ManifestUnresolved("go.mod declara require y no se pudo extraer el módulo")
     return tuple(found)
 
 
@@ -559,6 +623,14 @@ _IMPORT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"(?:require|load)\(\s*['\"]([A-Za-z_@][\w./@-]*)['\"]"),
 )
 
+#: Imports de Go: ``import "ruta"`` y las líneas de un bloque ``import ( ... )``. Go no usa puntos
+#: ni paréntesis de llamada: la ruta va entrecomillada, así que necesita su propia forma (AUD-T-01).
+_GO_IMPORT_SINGLE: Final[re.Pattern[str]] = re.compile(
+    r"""^\s*import\s+(?:[\w.]+\s+)?["`]([^"`]+)["`]"""
+)
+_GO_IMPORT_BLOCK: Final[re.Pattern[str]] = re.compile(r"^\s*import\s*\(\s*$")
+_GO_QUOTED_PATH: Final[re.Pattern[str]] = re.compile(r"""^\s*(?:[\w.]+\s+)?["`]([^"`]+)["`]\s*$""")
+
 
 def module_roots(line: str) -> tuple[str, ...]:
     """Raíces de los módulos que una línea importa, sin repetir."""
@@ -569,6 +641,72 @@ def module_roots(line: str) -> tuple[str, ...]:
             if root and root not in found:
                 found.append(root)
     return tuple(found)
+
+
+def go_import_paths(lines: Iterable[str]) -> tuple[str, ...]:
+    """Rutas importadas por Go en el diff: ``import "ruta"``, bloques y alias.
+
+    Es la forma que Go usa para importar (``import "go.mongodb.org/mongo-driver/mongo"``), y no
+    coincide con la de Python ni con ``require(...)`` de JavaScript (AUD-T-01). También se reconoce
+    una línea suelta entrecomillada con forma de ruta —lo que se añade **dentro** de un bloque
+    ``import ( ... )`` ya existente, cuyo abridor no viaja en el diff—.
+    """
+    found: list[str] = []
+    in_block = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if in_block:
+            if line.startswith(")"):
+                in_block = False
+                continue
+            match = _GO_QUOTED_PATH.match(line)
+            if match and match.group(1) not in found:
+                found.append(match.group(1))
+            continue
+        if _GO_IMPORT_BLOCK.match(line):
+            in_block = True
+            continue
+        match = _GO_IMPORT_SINGLE.match(line)
+        if match is None and _looks_like_go_module(line):
+            match = _GO_QUOTED_PATH.match(line)
+        if match and match.group(1) not in found:
+            found.append(match.group(1))
+    return tuple(found)
+
+
+def _looks_like_go_module(line: str) -> bool:
+    """``True`` si la línea es una ruta entrecomillada con forma de módulo de Go."""
+    match = _GO_QUOTED_PATH.match(line)
+    if match is None:
+        return False
+    path = match.group(1)
+    segments = [segment for segment in path.split("/") if segment]
+    return bool(segments) and ("/" in path or "." in segments[0])
+
+
+def _go_path_is_authorized(path: str, names: set[str], local_roots: frozenset[str]) -> bool:
+    """``True`` si una ruta de import de Go ya está autorizada o es de la biblioteca estándar.
+
+    La convención de Go es explícita: un primer segmento **sin punto** es biblioteca estándar
+    (``fmt``, ``net/http``); una dependencia de terceros siempre lo lleva
+    (``go.mongodb.org/…``, ``github.com/…``). No hay lista de tecnologías: se compara contra los
+    nombres que el contrato autorizó y contra los módulos propios del proyecto.
+    """
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return True
+    if "." not in segments[0]:
+        return True
+    if path in local_roots or segments[0] in local_roots:
+        return True
+    for name in names:
+        if len(name) < 4:
+            continue
+        if path == name or path.startswith(f"{name}/") or name in segments or name in path:
+            return True
+    return False
 
 
 def url_host(url: str) -> str:
@@ -695,6 +833,13 @@ def unproven_effect(
                 f"el diff ejecuta un proceso ({command or 'dinamico'}): el efecto de un comando no "
                 "se puede demostrar contenido con el contenido del fichero"
             )
+    for path in go_import_paths(added_lines):
+        if _go_path_is_authorized(path, known_names, local_roots):
+            continue
+        reasons.append(
+            f"el diff importa el modulo Go {path!r}: el motor no puede demostrar que esa "
+            "dependencia quede dentro de la arquitectura autorizada"
+        )
     return tuple(dict.fromkeys(reasons))
 
 
@@ -974,6 +1119,7 @@ __all__ = [
     "capability_token",
     "contract_resources",
     "expansion_report",
+    "go_import_paths",
     "is_resource_relevant",
     "module_roots",
     "parser_for",

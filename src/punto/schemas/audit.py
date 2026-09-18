@@ -248,6 +248,20 @@ class AuditEventType(StrEnum):
     PROVIDER_REQUEST_COMPLETED = "PROVIDER_REQUEST_COMPLETED"
     #: MULTI-PROVIDER v0: el proveedor falló; el fallo queda normalizado y contenido.
     PROVIDER_REQUEST_FAILED = "PROVIDER_REQUEST_FAILED"
+    #: DB AUTHORITY v0: el controlador comprobó la conectividad con el destino autorizado.
+    DB_CONNECT_CHECKED = "DB_CONNECT_CHECKED"
+    #: DB AUTHORITY v0: el controlador leyó el esquema real de la base de datos.
+    DB_SCHEMA_INTROSPECTED = "DB_SCHEMA_INTROSPECTED"
+    #: DB AUTHORITY v0: se clasificó una sentencia antes de ejecutarla (sin su texto).
+    DB_STATEMENT_CLASSIFIED = "DB_STATEMENT_CLASSIFIED"
+    #: DB AUTHORITY v0: una migración se aplicó dentro de una transacción.
+    DB_MIGRATION_APPLIED = "DB_MIGRATION_APPLIED"
+    #: DB AUTHORITY v0: la política o el presupuesto rechazaron una migración.
+    DB_MIGRATION_REJECTED = "DB_MIGRATION_REJECTED"
+    #: DB AUTHORITY v0: un seed idempotente se aplicó dentro de una transacción.
+    DB_SEED_APPLIED = "DB_SEED_APPLIED"
+    #: DB AUTHORITY v0: una consulta de verificación de sólo lectura se ejecutó.
+    DB_QUERY_VERIFIED = "DB_QUERY_VERIFIED"
 
 
 class AuditEvent(BaseModel):

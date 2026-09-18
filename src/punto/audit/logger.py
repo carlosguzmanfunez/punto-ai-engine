@@ -4368,6 +4368,159 @@ class AuditLogger:
             actor=actor,
         )
 
+    # ------------------------------------------------------------------ database
+    def _log_database(
+        self,
+        event_type: AuditEventType,
+        action: str,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None,
+        result: AuditResult,
+        actor: str | None,
+    ) -> AuditEvent:
+        """Registra un evento de base de datos con los metadatos ya saneados.
+
+        La credencial de la base **nunca** entra aquí: los metadatos admitidos son identidad de
+        proyecto, entorno, clasificación, huellas, recuentos y resultado. Además, todo texto pasa
+        por el borrado de credenciales del almacén de secretos antes de congelarse, de modo que un
+        DSN no pueda llegar al registro ni por error de quien llama.
+        """
+        return self.record(
+            event_type,
+            action=action,
+            resource_id=resource_id,
+            result=result,
+            actor=actor,
+            metadata=_redacted_metadata(metadata),
+        )
+
+    def log_db_connect_checked(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la comprobación de conectividad contra el destino autorizado."""
+        return self._log_database(
+            AuditEventType.DB_CONNECT_CHECKED,
+            "db_connect_checked",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_schema_introspected(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la lectura del esquema real de la base de datos."""
+        return self._log_database(
+            AuditEventType.DB_SCHEMA_INTROSPECTED,
+            "db_schema_introspected",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_statement_classified(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la clasificación de una sentencia (clase, huella y motivo; nunca su texto)."""
+        return self._log_database(
+            AuditEventType.DB_STATEMENT_CLASSIFIED,
+            "db_statement_classified",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_migration_applied(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una migración aplicada dentro de una transacción."""
+        return self._log_database(
+            AuditEventType.DB_MIGRATION_APPLIED,
+            "db_migration_applied",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_migration_rejected(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.FAILURE,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una migración rechazada por la política, el presupuesto o el clasificador."""
+        return self._log_database(
+            AuditEventType.DB_MIGRATION_REJECTED,
+            "db_migration_rejected",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_seed_applied(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un seed idempotente aplicado dentro de una transacción."""
+        return self._log_database(
+            AuditEventType.DB_SEED_APPLIED,
+            "db_seed_applied",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_db_query_verified(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una consulta de verificación de sólo lectura."""
+        return self._log_database(
+            AuditEventType.DB_QUERY_VERIFIED,
+            "db_query_verified",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
     def log_project_node_architecture_violation(
         self,
         *,
@@ -4630,6 +4783,27 @@ class AuditLogger:
     def extend(self, events: Sequence[AuditEvent]) -> None:
         """Reinserta eventos (uso en pruebas y restauración de estado)."""
         self._events.extend(events)
+
+
+def _redacted_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Sanea credenciales de los metadatos de un evento de base de datos.
+
+    Es la segunda barrera del registro: aunque quien llama pase por error un texto con una cadena
+    de conexión, el borrado del almacén de secretos la elimina antes de que el evento se congele.
+    Un evento de auditoría nunca contiene un DSN, una contraseña ni una cabecera de autorización.
+    """
+    from punto.providers.secrets import redact_secret_text
+
+    def _clean(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact_secret_text(value)
+        if isinstance(value, dict):
+            return {str(key): _clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_clean(item) for item in value]
+        return value
+
+    return {str(key): _clean(value) for key, value in (metadata or {}).items()}
 
 
 def _freeze_metadata(metadata: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...]:

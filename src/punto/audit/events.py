@@ -133,6 +133,16 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.PROVIDER_REQUEST_STARTED: "provider_request",
     AuditEventType.PROVIDER_REQUEST_COMPLETED: "provider_request",
     AuditEventType.PROVIDER_REQUEST_FAILED: "provider_request",
+    # --- Database authority (DB AUTHORITY v0) ---------------------------------
+    #: Se registran sobre el ``project_id``, de modo que ``AuditLogger.by_resource(project_id)``
+    #: reconstruye la operación de base de datos completa. Nunca llevan el DSN.
+    AuditEventType.DB_CONNECT_CHECKED: "database",
+    AuditEventType.DB_SCHEMA_INTROSPECTED: "database_schema",
+    AuditEventType.DB_STATEMENT_CLASSIFIED: "database_statement",
+    AuditEventType.DB_MIGRATION_APPLIED: "database_migration",
+    AuditEventType.DB_MIGRATION_REJECTED: "database_migration",
+    AuditEventType.DB_SEED_APPLIED: "database_seed",
+    AuditEventType.DB_QUERY_VERIFIED: "database_query",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

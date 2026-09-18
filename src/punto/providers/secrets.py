@@ -38,10 +38,22 @@ DEFAULT_SECRETS_FILE_NAME: Final[str] = "secrets.json"
 #: Longitud mínima de una clave aceptada. No se valida su forma (cada proveedor tiene la suya).
 MIN_API_KEY_CHARS: Final[int] = 8
 
+#: Prefijo de las claves de **proyecto** (DB AUTHORITY v0). Un secreto de proyecto no es una API
+#: key de proveedor: se guarda con alcance propio y nunca aparece como proveedor configurado.
+PROJECT_SECRET_PREFIX: Final[str] = "project:"
+
+#: Esquemas de DSN admitidos como secreto de proyecto.
+PROJECT_SECRET_SCHEMES: Final[tuple[str, ...]] = ("postgres://", "postgresql://")
+
 #: Patrones que se borran de cualquier texto que salga del almacén.
 _SECRET_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}"),
+    # DSN PostgreSQL con credenciales: se borra **entero** (usuario, contraseña, host y base), de
+    # modo que un mensaje de error del driver no pueda publicar ni el host del destino.
+    re.compile(r"(?i)\bpostgres(?:ql)?://[^\s'\"<>|]+"),
+    # Cadena de conexión con parámetros sueltos (por ejemplo ``password=...``).
+    re.compile(r"(?i)\b(password|passwd|pwd)\s*=\s*[^\s;&]+"),
 )
 
 
@@ -82,16 +94,85 @@ class SecretStore:
 
     # ------------------------------------------------------------------ lectura
     def api_key(self, provider: str) -> str:
-        """Clave de un proveedor, o cadena vacía si no hay ninguna configurada."""
-        return self._load().get(provider.strip().lower(), "")
+        """Clave de un proveedor, o cadena vacía si no hay ninguna configurada.
+
+        Nunca devuelve un secreto de **proyecto**: esos viven bajo su propio prefijo y sólo se
+        recuperan por :meth:`project_secret`, que es la costura del ejecutor de base de datos.
+        """
+        name = provider.strip().lower()
+        if name.startswith(PROJECT_SECRET_PREFIX):
+            return ""
+        return self._load().get(name, "")
 
     def has_api_key(self, provider: str) -> bool:
         """True si el proveedor tiene clave configurada. Nunca devuelve la clave."""
         return bool(self.api_key(provider))
 
     def configured_providers(self) -> tuple[str, ...]:
-        """Proveedores con clave configurada, en orden alfabético."""
-        return tuple(sorted(self._load()))
+        """Proveedores con clave configurada, en orden alfabético (sin secretos de proyecto)."""
+        return tuple(
+            sorted(name for name in self._load() if not name.startswith(PROJECT_SECRET_PREFIX))
+        )
+
+    # -------------------------------------------------------- secretos de proyecto
+    def set_project_secret(self, scope: str, value: str) -> None:
+        """Guarda un secreto de proyecto (por ejemplo el DSN de desarrollo) **sin devolverlo**.
+
+        Un secreto de proyecto no es una API key de proveedor: tiene su propio espacio de nombres
+        y su propia validación, y la API pública nunca publica su valor.
+
+        Raises:
+            SecretStoreError: si el alcance o el valor no son utilizables.
+        """
+        name = scope.strip().lower()
+        if not name:
+            raise SecretStoreError("el alcance del secreto no puede estar vacío")
+        if PROJECT_SECRET_PREFIX in name or ":" in name:
+            raise SecretStoreError("el alcance no puede contener ':' ni el prefijo reservado")
+        secret = value.strip()
+        if not secret:
+            raise SecretStoreError("el secreto de proyecto no puede estar vacío")
+        if not secret.lower().startswith(PROJECT_SECRET_SCHEMES):
+            raise SecretStoreError(
+                "el secreto de proyecto tiene que ser un DSN PostgreSQL "
+                f"({' o '.join(PROJECT_SECRET_SCHEMES)})"
+            )
+        data = self._load()
+        data[f"{PROJECT_SECRET_PREFIX}{name}"] = secret
+        self._write(data)
+
+    def has_project_secret(self, scope: str) -> bool:
+        """True si el proyecto tiene secreto configurado. Nunca devuelve el valor."""
+        return bool(self.project_secret(scope))
+
+    def project_secret(self, scope: str) -> str:
+        """Recuperación **interna** del secreto de un proyecto, para el controlador.
+
+        No se expone por ninguna API: sólo el ejecutor de base de datos la usa, y el valor nunca
+        viaja a un prompt, un log, una respuesta HTTP ni un evento de auditoría.
+        """
+        name = scope.strip().lower()
+        if not name:
+            return ""
+        return self._load().get(f"{PROJECT_SECRET_PREFIX}{name}", "")
+
+    def delete_project_secret(self, scope: str) -> bool:
+        """Borra el secreto de un proyecto. Devuelve ``True`` si había algo que borrar."""
+        name = scope.strip().lower()
+        data = self._load()
+        key = f"{PROJECT_SECRET_PREFIX}{name}"
+        if key not in data:
+            return False
+        del data[key]
+        self._write(data)
+        return True
+
+    def configured_project_scopes(self) -> tuple[str, ...]:
+        """Alcances de proyecto con secreto configurado. Sólo nombres, nunca valores."""
+        prefix = PROJECT_SECRET_PREFIX
+        return tuple(
+            sorted(name[len(prefix) :] for name in self._load() if name.startswith(prefix))
+        )
 
     # ----------------------------------------------------------------- escritura
     def set_api_key(self, provider: str, value: str) -> None:
@@ -190,6 +271,8 @@ __all__ = [
     "DEFAULT_SECRETS_DIR_NAME",
     "DEFAULT_SECRETS_FILE_NAME",
     "MIN_API_KEY_CHARS",
+    "PROJECT_SECRET_PREFIX",
+    "PROJECT_SECRET_SCHEMES",
     "SECRETS_FILE_ENV",
     "SecretStore",
     "SecretStoreError",

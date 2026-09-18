@@ -152,6 +152,44 @@ actions:
     description: "Acción con riesgo de seguridad elevado."
     category: "security"
 
+  # ---------------------- DB AUTHORITY v0 (base de datos de desarrollo) -------
+  # El motor opera EXCLUSIVAMENTE una base de desarrollo, después de una autorización humana
+  # inicial. Conectividad, introspección y lectura son nivel 0; el cambio de esquema no destructivo
+  # y el seed se alinean con `modify_dev_schema` (nivel 1, revisión posterior obligatoria); lo
+  # destructivo, lo masivo y la creación de recursos externos son nivel 3.
+  db_connect_check:
+    level: 0
+    description: "Comprobar conectividad con la base de datos de desarrollo autorizada."
+    category: "data"
+  db_introspect:
+    level: 0
+    description: "Leer el esquema de la base de datos de desarrollo (information_schema)."
+    category: "data"
+  db_safe_read:
+    level: 0
+    description: "Consultar datos con una sentencia de sólo lectura en desarrollo."
+    category: "data"
+  db_migration_apply:
+    level: 1
+    description: "Aplicar una migración no destructiva y previamente clasificada en desarrollo."
+    category: "data"
+  db_seed:
+    level: 1
+    description: "Ejecutar un seed idempotente en la base de datos de desarrollo."
+    category: "data"
+  db_destructive_apply:
+    level: 3
+    description: "Aplicar SQL destructivo (DROP, TRUNCATE, DROP COLUMN). Nunca autónomo."
+    category: "data"
+  db_mass_data_change:
+    level: 3
+    description: "Cambio masivo de datos (UPDATE/DELETE/MERGE). Nunca autónomo en v0."
+    category: "data"
+  external_resource_create:
+    level: 3
+    description: "Crear recursos externos con coste o autoridad (proyecto/branch/rol)."
+    category: "operations"
+
 # ----------------------------------------------------------------------------
 # Grupos de acciones que siempre requieren revisión o human gate.
 # ----------------------------------------------------------------------------
@@ -169,6 +207,12 @@ never_autonomous:
   - business_model_change
   - master_secret_change
   - high_security_risk
+  # DB AUTHORITY v0: lo destructivo, lo masivo y la creación de recursos externos nunca se
+  # ejecutan en autonomía. (El nivel 3 ya exige Human Gate; esta lista lo declara explícitamente,
+  # igual que `irreversible_delete`.)
+  - db_destructive_apply
+  - db_mass_data_change
+  - external_resource_create
 
 # ----------------------------------------------------------------------------
 # Archivos protegidos (espejo de constitution.yaml). Se comparan por ruta

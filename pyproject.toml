@@ -24,6 +24,9 @@ dependencies = [
   "PyYAML>=6.0.1",
   # ENGINE-2: cliente HTTP propio para la API de DeepSeek (sin SDK de terceros).
   "httpx>=0.27",
+  # DB AUTHORITY v0: driver PostgreSQL del CONTROLADOR. El motor ejecuta SQL; el proyecto
+  # sigue usando su propio ORM (Drizzle). El BUILDER y el sandbox no confiable nunca lo ven.
+  "psycopg[binary]>=3.2",
 ]
 
 [project.optional-dependencies]

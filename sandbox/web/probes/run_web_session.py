@@ -115,9 +115,18 @@ MAX_VIEWPORTS = 8
 
 #: Acciones de usuario que la sonda sabe ejecutar y máximo por sesión. Vocabulario cerrado: lo que
 #: no esté aquí es un payload inválido (exit 4), nunca una acción que se ignora en silencio.
-ACTION_KINDS = ("navigate", "click", "fill", "submit", "wait", "assert_visible", "assert_text")
+ACTION_KINDS = (
+    "navigate",
+    "click",
+    "fill",
+    "submit",
+    "select",
+    "wait",
+    "assert_visible",
+    "assert_text",
+)
 #: Acciones que exigen un valor además del destino.
-ACTION_KINDS_WITH_VALUE = ("fill", "assert_text")
+ACTION_KINDS_WITH_VALUE = ("fill", "select", "assert_text")
 MAX_ACTIONS = 20
 #: Tiempo máximo por acción, en milisegundos, si el host no dice otra cosa.
 DEFAULT_ACTION_TIMEOUT_MS = 5000

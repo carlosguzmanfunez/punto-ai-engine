@@ -154,16 +154,18 @@ def build_transport(
     settings: ProviderSettings | None = None,
     runner: SubprocessRunner | None = None,
     api_client: StructuredModelClient | None = None,
+    api_key: str = "",
 ) -> ProviderTransport:
     """Construye el transporte seleccionado para un proveedor.
 
     Args:
-        provider: Proveedor (``openai``, ``anthropic``, ``deepseek``).
+        provider: Proveedor (``openai``, ``anthropic``, ``deepseek`` o uno nuevo del catálogo).
         model: Modelo; vacío significa el de la configuración.
         settings: Configuración de proveedores; por defecto, la del repositorio.
         runner: Runner de procesos inyectable (pruebas). Solo lo usan los transportes de
             suscripción.
         api_client: Cliente ya construido para el transporte de API (pruebas o composición externa).
+        api_key: Clave del almacén de secretos, si la hay. Vacío significa «léela del entorno».
 
     Raises:
         TransportConfigError: si la combinación declarada no es válida.
@@ -178,30 +180,38 @@ def build_transport(
     if kind is TransportKind.CLAUDE_CODE:
         return ClaudeCodeTransport(model=chosen_model, runner=runner)
     return APITransport(
-        client=api_client if api_client is not None else _api_client_for(name, chosen_model),
+        client=(
+            api_client
+            if api_client is not None
+            else _api_client_for(name, chosen_model, api_key=api_key)
+        ),
         provider=name,
         model=chosen_model,
         kind=kind,
     )
 
 
-def _api_client_for(provider: str, model: str) -> StructuredModelClient:
-    """Cliente de API real del proveedor, con su credencial del entorno."""
+def _api_client_for(provider: str, model: str, *, api_key: str = "") -> StructuredModelClient:
+    """Cliente de API real del proveedor, con su credencial del almacén o del entorno."""
     if provider == PROVIDER_OPENAI:
         from punto.providers.openai import OpenAIClient, OpenAIConfig
 
-        return OpenAIClient(OpenAIConfig(api_key=_required_key("OPENAI_API_KEY"), model=model))
+        return OpenAIClient(
+            OpenAIConfig(api_key=api_key or _required_key("OPENAI_API_KEY"), model=model)
+        )
     if provider == "anthropic":
         from punto.providers.anthropic import AnthropicClient, AnthropicConfig
 
         return AnthropicClient(
-            AnthropicConfig(api_key=_required_key("ANTHROPIC_API_KEY"), model=model)
+            AnthropicConfig(api_key=api_key or _required_key("ANTHROPIC_API_KEY"), model=model)
         )
     if provider == "deepseek":
         from punto.providers.deepseek import DeepSeekClient, DeepSeekConfig
 
         return DeepSeekClient(
-            DeepSeekConfig(api_key=_required_key("DEEPSEEK_API_KEY"), model=model, max_tokens=8192)
+            DeepSeekConfig(
+                api_key=api_key or _required_key("DEEPSEEK_API_KEY"), model=model, max_tokens=8192
+            )
         )
     raise TransportConfigError(f"no hay cliente de API para el proveedor {provider!r}")
 
@@ -371,6 +381,7 @@ def transport_client(
     settings: ProviderSettings | None = None,
     runner: SubprocessRunner | None = None,
     api_client: StructuredModelClient | None = None,
+    api_key: str = "",
 ) -> StructuredModelClient:
     """Cliente del contrato de proveedor, con el transporte seleccionado por configuración.
 
@@ -384,6 +395,7 @@ def transport_client(
             settings=settings,
             runner=runner,
             api_client=api_client,
+            api_key=api_key,
         )
     )
 

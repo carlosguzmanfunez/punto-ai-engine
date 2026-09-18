@@ -129,10 +129,10 @@ ALLOWED_COMMAND_PROGRAMS: Final[frozenset[str]] = frozenset(
 #: Acciones de usuario que la sonda sabe ejecutar, y máximo por sesión. Vocabulario cerrado: un
 #: ``kind`` fuera de esta lista es un argumento inválido del llamante, no una acción ignorada.
 ACTION_KINDS: Final[frozenset[str]] = frozenset(
-    {"navigate", "click", "fill", "submit", "wait", "assert_visible", "assert_text"}
+    {"navigate", "click", "fill", "submit", "select", "wait", "assert_visible", "assert_text"}
 )
 #: Acciones que exigen un valor además del destino.
-ACTION_KINDS_WITH_VALUE: Final[frozenset[str]] = frozenset({"fill", "assert_text"})
+ACTION_KINDS_WITH_VALUE: Final[frozenset[str]] = frozenset({"fill", "select", "assert_text"})
 MAX_ACTIONS: Final[int] = 20
 
 #: Patrón del nombre lógico de un screenshot. El nombre viene del manifiesto del probe, así que
@@ -487,6 +487,7 @@ class WebSandboxBackend:
         viewports: Sequence[Viewport] = DEFAULT_VIEWPORTS,
         required_markers: Sequence[str] = (),
         actions: Sequence[Mapping[str, str]] | None = None,
+        preview_image: str = "",
         timeout_seconds: float | None = None,
         commands: Sequence[Sequence[str]] = (),
         preview_port: int = DEFAULT_PREVIEW_PORT,
@@ -505,9 +506,13 @@ class WebSandboxBackend:
             required_markers: Marcadores exigidos, en la sintaxis del probe
                 (``selector:<css>``, ``attr:<nombre>`` o ``attr:<nombre>=<valor>``).
             actions: Interacción que el navegador debe ejecutar **antes** de observar el documento:
-                ``click``, ``fill``, ``submit``, ``wait`` y ``assert_visible``. Se ejecutan en orden
-                y se detienen en el primer fallo; el estado que se observa (URL final, marcadores,
-                captura) es el posterior a la interacción.
+                ``click``, ``fill``, ``submit``, ``select``, ``wait`` y ``assert_visible``. Se
+                ejecutan en orden y se detienen en el primer fallo; el estado que se observa (URL
+                final, marcadores, captura) es el posterior a la interacción.
+            preview_image: Imagen del contenedor **no confiable** que ejecuta la aplicación. Vacío
+                significa la imagen del sandbox web. Se declara cuando la aplicación necesita
+                dependencias que el sandbox web no trae (por ejemplo, un backend Python): el
+                navegador sigue viviendo en la imagen del sandbox, en su propio contenedor.
             timeout_seconds: Tiempo máximo de la sesión; por defecto, el de los límites.
             commands: Comandos de proyecto que deben terminar **antes** de la preview
                 (compilar, generar, preparar). Listas de argv, nunca cadenas de shell.
@@ -552,6 +557,22 @@ class WebSandboxBackend:
             raise ValueError("timeout_seconds debe ser positivo")
         if preview_port <= 0 or preview_port > 65535:
             raise ValueError(f"preview_port fuera de rango: {preview_port}")
+        application_image = preview_image.strip() or WEB_SANDBOX_IMAGE
+        if preview_image.strip():
+            # Una imagen declarada tiene que existir: no se degrada en silencio a la del sandbox.
+            exists = subprocess.run(
+                [self._binary or "", "image", "exists", application_image],
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+                env=build_runtime_client_environment(self._runtime_name or ""),
+            )
+            if exists.returncode != 0:
+                raise WebSandboxUnavailableError(
+                    f"la imagen de la aplicación {application_image!r} no está disponible. "
+                    f"Constrúyela antes de pedir la sesión."
+                )
 
         self._audit_session_started(
             task_id=task_id,
@@ -616,6 +637,7 @@ class WebSandboxBackend:
                     network=network,
                     alias=alias,
                     container=preview_container,
+                    image=application_image,
                 ),
                 container=preview_container,
             )
@@ -983,11 +1005,15 @@ class WebSandboxBackend:
         network: str,
         alias: str,
         container: str,
+        image: str = "",
     ) -> list[str]:
         """Argumentos del contenedor **no confiable**: el proyecto y su preview.
 
         Monta el workspace ``rw`` (es su zona de trabajo) y el probe ``ro`` (lo ejecuta, no lo
         escribe). No monta la evidencia: no puede verla, así que no puede falsificarla.
+
+        ``image`` permite declarar una imagen de aplicación distinta de la del sandbox web; el
+        aislamiento es el mismo (red interna, mismos límites, misma ausencia de evidencia).
         """
         return [
             *self._hardened_arguments(
@@ -1001,7 +1027,7 @@ class WebSandboxBackend:
             f"{probe_root}:{PROBE_MOUNT}:ro,Z",
             "-w",
             "/workspace",
-            WEB_SANDBOX_IMAGE,
+            image.strip() or WEB_SANDBOX_IMAGE,
             "python3",
             f"{PROBE_MOUNT}/{PREVIEW_SCRIPT_NAME}",
             "--payload",

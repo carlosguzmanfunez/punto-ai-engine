@@ -61,6 +61,8 @@ class QATarget:
     preview_argv: tuple[tuple[str, ...], ...]
     project_relative: str = "."
     preview_port: int = DEFAULT_PREVIEW_PORT
+    #: Imagen del contenedor que ejecuta la aplicación; vacío significa la del sandbox web.
+    preview_image: str = ""
     timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
@@ -153,6 +155,7 @@ def run_browser_session(
             required_markers=(),
             actions=tuple(action for _, action in planned),
             preview_port=target.preview_port,
+            preview_image=target.preview_image,
             timeout_seconds=target.timeout_seconds,
         )
     except WebSandboxUnavailableError as error:

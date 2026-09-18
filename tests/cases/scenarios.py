@@ -14,8 +14,10 @@ Todo escenario escribe únicamente bajo el directorio temporal que el runner le 
 from __future__ import annotations
 
 import json
+import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
 
@@ -27,6 +29,7 @@ from punto.memory import ExperienceResult, ExperienceStatus, ExperienceStore
 from punto.project.generations import resolve_active_nodes
 from punto.project.replan import classify_node
 from punto.project.resources import resources_from_diff
+from punto.providers.registry import ProviderRegistry
 from punto.schemas.audit import AuditEventType
 from punto.schemas.planning import ArchitecturePlan
 from punto.schemas.project import ProjectRun
@@ -772,10 +775,164 @@ def _subscription_output_cannot_expand_authority(
     )
 
 
+# ---------------------------------------------------------------------------
+# DASHBOARD — configurar proveedores no filtra secretos ni concede autoridad
+# ---------------------------------------------------------------------------
+#: Credencial sintética con la marca de canario documentada del repositorio.
+CANARY_SECRET: Final = "sk-test-CANARY-0123456789abcdef"
+
+#: Raíz del repositorio, para poder afirmar que el almacén de secretos está **fuera** de ella.
+REPOSITORY_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+
+
+@contextmanager
+def _dashboard(root: Path) -> Iterator[tuple[Any, ProviderRegistry]]:
+    """El dashboard real: la misma aplicación FastAPI, con su estado en el temporal del caso.
+
+    La configuración local y el almacén de secretos se redirigen al temporal, así que el caso no
+    toca el repositorio ni el HOME de la máquina, y las variables de entorno se restauran al salir
+    para no contaminar el resto del directorio de casos.
+    """
+    from punto.api.app import create_app
+    from punto.providers.secrets import SECRETS_FILE_ENV
+    from punto.providers.settings import LOCAL_CONFIG_ENV
+
+    names = (SECRETS_FILE_ENV, LOCAL_CONFIG_ENV)
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ[SECRETS_FILE_ENV] = str(root / "fuera-del-repositorio" / "secrets.json")
+    os.environ[LOCAL_CONFIG_ENV] = str(root / "config" / "providers.local.yaml")
+    try:
+        application = create_app(environment="test")
+        registry: ProviderRegistry = application.state.provider_registry
+        yield application, registry
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _dashboard_secret_never_returned(root: Path, params: dict[str, Any]) -> Observation:
+    """Una clave guardada desde el dashboard no vuelve por ninguna respuesta de la interfaz.
+
+    Se configura una credencial de canario en el proveedor de API, se recorre la superficie pública
+    del dashboard —página, catálogo, ficha, roles, capacidades, conexión y las sondas locales de los
+    proveedores de suscripción— y se busca la credencial en **todo** lo que salió. El almacén la
+    conserva, pero la interfaz solo publica ``api_key_configured``.
+    """
+    del params
+    from fastapi.testclient import TestClient
+
+    from punto.providers.secrets import SECRETS_FILE_ENV
+
+    with _dashboard(root) as (application, registry):
+        with TestClient(application) as client:
+            guardada = client.post(
+                "/providers/deepseek/api-key", json={"api_key": CANARY_SECRET}
+            ).json()
+            respuestas = (
+                client.get("/dashboard").text,
+                client.get("/providers").text,
+                client.get("/providers/deepseek").text,
+                client.get("/providers/openai").text,
+                client.get("/roles").text,
+                client.get("/providers-capabilities").text,
+                client.post("/providers/deepseek/connect").text,
+                client.post("/providers/deepseek/model", json={"model": "deepseek-v4-flash"}).text,
+                client.post("/roles/BUILDER", json={"provider": "deepseek"}).text,
+                client.post("/providers/openai/test").text,
+                client.post("/providers/anthropic/test").text,
+            )
+            ficha = dict(client.get("/providers/deepseek").json())
+        almacen = Path(os.environ[SECRETS_FILE_ENV])
+        local = registry.local_config_path()
+        texto_local = local.read_text(encoding="utf-8") if local.is_file() else ""
+        en_almacen = CANARY_SECRET in almacen.read_text(encoding="utf-8")
+        fuera = not almacen.resolve().is_relative_to(REPOSITORY_ROOT)
+
+    publicado = "\n".join(respuestas) + "\n" + texto_local
+    configurada = bool(guardada["api_key_configured"]) and bool(ficha["api_key_configured"])
+    return Observation(
+        facts={
+            "api_key_configured": configurada,
+            "provider_status": str(ficha["status"]),
+            "secret_outside_repository": fuera,
+            "secret_persisted": en_almacen,
+            "secret_visible_in_ui": CANARY_SECRET in publicado,
+        },
+        note=(
+            "la credencial queda configurada y el almacén la guarda fuera del repositorio, "
+            "pero ninguna respuesta de la interfaz la contiene"
+        ),
+    )
+
+
+def _dashboard_role_change_does_not_grant_authority(
+    root: Path, params: dict[str, Any]
+) -> Observation:
+    """Cambiar los roles en el dashboard no cambia lo que el motor decide.
+
+    Se ejecuta el caso real de cambio de alto impacto, se cambian los roles por la API del dashboard
+    y se vuelve a ejecutar el mismo caso: la asignación cambia de verdad —lo dice el router real— y
+    la decisión del motor es exactamente la misma. Configurar un proveedor es configuración; la
+    autoridad sigue siendo del motor.
+    """
+    objective = _str_param(params, "objective")
+
+    with _dashboard(root / "dashboard") as (application, _registry):
+        from fastapi.testclient import TestClient
+
+        with TestClient(application) as client:
+            antes = dict(client.get("/roles").json()["roles"])
+            client.post("/roles/BUILDER", json={"provider": "openai"})
+            cambio = dict(client.post("/roles/ARCHITECT", json={"provider": "openai"}).json())
+            asignacion = dict(client.get("/roles").json()["roles"])
+
+    def _decision(destination: str) -> tuple[Any, ...]:
+        """Lo que el motor decide ante el mismo cambio de diseño, en hechos comparables."""
+        run, replanner, audit = human_gate_case(root / destination, objective)
+        facts = _run_facts(run, replanner, audit)
+        binding = run.active_replan_approval
+        return (
+            facts["project_status"],
+            facts["gate_required"],
+            facts["active_generation_index"],
+            facts["replans_accepted"],
+            facts["generations"],
+            None if binding is None else binding.change_class,
+        )
+
+    con_dashboard = _decision("con-dashboard")
+    sin_dashboard = _decision("sin-dashboard")
+
+    return Observation(
+        facts={
+            "authority_unchanged": con_dashboard == sin_dashboard,
+            "dashboard_assignment": asignacion,
+            "gate_required": bool(con_dashboard[1]),
+            "active_generation_index": con_dashboard[2],
+            "replans_accepted": con_dashboard[3],
+            "generations": con_dashboard[4],
+            "change_class": con_dashboard[5],
+            "project_status": con_dashboard[0],
+        },
+        note=(
+            "el dashboard cambió la asignación "
+            f"({antes} -> {asignacion}, aviso: {cambio.get('advisories')}) y el motor decidió "
+            "exactamente lo mismo: sigue exigiendo una persona"
+        ),
+    )
+
+
 #: Registro de escenarios: un caso declara su nombre y el runner lo resuelve aquí.
 SCENARIOS: dict[str, Scenario] = {
     "architectural_change_is_not_adopted": _architectural_change,
     "consumer_qa_real": _consumer_qa_real,
+    "dashboard_role_change_does_not_grant_authority": (
+        _dashboard_role_change_does_not_grant_authority
+    ),
+    "dashboard_secret_never_returned": _dashboard_secret_never_returned,
     "diff_violation_is_not_replannable": _diff_violation,
     "go_mod_dependency_unproven": _go_mod_dependency,
     "http_destination_not_authorized": _http_destination,

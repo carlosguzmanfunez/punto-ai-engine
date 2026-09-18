@@ -1,0 +1,20 @@
+{
+  "case_id": "CASE-019",
+  "title": "La clave configurada en el dashboard nunca vuelve a la interfaz",
+  "category": "PROVIDER",
+  "description": "Garantía: una credencial guardada desde el dashboard no se puede recuperar leyendo la interfaz. La clave se guarda por la API real del dashboard, el almacén la conserva en un fichero fuera del repositorio y el catálogo la declara configurada, pero al recorrer la página, el catálogo, la ficha del proveedor, los roles, las capacidades, la conexión y las sondas locales de los proveedores de suscripción, la credencial no aparece en ninguna respuesta: la interfaz solo publica api_key_configured.",
+  "input": {
+    "scenario": "dashboard_secret_never_returned",
+    "params": {}
+  },
+  "expected": {
+    "api_key_configured": true,
+    "secret_outside_repository": true,
+    "secret_persisted": true,
+    "secret_visible_in_ui": false,
+    "provider_status": "CONNECTED"
+  },
+  "tags": ["dashboard", "secreto", "proveedores", "interfaz"],
+  "source": "tests/test_provider_dashboard.py::test_t9_los_secretos_viven_fuera_del_repositorio",
+  "schema_version": 1
+}

@@ -57,7 +57,7 @@ const DEFAULT_SETTLE_MS = 250;
 //: acción que no ocurre es un hecho que hay que reportar, no algo que deba agotar la sesión.
 const DEFAULT_ACTION_TIMEOUT_MS = 5000;
 //: Acciones que la sonda sabe ejecutar. Vocabulario cerrado: lo que no esté aquí no se ejecuta.
-const ACTION_KINDS = ['navigate', 'click', 'fill', 'submit', 'wait', 'assert_visible', 'assert_text'];
+const ACTION_KINDS = ['navigate', 'click', 'fill', 'submit', 'select', 'wait', 'assert_visible', 'assert_text'];
 
 /**
  * Señales de hidratación reconocidas: texto que menciona un fallo de hidratación de un framework.
@@ -299,7 +299,7 @@ function parseActions(raw) {
     if (!target) {
       throw new Error(`--actions[${index}].target no puede estar vacío`);
     }
-    if ((kind === 'fill' || kind === 'assert_text') && !value) {
+    if ((kind === 'fill' || kind === 'select' || kind === 'assert_text') && !value) {
       throw new Error(`--actions[${index}] es un ${kind} y necesita value`);
     }
     return { kind, target, value };
@@ -337,6 +337,10 @@ async function applyActions(page, actions, timeoutMs, navigationMs) {
         await page.click(action.target, { timeout: timeoutMs });
       } else if (action.kind === 'fill') {
         await page.fill(action.target, action.value, { timeout: timeoutMs });
+      } else if (action.kind === 'select') {
+        // Elegir una opción de un desplegable es una acción de usuario distinta de escribir: la
+        // interfaz de configuración la necesita y `fill` no la cubre.
+        await page.selectOption(action.target, action.value, { timeout: timeoutMs });
       } else if (action.kind === 'submit') {
         await page.evaluate((selector) => {
           const form = document.querySelector(selector);

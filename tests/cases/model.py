@@ -25,10 +25,12 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
     {
         "accepted_revision_advanced",
         "active_generation_index",
+        "api_key_configured",
         "audit_events_contains",
         "authority_unchanged",
         "autonomous",
         "change_class",
+        "dashboard_assignment",
         "classification_category",
         "classification_eligibility",
         "containment_compatibility",
@@ -55,6 +57,9 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "replans_accepted",
         "resource_tokens_contains",
         "retrieval_status",
+        "secret_outside_repository",
+        "secret_persisted",
+        "secret_visible_in_ui",
         "subscription_api_fallback_used",
         "subscription_error_kind",
     }

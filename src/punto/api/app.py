@@ -230,10 +230,21 @@ def create_app(*, environment: str = "local") -> FastAPI:
                 content={"status": "error", "engine": ENGINE_NAME, "detail": message},
             )
 
+        # El dashboard de proveedores **no** depende del motor de tareas: se registra igual, para
+        # que la configuración de proveedores siga siendo administrable aunque falte la
+        # configuración constitucional.
+        from punto.api.dashboard import register_dashboard
+
+        register_dashboard(application)
         return application
 
     application.state.engine = engine
     _register_routes(application, engine)
+    # PROVIDER DASHBOARD v0: la pagina de configuracion de proveedores y sus endpoints se registran
+    # sobre esta misma aplicacion (no hay un segundo backend).
+    from punto.api.dashboard import register_dashboard
+
+    register_dashboard(application)
     return application
 
 

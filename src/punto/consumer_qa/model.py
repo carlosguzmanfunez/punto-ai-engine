@@ -36,6 +36,7 @@ class QAStepKind(StrEnum):
     CLICK = "click"
     FILL = "fill"
     SUBMIT = "submit"
+    SELECT = "select"
     WAIT = "wait"
     ASSERT_VISIBLE = "assert_visible"
 
@@ -57,6 +58,7 @@ SELECTOR_STEPS: frozenset[QAStepKind] = frozenset(
         QAStepKind.CLICK,
         QAStepKind.FILL,
         QAStepKind.SUBMIT,
+        QAStepKind.SELECT,
         QAStepKind.WAIT,
         QAStepKind.ASSERT_VISIBLE,
     }

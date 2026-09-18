@@ -1,0 +1,37 @@
+# ============================================================================
+# PUNTO AI ENGINE - imagen minima del dashboard de configuracion de proveedores
+# ============================================================================
+# Esta imagen NO trae el proyecto: el repositorio se monta en /workspace y la
+# aplicacion se importa desde /workspace/src. Aqui solo viven las dependencias
+# de Python que el backend del dashboard necesita.
+#
+# Se usa SOLO como contenedor de "preview" en una sesion de QA Consumer: el
+# navegador real vive en la imagen del sandbox web y navega hasta este backend
+# por la red interna de la sesion. No hay red hacia Internet en esa sesion.
+#
+# Construir:
+#   podman build -t localhost/punto-dashboard:0.1 sandbox/dashboard/
+# ============================================================================
+FROM docker.io/library/python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115" \
+    "uvicorn[standard]>=0.30" \
+    "pydantic>=2.9" \
+    "httpx>=0.27" \
+    "PyYAML>=6.0"
+
+# El sandbox de la sesion aplica --user 10001:10001: el directorio de trabajo
+# tiene que existir y ser utilizable por ese usuario.
+RUN mkdir -p /workspace && chmod 1777 /workspace
+
+WORKDIR /workspace
+
+# Sin ENTRYPOINT: la sesion de medicion pasa el argv exacto (uvicorn con la
+# fabrica de la aplicacion). Este CMD existe solo para que la imagen sea
+# inspeccionable sin argumentos.
+CMD ["python3", "-c", "import fastapi, uvicorn, pydantic, httpx, yaml; print('dashboard deps ok')"]

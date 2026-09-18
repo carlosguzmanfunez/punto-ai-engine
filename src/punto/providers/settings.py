@@ -12,6 +12,7 @@ proveedores, modelos y roles; nunca una clave, ni siquiera un ejemplo con valor.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,6 +117,82 @@ def default_settings() -> ProviderSettings:
     )
 
 
+#: Variable de entorno que reubica el fichero de configuración local del dashboard.
+LOCAL_CONFIG_ENV: Final[str] = "PUNTO_PROVIDERS_LOCAL_FILE"
+
+#: Nombre del fichero de configuración local del dashboard dentro de ``config/``.
+LOCAL_CONFIG_NAME: Final[str] = "providers.local.yaml"
+
+
+def local_config_path(
+    config_dir: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path | None:
+    """Ruta del fichero de configuración local del dashboard, si se puede resolver."""
+    source = os.environ if env is None else env
+    override = source.get(LOCAL_CONFIG_ENV, "").strip()
+    if override:
+        return Path(override)
+    try:
+        root = find_config_dir() if config_dir is None else Path(config_dir)
+    except ConfigError:
+        return None
+    return root / LOCAL_CONFIG_NAME
+
+
+def _read_local(
+    path: Path | None,
+    providers: dict[str, str],
+    enabled: dict[str, bool],
+    transports: dict[str, str],
+    auth_modes: dict[str, str],
+    assignment: dict[ProviderRole, str],
+) -> None:
+    """Aplica la configuración local del dashboard sobre la del repositorio.
+
+    El fichero lo escribe el dashboard (transporte, modelo, roles y proveedores nuevos). Si no
+    existe, esta función no hace nada: el motor arranca con lo declarado en el repositorio.
+    """
+    if path is None or not path.is_file():
+        return
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    if not isinstance(raw, Mapping):
+        return
+    for name, body in (raw.get("providers") or {}).items():
+        key = str(name).strip().lower()
+        if not isinstance(body, Mapping):
+            continue
+        model = str(body.get("model", "")).strip()
+        if model:
+            providers[key] = model
+        transport = str(body.get("transport", "")).strip().lower()
+        if transport:
+            transports[key] = transport
+        mode = str(body.get("auth_mode", "")).strip().lower()
+        if mode:
+            auth_modes[key] = mode
+    for name, body in (raw.get("custom") or {}).items():
+        key = str(name).strip().lower()
+        if not isinstance(body, Mapping):
+            continue
+        model = str(body.get("model", "")).strip()
+        if model:
+            providers[key] = model
+        transports.setdefault(key, "api")
+        auth_modes.setdefault(key, "api_key")
+        enabled.setdefault(key, bool(body.get("enabled", True)))
+    for role_name, provider in (raw.get("roles") or {}).items():
+        try:
+            role = ProviderRole(str(role_name))
+        except ValueError:
+            continue
+        assignment[role] = str(provider).strip().lower()
+
+
 def load_provider_settings(
     config_dir: Path | None = None, *, environ: Mapping[str, str] | None = None
 ) -> ProviderSettings:
@@ -168,6 +245,9 @@ def load_provider_settings(
             raise ProviderRouteError(
                 f"el proveedor {provider!r} está asignado a un rol y no declara modelo"
             )
+    _read_local(
+        local_config_path(config_dir, env), providers, enabled, transports, auth_modes, assignment
+    )
     return ProviderSettings(
         providers=providers,
         enabled=enabled,
@@ -289,9 +369,14 @@ def _validate_provider(name: str, *, source: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_AUTH_MODES",
+    "DEFAULT_TRANSPORTS",
+    "LOCAL_CONFIG_ENV",
+    "LOCAL_CONFIG_NAME",
     "PROVIDERS_FILE_ENV",
     "PROVIDERS_FILE_NAME",
     "ProviderSettings",
     "default_settings",
     "load_provider_settings",
+    "local_config_path",
 ]

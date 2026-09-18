@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PUNTO · Configuración de proveedores IA</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --panel-2: #1d2129;
+        --line: #2a2f3a;
+        --text: #e6e9ef;
+        --muted: #98a2b3;
+        --accent: #4f8cff;
+        --ok: #35c07f;
+        --warn: #e0a32e;
+        --bad: #e05a5a;
+        --off: #6b7280;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 18px 24px;
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+      header .crumb { color: var(--muted); font-size: 13px; }
+      main { padding: 24px; max-width: 1180px; margin: 0 auto; }
+      section { margin-bottom: 28px; }
+      section > h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 0 0 12px;
+      }
+      .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px;
+      }
+      .card h3 { margin: 0 0 4px; font-size: 16px; }
+      .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; }
+      .row .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+      .row .value { text-align: right; font-variant-numeric: tabular-nums; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 7px; background: var(--off); }
+      .dot.CONNECTED { background: var(--ok); }
+      .dot.NOT_AUTHENTICATED, .dot.NOT_INSTALLED, .dot.NOT_CONFIGURED { background: var(--warn); }
+      .dot.UNAVAILABLE, .dot.ERROR, .dot.LIMIT_REACHED { background: var(--bad); }
+      .status { font-weight: 600; }
+      select, input, button {
+        font: inherit;
+        color: var(--text);
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 7px 9px;
+      }
+      select, input { width: 100%; max-width: 260px; }
+      input[type="password"] { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+      button.secondary { background: transparent; border-color: var(--line); color: var(--text); }
+      button:disabled { opacity: 0.55; cursor: default; }
+      .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+      .note {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-radius: 7px;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .note.warn { border-color: var(--warn); color: var(--warn); }
+      .note.bad { border-color: var(--bad); color: var(--bad); }
+      .note.ok { border-color: var(--ok); color: var(--ok); }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .form-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+      .field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+      .caps { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+      .cap {
+        font-size: 11px;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 2px 8px;
+        color: var(--muted);
+      }
+      .cap.on { color: var(--text); border-color: var(--accent); }
+      footer { color: var(--muted); font-size: 12px; padding: 0 24px 32px; max-width: 1180px; margin: 0 auto; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>PUNTO AI ENGINE</h1>
+      <span class="crumb">Configuración · Proveedores IA</span>
+    </header>
+    <main>
+      <section>
+        <h2>Proveedores</h2>
+        <div id="providers" class="grid" data-testid="providers"></div>
+      </section>
+
+      <section>
+        <h2>Asignación de roles</h2>
+        <div class="card">
+          <div id="roles" data-testid="roles"></div>
+          <div id="roles-note" class="note">
+            La asignación es configuración: cambiar de proveedor un rol no modifica ENGINE ni
+            concede capacidades. Las acciones sensibles siguen pasando por el Human Gate.
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Agregar proveedor</h2>
+        <div class="card">
+          <div class="form-grid">
+            <div class="field">
+              <label for="custom-display-name">Display name</label>
+              <input id="custom-display-name" placeholder="Qwen local" />
+            </div>
+            <div class="field">
+              <label for="custom-provider-id">Provider ID</label>
+              <input id="custom-provider-id" placeholder="qwen_local" />
+            </div>
+            <div class="field">
+              <label for="custom-base-url">Base URL</label>
+              <input id="custom-base-url" placeholder="https://api.ejemplo.com/v1" />
+            </div>
+            <div class="field">
+              <label for="custom-model">Model</label>
+              <input id="custom-model" placeholder="qwen2.5-14b-instruct" />
+            </div>
+            <div class="field">
+              <label for="custom-adapter">Adapter type</label>
+              <select id="custom-adapter"></select>
+            </div>
+            <div class="field">
+              <label for="custom-api-key">API Key</label>
+              <input id="custom-api-key" type="password" autocomplete="off" placeholder="(opcional)" />
+            </div>
+          </div>
+          <div class="field" style="margin-top: 10px">
+            <label>Capabilities</label>
+            <div id="custom-capabilities" class="caps"></div>
+          </div>
+          <div class="actions">
+            <button id="add-provider" data-testid="add-provider">Guardar proveedor</button>
+          </div>
+          <div id="custom-note" class="note">
+            Se guarda en la configuración local del dashboard (fuera de Git). La clave, si la hay,
+            va al almacén de secretos del sistema y nunca vuelve al navegador.
+          </div>
+        </div>
+      </section>
+    </main>
+    <footer>
+      El estado que ves es el estado real del backend: sesión del cliente oficial, credencial
+      configurada y sondas oficiales. No hay estados simulados.
+    </footer>
+
+    <script>
+      const state = { providers: [], capabilities: [], adapterTypes: [], roles: {} };
+
+      async function api(path, options) {
+        const response = await fetch(path, {
+          headers: { "content-type": "application/json" },
+          ...options,
+        });
+        const text = await response.text();
+        let payload = null;
+        try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = { detail: text }; }
+        if (!response.ok) {
+          const detail = payload && payload.detail ? payload.detail : response.statusText;
+          throw new Error(detail);
+        }
+        return payload;
+      }
+
+      function statusRow(provider) {
+        return `
+          <div class="row">
+            <span class="label">Status</span>
+            <span class="value"><span class="dot ${provider.status}" id="status-${provider.provider}"></span>
+            <span class="status">${provider.status}</span></span>
+          </div>
+          <div class="row">
+            <span class="label">Role</span>
+            <span class="value">${provider.roles.length ? provider.roles.join(", ") : "—"}</span>
+          </div>`;
+      }
+
+      function transportRow(provider) {
+        const options = provider.transports
+          .map((item) => `<option value="${item}"${item === provider.transport ? " selected" : ""}>${labelOf(item)}</option>`)
+          .join("");
+        return `
+          <div class="row">
+            <span class="label">Transport</span>
+            <select id="transport-${provider.provider}" data-transport="${provider.provider}">${options}</select>
+          </div>
+          <div class="row">
+            <span class="label">Auth</span>
+            <span class="value" id="auth-${provider.provider}">${provider.auth_mode}</span>
+          </div>`;
+      }
+
+      function modelRow(provider) {
+        return `
+          <div class="row">
+            <span class="label">Model</span>
+            <input id="model-${provider.provider}" data-model="${provider.provider}"
+                   value="${provider.model}" />
+          </div>`;
+      }
+
+      function apiRow(provider) {
+        const usesApi = ["api", "existing"].includes(provider.transport);
+        if (!usesApi) return "";
+        const configured = provider.api_key_configured
+          ? '<span class="note ok" style="margin:0;display:inline-block">clave configurada</span>'
+          : '<span class="note warn" style="margin:0;display:inline-block">sin clave</span>';
+        return `
+          <div class="row">
+            <span class="label">API Key</span>
+            <span class="value" id="api-key-state-${provider.provider}">${configured}</span>
+          </div>
+          <div class="row">
+            <span class="label">API key</span>
+            <input id="api-key-${provider.provider}" data-api-key="${provider.provider}"
+                   type="password" autocomplete="off" placeholder="escribe para guardar (no se muestra)" />
+          </div>
+          <div class="actions">
+            <button class="secondary" id="save-key-${provider.provider}" data-save-key="${provider.provider}">Guardar clave</button>
+          </div>`;
+      }
+
+      function capabilitiesRow(provider) {
+        return `<div class="caps">${state.capabilities
+          .map((cap) => `<span class="cap${provider.capabilities.includes(cap) ? " on" : ""}">${cap}</span>`)
+          .join("")}</div>`;
+      }
+
+      function labelOf(transport) {
+        const labels = {
+          codex: "Codex / ChatGPT account",
+          claude_code: "Claude Code / Claude account",
+          api: "API",
+          existing: "API (existing)",
+        };
+        return labels[transport] || transport;
+      }
+
+      function card(provider) {
+        const builtin = provider.builtin ? "" : ' <span class="cap">custom</span>';
+        return `
+          <article class="card" data-provider="${provider.provider}" data-testid="card-${provider.provider}">
+            <h3>${provider.display_name}${builtin}</h3>
+            <div class="sub">${provider.adapter_type}${provider.base_url ? " · " + provider.base_url : ""}</div>
+            ${statusRow(provider)}
+            ${transportRow(provider)}
+            ${modelRow(provider)}
+            ${apiRow(provider)}
+            ${capabilitiesRow(provider)}
+            <div class="actions">
+              <button id="save-${provider.provider}" data-save="${provider.provider}">Guardar</button>
+              <button class="secondary" id="connect-${provider.provider}" data-connect="${provider.provider}">Connect</button>
+              <button class="secondary" id="test-${provider.provider}" data-test="${provider.provider}">Test connection</button>
+            </div>
+            <div class="note" id="note-${provider.provider}" data-note="${provider.provider}">—</div>
+          </article>`;
+      }
+
+      function render() {
+        document.getElementById("providers").innerHTML = state.providers.map(card).join("");
+        renderRoles();
+        document.querySelectorAll("[data-save]").forEach((button) =>
+          button.addEventListener("click", () => save(button.dataset.save)));
+        document.querySelectorAll("[data-connect]").forEach((button) =>
+          button.addEventListener("click", () => connect(button.dataset.connect)));
+        document.querySelectorAll("[data-test]").forEach((button) =>
+          button.addEventListener("click", () => test(button.dataset.test)));
+        document.querySelectorAll("[data-save-key]").forEach((button) =>
+          button.addEventListener("click", () => saveKey(button.dataset.saveKey)));
+        document.querySelectorAll("[data-transport]").forEach((select) =>
+          select.addEventListener("change", () => transport(select.dataset.transport, select.value)));
+      }
+
+      function renderRoles() {
+        const roles = ["ARCHITECT", "BUILDER", "VISUAL_QA"];
+        document.getElementById("roles").innerHTML = roles
+          .map((role) => {
+            const current = state.roles[role] || "";
+            const options = state.providers
+              .map((p) => `<option value="${p.provider}"${p.provider === current ? " selected" : ""}>${p.display_name}</option>`)
+              .join("");
+            return `
+              <div class="row">
+                <span class="label">${role}</span>
+                <select id="role-${role}" data-role="${role}">${options}</select>
+              </div>`;
+          })
+          .join("");
+        document.querySelectorAll("[data-role]").forEach((select) =>
+          select.addEventListener("change", () => assignRole(select.dataset.role, select.value)));
+      }
+
+      function note(provider, text, kind) {
+        const element = document.getElementById(`note-${provider}`);
+        element.className = "note" + (kind ? " " + kind : "");
+        element.textContent = text;
+      }
+
+      async function load() {
+        const [providers, roles, capabilities] = await Promise.all([
+          api("/providers"),
+          api("/roles"),
+          api("/providers-capabilities"),
+        ]);
+        state.providers = providers.providers;
+        state.capabilities = capabilities.capabilities;
+        state.adapterTypes = capabilities.adapter_types;
+        state.roles = roles.roles;
+        document.getElementById("custom-adapter").innerHTML = state.adapterTypes
+          .map((item) => `<option value="${item}">${item}</option>`)
+          .join("");
+        document.getElementById("custom-capabilities").innerHTML = state.capabilities
+          .map((cap) => `<label class="cap"><input type="checkbox" value="${cap}" /> ${cap}</label>`)
+          .join("");
+        render();
+      }
+
+      async function save(provider) {
+        try {
+          const model = document.getElementById(`model-${provider}`).value;
+          await api(`/providers/${provider}/model`, {
+            method: "POST",
+            body: JSON.stringify({ model }),
+          });
+          await load();
+          note(provider, "modelo guardado", "ok");
+        } catch (error) {
+          note(provider, String(error.message || error), "bad");
+        }
+      }
+
+      async function transport(provider, value) {
+        try {
+          const authMode = value === "codex" ? "chatgpt" : value === "claude_code" ? "claude_account" : "api_key";
+          await api(`/providers/${provider}/transport`, {
+            method: "POST",
+            body: JSON.stringify({ transport: value, auth_mode: authMode }),
+          });
+          await load();
+          note(provider, `transporte cambiado a ${value}`, "ok");
+        } catch (error) {
+          note(provider, String(error.message || error), "bad");
+        }
+      }
+
+      async function saveKey(provider) {
+        const field = document.getElementById(`api-key-${provider}`);
+        try {
+          const result = await api(`/providers/${provider}/api-key`, {
+            method: "POST",
+            body: JSON.stringify({ api_key: field.value }),
+          });
+          field.value = "";
+          await load();
+          note(provider, `clave guardada · api_key_configured=${result.api_key_configured}`, "ok");
+        } catch (error) {
+          note(provider, String(error.message || error), "bad");
+        }
+      }
+
+      async function connect(provider) {
+        try {
+          const info = await api(`/providers/${provider}/connect`, { method: "POST" });
+          const text = info.command
+            ? `Ejecuta en tu terminal: ${info.command}\nDespués, Test connection.\nAuth: ${info.auth_status}`
+            : `Este transporte se autoriza con su clave de API.\nAuth: ${info.auth_status}`;
+          note(provider, text, info.auth_status === "AUTHENTICATED" ? "ok" : "");
+        } catch (error) {
+          note(provider, String(error.message || error), "bad");
+        }
+      }
+
+      async function test(provider) {
+        const button = document.getElementById(`test-${provider}`);
+        button.disabled = true;
+        note(provider, "comprobando…");
+        try {
+          const result = await api(`/providers/${provider}/test`, { method: "POST" });
+          note(provider, `${result.status}\n${result.detail || ""}`.trim(),
+            result.status === "CONNECTED" ? "ok" : "warn");
+        } catch (error) {
+          note(provider, String(error.message || error), "bad");
+        } finally {
+          button.disabled = false;
+          const status = document.getElementById(`status-${provider}`);
+          if (status) status.className = "dot " + (status.className.split(" ")[1] || "");
+        }
+      }
+
+      async function assignRole(role, provider) {
+        const element = document.getElementById("roles-note");
+        try {
+          const result = await api(`/roles/${role}`, {
+            method: "POST",
+            body: JSON.stringify({ provider }),
+          });
+          state.roles = result.roles;
+          element.className = "note" + (result.advisories.length ? " warn" : " ok");
+          element.textContent = result.advisories.length
+            ? result.advisories.join("\n")
+            : `${role} → ${provider} (sin avisos de capacidad)`;
+          await load();
+        } catch (error) {
+          element.className = "note bad";
+          element.textContent = String(error.message || error);
+        }
+      }
+
+      document.getElementById("add-provider").addEventListener("click", async () => {
+        const element = document.getElementById("custom-note");
+        const capabilities = Array.from(
+          document.querySelectorAll("#custom-capabilities input:checked")
+        ).map((input) => input.value);
+        try {
+          const result = await api("/providers/custom", {
+            method: "POST",
+            body: JSON.stringify({
+              provider_id: document.getElementById("custom-provider-id").value,
+              display_name: document.getElementById("custom-display-name").value,
+              base_url: document.getElementById("custom-base-url").value,
+              model: document.getElementById("custom-model").value,
+              adapter_type: document.getElementById("custom-adapter").value,
+              capabilities: capabilities.length ? capabilities : ["TEXT"],
+              api_key: document.getElementById("custom-api-key").value,
+            }),
+          });
+          await load();
+          element.className = "note ok";
+          element.textContent = `proveedor ${result.provider} registrado · api_key_configured=${result.api_key_configured}`;
+          ["custom-provider-id", "custom-display-name", "custom-base-url", "custom-model", "custom-api-key"].forEach(
+            (id) => (document.getElementById(id).value = "")
+          );
+        } catch (error) {
+          element.className = "note bad";
+          element.textContent = String(error.message || error);
+        }
+      });
+
+      load().catch((error) => {
+        document.getElementById("providers").innerHTML =
+          `<div class="note bad">no se pudo cargar el catálogo: ${error.message || error}</div>`;
+      });
+    </script>
+  </body>
+</html>

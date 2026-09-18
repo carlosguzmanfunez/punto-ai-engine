@@ -1,0 +1,28 @@
+{
+  "case_id": "CASE-020",
+  "title": "Cambiar los roles en el dashboard no cambia lo que decide el motor",
+  "category": "AUTHORITY",
+  "description": "Garantía: asignar proveedores a los roles desde el dashboard es configuración, no autoridad. La asignación se cambia por la API real y el catálogo la refleja —el ProviderRouter real la ve—, pero el mismo caso de replanificación de alto impacto que exige una persona se ejecuta antes y después del cambio y el motor decide exactamente lo mismo: ninguna generación adoptada, la generación original gobernando y el Human Gate abierto. Conectar un proveedor no habilita ninguna acción del motor.",
+  "input": {
+    "scenario": "dashboard_role_change_does_not_grant_authority",
+    "params": {
+      "objective": "Use CockroachDB instead of the current store"
+    }
+  },
+  "expected": {
+    "authority_unchanged": true,
+    "dashboard_assignment": {
+      "ARCHITECT": "openai",
+      "BUILDER": "openai",
+      "VISUAL_QA": "anthropic"
+    },
+    "change_class": "DATASTORE_CHANGE",
+    "gate_required": true,
+    "project_status": "HUMAN_APPROVAL",
+    "active_generation_index": 0,
+    "replans_accepted": 0
+  },
+  "tags": ["dashboard", "roles", "autoridad", "human-gate"],
+  "source": "tests/test_provider_dashboard.py::test_t5_y_t12_el_cambio_de_rol_lo_ve_el_router",
+  "schema_version": 1
+}

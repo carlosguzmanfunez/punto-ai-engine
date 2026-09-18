@@ -302,7 +302,9 @@ def test_comentarios_y_espacios_no_permiten_bypass() -> None:
 @pytest.mark.parametrize(
     "sql",
     (
-        "CREATE TYPE estado AS ENUM ('a', 'b')",
+        # ``CREATE TYPE … AS ENUM`` ya **no** está aquí: la forma segura se admite desde v0.1 y
+        # sus variantes inseguras tienen su propia batería más abajo.
+        "CREATE TYPE foo AS (a int)",
         "CREATE EXTENSION IF NOT EXISTS pgcrypto",
         "GRANT ALL ON properties TO public",
         "REVOKE SELECT ON properties FROM public",
@@ -972,3 +974,124 @@ def test_el_driver_real_esta_disponible_sin_abrir_conexiones() -> None:
 
     assert PsycopgDriver() is not None
     assert psycopg.__version__
+
+
+# ---------------------------------------------------------------------------
+# 7. Tipos enumerados de PostgreSQL (v0.1)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "sql",
+    (
+        # Forma mínima.
+        "CREATE TYPE operation AS ENUM ('sale', 'rent')",
+        # Identificador citado.
+        'CREATE TYPE "property_status" AS ENUM (\'draft\', \'published\')',
+        # La forma que emite drizzle-kit: cualificado por esquema, citado y sin espacio antes del
+        # paréntesis.
+        'CREATE TYPE "public"."property_operation" AS ENUM(\'SALE\', \'RENT\')',
+        # Whitespace y saltos de línea.
+        "CREATE   TYPE\n  operation\n  AS\n  ENUM\n  (\n    'sale',\n    'rent'\n  )",
+        # Comentarios permitidos por el tokenizer, dentro y fuera de la lista.
+        "CREATE TYPE operation /* tipo */ AS ENUM ( -- valores\n  'sale', 'rent' /* fin */ )",
+        # Apóstrofo escapado con comilla doble.
+        "CREATE TYPE t AS ENUM ('it''s', 'ok')",
+        # Apóstrofo escapado con barra invertida y barra invertida literal.
+        r"CREATE TYPE t AS ENUM ('it\'s', 'back\\slash')",
+        # Coma dentro del valor: no parte la lista.
+        "CREATE TYPE t AS ENUM ('a,b', 'c')",
+        # Muchos valores y punto y coma final.
+        "CREATE TYPE property_status AS ENUM ('DRAFT', 'PUBLISHED', 'RESERVED', 'SOLD');",
+    ),
+)
+def test_create_type_as_enum_es_ddl_seguro(sql: str) -> None:
+    """La forma estrecha ``CREATE TYPE … AS ENUM (...)`` es DDL aditivo y autónomo."""
+    statement = classify_statement(sql)
+
+    assert statement.classification is SqlClassification.SAFE_DDL, sql
+    assert statement.autonomous is True
+    assert "enumerado" in statement.reason
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "ALTER TYPE operation ADD VALUE 'otro'",
+        "ALTER TYPE operation RENAME VALUE 'sale' TO 'venta'",
+        "CREATE TYPE foo AS (a int, b text)",
+        "CREATE TYPE foo AS RANGE (subtype = int4)",
+        "CREATE DOMAIN codigo AS text",
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+        "DO $$ BEGIN NULL; END $$",
+        "GRANT USAGE ON TYPE operation TO public",
+        "REVOKE USAGE ON TYPE operation FROM public",
+        "CREATE TYPE foo AS ENUM",
+        "CREATE TYPE foo AS ENUM ()",
+        "CREATE TYPE foo AS ENUM ('a') extra",
+        "CREATE TYPE foo AS ENUM 'a'",
+        "CREATE TYPE foo AS ENUM ('a',)",
+        "CREATE TYPE foo AS ENUM (,'a')",
+        "CREATE TYPE foo AS ENUM ('a', b)",
+        "CREATE TYPE foo AS ENUM ('a' 'b')",
+        "CREATE TYPE foo AS ENUM ('a'",
+        "CREATE TYPE foo AS ENUM (a)",
+        "CREATE TYPE IF NOT EXISTS foo AS ENUM ('a')",
+        "CREATE TYPE AS ENUM ('a')",
+    ),
+)
+def test_create_type_no_admitido_sigue_cerrado(sql: str) -> None:
+    """Todo lo que no sea exactamente la forma segura queda denegado o destructivo."""
+    statement = classify_statement(sql)
+
+    assert statement.classification in {
+        SqlClassification.UNKNOWN,
+        SqlClassification.DESTRUCTIVE,
+    }, sql
+    assert statement.autonomous is False
+
+
+def test_drop_type_es_destructive() -> None:
+    """``DROP TYPE`` se clasifica como destructivo, no como desconocido."""
+    assert classify_statement("DROP TYPE operation").classification is (
+        SqlClassification.DESTRUCTIVE
+    )
+
+
+def test_migracion_con_enum_pasa_por_nivel_1(
+    target: DatabaseTarget, secrets: SecretStore, policy: PolicyEngine
+) -> None:
+    """Una migración de Drizzle con enum, tabla e índice es toda SAFE_DDL y se aplica."""
+    audit = AuditLogger()
+    executor, driver = make_executor(target, secrets, policy, audit=audit)
+    sql = (
+        'CREATE TYPE "public"."property_operation" AS ENUM(\'SALE\', \'RENT\');\n'
+        "CREATE TABLE IF NOT EXISTS properties (id serial primary key, "
+        "operation \"public\".\"property_operation\" NOT NULL);\n"
+        "CREATE INDEX properties_operation_idx ON properties (operation);"
+    )
+
+    plan = executor.plan(sql)
+    result = executor.apply_migration(sql)
+
+    assert plan.total == 3
+    assert plan.classifications == {"SAFE_DDL": 3}
+    assert plan.autonomous is True
+    assert result.committed is True
+    assert result.statements == 3
+    assert driver.last_connection.commits == 1
+    assert AuditEventType.DB_MIGRATION_APPLIED in [e.event_type for e in audit.events()]
+
+
+def test_un_alter_type_en_el_script_deniega_todo(
+    target: DatabaseTarget, secrets: SecretStore, policy: PolicyEngine
+) -> None:
+    """Si el script mezcla un enum permitido con un ``ALTER TYPE``, no se ejecuta nada."""
+    executor, driver = make_executor(target, secrets, policy)
+
+    with pytest.raises(DatabaseDeniedError):
+        executor.apply_migration(
+            "CREATE TYPE operation AS ENUM ('sale'); ALTER TYPE operation ADD VALUE 'rent';"
+        )
+
+    assert driver.executed == []
+    assert driver.dsns == []

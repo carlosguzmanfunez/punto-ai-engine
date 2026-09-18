@@ -178,6 +178,83 @@ TRANSACTION_KEYWORDS: Final[tuple[str, ...]] = (
     "ABORT",
 )
 
+#: Identificador PostgreSQL: simple o citado, y opcionalmente cualificado por esquema.
+_PG_IDENTIFIER: Final[str] = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)'
+_PG_QUALIFIED: Final[str] = rf"{_PG_IDENTIFIER}(?:\s*\.\s*{_PG_IDENTIFIER})?"
+
+#: Forma **estrecha** de creación de un tipo enumerado: ``CREATE TYPE <id> AS ENUM ('v', …)``.
+#: Es la única variante de ``CREATE TYPE`` que el motor admite en autonomía, porque es aditiva y no
+#: puede perder datos. Cualquier otra forma queda como ``UNKNOWN`` (denegada).
+_ENUM_CREATE: Final[re.Pattern[str]] = re.compile(
+    rf"^CREATE\s+TYPE\s+{_PG_QUALIFIED}\s+AS\s+ENUM\s*\((?P<values>.*)\)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_enum_values(values: str) -> tuple[str, ...] | None:
+    """Interpreta la lista de valores de un ``ENUM``.
+
+    Sólo se admite una lista **no vacía** de literales de cadena separados por comas, sin coma
+    final, con los escapes de PostgreSQL (``''`` y ``\\'``). Cualquier otra cosa devuelve ``None``:
+    no se interpreta la semántica de los valores, sólo se demuestra que la forma es la segura.
+    """
+    index = 0
+    length = len(values)
+    found: list[str] = []
+    while index < length:
+        while index < length and values[index].isspace():
+            index += 1
+        if index >= length or values[index] != "'":
+            return None
+        index += 1
+        closed = False
+        while index < length:
+            char = values[index]
+            if char == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if char == "'":
+                if index + 1 < length and values[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                closed = True
+                break
+            index += 1
+        if not closed:
+            return None
+        found.append("value")
+        while index < length and values[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        if values[index] != ",":
+            return None
+        index += 1
+        probe = index
+        while probe < length and values[probe].isspace():
+            probe += 1
+        if probe >= length:
+            return None
+    return tuple(found) if found else None
+
+
+def _classify_enum_type(normalized: str) -> tuple[SqlClassification, str]:
+    """Clasifica un ``CREATE TYPE``: sólo ``AS ENUM (...)`` bien formado es ``SAFE_DDL``."""
+    match = _ENUM_CREATE.match(normalized)
+    if match is None:
+        return (
+            SqlClassification.UNKNOWN,
+            "CREATE TYPE no admitido: sólo la forma CREATE TYPE <id> AS ENUM ('v', ...)",
+        )
+    values = _parse_enum_values(match.group("values"))
+    if not values:
+        return (
+            SqlClassification.UNKNOWN,
+            "CREATE TYPE ... AS ENUM mal formado o con valores que no son literales de cadena",
+        )
+    return SqlClassification.SAFE_DDL, f"tipo enumerado con {len(values)} valor(es)"
+
 
 def statement_sha256(statement: str) -> str:
     """SHA-256 del texto de una sentencia, para evidencia sin exponer su contenido."""
@@ -477,6 +554,11 @@ def _classify_normalized(normalized: str) -> tuple[SqlClassification, str]:
             return SqlClassification.SAFE_DDL, "creación de tabla"
         if second in {"INDEX", "UNIQUE"}:
             return SqlClassification.SAFE_DDL, "creación de índice"
+        if second == "TYPE":
+            # Única variante admitida: CREATE TYPE <id> AS ENUM ('v', ...). Todo lo demás
+            # (ALTER TYPE, DROP TYPE, composite, RANGE, DOMAIN, EXTENSION, FUNCTION…) queda
+            # denegado por no estar en la lista admitida.
+            return _classify_enum_type(normalized)
         return SqlClassification.UNKNOWN, f"CREATE {second or '?'} no está en la lista admitida"
 
     # 6. ALTER TABLE aditivo y compatible.

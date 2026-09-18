@@ -1,0 +1,25 @@
+{
+  "case_id": "CASE-007",
+  "title": "Una violación de arquitectura no dispara replanificación autónoma",
+  "category": "REPLAN",
+  "description": "Garantía: el replan no puede reconciliar autoridad. Un diff que introduce un paquete no autorizado es una violación de arquitectura: la clasificación es del motor, la elegibilidad es de parada y el replanner —inyectado y con presupuesto autorizado— no recibe ni una llamada, porque otra estrategia no convierte en autorizado lo que ya se introdujo.",
+  "input": {
+    "scenario": "diff_violation_is_not_replannable",
+    "params": {}
+  },
+  "expected": {
+    "project_status": "BLOCKED",
+    "project_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "node_status": "BLOCKED",
+    "node_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "accepted_revision_advanced": false,
+    "replanner_calls": 0,
+    "classification_category": "ARCHITECTURE_VIOLATION",
+    "classification_eligibility": "NON_REPLANNABLE",
+    "autonomous": false
+  },
+  "tags": ["replan", "architecture", "f621", "containment"],
+  "source": "tests/test_project_replan_observed_resources.py::test_h2_la_violacion_no_dispara_replanificacion_autonoma",
+  "schema_version": 1,
+  "related_failure": "F621"
+}

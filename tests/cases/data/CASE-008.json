@@ -1,0 +1,24 @@
+{
+  "case_id": "CASE-008",
+  "title": "Un destino HTTP no autorizado falla cerrado",
+  "category": "AUTHORITY",
+  "description": "Garantía: no es el esquema lo que autoriza, es el destino. Una llamada a una integración externa que el envelope no declara bloquea el nodo por violación de arquitectura y nombra el destino en el detalle; la revisión aceptada no avanza, así que el efecto no se adopta.",
+  "input": {
+    "scenario": "http_destination_not_authorized",
+    "params": {
+      "endpoint": "https://unknown-external-provider.example/api"
+    }
+  },
+  "expected": {
+    "project_status": "BLOCKED",
+    "project_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "node_status": "BLOCKED",
+    "node_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "accepted_revision_advanced": false,
+    "failure_detail_contains": ["unknown-external-provider.example"]
+  },
+  "tags": ["effect-authority", "http", "containment", "f633"],
+  "source": "tests/test_project_replan_terminal_matrix.py::test_e2_http_para_una_integracion_no_autorizada_falla_cerrado",
+  "schema_version": 1,
+  "related_failure": "F633"
+}

@@ -1,0 +1,22 @@
+{
+  "case_id": "CASE-014",
+  "title": "Un fallo interno de la memoria no rompe el resultado legítimo del motor",
+  "category": "MEMORY",
+  "description": "Garantía: la memoria es opcional y su indisponibilidad no detiene el trabajo. Si la recuperación revienta, el motor continúa, el nodo se resuelve exactamente igual, no hay bloque de conocimiento en la petición del child y el fallo queda auditado como PELL_RETRIEVAL_FAILED.",
+  "input": {
+    "scenario": "memory_retrieval_failure_survives",
+    "params": {
+      "problem": "reparar la contención de recursos del manifiesto go.mod"
+    }
+  },
+  "expected": {
+    "project_status": "COMPLETED",
+    "node_status": "COMPLETED",
+    "memory_in_context": false,
+    "retrieval_status": "FAILED",
+    "audit_events_contains": ["PELL_RETRIEVAL_FAILED"]
+  },
+  "tags": ["pell", "memoria", "fail-open-del-consejo"],
+  "source": "tests/test_pell_retrieval_loop.py::test_t5_un_fallo_del_store_no_rompe_la_resolucion",
+  "schema_version": 1
+}

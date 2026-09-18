@@ -1,0 +1,23 @@
+{
+  "case_id": "CASE-003",
+  "title": "Un ResourceSet expandido se detecta y no concede autonomía",
+  "category": "RESOURCE_CONTAINMENT",
+  "description": "Garantía: pedir un recurso que el envelope autorizado no contiene —mongodb con la arquitectura en postgres— es EXPANDED aunque el Planner declare LOW y LEVEL_0_AUTONOMOUS. La petición estructurada es una petición, nunca una autorización: el recurso se enumera y la autonomía queda denegada.",
+  "input": {
+    "scenario": "resource_expansion_is_detected",
+    "params": {
+      "resource": "datastore:mongodb"
+    }
+  },
+  "expected": {
+    "containment_compatibility": "EXPANDED",
+    "autonomous": false,
+    "expanded_resources_contains": ["datastore:mongodb"],
+    "expanded_dimensions_contains": ["datastore"],
+    "resource_tokens_contains": ["datastore:mongodb"]
+  },
+  "tags": ["containment", "envelope", "f633"],
+  "source": "tests/test_project_replan_capability_containment.py::test_a1_pedir_un_almacen_no_autorizado_no_concede_autonomia",
+  "schema_version": 1,
+  "related_failure": "F633"
+}

@@ -1,0 +1,23 @@
+{
+  "case_id": "CASE-010",
+  "title": "Sin experiencia relevante el motor se comporta como siempre",
+  "category": "MEMORY",
+  "description": "Garantía: la memoria que no tiene nada que decir no cambia nada. Con PELL inyectada pero sin coincidencias, el nodo se resuelve igual que sin memoria: no hay bloque de conocimiento en la petición del child y la recuperación queda auditada como MISS.",
+  "input": {
+    "scenario": "memory_retrieval",
+    "params": {
+      "kind": "miss",
+      "problem": "reparar la contención de recursos del manifiesto go.mod"
+    }
+  },
+  "expected": {
+    "project_status": "COMPLETED",
+    "node_status": "COMPLETED",
+    "memory_in_context": false,
+    "retrieval_status": "MISS",
+    "audit_events_contains": ["PELL_RETRIEVAL_STARTED", "PELL_RETRIEVAL_MISS"]
+  },
+  "tags": ["pell", "memoria", "miss"],
+  "source": "tests/test_pell_retrieval_loop.py::test_t1b_memoria_sin_experiencia_relevante_es_un_miss",
+  "schema_version": 1
+}

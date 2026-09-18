@@ -1,0 +1,26 @@
+{
+  "case_id": "CASE-004",
+  "title": "Un require de go.mod en una línea no produce contención falsa",
+  "category": "RESOURCE_CONTAINMENT",
+  "description": "Garantía (AUD-T-01): un go.mod que añade una dependencia no autorizada se detecta y el nodo no se adopta, nunca se declara CONTAINED sobre un diff que introduce un paquete ajeno al envelope. La forma de una línea del require es la que producía el falso CONTAINED, así que el caso la fija como comportamiento prohibido.",
+  "input": {
+    "scenario": "go_mod_dependency_unproven",
+    "params": {
+      "variant": "una-linea"
+    }
+  },
+  "expected": {
+    "project_status": "BLOCKED",
+    "project_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "node_status": "BLOCKED",
+    "node_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "accepted_revision_advanced": false,
+    "replanner_calls": 0,
+    "resource_tokens_contains": ["package:go.mongodb.org/mongo-driver"]
+  },
+  "tags": ["go.mod", "parser", "aud-t-01", "containment"],
+  "source": "tests/test_project_replan_go_mod_containment.py::test_e2e_una_dependencia_go_no_autorizada_no_se_adopta",
+  "schema_version": 1,
+  "related_failure": "AUD-T-01",
+  "related_memory": "experiencia PELL del problema «reparar la contención de recursos del manifiesto go.mod»"
+}

@@ -1,0 +1,24 @@
+{
+  "case_id": "CASE-012",
+  "title": "Una experiencia FAILED advierte del enfoque que ya falló",
+  "category": "MEMORY",
+  "description": "Garantía: la memoria que recuerda un fracaso lo entrega identificado como tal, para que la resolución no repita el camino conocido. La experiencia fallida y relevante llega en el contexto real bajo la marca de enfoque fallido conocido, junto a su causa, y el nodo se resuelve igual.",
+  "input": {
+    "scenario": "memory_retrieval",
+    "params": {
+      "kind": "failed",
+      "problem": "reparar la contención de recursos del manifiesto go.mod"
+    }
+  },
+  "expected": {
+    "project_status": "COMPLETED",
+    "node_status": "COMPLETED",
+    "memory_in_context": true,
+    "retrieval_status": "HIT",
+    "context_markers_contains": ["PRIOR FAILED EXPERIENCE", "KNOWN FAILED APPROACH"]
+  },
+  "tags": ["pell", "memoria", "failed"],
+  "source": "tests/test_pell_retrieval_loop.py::test_t3_la_experiencia_fallida_llega_identificada_como_fallo",
+  "schema_version": 1,
+  "related_memory": "problem: reparar la contención de recursos del manifiesto go.mod"
+}

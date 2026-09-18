@@ -1,0 +1,24 @@
+{
+  "case_id": "CASE-011",
+  "title": "Una experiencia VERIFIED llega como conocimiento, no como autoridad",
+  "category": "MEMORY",
+  "description": "Garantía: la memoria aconseja. Una experiencia verificada y relevante viaja en el contexto real de resolución etiquetada como enfoque exitoso conocido, y el nodo se resuelve sin que el conocimiento cambie la acción, el riesgo, la autoridad, el presupuesto, los ficheros autorizados ni los criterios de aceptación.",
+  "input": {
+    "scenario": "memory_retrieval",
+    "params": {
+      "kind": "verified",
+      "problem": "reparar la contención de recursos del manifiesto go.mod"
+    }
+  },
+  "expected": {
+    "project_status": "COMPLETED",
+    "node_status": "COMPLETED",
+    "memory_in_context": true,
+    "retrieval_status": "HIT",
+    "context_markers_contains": ["PRIOR VERIFIED EXPERIENCE", "KNOWN SUCCESSFUL APPROACH"]
+  },
+  "tags": ["pell", "memoria", "verified", "human-gate"],
+  "source": "tests/test_pell_retrieval_loop.py::test_t2_la_experiencia_verificada_llega_al_contexto_real",
+  "schema_version": 1,
+  "related_memory": "problem: reparar la contención de recursos del manifiesto go.mod"
+}

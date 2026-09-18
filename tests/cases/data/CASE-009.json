@@ -1,0 +1,23 @@
+{
+  "case_id": "CASE-009",
+  "title": "Una llamada de shell con efecto no probado falla cerrado",
+  "category": "FAIL_CLOSED",
+  "description": "Garantía: un comando cuyo efecto no se puede demostrar no se adopta. La existencia de subprocess no es peligrosa ni segura por sí misma: el comando se juzga contra la frontera de ejecución del motor y, sin prueba de que esté acotado, el nodo se bloquea y la revisión aceptada no avanza.",
+  "input": {
+    "scenario": "unproven_shell_effect",
+    "params": {
+      "line": "subprocess.run([\"docker\", \"compose\", \"up\"])"
+    }
+  },
+  "expected": {
+    "project_status": "BLOCKED",
+    "project_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "node_status": "BLOCKED",
+    "node_failure_code": "PROJECT_NODE_ARCHITECTURE_VIOLATION",
+    "accepted_revision_advanced": false
+  },
+  "tags": ["effect-authority", "shell", "fail-closed", "f633"],
+  "source": "tests/test_project_replan_terminal_matrix.py::test_f2_una_llamada_de_shell_no_acotada_falla_cerrado",
+  "schema_version": 1,
+  "related_failure": "F633"
+}

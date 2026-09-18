@@ -1,0 +1,23 @@
+{
+  "case_id": "CASE-002",
+  "title": "Un reintento táctico legítimo sigue adelante sin sobrebloqueo",
+  "category": "AUTHORITY",
+  "description": "Garantía: la barrera de autoridad no es un muro. Un reintento del mismo nodo con otra estrategia técnica dentro del mismo contrato, el mismo alcance y los mismos criterios se adopta en autonomía: el proyecto activa la generación 1 y cierra COMPLETED con una sola propuesta pagada.",
+  "input": {
+    "scenario": "tactical_replan_is_adopted",
+    "params": {}
+  },
+  "expected": {
+    "project_status": "COMPLETED",
+    "project_failure_code": null,
+    "generations": 2,
+    "active_generation_index": 1,
+    "replans_accepted": 1,
+    "gate_required": false,
+    "replanner_calls": 1
+  },
+  "tags": ["replan", "control-positivo", "f632"],
+  "source": "tests/test_project_replan_fail_closed.py::test_i_control_positivo_tactico_sigue_siendo_autonomo",
+  "schema_version": 1,
+  "related_failure": "F632"
+}

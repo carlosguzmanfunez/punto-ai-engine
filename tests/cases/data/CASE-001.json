@@ -1,0 +1,30 @@
+{
+  "case_id": "CASE-001",
+  "title": "Un cambio de diseño declarado como táctico no se adopta en autonomía",
+  "category": "AUTHORITY",
+  "description": "Garantía: una replanificación que cambia el diseño del proyecto —sustituir el motor de datos— no se adopta sola, aunque la propuesta se declare LOW y LEVEL_0_AUTONOMOUS, escriba el mismo fichero y conserve los criterios. La clase de cambio la deriva el motor del texto y el proyecto espera a una persona con la generación original gobernando.",
+  "input": {
+    "scenario": "architectural_change_is_not_adopted",
+    "params": {
+      "objective": "Use CockroachDB instead of the current store"
+    }
+  },
+  "expected": {
+    "project_status": "HUMAN_APPROVAL",
+    "project_failure_code": null,
+    "generations": 1,
+    "active_generation_index": 0,
+    "replans_accepted": 0,
+    "gate_required": true,
+    "replanner_calls": 1,
+    "change_class": "DATASTORE_CHANGE",
+    "audit_events_contains": [
+      "PROJECT_REPLAN_CHANGE_CLASSIFIED",
+      "PROJECT_REPLAN_APPROVAL_REQUESTED"
+    ]
+  },
+  "tags": ["replan", "change-class", "human-gate", "f632"],
+  "source": "tests/test_project_replan_fail_closed.py::test_f_kernel_no_adopta_un_cambio_de_motor",
+  "schema_version": 1,
+  "related_failure": "F632"
+}

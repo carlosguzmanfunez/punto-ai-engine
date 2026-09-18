@@ -32,7 +32,7 @@ version: "0.1.0"
 providers:
   openai:
     enabled: true
-    model: "gpt-5-codex"
+    model: "gpt-5.6-sol"
     # Cliente oficial de OpenAI con la cuenta ChatGPT. Alternativa explicita: transport: "api"
     transport: "codex"
     auth_mode: "chatgpt"

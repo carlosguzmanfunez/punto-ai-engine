@@ -328,8 +328,10 @@ def test_t9_los_secretos_viven_fuera_del_repositorio(
 
     assert ruta.is_file()
     assert ruta == tmp_path / "secrets.json"
-    assert "Desktop" not in str(ruta) or "punto-ai-engine" not in str(ruta).lower() or True
-    assert Path("src") not in ruta.parents or True
+    repositorio = Path(__file__).resolve().parents[1]
+    assert not ruta.resolve().is_relative_to(repositorio), (
+        "el almacén de secretos nunca vive dentro del repositorio"
+    )
     contenido = ruta.read_text(encoding="utf-8")
     assert TEST_KEY in contenido, "el almacén es el único sitio donde vive la clave"
     assert SecretStore(ruta).has_api_key("deepseek") is True

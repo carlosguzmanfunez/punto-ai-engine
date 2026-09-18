@@ -4203,6 +4203,79 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_pell_retrieval(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        status: str,
+        detail: str = "",
+        verified_count: int = 0,
+        failed_count: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra una consulta a la memoria de experiencia antes de resolver un nodo (PELL-1).
+
+        ``status`` es ``HIT``, ``MISS``, ``FAILED`` o ``DISABLED``. Un fallo de la memoria no cambia
+        la resolución: queda auditado como ``PELL_RETRIEVAL_FAILED`` y el motor continúa sin
+        conocimiento previo.
+        """
+        mapping = {
+            "STARTED": (AuditEventType.PELL_RETRIEVAL_STARTED, AuditResult.PENDING),
+            "HIT": (AuditEventType.PELL_RETRIEVAL_HIT, AuditResult.SUCCESS),
+            "MISS": (AuditEventType.PELL_RETRIEVAL_MISS, AuditResult.SUCCESS),
+            "FAILED": (AuditEventType.PELL_RETRIEVAL_FAILED, AuditResult.FAILURE),
+            "DISABLED": (AuditEventType.PELL_RETRIEVAL_MISS, AuditResult.PENDING),
+        }
+        event_type, result = mapping.get(status, mapping["MISS"])
+        return self._project_event(
+            event_type,
+            action="pell_retrieval",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status=status,
+            result=result,
+            detail=detail,
+            metadata={
+                "retrieved_verified_count": verified_count,
+                "retrieved_failed_count": failed_count,
+            },
+            actor=actor,
+        )
+
+    def log_pell_experience_recorded(
+        self,
+        *,
+        project_run_id: UUID,
+        project_id: UUID,
+        node_id: str,
+        experience_id: str,
+        experience_status: str,
+        detail: str = "",
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el resultado de un nodo se guardó como experiencia (PELL-1).
+
+        La memoria **aconseja**: este evento deja constancia de qué se aprendió, no de qué se
+        autorizó. La autoridad sigue siendo del motor.
+        """
+        return self._project_event(
+            AuditEventType.PELL_EXPERIENCE_RECORDED,
+            action="pell_experience_recorded",
+            project_run_id=project_run_id,
+            project_id=project_id,
+            node_id=node_id,
+            status=experience_status,
+            detail=detail,
+            metadata={
+                "experience_id": experience_id,
+                "experience_status": experience_status,
+            },
+            actor=actor,
+        )
+
     def log_project_node_architecture_violation(
         self,
         *,

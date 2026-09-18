@@ -28,18 +28,40 @@ from punto.memory.experience import (
     problem_fingerprint,
     tokens,
 )
+from punto.memory.retrieval import (
+    MAX_FAILED_EXPERIENCES,
+    MAX_VERIFIED_EXPERIENCES,
+    MemoryQuery,
+    MemoryRetriever,
+    PriorExperienceContext,
+    RetrievalOutcome,
+    RetrievalStatus,
+    build_memory_query,
+    merge_context,
+    render_experience_block,
+)
 from punto.memory.store import ExperienceStore, default_memory_path
 
 __all__ = [
     "EXPERIENCE_SCHEMA_VERSION",
+    "MAX_FAILED_EXPERIENCES",
+    "MAX_VERIFIED_EXPERIENCES",
     "ExperienceMemory",
     "ExperienceResult",
     "ExperienceSchemaError",
     "ExperienceSecretError",
     "ExperienceStatus",
     "ExperienceStore",
+    "MemoryQuery",
+    "MemoryRetriever",
+    "PriorExperienceContext",
+    "RetrievalOutcome",
+    "RetrievalStatus",
     "assert_no_secrets",
+    "build_memory_query",
     "default_memory_path",
+    "merge_context",
     "problem_fingerprint",
+    "render_experience_block",
     "tokens",
 ]

@@ -58,6 +58,19 @@ from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from punto.common import utc_now
+from punto.memory.experience import (
+    ExperienceMemory,
+    ExperienceResult,
+    ExperienceStatus,
+    tokens,
+)
+from punto.memory.retrieval import (
+    MemoryRetriever,
+    RetrievalOutcome,
+    build_memory_query,
+    merge_context,
+)
+from punto.memory.store import ExperienceStore
 from punto.policy.human_gate import HumanApprovalProof, ReplanApprovalProof
 from punto.policy.policy_engine import PolicyEvaluationContext
 from punto.project.budget import (
@@ -160,7 +173,13 @@ from punto.schemas.replan import (
     ReplanApprovalBinding,
     ReplanInvocationAuthorization,
 )
-from punto.schemas.workflow import ArtifactReference, RoleName, WorkflowRequest, WorkflowRun
+from punto.schemas.workflow import (
+    MAX_WORKFLOW_CONTEXT_CHARS,
+    ArtifactReference,
+    RoleName,
+    WorkflowRequest,
+    WorkflowRun,
+)
 from punto.workflow.artifacts import ArtifactStore
 from punto.workflow.errors import WorkflowError
 from punto.workflow.handoff import DEVELOPER_KIND, resolve_developer, resolve_plan
@@ -415,6 +434,7 @@ class ProjectExecutionKernel:
         guard: ProjectReplanGuard | None = None,
         policy: WorkflowPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
+        memory: ExperienceStore | None = None,
     ) -> None:
         """Construye el kernel con sus dependencias durables.
 
@@ -451,6 +471,11 @@ class ProjectExecutionKernel:
         self._artifacts = artifacts
         self._lineage = lineage
         self._audit = audit
+        #: Memoria de experiencia (PELL-1). Sin memoria inyectada, el kernel se comporta igual que
+        #: antes de PELL: la memoria es opcional y nunca autoridad.
+        self._memory = memory
+        self._retriever = MemoryRetriever(memory)
+        self._prior_experience_cache: dict[str, RetrievalOutcome] = {}
         self._machine = machine or ProjectStateMachine()
         self._guard = guard
         self._policy = policy
@@ -900,7 +925,7 @@ class ProjectExecutionKernel:
         proceso murió a mitad del child, el mismo ``workflow_id`` continúa el mismo run en vez de
         crear otro.
         """
-        child = self._workflow.run_all(self._child_request(run, node_run, node))
+        child = self._workflow.run_all(self._with_prior_experience(run, node_run, node))
         if not existed and self._audit is not None:
             self._audit.log_project_child_workflow_created(
                 project_run_id=run.project_run_id,
@@ -1087,6 +1112,10 @@ class ProjectExecutionKernel:
             completed=accepted,
         )
         run = run.with_node(settled)
+        # PELL-1: el resultado del nodo vuelve a la memoria como experiencia (nunca como autoridad).
+        self._record_experience(
+            run, node_run, node, settled, accepted=accepted, rejection=rejection
+        )
         run = run.model_copy(
             update={
                 "workspace": run.workspace.model_copy(
@@ -2945,6 +2974,170 @@ class ProjectExecutionKernel:
             budget=budget,
             evidence_references=evidence,
         )
+
+    def _with_prior_experience(
+        self, run: ProjectRun, node_run: ProjectNodeRun, node: GraphNode
+    ) -> WorkflowRequest:
+        """Entrega el conocimiento previo de PELL al contexto del child (PELL-1).
+
+        Es el **único** punto de recuperación del motor: la petición del child se construye aquí,
+        justo antes de que el workflow resuelva el nodo, y la memoria solo aporta texto de contexto.
+        Si no hay memoria inyectada, no hay experiencia relevante o la memoria falla, la petición
+        sale exactamente como antes de PELL: el motor no cambia su comportamiento.
+
+        La recuperación se memoiza por nodo para que la petición sea **idéntica** en cada
+        reconstrucción —de su huella depende la idempotencia del child—: durante la vida de un nodo
+        la memoria no cambia, porque solo se escribe al liquidar nodos.
+        """
+        request = self._child_request(run, node_run, node)
+        outcome = self._prior_experience(run, node_run, node)
+        if not outcome.context.rendered:
+            return request
+        summary = merge_context(
+            request.context_summary, outcome.context.rendered, limit=MAX_WORKFLOW_CONTEXT_CHARS
+        )
+        return request.model_copy(update={"context_summary": summary})
+
+    def _prior_experience(
+        self, run: ProjectRun, node_run: ProjectNodeRun, node: GraphNode
+    ) -> RetrievalOutcome:
+        """Consulta la memoria una vez por nodo y audita el intento con su resultado."""
+        cached = self._prior_experience_cache.get(node_run.node_id)
+        if cached is not None:
+            return cached
+        query = build_memory_query(
+            objective=node.objective,
+            action=run.request.action,
+            files=node.allowed_files,
+            context=run.request.objective,
+        )
+        if self._audit is not None and self._retriever.enabled:
+            self._audit.log_pell_retrieval(
+                project_run_id=run.project_run_id,
+                project_id=run.project_id,
+                node_id=node_run.node_id,
+                status="STARTED",
+                detail=query.describe(),
+            )
+        outcome = self._retriever.retrieve(query)
+        self._prior_experience_cache[node_run.node_id] = outcome
+        if self._audit is not None and self._retriever.enabled:
+            verified, failed = outcome.context.counts
+            self._audit.log_pell_retrieval(
+                project_run_id=run.project_run_id,
+                project_id=run.project_id,
+                node_id=node_run.node_id,
+                status=outcome.status.value,
+                detail=outcome.detail,
+                verified_count=verified,
+                failed_count=failed,
+            )
+        return outcome
+
+    def _record_experience(
+        self,
+        run: ProjectRun,
+        node_run: ProjectNodeRun,
+        node: GraphNode,
+        settled: ProjectNodeRun,
+        *,
+        accepted: bool,
+        rejection: _Rejection | None,
+    ) -> None:
+        """Registra el resultado del nodo como experiencia (PELL-1).
+
+        Lo que se guarda son **hechos del motor**: si el parent aceptó el nodo, con qué revisión y
+        con qué verificación; o por qué lo rechazó. ``VERIFIED`` exige un cambio demostrable
+        (revisión aceptada que avanza y handoff publicado): un nodo aceptado sin evidencia queda
+        ``CANDIDATE`` y nunca se declara verificado por lo que diga un agente. Un fallo queda
+        ``FAILED`` con su causa.
+
+        La memoria no puede tumbar la resolución: cualquier error al registrar se ignora.
+        """
+        if self._memory is None:
+            return
+        revision_after = settled.accepted_revision_after
+        revision_before = settled.accepted_revision_before
+        demonstrated = accepted and bool(settled.handoff_ref) and revision_after != revision_before
+        reason = settled.failure_detail or (
+            f"el nodo terminó {settled.child_status}" if not accepted else ""
+        )
+        try:
+            if accepted and demonstrated:
+                experience = ExperienceMemory(
+                    problem=node.objective,
+                    context=run.request.objective,
+                    attempts=(f"nodo {node_run.node_id}: {node.title or node.objective}",),
+                    solution=(
+                        "el plan autorizado del nodo se completó y el parent lo aceptó en la "
+                        f"revisión {revision_after}"
+                    ),
+                    procedure=(
+                        *node.acceptance_criteria,
+                        "aceptación del parent: alcance, criterios, riesgo, autoridad y "
+                        "arquitectura",
+                    ),
+                    result=ExperienceResult.SUCCESS,
+                    verification=(
+                        "el parent aceptó el nodo: sin violación de alcance ni de arquitectura",
+                        f"revisión aceptada {revision_after}",
+                        "handoff del nodo publicado",
+                    ),
+                    tags=self._experience_tags(run, node, code=""),
+                    status=ExperienceStatus.VERIFIED,
+                )
+            elif accepted:
+                experience = ExperienceMemory(
+                    problem=node.objective,
+                    context=run.request.objective,
+                    attempts=(f"nodo {node_run.node_id}: {node.title or node.objective}",),
+                    solution="el parent aceptó el nodo, pero no hay un cambio demostrable",
+                    procedure=tuple(node.acceptance_criteria),
+                    verification=("aceptación del parent sin revisión nueva",),
+                    tags=self._experience_tags(run, node, code=""),
+                    status=ExperienceStatus.CANDIDATE,
+                )
+            else:
+                code = rejection.code.value if rejection is not None else settled.child_status
+                experience = ExperienceMemory(
+                    problem=node.objective,
+                    context=run.request.objective,
+                    attempts=(
+                        f"nodo {node_run.node_id}: {node.title or node.objective}",
+                        f"child terminó {settled.child_status}",
+                    ),
+                    failure_reason=reason or "el nodo no fue aceptado",
+                    result=ExperienceResult.FAILED,
+                    verification=(f"el motor rechazó el nodo: {code}",),
+                    tags=self._experience_tags(run, node, code=str(code)),
+                    status=ExperienceStatus.FAILED,
+                )
+            stored = self._memory.add(experience)
+        except Exception:
+            # La memoria es opcional y no puede interrumpir la resolución.
+            return
+        if self._audit is not None:
+            self._audit.log_pell_experience_recorded(
+                project_run_id=run.project_run_id,
+                project_id=run.project_id,
+                node_id=node_run.node_id,
+                experience_id=stored.id,
+                experience_status=stored.status.value,
+                detail=stored.describe(),
+            )
+
+    @staticmethod
+    def _experience_tags(run: ProjectRun, node: GraphNode, *, code: str) -> tuple[str, ...]:
+        """Etiquetas deterministas de la experiencia: acción, ficheros y código del veredicto."""
+        query = build_memory_query(
+            objective=node.objective,
+            action=run.request.action,
+            files=node.allowed_files,
+        )
+        tags = list(query.tags)
+        if code:
+            tags.extend(tokens(code))
+        return tuple(dict.fromkeys(tags))
 
     def _child_or_none(self, child_workflow_id: UUID | None) -> WorkflowRun | None:
         """Child del nodo, o ``None`` si todavía no existe en el almacén de checkpoints."""

@@ -30,6 +30,7 @@ import pytest
 
 from project_support import FAKE_REVISION, ChildOutcome, FollowProjectLineage
 from punto.audit.logger import AuditLogger
+from punto.memory.store import ExperienceStore
 from punto.planner.base import PlannerLimits
 from punto.policy.config_loader import find_config_dir
 from punto.policy.human_gate import HumanGate
@@ -288,12 +289,18 @@ def replan_kernel(
     audit: AuditLogger | None = None,
     policy: WorkflowPolicy | None = None,
     with_policy: bool = True,
+    memory: ExperienceStore | None = None,
 ) -> ProjectExecutionKernel:
-    """Kernel del proyecto con la frontera del replan inyectada y auditoría observable."""
+    """Kernel del proyecto con la frontera del replan inyectada y auditoría observable.
+
+    ``memory`` inyecta la memoria de experiencia (PELL-1); sin ella el kernel se comporta como
+    antes.
+    """
     return harnessed.kernel(
         audit=audit if audit is not None else AuditLogger(),
         replanner=replanner,
         policy=(policy if policy is not None else workflow_policy()) if with_policy else None,
+        memory=memory,
     )
 
 

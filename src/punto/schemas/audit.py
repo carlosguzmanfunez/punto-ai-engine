@@ -232,6 +232,16 @@ class AuditEventType(StrEnum):
     PROJECT_NODE_UNDECLARED_CHANGE = "PROJECT_NODE_UNDECLARED_CHANGE"
     #: Un nodo fue sustituido por una replanificación: conserva su historia y su gasto.
     PROJECT_NODE_SUPERSEDED = "PROJECT_NODE_SUPERSEDED"
+    #: PELL-1: el motor consulta la memoria de experiencia antes de preparar un nodo.
+    PELL_RETRIEVAL_STARTED = "PELL_RETRIEVAL_STARTED"
+    #: PELL-1: la consulta encontró conocimiento previo relevante.
+    PELL_RETRIEVAL_HIT = "PELL_RETRIEVAL_HIT"
+    #: PELL-1: la consulta no encontró nada relevante; el flujo sigue igual.
+    PELL_RETRIEVAL_MISS = "PELL_RETRIEVAL_MISS"
+    #: PELL-1: la memoria no estuvo disponible; el motor continúa sin conocimiento previo.
+    PELL_RETRIEVAL_FAILED = "PELL_RETRIEVAL_FAILED"
+    #: PELL-1: el resultado de un nodo se registró como experiencia nueva.
+    PELL_EXPERIENCE_RECORDED = "PELL_EXPERIENCE_RECORDED"
 
 
 class AuditEvent(BaseModel):

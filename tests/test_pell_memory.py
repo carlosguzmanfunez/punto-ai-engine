@@ -285,7 +285,7 @@ def test_la_verificacion_se_conserva(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "texto",
     (
-        "usar la clave sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF",
+        "usar la clave sk-ant-api03-TEST-CANARY-0123456789abcdef",
         "configurar DATABASE_URL=postgres://admin:s3cretpass@db.internal/core",
         "Authorization: Bearer abcdef0123456789abcdef0123456789",
         "token=9f3a7c1b5d2e8f4a6c0b9d3e7f1a5c8b",

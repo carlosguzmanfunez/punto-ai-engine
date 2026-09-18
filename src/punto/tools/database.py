@@ -190,6 +190,62 @@ _ENUM_CREATE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+#: Lista de columnas de una restricción: identificadores separados por comas.
+_IDENT_LIST: Final[str] = rf"{_PG_IDENTIFIER}(?:\s*,\s*{_PG_IDENTIFIER})*"
+
+#: Acciones referenciales admitidas por PostgreSQL en una clave ajena.
+_REFERENTIAL_ACTION: Final[str] = r"(?:NO\s+ACTION|RESTRICT|CASCADE|SET\s+NULL|SET\s+DEFAULT)"
+
+#: Cabecera de una clave ajena añadida con ``ALTER TABLE``: la única forma de ``ADD CONSTRAINT``
+#: que el motor admite, porque es **aditiva** (no puede perder datos).
+_FK_HEAD: Final[re.Pattern[str]] = re.compile(
+    rf"^ALTER\s+TABLE\s+{_PG_QUALIFIED}\s+ADD\s+CONSTRAINT\s+{_PG_IDENTIFIER}\s+"
+    rf"FOREIGN\s+KEY\s*\({_IDENT_LIST}\)\s+REFERENCES\s+{_PG_QUALIFIED}\s*\({_IDENT_LIST}\)",
+    re.IGNORECASE,
+)
+
+#: Cláusulas que pueden seguir a una clave ajena: ``ON DELETE`` y ``ON UPDATE``, una vez cada una.
+_FK_TAIL: Final[re.Pattern[str]] = re.compile(
+    rf"^(?:\s+ON\s+(?P<kind>DELETE|UPDATE)\s+(?P<action>{_REFERENTIAL_ACTION}))", re.IGNORECASE
+)
+
+#: Texto que puede quedar al final de una sentencia ya completa.
+_TRAILING: Final[re.Pattern[str]] = re.compile(r"^\s*;?\s*$")
+
+def _classify_add_foreign_key(normalized: str) -> tuple[SqlClassification, str]:
+    """Clasifica ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...``.
+
+    Se analiza de forma estructural: cabecera exacta (tabla, nombre, columnas locales, tabla y
+    columnas referenciadas) y, después, sólo las cláusulas ``ON DELETE``/``ON UPDATE`` con acciones
+    admitidas y **una vez cada una**. Cualquier otra cosa (``CHECK``, ``UNIQUE``, ``PRIMARY KEY``,
+    ``NOT VALID``, ``DEFERRABLE``, una segunda restricción en la misma sentencia, texto sobrante) no
+    encaja y la sentencia queda como ``UNKNOWN``.
+    """
+    cabecera = _FK_HEAD.match(normalized)
+    if cabecera is None:
+        return (
+            SqlClassification.UNKNOWN,
+            "ADD CONSTRAINT no admitido: sólo FOREIGN KEY con REFERENCES e identificadores válidos",
+        )
+    resto = normalized[cabecera.end() :]
+    vistas: set[str] = set()
+    while True:
+        clausula = _FK_TAIL.match(resto)
+        if clausula is None:
+            break
+        tipo = clausula.group("kind").upper()
+        if tipo in vistas:
+            return SqlClassification.UNKNOWN, f"cláusula ON {tipo} repetida en la clave ajena"
+        vistas.add(tipo)
+        resto = resto[clausula.end() :]
+    if not _TRAILING.match(resto):
+        return (
+            SqlClassification.UNKNOWN,
+            "texto no admitido tras la clave ajena (opciones no soportadas)",
+        )
+    acciones = f" con {' y '.join(sorted(f'ON {tipo}' for tipo in vistas))}" if vistas else ""
+    return SqlClassification.SAFE_DDL, f"clave ajena aditiva{acciones}"
+
 
 def _parse_enum_values(values: str) -> tuple[str, ...] | None:
     """Interpreta la lista de valores de un ``ENUM``.
@@ -565,8 +621,15 @@ def _classify_normalized(normalized: str) -> tuple[SqlClassification, str]:
     if words[0] == "ALTER":
         if words[1:2] != ("TABLE",):
             return SqlClassification.UNKNOWN, "sólo se admite ALTER TABLE aditivo"
+        if " add constraint" in padded or " add  constraint" in padded:
+            # Única forma admitida de ADD CONSTRAINT: una clave ajena completa y bien formada.
+            # CHECK, UNIQUE, PRIMARY KEY y las opciones no soportadas quedan denegadas.
+            return _classify_add_foreign_key(normalized)
         if " add column" not in padded and " add  column" not in padded:
-            return SqlClassification.UNKNOWN, "sólo se admite ADD COLUMN"
+            return (
+                SqlClassification.UNKNOWN,
+                "sólo se admite ADD COLUMN o ADD CONSTRAINT FOREIGN KEY",
+            )
         for forbidden in (" rename", " alter column", " add constraint", " set ", " owner"):
             if forbidden in padded:
                 return SqlClassification.UNKNOWN, f"ALTER TABLE con '{forbidden.strip()}'"

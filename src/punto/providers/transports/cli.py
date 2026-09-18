@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from punto.providers.transport import (
     DEFAULT_TRANSPORT_TIMEOUT_SECONDS,
     ProviderTransport,
     RealSubprocessRunner,
+    StdinSubprocessRunner,
     SubprocessRunner,
     TransportAuthStatus,
     TransportError,
@@ -50,7 +52,17 @@ class CliTransport(ProviderTransport):
     Los subtipos declaran el binario, los ``argv`` oficiales y cómo leer la salida. Esta clase
     resuelve lo demás: ejecutar sin shell, aplicar timeout, clasificar el fallo y recordar el último
     estado de uso observado (que es lo único que se puede afirmar sin inventar métricas).
+
+    El prompt puede viajar de dos formas: como último argumento (por defecto) o por la **entrada
+    estándar** (``prompt_via_stdin``). La segunda existe por un defecto real medido en Windows
+    (PILOT-01R · R1): un cliente oficial instalado por npm es un ``.cmd`` y Windows interpone
+    ``cmd.exe``, que reparsea la línea de comandos, **corta el argumento en el primer salto de
+    línea** y expande ``%VARIABLE%``. Por ``stdin`` el prompt llega íntegro y el shell no lo
+    interpreta.
     """
+
+    #: Si es ``True``, el prompt se entrega por la entrada estándar en vez de por el ``argv``.
+    prompt_via_stdin: bool = False
 
     def __init__(
         self,
@@ -104,8 +116,28 @@ class CliTransport(ProviderTransport):
         raise NotImplementedError
 
     def execution_argv(self, prompt: str) -> tuple[str, ...]:
-        """``argv`` oficial de una ejecución no interactiva."""
+        """``argv`` oficial de una ejecución no interactiva, **con** el prompt.
+
+        Es la forma completa del comando, útil para inspección y auditoría. Lo que se ejecuta de
+        verdad lo decide :meth:`delivery_argv`: si el transporte entrega el prompt por ``stdin``,
+        el ``argv`` no lo lleva.
+        """
+        return (*self.prompt_argv(), prompt)
+
+    def prompt_argv(self) -> tuple[str, ...]:
+        """``argv`` de una ejecución no interactiva, **sin** el prompt."""
         raise NotImplementedError
+
+    def delivery_argv(self, prompt: str) -> tuple[str, ...]:
+        """``argv`` que se ejecuta realmente: sin el prompt si éste viaja por ``stdin``."""
+        if self.prompt_via_stdin and self._stdin_runner() is not None:
+            return self.prompt_argv()
+        return self.execution_argv(prompt)
+
+    def _stdin_runner(self) -> StdinSubprocessRunner | None:
+        """Runner con entrega por ``stdin``, si el inyectado lo soporta."""
+        candidate = getattr(self._runner, "run_with_stdin", None)
+        return cast("StdinSubprocessRunner", self._runner) if callable(candidate) else None
 
     def installed(self) -> bool:
         """True si el binario oficial responde a ``--version``."""
@@ -151,7 +183,7 @@ class CliTransport(ProviderTransport):
         Raises:
             TransportError: si el binario no está, si se agotó el tiempo o si el proceso falló.
         """
-        process = self._run(self.execution_argv(prompt))
+        process = self._run_prompt(prompt)
         if process.not_installed:
             raise TransportError(
                 TransportErrorKind.NOT_INSTALLED,
@@ -180,6 +212,26 @@ class CliTransport(ProviderTransport):
                 f"{clip_text(process.stderr or process.stdout, 400)}",
             )
         return process
+
+    def _run_prompt(self, prompt: str) -> TransportProcess:
+        """Lanza la ejecución no interactiva del prompt por la vía que declare el transporte.
+
+        Si ``prompt_via_stdin`` está activo y el runner sabe entregar entrada estándar, el prompt
+        viaja por ahí (íntegro, sin reparseo del shell); en cualquier otro caso viaja como el último
+        argumento del ``argv``, que es el comportamiento histórico.
+        """
+        stdin_runner = self._stdin_runner()
+        if self.prompt_via_stdin and stdin_runner is not None:
+            process = stdin_runner.run_with_stdin(
+                self.prompt_argv(),
+                timeout=self._timeout_seconds,
+                stdin_text=prompt,
+                env=build_environment(),
+            )
+            if process.not_installed:
+                self._last_auth = TransportAuthStatus.NOT_INSTALLED
+            return process
+        return self._run(self.execution_argv(prompt))
 
     def _run(self, argv: Sequence[str]) -> TransportProcess:
         """Lanza el proceso con el entorno mínimo y clasifica los fallos de spawn.

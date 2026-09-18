@@ -188,6 +188,27 @@ class SubprocessRunner(Protocol):
         ...  # pragma: no cover - protocolo
 
 
+class StdinSubprocessRunner(Protocol):
+    """Runner que además sabe entregar texto por la **entrada estándar**.
+
+    Existe por un defecto real medido en Windows (PILOT-01R · R1): un cliente oficial instalado por
+    npm es un ``.cmd`` y, al lanzarlo, Windows interpone ``cmd.exe``, que **reparsea la línea de
+    comandos** y corta cualquier argumento en el primer salto de línea. Entregar el prompt por
+    ``stdin`` no pasa por ese reparseo: llega íntegro y no puede interpretarse como shell.
+    """
+
+    def run_with_stdin(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        stdin_text: str,
+        env: Mapping[str, str] | None = None,
+    ) -> TransportProcess:
+        """Ejecuta el proceso con ``stdin_text`` en su entrada estándar (UTF-8)."""
+        ...  # pragma: no cover - protocolo
+
+
 #: Variables de entorno que un cliente oficial necesita para encontrar su sesión y su binario.
 #: Todo lo demás se descarta: ninguna clave de API viaja a un proceso de suscripción.
 ENV_ALLOWLIST: Final[tuple[str, ...]] = (
@@ -321,6 +342,34 @@ class RealSubprocessRunner:
         ``PATHEXT`` por su cuenta. Si no se encuentra, se intenta igualmente el nombre lógico para
         que el fallo se clasifique como ``NOT_INSTALLED`` en vez de esconderse.
         """
+        return self._spawn(argv, timeout=timeout, env=env, stdin_text=None)
+
+    def run_with_stdin(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        stdin_text: str,
+        env: Mapping[str, str] | None = None,
+    ) -> TransportProcess:
+        """Ejecuta el proceso entregando ``stdin_text`` por la entrada estándar, en UTF-8.
+
+        Es la vía que **no** pasa por ``cmd.exe``: un cliente oficial instalado por npm es un
+        ``.cmd`` y Windows reparsea su línea de comandos, cortando cualquier argumento en el primer
+        salto de línea y expandiendo ``%VARIABLE%``. Por ``stdin`` el contenido llega íntegro y el
+        shell no lo interpreta.
+        """
+        return self._spawn(argv, timeout=timeout, env=env, stdin_text=stdin_text)
+
+    def _spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        env: Mapping[str, str] | None,
+        stdin_text: str | None,
+    ) -> TransportProcess:
+        """Lanza el proceso con (o sin) entrada estándar y normaliza el resultado."""
         arguments = tuple(argv)
         environment = build_environment() if env is None else dict(env)
         program = shutil.which(arguments[0], path=environment.get("PATH")) or arguments[0]
@@ -336,6 +385,7 @@ class RealSubprocessRunner:
                 shell=False,
                 check=False,
                 env=environment,
+                input=stdin_text,
             )
         except FileNotFoundError:
             return TransportProcess(

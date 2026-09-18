@@ -102,11 +102,11 @@ class ClaudeCodeTransport(CliTransport):
         """``argv`` oficial del estado de sesión."""
         return (self.binary, *AUTH_STATUS_ARGV)
 
-    def execution_argv(self, prompt: str) -> tuple[str, ...]:
-        """``argv`` de una ejecución no interactiva, sin shell y solo con opciones documentadas.
+    def prompt_argv(self) -> tuple[str, ...]:
+        """``argv`` de una ejecución no interactiva, **sin** el prompt.
 
-        El prompt viaja como argumento posicional al final, igual que en el resto de transportes:
-        una sola forma de construir el ``argv`` es una sola forma de auditarlo.
+        El prompt viaja como último argumento (``execution_argv`` lo añade): Claude Code no necesita
+        la vía de ``stdin`` que sí usa el transporte de Codex.
         """
         return (
             self.binary,
@@ -115,7 +115,6 @@ class ClaudeCodeTransport(CliTransport):
             "json",
             "--model",
             self.model,
-            prompt,
         )
 
     def capabilities(self) -> TransportCapabilities:

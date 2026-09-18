@@ -76,6 +76,10 @@ TEXT_KEYS: Final[tuple[str, ...]] = ("text", "message", "content", "output_text"
 class CodexTransport(CliTransport):
     """Ejecuta Codex con la sesión oficial de la cuenta ChatGPT."""
 
+    #: El prompt viaja por ``stdin``: en Windows el binario es un ``.cmd`` y ``cmd.exe`` trunca los
+    #: argumentos con saltos de línea (PILOT-01R · R1).
+    prompt_via_stdin: bool = True
+
     def __init__(
         self,
         *,
@@ -117,12 +121,13 @@ class CodexTransport(CliTransport):
         """``argv`` oficial del estado de sesión."""
         return (self.binary, *LOGIN_STATUS_ARGV)
 
-    def execution_argv(self, prompt: str) -> tuple[str, ...]:
-        """``argv`` de una ejecución no interactiva, sin shell y sin opciones inventadas.
+    def prompt_argv(self) -> tuple[str, ...]:
+        """``argv`` de una ejecución no interactiva, **sin** el prompt.
 
-        ``--sandbox read-only`` mantiene a Codex sin permiso de escritura: este transporte pide una
-        respuesta, no un cambio en el repositorio. ``--skip-git-repo-check`` permite ejecutarlo
-        fuera de un repositorio Git.
+        El prompt no viaja como argumento: se entrega por la entrada estándar. En Windows, ``codex``
+        es un ``.cmd`` de npm y Windows interpone ``cmd.exe``, que reparsea la línea de comandos y
+        corta el argumento en el primer salto de línea (defecto medido en PILOT-01R · R1). Por
+        ``stdin`` el prompt llega íntegro, sin reparseo y sin que el shell lo interprete.
         """
         return (
             self.binary,
@@ -133,8 +138,15 @@ class CodexTransport(CliTransport):
             "--skip-git-repo-check",
             "--model",
             self.model,
-            prompt,
         )
+
+    def execution_argv(self, prompt: str) -> tuple[str, ...]:
+        """``argv`` completo (con el prompt) para inspección y auditoría.
+
+        Lo que se ejecuta de verdad lo decide :meth:`delivery_argv`, que en este transporte omite el
+        prompt porque viaja por ``stdin``.
+        """
+        return (*self.prompt_argv(), prompt)
 
     def capabilities(self) -> TransportCapabilities:
         """Codex no interactivo trabaja con texto: sin imágenes por esta vía."""

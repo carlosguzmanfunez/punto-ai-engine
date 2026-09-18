@@ -212,6 +212,72 @@ _FK_TAIL: Final[re.Pattern[str]] = re.compile(
 #: Texto que puede quedar al final de una sentencia ya completa.
 _TRAILING: Final[re.Pattern[str]] = re.compile(r"^\s*;?\s*$")
 
+#: Funciones de PostgreSQL que **cambian estado** aunque aparezcan dentro de un ``SELECT``. La lista
+#: es corta y semántica, por categorías: escritura de secuencias (``setval``, ``nextval``),
+#: administración del servidor (``pg_terminate_backend``, ``pg_cancel_backend``, ``pg_reload_conf``,
+#: ``pg_create_restore_point``, ``pg_switch_wal``, ``pg_promote``), configuración de sesión
+#: (``set_config``), objetos grandes (``lo_unlink``), bloqueos y notificaciones de sesión
+#: (``pg_advisory_*``, ``pg_notify``).
+#:
+#: ``currval`` **no** está: consulta el valor de la sesión y no modifica nada. Una sentencia con
+#: cualquiera de estas funciones nunca es ``SAFE_READ``: queda como ``UNKNOWN`` (DENY), que es la
+#: frontera fail-closed que pide la fase.
+STATE_CHANGING_FUNCTIONS: Final[tuple[str, ...]] = (
+    "setval",
+    "nextval",
+    "set_config",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_create_restore_point",
+    "pg_switch_wal",
+    "pg_promote",
+    "pg_notify",
+    "lo_unlink",
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+)
+
+#: Llamada a una función que cambia estado: ``nombre(`` con espacios opcionales.
+_STATE_CHANGING_CALL: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:" + "|".join(STATE_CHANGING_FUNCTIONS) + r")\s*\(", re.IGNORECASE
+)
+
+#: Operación **gobernada** de sincronización de una secuencia tras un seed con identificadores
+#: explícitos (PILOT-01R · secuencias). ``RESTART`` exige el número: reiniciar sin valor volvería al
+#: inicio de la secuencia y podría chocar con filas existentes, así que no se admite.
+_ALTER_SEQUENCE_RESTART: Final[re.Pattern[str]] = re.compile(
+    rf"^ALTER\s+SEQUENCE\s+{_PG_QUALIFIED}\s+RESTART(?:\s+WITH)?\s+(?P<value>\d{{1,18}})\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _classify_alter_sequence(normalized: str) -> tuple[SqlClassification, str]:
+    """Clasifica ``ALTER SEQUENCE <id> RESTART [WITH] <entero>``.
+
+    Es la forma gobernada de alinear una secuencia después de un seed con identificadores
+    explícitos: no toca datos y no puede perderlos. El valor tiene que calcularlo el controlador a
+    partir de una lectura (``MAX(id)``), nunca el contenido no confiable de una propuesta.
+    """
+    coincidencia = _ALTER_SEQUENCE_RESTART.match(normalized)
+    if coincidencia is None:
+        return (
+            SqlClassification.UNKNOWN,
+            "ALTER SEQUENCE no admitido: sólo RESTART [WITH] <entero>",
+        )
+    return SqlClassification.SAFE_DDL, f"secuencia reiniciada en {coincidencia.group('value')}"
+
+
+
 def _classify_add_foreign_key(normalized: str) -> tuple[SqlClassification, str]:
     """Clasifica ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...``.
 
@@ -245,6 +311,7 @@ def _classify_add_foreign_key(normalized: str) -> tuple[SqlClassification, str]:
         )
     acciones = f" con {' y '.join(sorted(f'ON {tipo}' for tipo in vistas))}" if vistas else ""
     return SqlClassification.SAFE_DDL, f"clave ajena aditiva{acciones}"
+
 
 
 def _parse_enum_values(values: str) -> tuple[str, ...] | None:
@@ -588,6 +655,15 @@ def _classify_normalized(normalized: str) -> tuple[SqlClassification, str]:
         if token in padded:
             return SqlClassification.UNKNOWN, f"función no admitida: {token}"
 
+    # 3b. Funciones que cambian estado: empezar por SELECT no convierte una escritura en lectura.
+    cambio_de_estado = _STATE_CHANGING_CALL.search(normalized)
+    if cambio_de_estado is not None:
+        return (
+            SqlClassification.UNKNOWN,
+            f"función que cambia estado dentro de una sentencia: "
+            f"{cambio_de_estado.group(0).rstrip('(').strip()}",
+        )
+
     # 4. Lectura.
     if words[0] in {"SELECT", "SHOW", "VALUES"}:
         for forbidden in SELECT_FORBIDDEN:
@@ -617,8 +693,10 @@ def _classify_normalized(normalized: str) -> tuple[SqlClassification, str]:
             return _classify_enum_type(normalized)
         return SqlClassification.UNKNOWN, f"CREATE {second or '?'} no está en la lista admitida"
 
-    # 6. ALTER TABLE aditivo y compatible.
+    # 6. ALTER TABLE aditivo y compatible; ALTER SEQUENCE gobernado para alinear secuencias.
     if words[0] == "ALTER":
+        if words[1:2] == ("SEQUENCE",):
+            return _classify_alter_sequence(normalized)
         if words[1:2] != ("TABLE",):
             return SqlClassification.UNKNOWN, "sólo se admite ALTER TABLE aditivo"
         if " add constraint" in padded or " add  constraint" in padded:

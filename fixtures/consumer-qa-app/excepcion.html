@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — excepción</title>
+  </head>
+  <body>
+    <h1 id="titulo">Pantalla con excepción</h1>
+    <script>
+      // Roto a propósito: excepción de JavaScript no controlada durante la carga.
+      throw new Error('fallo intencionado de la aplicación de referencia');
+    </script>
+  </body>
+</html>

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — formulario mudo</title>
+  </head>
+  <body>
+    <h1 id="titulo">Pantalla con formulario mudo</h1>
+    <form id="alta" action="#" method="post">
+      <label for="nombre">nombre</label>
+      <input id="nombre" name="nombre" type="text" />
+      <button id="enviar" type="submit">enviar</button>
+    </form>
+    <div id="salida"></div>
+    <script>
+      // Roto a propósito: el formulario se puede rellenar y enviar, pero no responde con estado.
+      document.getElementById('alta').addEventListener('submit', (evento) => {
+        evento.preventDefault();
+      });
+    </script>
+  </body>
+</html>

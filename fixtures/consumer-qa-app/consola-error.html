@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — error de consola</title>
+  </head>
+  <body>
+    <h1 id="titulo">Pantalla con error de consola</h1>
+    <script>
+      // Roto a propósito: la pantalla se ve, pero la aplicación registra un error grave. Un error de
+      // consola es un fallo; un aviso informativo no lo es (ver aviso.html).
+      console.error('no se pudo cargar el estado inicial de la aplicación');
+    </script>
+  </body>
+</html>

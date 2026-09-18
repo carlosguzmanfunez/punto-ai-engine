@@ -13,6 +13,7 @@ Todo escenario escribe únicamente bajo el directorio temporal que el runner le 
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from typing import Any
 from cases.model import CaseDirectoryError, Observation
 from project_support import ChildOutcome, planned
 from punto.audit.logger import AuditLogger
+from punto.consumer_qa import QATarget, case_by_id, run_consumer_qa
 from punto.memory import ExperienceResult, ExperienceStatus, ExperienceStore
 from punto.project.generations import resolve_active_nodes
 from punto.project.replan import classify_node
@@ -504,9 +506,47 @@ def _memory_retrieval_failure(root: Path, params: dict[str, Any]) -> Observation
     return Observation(facts=facts, note="el motor continúa y deja el fallo auditado")
 
 
+# ---------------------------------------------------------------------------
+# CONSUMER_QA — la aplicación se abre, funciona y se puede utilizar
+# ---------------------------------------------------------------------------
+def _consumer_qa_real(root: Path, params: dict[str, Any]) -> Observation:
+    """Un caso de QA Consumer contra la aplicación de referencia, con navegador real.
+
+    La aplicación se copia al temporal del caso y se sirve dentro del sandbox web que ya existe: el
+    caso del directorio ejecuta el camino completo (arranque, navegador, interacción, expectativa) y
+    devuelve el veredicto del consumidor como hechos observados.
+    """
+    qa_id = _str_param(params, "qa_id")
+    app = root / "app"
+    shutil.copytree(_consumer_qa_fixture(), app)
+    target = QATarget(
+        workspace=root,
+        project_relative="app",
+        preview_argv=(("python3", "-m", "http.server", "4173", "--bind", "0.0.0.0"),),
+        timeout_seconds=300.0,
+    )
+    result = run_consumer_qa(case_by_id(qa_id), target, evidence_dir=root / "evidencia")
+    evidence = result.evidence
+    facts: dict[str, Any] = {
+        "qa_status": result.status.value,
+        "qa_failures": len(result.failures),
+        "qa_http_status": None if evidence is None else evidence.http_status,
+        "qa_evidence_screenshot": bool(evidence is not None and evidence.has_screenshot),
+        "qa_browser": () if evidence is None else tuple(evidence.browser.lower().split()),
+        "qa_failure_reason": result.reason,
+    }
+    return Observation(facts=facts, note=result.reason)
+
+
+def _consumer_qa_fixture() -> Path:
+    """Aplicación de referencia del consumidor, en el repositorio."""
+    return Path(__file__).resolve().parents[2] / "fixtures" / "consumer-qa-app"
+
+
 #: Registro de escenarios: un caso declara su nombre y el runner lo resuelve aquí.
 SCENARIOS: dict[str, Scenario] = {
     "architectural_change_is_not_adopted": _architectural_change,
+    "consumer_qa_real": _consumer_qa_real,
     "diff_violation_is_not_replannable": _diff_violation,
     "go_mod_dependency_unproven": _go_mod_dependency,
     "http_destination_not_authorized": _http_destination,

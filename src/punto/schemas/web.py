@@ -263,6 +263,27 @@ class WebFailedResource(BaseModel):
     resource_type: str = Field(default="", description="Tipo declarado por el navegador.")
 
 
+class WebActionOutcome(BaseModel):
+    """Resultado de una acción de usuario ejecutada por el probe dentro del navegador.
+
+    Es una **observación**, no un veredicto: la acción ocurrió o no ocurrió, y con qué detalle.
+    Quien decide si eso incumple una expectativa es el consumidor que pidió la interacción.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str = Field(..., min_length=1, description="Acción ejecutada (click, fill, submit, ...).")
+    target: str = Field(default="", description="Selector sobre el que se actuó.")
+    status: str = Field(..., description="``ok`` si se ejecutó, ``failed`` si no pudo ejecutarse.")
+    detail: str = Field(default="", description="Motivo determinista del fallo, si lo hubo.")
+
+    @property
+    def ok(self) -> bool:
+        """True si la acción llegó a ejecutarse."""
+        return self.status == "ok"
+
+
+
 class WebCheckOutcome(BaseModel):
     """Resultado de una comprobación determinista del navegador."""
 
@@ -414,6 +435,13 @@ class RouteObservation(BaseModel):
     client_width: int = Field(default=0, ge=0, description="Ancho del viewport en píxeles CSS.")
     missing_markers: tuple[str, ...] = Field(
         default=(), description="Elementos exigidos por la especificación que no aparecieron."
+    )
+    actions: tuple[WebActionOutcome, ...] = Field(
+        default=(),
+        description=(
+            "Acciones de usuario ejecutadas, en orden, con su resultado. Vacío significa que la "
+            "sesión no pidió ninguna interacción: no es lo mismo que pedir una y no poder medirla."
+        ),
     )
     hydration_signals: tuple[str, ...] = Field(
         default=(), description="Señales estructuradas de fallo de hidratación."
@@ -678,6 +706,7 @@ __all__ = [
     "ScreenshotArtifact",
     "Viewport",
     "ViewportName",
+    "WebActionOutcome",
     "WebCheckKind",
     "WebCheckOutcome",
     "WebCommandKind",

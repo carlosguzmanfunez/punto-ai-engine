@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — aplicación de referencia</title>
+    <link rel="stylesheet" href="/estilo.css" />
+  </head>
+  <body>
+    <h1 id="titulo">Punto QA</h1>
+    <nav>
+      <a id="ir" href="/about.html">acerca</a>
+      <a id="ir-roto" href="/no-existe.html">enlace roto</a>
+      <a id="ir-aviso" href="/aviso.html">página con aviso</a>
+      <a id="ir-excepcion" href="/excepcion.html">página con excepción</a>
+      <a id="ir-muerto" href="/interaccion-muerta.html">botón muerto</a>
+      <a id="ir-formulario" href="/formulario.html">formulario</a>
+    </nav>
+    <main>
+      <button id="ping" type="button">ping</button>
+      <form id="alta" action="#" method="post">
+        <label for="nombre">nombre</label>
+        <input id="nombre" name="nombre" type="text" />
+        <button id="enviar" type="submit">enviar</button>
+      </form>
+      <div id="salida"></div>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

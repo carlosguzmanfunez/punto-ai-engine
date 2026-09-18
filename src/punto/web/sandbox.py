@@ -126,6 +126,15 @@ ALLOWED_COMMAND_PROGRAMS: Final[frozenset[str]] = frozenset(
     {"bun", "node", "npm", "npx", "pnpm", "python", "python3", "yarn"}
 )
 
+#: Acciones de usuario que la sonda sabe ejecutar, y máximo por sesión. Vocabulario cerrado: un
+#: ``kind`` fuera de esta lista es un argumento inválido del llamante, no una acción ignorada.
+ACTION_KINDS: Final[frozenset[str]] = frozenset(
+    {"navigate", "click", "fill", "submit", "wait", "assert_visible", "assert_text"}
+)
+#: Acciones que exigen un valor además del destino.
+ACTION_KINDS_WITH_VALUE: Final[frozenset[str]] = frozenset({"fill", "assert_text"})
+MAX_ACTIONS: Final[int] = 20
+
 #: Patrón del nombre lógico de un screenshot. El nombre viene del manifiesto del probe, así que
 #: se exige forma de archivo simple: sin separadores, sin ``..`` y con extensión ``.png``.
 SCREENSHOT_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -477,6 +486,7 @@ class WebSandboxBackend:
         route: str,
         viewports: Sequence[Viewport] = DEFAULT_VIEWPORTS,
         required_markers: Sequence[str] = (),
+        actions: Sequence[Mapping[str, str]] | None = None,
         timeout_seconds: float | None = None,
         commands: Sequence[Sequence[str]] = (),
         preview_port: int = DEFAULT_PREVIEW_PORT,
@@ -494,6 +504,10 @@ class WebSandboxBackend:
             viewports: Viewports a capturar, en orden. Por defecto los tres del contrato.
             required_markers: Marcadores exigidos, en la sintaxis del probe
                 (``selector:<css>``, ``attr:<nombre>`` o ``attr:<nombre>=<valor>``).
+            actions: Interacción que el navegador debe ejecutar **antes** de observar el documento:
+                ``click``, ``fill``, ``submit``, ``wait`` y ``assert_visible``. Se ejecutan en orden
+                y se detienen en el primer fallo; el estado que se observa (URL final, marcadores,
+                captura) es el posterior a la interacción.
             timeout_seconds: Tiempo máximo de la sesión; por defecto, el de los límites.
             commands: Comandos de proyecto que deben terminar **antes** de la preview
                 (compilar, generar, preparar). Listas de argv, nunca cadenas de shell.
@@ -518,6 +532,7 @@ class WebSandboxBackend:
         safe_workspace = assert_mountable_workspace(workspace)
         project = _safe_relative(project_relative, field="project_relative")
         markers = _normalize_markers(required_markers)
+        chosen_actions = _normalize_actions(actions)
         project_commands = _normalize_argv_list(commands, field="commands")
         preview_commands = _normalize_argv_list(preview_argv, field="preview_argv")
         if not preview_commands:
@@ -584,6 +599,7 @@ class WebSandboxBackend:
                     for viewport in chosen_viewports
                 ],
                 "required_markers": list(markers),
+                "actions": [dict(action) for action in chosen_actions],
                 "output_dir": EVIDENCE_MOUNT,
                 "capture_timeout_seconds": self._limits.capture_timeout_seconds,
                 "preview_timeout_seconds": self._preview_wait(effective_timeout),
@@ -1335,6 +1351,43 @@ def _normalize_argv_list(
             )
         commands.append(tuple(arguments))
     return tuple(commands)
+
+
+def _normalize_actions(
+    values: Sequence[Mapping[str, str]] | None,
+) -> tuple[dict[str, str], ...]:
+    """Valida la interacción pedida a la sesión: acciones del vocabulario cerrado del probe.
+
+    Cada acción es ``{"kind", "target", "value"}``. Un ``kind`` desconocido, un destino vacío o un
+    ``fill`` sin valor son argumentos inválidos del llamante: se rechazan aquí, antes de montar
+    ningún contenedor, y no se degradan a «acción ignorada».
+
+    Raises:
+        ValueError: si la lista supera el máximo, o alguna acción no tiene la forma exigida.
+    """
+    if values is None:
+        return ()
+    actions: list[dict[str, str]] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"actions[{index}] debe ser un objeto con kind y target")
+        kind = str(item.get("kind", "")).strip()
+        target = str(item.get("target", "")).strip()
+        raw_value = item.get("value", "")
+        value = "" if raw_value is None else str(raw_value)
+        if kind not in ACTION_KINDS:
+            raise ValueError(
+                f"actions[{index}].kind no está en el vocabulario del sandbox "
+                f"({', '.join(sorted(ACTION_KINDS))})"
+            )
+        if not target:
+            raise ValueError(f"actions[{index}].target no puede estar vacío")
+        if kind in ACTION_KINDS_WITH_VALUE and not value:
+            raise ValueError(f"actions[{index}] es un {kind} y necesita value")
+        actions.append({"kind": kind, "target": target, "value": value})
+    if len(actions) > MAX_ACTIONS:
+        raise ValueError(f"actions supera el máximo del contrato ({MAX_ACTIONS})")
+    return tuple(actions)
 
 
 def _load_json_object(path: Path) -> dict[str, object]:

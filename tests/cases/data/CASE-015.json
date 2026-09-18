@@ -1,0 +1,22 @@
+{
+  "case_id": "CASE-015",
+  "title": "Un caso del directorio abre la aplicación en un navegador real y la usa",
+  "category": "CONSUMER_QA",
+  "description": "Garantía: el directorio de casos puede invocar QA Consumer y obtener un veredicto real del navegador. El caso arranca la aplicación de referencia en el sandbox web, la abre con Chromium, comprueba que el elemento principal está visible, que la respuesta HTTP es correcta y que no hay errores de consola ni excepciones, y conserva la captura como evidencia.",
+  "input": {
+    "scenario": "consumer_qa_real",
+    "params": {
+      "qa_id": "QA-001"
+    }
+  },
+  "expected": {
+    "qa_status": "PASS",
+    "qa_failures": 0,
+    "qa_http_status": 200,
+    "qa_evidence_screenshot": true,
+    "qa_browser_contains": ["chromium"]
+  },
+  "tags": ["consumer-qa", "navegador", "interaccion"],
+  "source": "tests/consumer_qa/test_consumer_qa.py::test_t12_case_directory_ejecuta_consumer_qa",
+  "schema_version": 1
+}

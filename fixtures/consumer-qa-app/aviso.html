@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — aviso informativo</title>
+  </head>
+  <body>
+    <h1 id="titulo">Pantalla con aviso</h1>
+    <script>
+      // Aviso informativo: se registra en la evidencia, pero NO puede hacer fallar el QA. Solo un
+      // error de consola o una excepción son fallos; un warning no lo es.
+      console.warn('aviso informativo de la aplicación de referencia');
+      console.info('información de arranque');
+    </script>
+  </body>
+</html>

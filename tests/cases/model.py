@@ -43,6 +43,11 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "node_status",
         "project_failure_code",
         "project_status",
+        "qa_browser_contains",
+        "qa_evidence_screenshot",
+        "qa_failures",
+        "qa_http_status",
+        "qa_status",
         "replanner_calls",
         "replans_accepted",
         "resource_tokens_contains",
@@ -59,6 +64,7 @@ CONTAINMENT_KEYS: frozenset[str] = frozenset(
         "expanded_resources_contains",
         "failure_detail_contains",
         "resource_tokens_contains",
+        "qa_browser_contains",
     }
 )
 
@@ -80,6 +86,7 @@ class CaseCategory(StrEnum):
     REPLAN = "REPLAN"
     MEMORY = "MEMORY"
     FAIL_CLOSED = "FAIL_CLOSED"
+    CONSUMER_QA = "CONSUMER_QA"
 
 
 class CaseDirectoryError(Exception):

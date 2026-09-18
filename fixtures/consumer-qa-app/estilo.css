@@ -1,0 +1,9 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+}
+
+#pong {
+  display: inline-block;
+  margin-left: 0.5rem;
+}

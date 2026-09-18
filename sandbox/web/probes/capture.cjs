@@ -53,6 +53,11 @@ const MAX_TEXT = 2000;
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_SETTLE_MS = 250;
+//: Tiempo máximo de una acción de usuario (click, relleno, envío, espera). Corto a propósito: una
+//: acción que no ocurre es un hecho que hay que reportar, no algo que deba agotar la sesión.
+const DEFAULT_ACTION_TIMEOUT_MS = 5000;
+//: Acciones que la sonda sabe ejecutar. Vocabulario cerrado: lo que no esté aquí no se ejecuta.
+const ACTION_KINDS = ['navigate', 'click', 'fill', 'submit', 'wait', 'assert_visible', 'assert_text'];
 
 /**
  * Señales de hidratación reconocidas: texto que menciona un fallo de hidratación de un framework.
@@ -178,8 +183,10 @@ function parseArguments(argv) {
     route: '/',
     viewport: '',
     markers: [],
+    actions: [],
     timeoutMs: DEFAULT_TIMEOUT_MS,
     settleMs: DEFAULT_SETTLE_MS,
+    actionTimeoutMs: DEFAULT_ACTION_TIMEOUT_MS,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -210,6 +217,16 @@ function parseArguments(argv) {
       case '--marker':
         options.markers.push(next());
         break;
+      case '--actions':
+        options.actions = parseActions(next());
+        break;
+      case '--action-timeout': {
+        const value = Number.parseInt(next(), 10);
+        if (Number.isFinite(value) && value > 0) {
+          options.actionTimeoutMs = value;
+        }
+        break;
+      }
       case '--timeout': {
         const value = Number.parseInt(next(), 10);
         if (Number.isFinite(value) && value > 0) {
@@ -247,6 +264,120 @@ function parseArguments(argv) {
     throw new Error(USAGE);
   }
   return options;
+}
+
+/**
+ * Normaliza la lista de acciones que llega en `--actions` (un JSON con forma de lista).
+ *
+ * La validación vive también en el host y en el driver del contenedor: aquí es la última puerta,
+ * porque un `kind` desconocido no puede ejecutarse «en silencio». Un JSON ilegible es un error de
+ * invocación (exit 2), no una observación.
+ *
+ * @param {string} raw Texto JSON con la lista de acciones.
+ * @returns {object[]} Acciones normalizadas.
+ */
+function parseActions(raw) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`--actions no es JSON válido: ${error.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('--actions debe ser una lista');
+  }
+  return parsed.map((item, index) => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`--actions[${index}] debe ser un objeto`);
+    }
+    const kind = truncate(item.kind);
+    const target = truncate(item.target === undefined ? '' : item.target);
+    const value = truncate(item.value === undefined ? '' : item.value);
+    if (!ACTION_KINDS.includes(kind)) {
+      throw new Error(`--actions[${index}].kind no está en ${ACTION_KINDS.join(', ')}`);
+    }
+    if (!target) {
+      throw new Error(`--actions[${index}].target no puede estar vacío`);
+    }
+    if ((kind === 'fill' || kind === 'assert_text') && !value) {
+      throw new Error(`--actions[${index}] es un ${kind} y necesita value`);
+    }
+    return { kind, target, value };
+  });
+}
+
+/**
+ * Ejecuta las acciones en orden y devuelve un registro por acción.
+ *
+ * Se detiene en la primera que falla: continuar después de un fallo mediría un estado que no
+ * corresponde a la secuencia pedida, y el resultado tiene que decir exactamente dónde se rompió.
+ *
+ * @param {object} page Página de Playwright.
+ * @param {object[]} actions Acciones normalizadas.
+ * @param {number} timeoutMs Tiempo máximo por acción.
+ * @param {number} navigationMs Tiempo máximo de una navegación pedida como acción.
+ * @returns {Promise<object[]>} Registro por acción ejecutada.
+ */
+async function applyActions(page, actions, timeoutMs, navigationMs) {
+  const results = [];
+  for (const action of actions) {
+    const record = {
+      kind: action.kind,
+      target: action.target,
+      status: 'ok',
+      detail: '',
+    };
+    try {
+      if (action.kind === 'navigate') {
+        // Un destino relativo se resuelve contra la URL actual: la sonda no conoce la base de la
+        // aplicación, y adivinarla sería medir otra cosa.
+        const destino = new URL(action.target, page.url()).toString();
+        await page.goto(destino, { waitUntil: 'networkidle', timeout: navigationMs });
+      } else if (action.kind === 'click') {
+        await page.click(action.target, { timeout: timeoutMs });
+      } else if (action.kind === 'fill') {
+        await page.fill(action.target, action.value, { timeout: timeoutMs });
+      } else if (action.kind === 'submit') {
+        await page.evaluate((selector) => {
+          const form = document.querySelector(selector);
+          if (form === null) {
+            throw new Error(`no existe el formulario ${selector}`);
+          }
+          if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+          } else {
+            form.submit();
+          }
+        }, action.target);
+      } else if (action.kind === 'wait') {
+        await page.waitForSelector(action.target, { timeout: timeoutMs });
+      } else if (action.kind === 'assert_visible') {
+        await page.waitForSelector(action.target, { state: 'visible', timeout: timeoutMs });
+      } else if (action.kind === 'assert_text') {
+        await page.waitForFunction(
+          ([selector, esperado]) => {
+            const element = document.querySelector(selector);
+            if (element === null) {
+              return false;
+            }
+            const text = (element.textContent || '').trim();
+            return text.includes(esperado);
+          },
+          [action.target, action.value],
+          { timeout: timeoutMs },
+        );
+      } else {
+        throw new Error(`acción no soportada: ${action.kind}`);
+      }
+    } catch (error) {
+      record.status = 'failed';
+      record.detail = truncate(error && error.message ? error.message : String(error));
+      results.push(record);
+      break;
+    }
+    results.push(record);
+  }
+  return results;
 }
 
 /**
@@ -562,6 +693,7 @@ async function capture(options) {
     client_width: 0,
     missing_markers: [],
     present_markers: [],
+    actions: [],
     hydration_signals: hydrationSignals,
     viewport_clipping: [],
     accessibility: null,
@@ -642,6 +774,21 @@ async function capture(options) {
     if (options.settleMs > 0) {
       // Espera corta adicional: `networkidle` no garantiza que el último repintado haya ocurrido.
       await page.waitForTimeout(options.settleMs);
+    }
+
+    // Las acciones de usuario van **antes** de leer la URL final y los hechos del documento: lo que
+    // hay que observar es el estado al que llegó la aplicación después de interactuar, no el estado
+    // inicial. Un click que navega cambia la URL final, y eso es justo lo que mide una navegación.
+    if (options.actions.length > 0) {
+      result.actions = await applyActions(
+        page,
+        options.actions,
+        options.actionTimeoutMs,
+        options.timeoutMs,
+      );
+      if (options.settleMs > 0) {
+        await page.waitForTimeout(options.settleMs);
+      }
     }
 
     // La URL final se lee **después** del settle, no antes: una redirección por JavaScript

@@ -113,6 +113,15 @@ MAX_TEXT = 2000
 #: Alineado con ``MAX_SCREENSHOTS`` del contrato: el host es el que manda y rechaza más de 8.
 MAX_VIEWPORTS = 8
 
+#: Acciones de usuario que la sonda sabe ejecutar y máximo por sesión. Vocabulario cerrado: lo que
+#: no esté aquí es un payload inválido (exit 4), nunca una acción que se ignora en silencio.
+ACTION_KINDS = ("navigate", "click", "fill", "submit", "wait", "assert_visible", "assert_text")
+#: Acciones que exigen un valor además del destino.
+ACTION_KINDS_WITH_VALUE = ("fill", "assert_text")
+MAX_ACTIONS = 20
+#: Tiempo máximo por acción, en milisegundos, si el host no dice otra cosa.
+DEFAULT_ACTION_TIMEOUT_MS = 5000
+
 #: Marca con la que este probe publica en stdout el sha256 de su manifiesto de evidencia.
 #: El stdout del proceso no lo puede reescribir el proyecto, así que el host puede comparar lo
 #: publicado con el archivo que lee: si alguien manipuló el manifiesto después, no coinciden.
@@ -181,6 +190,34 @@ def _as_int_or_none(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _action_results(value: object) -> list[dict[str, str]]:
+    """Registro de acciones que reportó ``capture.cjs``, con la forma de ``WebActionOutcome``.
+
+    Solo se aceptan los estados del contrato: ``ok`` y ``failed``. Cualquier otra cosa se declara
+    ``failed`` con el detalle de que el dato no era interpretable, porque un estado desconocido no
+    puede contarse como una acción que salió bien.
+    """
+    if not isinstance(value, list):
+        return []
+    results: list[dict[str, str]] = []
+    for item in value[:MAX_ACTIONS]:
+        if not isinstance(item, dict):
+            continue
+        status = _truncate(item.get("status", ""), 20)
+        if status not in ("ok", "failed"):
+            status = "failed"
+        results.append(
+            {
+                "kind": _truncate(item.get("kind", ""), 40),
+                "target": _truncate(item.get("target", "")),
+                "status": status,
+                "detail": _truncate(item.get("detail", "")),
+            }
+        )
+    return results
+
 
 
 def _as_positive_int(value: object) -> int:
@@ -482,6 +519,38 @@ def _normalize_markers(value: object) -> list[str]:
     return markers
 
 
+def _normalize_actions(value: object) -> list[dict[str, str]]:
+    """Valida las acciones de usuario de la sesión (interacción real en el navegador).
+
+    Un ``kind`` fuera del vocabulario cerrado, un destino vacío o un ``fill`` sin valor son
+    **payload inválido** (exit 4): es un error de quien pidió la medición, no un fallo de la
+    aplicación, y no puede degradarse a «acción ignorada».
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("actions debe ser una lista")
+    if len(value) > MAX_ACTIONS:
+        raise ValueError(f"actions supera el máximo de {MAX_ACTIONS}")
+    actions: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"actions[{index}] debe ser un objeto")
+        kind = str(item.get("kind", "")).strip()
+        target = str(item.get("target", "")).strip()
+        raw_value = item.get("value", "")
+        text = "" if raw_value is None else str(raw_value)
+        if kind not in ACTION_KINDS:
+            raise ValueError(f"actions[{index}].kind no está en {list(ACTION_KINDS)}")
+        if not target:
+            raise ValueError(f"actions[{index}].target no puede estar vacío")
+        if kind in ACTION_KINDS_WITH_VALUE and not text:
+            raise ValueError(f"actions[{index}] es un {kind} y necesita value")
+        actions.append({"kind": kind, "target": target, "value": text})
+    return actions
+
+
+
 # ---------------------------------------------------------------------------
 # Preview remota: espera de disponibilidad
 # ---------------------------------------------------------------------------
@@ -583,6 +652,7 @@ def _capture_viewport(
     output_dir: Path,
     markers: list[str],
     timeout_seconds: float,
+    actions: list[dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Ejecuta ``capture.cjs`` para un viewport y devuelve (registro, observaciones).
 
@@ -620,6 +690,11 @@ def _capture_viewport(
     ]
     for marker in markers:
         argv.extend(["--marker", marker])
+    if actions:
+        # La lista viaja como JSON en un solo argumento: un destino puede contener ``:`` y partir la
+        # cadena por separadores haría que el selector se interpretara a medias.
+        argv.extend(["--actions", json.dumps(actions, ensure_ascii=False, sort_keys=True)])
+        argv.extend(["--action-timeout", str(DEFAULT_ACTION_TIMEOUT_MS)])
 
     record = _run_command(argv, cwd=output_dir, timeout=timeout_seconds + 30.0)
     record["viewport"] = name
@@ -716,6 +791,7 @@ def _build_observation(
         "scroll_width": max(0, _as_int_or_none(payload.get("scroll_width")) or 0),
         "client_width": max(0, _as_int_or_none(payload.get("client_width")) or 0),
         "missing_markers": _as_str_list(payload.get("missing_markers"), 25),
+        "actions": _action_results(payload.get("actions")),
         "hydration_signals": _as_str_list(payload.get("hydration_signals"), 25),
         "screenshot_name": logical_name,
         "accessibility": accessibility,
@@ -867,6 +943,7 @@ def main() -> int:
             output_dir = _output_dir(payload.get("output_dir"))
             viewports = _normalize_viewports(payload.get("viewports"))
             markers = _normalize_markers(payload.get("required_markers"))
+            actions = _normalize_actions(payload.get("actions"))
             base_url = _base_url(payload.get("base_url"))
             capture_timeout = _seconds(
                 payload.get("capture_timeout_seconds"), "capture_timeout_seconds", 90.0
@@ -935,6 +1012,7 @@ def main() -> int:
                 output_dir=output_dir,
                 markers=markers,
                 timeout_seconds=capture_timeout,
+                actions=actions,
             )
             diagnostics["captures"].append(record)
             logical_name = str(record["screenshot"])

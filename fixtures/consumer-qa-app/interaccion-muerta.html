@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Punto QA — interacción muerta</title>
+  </head>
+  <body>
+    <h1 id="titulo">Pantalla con botón muerto</h1>
+    <button id="ping" type="button">ping</button>
+    <div id="salida"></div>
+    <script>
+      // Roto a propósito: el botón existe y se puede pulsar, pero no hace nada. La expectativa de
+      // que aparezca #pong después del click no se cumple, y ese es el fallo observable.
+    </script>
+  </body>
+</html>

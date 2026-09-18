@@ -26,6 +26,7 @@ import os
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -55,7 +56,12 @@ from punto.providers.contract import (
     parse_structured_output,
 )
 from punto.providers.openai import OpenAIError
+from punto.providers.transport import TransportError, provider_error_kind_of
 from punto.tools.errors import ProviderRouteError
+
+if TYPE_CHECKING:
+    from punto.providers.settings import ProviderSettings
+    from punto.providers.transport import SubprocessRunner
 
 #: Proveedores que el motor conoce en esta fase. Un nombre fuera de la lista es un error de
 #: configuración, no un proveedor nuevo.
@@ -373,7 +379,15 @@ class ProviderRouter:
         max_output_tokens: int | None,
         provider: str,
     ) -> ModelCompletion:
-        """Llama al adaptador con la primitiva que corresponda (texto o multimodal)."""
+        """Llama al adaptador con la primitiva que corresponda (texto o multimodal).
+
+        Antes de invocar se usa, si existe, el gancho opcional ``bind_role``: un cliente que pone un
+        transporte debajo necesita saber qué rol pidió la respuesta. El router no sabe nada más de
+        ese cliente —ni de su transporte—: solo aprovecha un gancho declarado.
+        """
+        binder = getattr(client, "bind_role", None)
+        if callable(binder):
+            binder(request.role)
         system_prompt = request.instructions
         if request.context:
             system_prompt = f"{request.instructions}\n\n{request.context}"
@@ -584,7 +598,11 @@ def classify_provider_error(error: BaseException) -> ProviderErrorKind:
     El motor no debe conocer el dialecto de cada proveedor: aquí se normaliza una sola vez. La
     clasificación mira los tipos del contrato y, cuando el adaptador tiene su propia jerarquía, el
     nombre de la clase —que es estable y está declarado por el adaptador, no inferido del mensaje—.
+    Un fallo de **transporte** (Codex, Claude Code) ya trae su propia clase normalizada y se
+    proyecta tal cual sobre el vocabulario del contrato.
     """
+    if isinstance(error, TransportError):
+        return provider_error_kind_of(error.kind)
     if isinstance(error, ProviderAuthenticationError):
         return ProviderErrorKind.AUTHENTICATION
     if isinstance(error, ProviderUnavailableError):
@@ -620,55 +638,38 @@ def load_default_router(
     audit: AuditLogger | None = None,
     assignment: Mapping[ProviderRole, str] | None = None,
     models: Mapping[str, str] | None = None,
+    settings: ProviderSettings | None = None,
+    runner: SubprocessRunner | None = None,
 ) -> ProviderRouter:
-    """Router con los tres adaptadores reales, construidos desde el entorno.
+    """Router con los tres proveedores reales, cada uno con su transporte configurado.
 
-    Los adaptadores se construyen **al ejecutar**, no al registrar: un router sin credenciales se
-    puede construir y consultar (la tabla de estado funciona), y el fallo aparece como
+    Los clientes se construyen **al ejecutar**, no al registrar: un router sin credenciales ni
+    sesiones se puede construir y consultar (la tabla de estado funciona) y el fallo aparece como
     ``AUTH_FAILED``/``UNAVAILABLE`` en la comprobación, no como una excepción de importación.
+
+    El router no sabe qué transporte hay debajo: pide un cliente del contrato de proveedor y la
+    configuración decide si eso es Codex, Claude Code o la API.
     """
     router = ProviderRouter(assignment=assignment, models=models, audit=audit)
-    router.register_provider(PROVIDER_OPENAI, _openai_factory)
-    router.register_provider(PROVIDER_DEEPSEEK, _deepseek_factory)
-    router.register_provider(PROVIDER_ANTHROPIC, _anthropic_factory)
+    for name in (PROVIDER_OPENAI, PROVIDER_DEEPSEEK, PROVIDER_ANTHROPIC):
+        router.register_provider(name, _transport_factory(name, settings=settings, runner=runner))
     return router
 
 
-def _openai_factory(model: str) -> StructuredModelClient:
-    """Adaptador real de OpenAI para el modelo dado."""
-    from punto.providers.openai import OpenAIClient, OpenAIConfig
+def _transport_factory(
+    provider: str,
+    *,
+    settings: ProviderSettings | None = None,
+    runner: SubprocessRunner | None = None,
+) -> ProviderFactory:
+    """Fábrica del cliente de un proveedor, con el transporte que elija la configuración."""
 
-    return OpenAIClient(OpenAIConfig(api_key=_required_key("OPENAI_API_KEY"), model=model))
+    def _build(model: str) -> StructuredModelClient:
+        from punto.providers.transport_registry import transport_client
 
+        return transport_client(provider, model=model, settings=settings, runner=runner)
 
-def _deepseek_factory(model: str) -> StructuredModelClient:
-    """Adaptador real de DeepSeek para el modelo dado."""
-    from punto.providers.deepseek import DeepSeekClient, DeepSeekConfig
-
-    return DeepSeekClient(
-        DeepSeekConfig(api_key=_required_key("DEEPSEEK_API_KEY"), model=model, max_tokens=8192)
-    )
-
-
-def _anthropic_factory(model: str) -> StructuredModelClient:
-    """Adaptador real de Anthropic para el modelo dado."""
-    from punto.providers.anthropic import AnthropicClient, AnthropicConfig
-
-    return AnthropicClient(
-        AnthropicConfig(api_key=_required_key("ANTHROPIC_API_KEY"), model=model)
-    )
-
-
-def _required_key(name: str) -> str:
-    """Credencial del entorno.
-
-    Raises:
-        ProviderAuthenticationError: si falta. El mensaje nombra la variable, nunca un valor.
-    """
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise ProviderAuthenticationError(f"{name} vacía o ausente")
-    return value
+    return _build
 
 
 def _redact_without_client(text: str) -> str:

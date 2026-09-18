@@ -76,6 +76,10 @@ class ProviderErrorKind(StrEnum):
     REFUSAL = "REFUSAL"
     UNAVAILABLE = "UNAVAILABLE"
     CONFIG = "CONFIG"
+    #: SUBSCRIPTION v0: el proceso local de un transporte de suscripción falló. Es distinto de
+    #: ``NETWORK`` (no hubo red) y de ``UNKNOWN`` (sí se sabe qué pasó): el cliente oficial terminó
+    #: con error y su salida normalizada se conserva en el detalle.
+    PROCESS_FAILED = "PROCESS_FAILED"
     UNKNOWN = "UNKNOWN"
 
 

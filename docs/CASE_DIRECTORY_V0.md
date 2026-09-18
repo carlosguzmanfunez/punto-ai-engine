@@ -36,7 +36,9 @@ previa para que un caso se ejecute.
 Categorías: `AUTHORITY`, `RESOURCE_CONTAINMENT`, `HUMAN_GATE`, `REPLAN`, `MEMORY`, `FAIL_CLOSED`,
 `CONSUMER_QA` (ejecuta QA Consumer contra una aplicación real; ver
 [QA_CONSUMER_V0.md](QA_CONSUMER_V0.md)) y `PROVIDER` (la salida de un proveedor de modelos no
-concede autoridad; ver [MULTI_PROVIDER_V0.md](MULTI_PROVIDER_V0.md)).
+concede autoridad; ver [MULTI_PROVIDER_V0.md](MULTI_PROVIDER_V0.md)) y `TRANSPORT` (el transporte de
+suscripción no dispara la API de pago ni amplía autoridad; ver
+[SUBSCRIPTION_TRANSPORTS_V0.md](SUBSCRIPTION_TRANSPORTS_V0.md)).
 
 El vocabulario de `expected` es **cerrado**. Las claves `*_contains` exigen contención; el resto,
 igualdad exacta. Una clave que el runner no conoce invalida el caso.

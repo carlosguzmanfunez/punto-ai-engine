@@ -1,0 +1,20 @@
+{
+  "case_id": "CASE-017",
+  "title": "El límite de la suscripción no dispara la API de pago",
+  "category": "TRANSPORT",
+  "description": "Garantía: un transporte de suscripción agotado no provoca un gasto automático. Con OpenAI servido por Codex (proceso controlado) y un cliente de API disponible al lado que registraría cualquier llamada, el motor devuelve el fallo normalizado del transporte configurado y la API no se invoca: cambiar de transporte es una decisión de configuración explícita, nunca una reacción del motor.",
+  "input": {
+    "scenario": "subscription_failure_never_falls_back",
+    "params": {}
+  },
+  "expected": {
+    "provider_name": "openai",
+    "provider_status": "FAILED",
+    "provider_transport": "codex",
+    "subscription_error_kind": "RATE_LIMIT",
+    "subscription_api_fallback_used": false
+  },
+  "tags": ["transport", "suscripcion", "sin-fallback", "coste"],
+  "source": "tests/test_subscription_transports.py::test_t9_sin_fallback_automatico_a_la_api",
+  "schema_version": 1
+}

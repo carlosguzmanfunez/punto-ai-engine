@@ -1,21 +1,30 @@
 # ============================================================================
-# PUNTO AI ENGINE - PROVEEDORES Y ROLES (MULTI-PROVIDER v0)
+# PUNTO AI ENGINE - PROVEEDORES, TRANSPORTES Y ROLES (SUBSCRIPTION TRANSPORTS v0)
 # ============================================================================
-# Este fichero declara TRES cosas y nada mas:
+# Este fichero declara CUATRO cosas y nada mas:
 #
 #   providers: que adaptadores estan habilitados y con que modelo.
+#   transport: por donde habla cada proveedor (codex, claude_code, api, existing).
+#   auth_mode: como se autoriza ese transporte (chatgpt, claude_account, api_key).
 #   roles:     que proveedor atiende cada rol de orquestacion.
 #
-# Modelo = configuracion. Proveedor = adaptador. Rol = asignacion.
-# Cambiar cualquiera de los tres NO requiere tocar el motor.
+# Modelo = configuracion. Proveedor = adaptador. Transporte = camino. Rol = asignacion.
+# Cambiar cualquiera de los cuatro NO requiere tocar el motor.
 #
-# CREDENCIALES: no viven aqui. Se leen del entorno del proceso:
-#   OPENAI_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY
-# Nunca se escriben en este fichero, ni en los resultados, ni en la auditoria.
+# SIN FALLBACK AUTOMATICO: si el transporte de suscripcion agota su limite o falla, la peticion
+# vuelve con su fallo normalizado. NO se cambia a la API de pago por iniciativa del motor; eso
+# podria generar cargos, asi que es una decision de configuracion explicita.
+#
+# CREDENCIALES: no viven aqui. La sesion de Codex y la de Claude Code las administran sus propios
+# clientes oficiales (`codex login`, `claude auth login`); la API lee su clave del entorno
+# (OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY). Nada de eso se escribe en este fichero, ni
+# en los resultados, ni en la auditoria, ni en el paquete de entrega.
 #
 # Sobreescrituras por entorno (mismas reglas, sin tocar el fichero):
 #   PUNTO_ARCHITECT_PROVIDER, PUNTO_BUILDER_PROVIDER, PUNTO_VISUAL_QA_PROVIDER
 #   PUNTO_OPENAI_MODEL, PUNTO_DEEPSEEK_MODEL, PUNTO_ANTHROPIC_MODEL
+#   PUNTO_OPENAI_TRANSPORT, PUNTO_ANTHROPIC_TRANSPORT, PUNTO_DEEPSEEK_TRANSPORT
+#   PUNTO_OPENAI_AUTH_MODE, PUNTO_ANTHROPIC_AUTH_MODE, PUNTO_DEEPSEEK_AUTH_MODE
 # ============================================================================
 
 version: "0.1.0"
@@ -24,12 +33,22 @@ providers:
   openai:
     enabled: true
     model: "gpt-5-codex"
+    # Cliente oficial de OpenAI con la cuenta ChatGPT. Alternativa explicita: transport: "api"
+    transport: "codex"
+    auth_mode: "chatgpt"
   deepseek:
     enabled: true
     model: "deepseek-v4-pro"
+    # Transporte existente: la API oficial con clave.
+    transport: "existing"
+    auth_mode: "api_key"
   anthropic:
     enabled: true
     model: "claude-sonnet-5"
+    # Cliente oficial de Anthropic (Claude Code) con la cuenta Claude.
+    # Alternativa explicita: transport: "api"
+    transport: "claude_code"
+    auth_mode: "claude_account"
 
 roles:
   ARCHITECT: openai

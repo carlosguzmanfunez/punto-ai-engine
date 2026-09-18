@@ -45,7 +45,7 @@ def test_los_casos_canonicos_se_ejecutan_y_comparan(case: EngineCase) -> None:
 # ---------------------------------------------------------------------------
 def test_el_directorio_canonico_carga_completo() -> None:
     """El directorio carga sus casos: identificadores únicos, escenarios y categorías."""
-    assert len(CASES) == 16, "el directorio canónico declara dieciséis casos"
+    assert len(CASES) == 18, "el directorio canónico declara dieciocho casos"
     assert len({case.case_id for case in CASES}) == len(CASES)
     assert all(case.case_input.scenario in SCENARIOS for case in CASES)
     assert {case.category for case in CASES} == set(CaseCategory)

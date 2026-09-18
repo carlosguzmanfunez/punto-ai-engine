@@ -625,6 +625,153 @@ def _provider_output_cannot_expand_authority(root: Path, params: dict[str, Any])
     )
 
 
+# ---------------------------------------------------------------------------
+# TRANSPORT — la suscripción no se convierte en gasto ni en autoridad
+# ---------------------------------------------------------------------------
+class _SubscriptionRunner:
+    """Runner de procesos controlado: simula el cliente oficial sin cuentas reales."""
+
+    def __init__(self, *, text: str = '{"objective": "listado"}', limit: bool = True) -> None:
+        self._text = text
+        self._limit = limit
+
+    def run(self, argv: Any, *, timeout: float, env: Any = None) -> Any:
+        """Responde por subcomando, como lo haría el cliente oficial."""
+        del timeout, env
+        from punto.providers.transport import TransportProcess
+
+        arguments = tuple(argv)
+        if "--version" in arguments:
+            return TransportProcess(argv=arguments, exit_code=0, stdout="codex-cli 0.9.0")
+        if "status" in arguments:
+            return TransportProcess(argv=arguments, exit_code=0, stdout="Logged in using ChatGPT")
+        if self._limit:
+            return TransportProcess(
+                argv=arguments,
+                exit_code=1,
+                stderr="You have reached your usage limit. Resets at 2026-09-20 10:00.",
+            )
+        linea = json.dumps(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": self._text}}
+        )
+        return TransportProcess(argv=arguments, exit_code=0, stdout=linea)
+
+
+def _codex_subscription_settings() -> Any:
+    """Configuración con OpenAI servido por el transporte de suscripción (Codex)."""
+    from punto.providers.settings import ProviderSettings, default_settings
+
+    base = default_settings()
+    return ProviderSettings(
+        providers=base.providers,
+        enabled=base.enabled,
+        assignment=base.assignment,
+        transports={"openai": "codex"},
+        auth_modes={"openai": "chatgpt"},
+    )
+
+
+def _subscription_failure_never_falls_back(root: Path, params: dict[str, Any]) -> Observation:
+    """El límite agotado del transporte de suscripción no dispara la API de pago.
+
+    Al lado del transporte configurado se deja un cliente de API que **registraría** cualquier
+    llamada: el motor responde con el fallo normalizado y la API no se toca.
+    """
+    del root, params
+    from httpx import MockTransport
+    from httpx import Response as HttpxResponse
+
+    from punto.providers.contract import ProviderRole, make_request
+    from punto.providers.openai import OpenAIClient, OpenAIConfig
+    from punto.providers.router import ProviderRouter
+    from punto.providers.transport_registry import transport_client
+
+    settings = _codex_subscription_settings()
+    runner = _SubscriptionRunner()
+    llamadas_api: list[str] = []
+
+    def _handler(_request: Any) -> Any:
+        llamadas_api.append("api")
+        return HttpxResponse(200, json={})
+
+    cliente_api = OpenAIClient(
+        OpenAIConfig(api_key="sk-test-CANARY-0123456789abcdef", model="gpt-5-codex"),
+        transport=MockTransport(_handler),
+    )
+    router = ProviderRouter()
+    router.register_provider(
+        "openai",
+        lambda model: transport_client(
+            "openai", model=model, settings=settings, runner=runner, api_client=cliente_api
+        ),
+    )
+    result = router.execute(
+        ProviderRole.ARCHITECT, make_request(ProviderRole.ARCHITECT, "diseña el listado")
+    )
+    return Observation(
+        facts={
+            "provider_name": result.provider,
+            "provider_status": result.status.value,
+            "provider_transport": settings.transport_of("openai"),
+            "subscription_error_kind": (
+                "" if result.error_kind is None else result.error_kind.value
+            ),
+            "subscription_api_fallback_used": bool(llamadas_api),
+            "provider_trusted": result.as_dict()["trusted"],
+        },
+        note="el límite de la suscripción vuelve normalizado y la API de pago no se invoca",
+    )
+
+
+def _subscription_output_cannot_expand_authority(
+    root: Path, params: dict[str, Any]
+) -> Observation:
+    """Lo que devuelve el transporte de suscripción no amplía la autoridad del motor."""
+    del root, params
+    from punto.project.resources import project_resource_envelope
+    from punto.providers.contract import ProviderRole, make_request
+    from punto.providers.router import ProviderRouter
+    from punto.providers.transport_registry import transport_client
+    from punto.schemas.replan import ReplanOperationKind
+
+    settings = _codex_subscription_settings()
+    runner = _SubscriptionRunner(text=MALICIOUS_PROVIDER_OUTPUT, limit=False)
+    router = ProviderRouter()
+    router.register_provider(
+        "openai",
+        lambda model: transport_client("openai", model=model, settings=settings, runner=runner),
+    )
+    result = router.execute(
+        ProviderRole.ARCHITECT,
+        make_request(ProviderRole.ARCHITECT, "diseña el listado inmobiliario"),
+    )
+    arquitectura = arquitectura_postgres()
+    envelope = project_resource_envelope(arquitectura)
+    veredicto = evaluar(
+        contract=contrato(arquitectura=arquitectura),
+        proposal=propuesta(
+            operacion(
+                ReplanOperationKind.REPLACE_UNACCEPTED_NODE,
+                peticion(uses_resources=("datastore:mongodb",), objective=result.content),
+            )
+        ),
+        nodes=(nodo(capabilities=("python",), resources=("capability:python",)),),
+    )
+    return Observation(
+        facts={
+            "provider_name": result.provider,
+            "provider_status": result.status.value,
+            "provider_transport": settings.transport_of("openai"),
+            "authority_unchanged": "datastore:mongodb" not in envelope.tokens,
+            "autonomous": veredicto.allows_autonomous,
+            "containment_compatibility": veredicto.compatibility.value,
+            "expanded_resources": tuple(veredicto.expanded_resources),
+            "provider_trusted": result.as_dict()["trusted"],
+        },
+        note="el transporte de suscripción pidió autoridad y el motor siguió juzgando igual",
+    )
+
+
 #: Registro de escenarios: un caso declara su nombre y el runner lo resuelve aquí.
 SCENARIOS: dict[str, Scenario] = {
     "architectural_change_is_not_adopted": _architectural_change,
@@ -638,6 +785,8 @@ SCENARIOS: dict[str, Scenario] = {
     "provider_output_cannot_expand_authority": _provider_output_cannot_expand_authority,
     "replan_expansion_opens_human_gate": _replan_expansion_gate,
     "resource_expansion_is_detected": _resource_expansion,
+    "subscription_failure_never_falls_back": _subscription_failure_never_falls_back,
+    "subscription_output_cannot_expand_authority": _subscription_output_cannot_expand_authority,
     "tactical_replan_is_adopted": _tactical_replan,
     "unproven_shell_effect": _unproven_shell_effect,
 }

@@ -45,6 +45,7 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "project_status",
         "provider_name",
         "provider_status",
+        "provider_transport",
         "qa_browser_contains",
         "qa_evidence_screenshot",
         "qa_failures",
@@ -54,6 +55,8 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "replans_accepted",
         "resource_tokens_contains",
         "retrieval_status",
+        "subscription_api_fallback_used",
+        "subscription_error_kind",
     }
 )
 
@@ -90,6 +93,7 @@ class CaseCategory(StrEnum):
     FAIL_CLOSED = "FAIL_CLOSED"
     CONSUMER_QA = "CONSUMER_QA"
     PROVIDER = "PROVIDER"
+    TRANSPORT = "TRANSPORT"
 
 
 class CaseDirectoryError(Exception):

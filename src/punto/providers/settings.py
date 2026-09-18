@@ -38,18 +38,53 @@ ROLE_PROVIDER_ENV_SUFFIX: Final[str] = "_PROVIDER"
 #: Variable de entorno por proveedor, para fijar su modelo.
 PROVIDER_MODEL_ENV_SUFFIX: Final[str] = "_MODEL"
 
+#: Variable de entorno por proveedor, para elegir su transporte (``codex``, ``claude_code``,
+#: ``api``).
+PROVIDER_TRANSPORT_ENV_SUFFIX: Final[str] = "_TRANSPORT"
+
+#: Variable de entorno por proveedor, para declarar su modo de autenticación.
+PROVIDER_AUTH_MODE_ENV_SUFFIX: Final[str] = "_AUTH_MODE"
+
+#: Transporte por defecto de cada proveedor. OpenAI y Anthropic prefieren el **cliente de
+#: suscripción** (Codex con cuenta ChatGPT, Claude Code con cuenta Claude) y dejan la API como
+#: alternativa explícita; DeepSeek conserva su transporte de siempre.
+DEFAULT_TRANSPORTS: Final[Mapping[str, str]] = {
+    "openai": "codex",
+    "deepseek": "existing",
+    "anthropic": "claude_code",
+}
+
+#: Modo de autenticación por defecto de cada proveedor, coherente con su transporte.
+DEFAULT_AUTH_MODES: Final[Mapping[str, str]] = {
+    "openai": "chatgpt",
+    "deepseek": "api_key",
+    "anthropic": "claude_account",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderSettings:
-    """Proveedores habilitados con su modelo, y asignación de roles."""
+    """Proveedores habilitados con su modelo y su transporte, y asignación de roles."""
 
     providers: Mapping[str, str] = field(default_factory=dict)
     enabled: Mapping[str, bool] = field(default_factory=dict)
     assignment: Mapping[ProviderRole, str] = field(default_factory=dict)
+    transports: Mapping[str, str] = field(default_factory=dict)
+    auth_modes: Mapping[str, str] = field(default_factory=dict)
 
     def model_of(self, provider: str) -> str:
         """Modelo configurado de un proveedor, o el conocido por el motor."""
         return self.providers.get(provider, "") or DEFAULT_PROVIDER_MODELS.get(provider, "")
+
+    def transport_of(self, provider: str) -> str:
+        """Transporte seleccionado para un proveedor, o el de por defecto."""
+        name = provider.strip().lower()
+        return self.transports.get(name, "") or DEFAULT_TRANSPORTS.get(name, "api")
+
+    def auth_mode_of(self, provider: str) -> str:
+        """Modo de autenticación declarado para un proveedor."""
+        name = provider.strip().lower()
+        return self.auth_modes.get(name, "") or DEFAULT_AUTH_MODES.get(name, "api_key")
 
     def is_enabled(self, provider: str) -> bool:
         """True si el proveedor está habilitado (por defecto, sí)."""
@@ -65,6 +100,8 @@ class ProviderSettings:
             "providers": dict(self.providers),
             "enabled": dict(self.enabled),
             "roles": {role.value: provider for role, provider in self.assignment.items()},
+            "transports": {name: self.transport_of(name) for name in self.providers},
+            "auth_modes": {name: self.auth_mode_of(name) for name in self.providers},
         }
 
 
@@ -74,6 +111,8 @@ def default_settings() -> ProviderSettings:
         providers=dict(DEFAULT_PROVIDER_MODELS),
         enabled=dict.fromkeys(DEFAULT_PROVIDER_MODELS, True),
         assignment=dict(DEFAULT_ROLE_ASSIGNMENT),
+        transports=dict(DEFAULT_TRANSPORTS),
+        auth_modes=dict(DEFAULT_AUTH_MODES),
     )
 
 
@@ -99,16 +138,26 @@ def load_provider_settings(
     providers = dict(base.providers)
     enabled = dict(base.enabled)
     assignment = dict(base.assignment)
+    transports = dict(base.transports)
+    auth_modes = dict(base.auth_modes)
 
     if path is not None and path.is_file():
         raw = load_yaml_file(path)
-        providers, enabled = _read_providers(raw, providers, enabled)
+        providers, enabled, transports, auth_modes = _read_providers(
+            raw, providers, enabled, transports, auth_modes
+        )
         assignment = _read_roles(raw, assignment)
 
     for name in KNOWN_PROVIDERS:
         override = env.get(f"PUNTO_{name.upper()}{PROVIDER_MODEL_ENV_SUFFIX}", "").strip()
         if override:
             providers[name] = override
+        chosen = env.get(f"PUNTO_{name.upper()}{PROVIDER_TRANSPORT_ENV_SUFFIX}", "").strip()
+        if chosen:
+            transports[name] = chosen
+        declared = env.get(f"PUNTO_{name.upper()}{PROVIDER_AUTH_MODE_ENV_SUFFIX}", "").strip()
+        if declared:
+            auth_modes[name] = declared
     for role in ProviderRole:
         override = env.get(f"PUNTO_{role.value}{ROLE_PROVIDER_ENV_SUFFIX}", "").strip()
         if override:
@@ -119,7 +168,13 @@ def load_provider_settings(
             raise ProviderRouteError(
                 f"el proveedor {provider!r} está asignado a un rol y no declara modelo"
             )
-    return ProviderSettings(providers=providers, enabled=enabled, assignment=assignment)
+    return ProviderSettings(
+        providers=providers,
+        enabled=enabled,
+        assignment=assignment,
+        transports=transports,
+        auth_modes=auth_modes,
+    )
 
 
 def _settings_path(config_dir: Path | None, env: Mapping[str, str]) -> Path | None:
@@ -135,16 +190,24 @@ def _settings_path(config_dir: Path | None, env: Mapping[str, str]) -> Path | No
 
 
 def _read_providers(
-    raw: Mapping[str, object], providers: dict[str, str], enabled: dict[str, bool]
-) -> tuple[dict[str, str], dict[str, bool]]:
-    """Lee la sección ``providers`` del fichero.
+    raw: Mapping[str, object],
+    providers: dict[str, str],
+    enabled: dict[str, bool],
+    transports: dict[str, str],
+    auth_modes: dict[str, str],
+) -> tuple[dict[str, str], dict[str, bool], dict[str, str], dict[str, str]]:
+    """Lee la sección ``providers`` del fichero, con su transporte y su modo de autenticación.
+
+    El transporte se valida contra el vocabulario cerrado de :class:`TransportKind`: un nombre
+    inventado es un error de configuración, no un transporte que se ignora.
 
     Raises:
-        ProviderRouteError: si la sección tiene una forma inválida o un proveedor desconocido.
+        ProviderRouteError: si la sección tiene una forma inválida, un proveedor desconocido, un
+            modelo vacío o un transporte que no existe.
     """
     section = raw.get("providers", {})
     if section is None:
-        return providers, enabled
+        return providers, enabled, transports, auth_modes
     if not isinstance(section, Mapping):
         raise ProviderRouteError("la sección 'providers' debe ser un mapa")
     for name, body in section.items():
@@ -159,7 +222,31 @@ def _read_providers(
         if not isinstance(flag, bool):
             raise ProviderRouteError(f"providers.{key}.enabled debe ser booleano")
         enabled[key] = flag
-    return providers, enabled
+        transport = str(body.get("transport", "")).strip()
+        if transport:
+            transports[key] = _validate_transport(transport, key=key)
+        auth_mode = str(body.get("auth_mode", "")).strip()
+        if auth_mode:
+            auth_modes[key] = auth_mode
+    return providers, enabled, transports, auth_modes
+
+
+def _validate_transport(name: str, *, key: str) -> str:
+    """Valida el nombre de un transporte contra el vocabulario cerrado.
+
+    Raises:
+        ProviderRouteError: si el transporte no está en el vocabulario.
+    """
+    from punto.providers.transport import TransportKind
+
+    candidate = name.strip().lower()
+    known = {kind.value for kind in TransportKind}
+    if candidate not in known:
+        conocidos = ", ".join(sorted(known))
+        raise ProviderRouteError(
+            f"providers.{key}.transport desconocido: {name!r}. Conocidos: {conocidos}"
+        )
+    return candidate
 
 
 def _read_roles(

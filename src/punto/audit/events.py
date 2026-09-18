@@ -129,6 +129,10 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.VISUAL_QA_FINDING_RECORDED: "visual_qa_finding",
     AuditEventType.VISUAL_QA_COMPLETED: "visual_qa_report",
     AuditEventType.VISUAL_QA_BLOCKED: "visual_qa_report",
+    # --- Multi-provider orchestration (MULTI-PROVIDER v0) ---------------------
+    AuditEventType.PROVIDER_REQUEST_STARTED: "provider_request",
+    AuditEventType.PROVIDER_REQUEST_COMPLETED: "provider_request",
+    AuditEventType.PROVIDER_REQUEST_FAILED: "provider_request",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

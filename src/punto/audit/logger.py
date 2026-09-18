@@ -17,7 +17,7 @@ from uuid import UUID
 from punto.common import deep_freeze
 from punto.schemas.audit import AuditEvent, AuditEventType
 from punto.schemas.enums import AuditResult
-from punto.schemas.execution import CommandResult, FileChange, ValidationResult
+from punto.schemas.execution import CommandResult, FileChange, ModelUsage, ValidationResult
 
 from .events import DEFAULT_ACTOR, RESOURCE_BY_EVENT
 
@@ -4276,6 +4276,98 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_provider_request_started(
+        self,
+        *,
+        request_id: str,
+        role: str,
+        provider: str,
+        model: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que se envió una petición normalizada a un proveedor (MULTI-PROVIDER v0).
+
+        El evento lleva **quién** responde y con qué modelo, y nada del contenido: ni el prompt ni
+        ninguna credencial. Es la traza que permite auditar la orquestación sin exponer material.
+        """
+        return self.record(
+            AuditEventType.PROVIDER_REQUEST_STARTED,
+            action="provider_request_started",
+            metadata={
+                "request_id": request_id,
+                "role": role,
+                "provider": provider,
+                "model": model,
+                "phase": "STARTED",
+            },
+            actor=actor,
+        )
+
+    def log_provider_request_completed(
+        self,
+        *,
+        request_id: str,
+        role: str,
+        provider: str,
+        model: str,
+        duration_ms: int = 0,
+        usage: ModelUsage | None = None,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que el proveedor respondió con éxito.
+
+        Se anotan las cifras (duración y consumo) y nunca el contenido: el resultado viaja al motor,
+        no al registro. Que la respuesta fuera inteligencia externa no confiable no cambia aquí.
+        """
+        return self.record(
+            AuditEventType.PROVIDER_REQUEST_COMPLETED,
+            action="provider_request_completed",
+            metadata={
+                "request_id": request_id,
+                "role": role,
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration_ms,
+                "usage": _usage_metadata(usage),
+                "phase": "SUCCESS",
+            },
+            actor=actor,
+        )
+
+    def log_provider_request_failed(
+        self,
+        *,
+        request_id: str,
+        role: str,
+        provider: str,
+        model: str,
+        status: str,
+        error_kind: str,
+        duration_ms: int = 0,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el fallo normalizado de una petición.
+
+        El fallo no se oculta ni se sustituye por otro proveedor: se declara con su vocabulario
+        normalizado (``TIMEOUT``, ``RATE_LIMIT``, ``AUTHENTICATION``, ``NETWORK``, ...).
+        """
+        return self.record(
+            AuditEventType.PROVIDER_REQUEST_FAILED,
+            action="provider_request_failed",
+            result=AuditResult.FAILURE,
+            metadata={
+                "request_id": request_id,
+                "role": role,
+                "provider": provider,
+                "model": model,
+                "error_kind": error_kind,
+                "status": status,
+                "duration_ms": duration_ms,
+                "phase": status or "FAILED",
+            },
+            actor=actor,
+        )
+
     def log_project_node_architecture_violation(
         self,
         *,
@@ -4546,6 +4638,17 @@ def _freeze_metadata(metadata: Mapping[str, Any] | None) -> tuple[tuple[str, Any
         return ()
     frozen = {str(key): deep_freeze(value) for key, value in metadata.items()}
     return tuple(sorted(frozen.items()))
+
+
+def _usage_metadata(usage: ModelUsage | None) -> dict[str, int]:
+    """Cifras de consumo para el evento: tokens, nunca contenido."""
+    if usage is None:
+        return {}
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
 
 
 __all__ = ["AuditLogger"]

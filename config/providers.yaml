@@ -1,0 +1,37 @@
+# ============================================================================
+# PUNTO AI ENGINE - PROVEEDORES Y ROLES (MULTI-PROVIDER v0)
+# ============================================================================
+# Este fichero declara TRES cosas y nada mas:
+#
+#   providers: que adaptadores estan habilitados y con que modelo.
+#   roles:     que proveedor atiende cada rol de orquestacion.
+#
+# Modelo = configuracion. Proveedor = adaptador. Rol = asignacion.
+# Cambiar cualquiera de los tres NO requiere tocar el motor.
+#
+# CREDENCIALES: no viven aqui. Se leen del entorno del proceso:
+#   OPENAI_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY
+# Nunca se escriben en este fichero, ni en los resultados, ni en la auditoria.
+#
+# Sobreescrituras por entorno (mismas reglas, sin tocar el fichero):
+#   PUNTO_ARCHITECT_PROVIDER, PUNTO_BUILDER_PROVIDER, PUNTO_VISUAL_QA_PROVIDER
+#   PUNTO_OPENAI_MODEL, PUNTO_DEEPSEEK_MODEL, PUNTO_ANTHROPIC_MODEL
+# ============================================================================
+
+version: "0.1.0"
+
+providers:
+  openai:
+    enabled: true
+    model: "gpt-5-codex"
+  deepseek:
+    enabled: true
+    model: "deepseek-v4-pro"
+  anthropic:
+    enabled: true
+    model: "claude-sonnet-5"
+
+roles:
+  ARCHITECT: openai
+  BUILDER: deepseek
+  VISUAL_QA: anthropic

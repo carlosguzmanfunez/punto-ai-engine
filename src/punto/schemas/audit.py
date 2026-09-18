@@ -242,6 +242,12 @@ class AuditEventType(StrEnum):
     PELL_RETRIEVAL_FAILED = "PELL_RETRIEVAL_FAILED"
     #: PELL-1: el resultado de un nodo se registró como experiencia nueva.
     PELL_EXPERIENCE_RECORDED = "PELL_EXPERIENCE_RECORDED"
+    #: MULTI-PROVIDER v0: se envió una petición normalizada a un proveedor.
+    PROVIDER_REQUEST_STARTED = "PROVIDER_REQUEST_STARTED"
+    #: MULTI-PROVIDER v0: el proveedor respondió con éxito.
+    PROVIDER_REQUEST_COMPLETED = "PROVIDER_REQUEST_COMPLETED"
+    #: MULTI-PROVIDER v0: el proveedor falló; el fallo queda normalizado y contenido.
+    PROVIDER_REQUEST_FAILED = "PROVIDER_REQUEST_FAILED"
 
 
 class AuditEvent(BaseModel):

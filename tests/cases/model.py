@@ -43,6 +43,8 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "node_status",
         "project_failure_code",
         "project_status",
+        "provider_name",
+        "provider_status",
         "qa_browser_contains",
         "qa_evidence_screenshot",
         "qa_failures",
@@ -87,6 +89,7 @@ class CaseCategory(StrEnum):
     MEMORY = "MEMORY"
     FAIL_CLOSED = "FAIL_CLOSED"
     CONSUMER_QA = "CONSUMER_QA"
+    PROVIDER = "PROVIDER"
 
 
 class CaseDirectoryError(Exception):

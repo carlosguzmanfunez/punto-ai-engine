@@ -33,9 +33,10 @@ Cada caso responde a cuatro preguntas: **qué situación** reproduce (`descripti
 `related_failure` y `related_memory` son trazabilidad opcional: nada depende de que exista memoria
 previa para que un caso se ejecute.
 
-Categorías: `AUTHORITY`, `RESOURCE_CONTAINMENT`, `HUMAN_GATE`, `REPLAN`, `MEMORY`, `FAIL_CLOSED` y
-`CONSUMER_QA` (esta última ejecuta QA Consumer contra una aplicación real; ver
-[QA_CONSUMER_V0.md](QA_CONSUMER_V0.md)).
+Categorías: `AUTHORITY`, `RESOURCE_CONTAINMENT`, `HUMAN_GATE`, `REPLAN`, `MEMORY`, `FAIL_CLOSED`,
+`CONSUMER_QA` (ejecuta QA Consumer contra una aplicación real; ver
+[QA_CONSUMER_V0.md](QA_CONSUMER_V0.md)) y `PROVIDER` (la salida de un proveedor de modelos no
+concede autoridad; ver [MULTI_PROVIDER_V0.md](MULTI_PROVIDER_V0.md)).
 
 El vocabulario de `expected` es **cerrado**. Las claves `*_contains` exigen contención; el resto,
 igualdad exacta. Una clave que el runner no conoce invalida el caso.

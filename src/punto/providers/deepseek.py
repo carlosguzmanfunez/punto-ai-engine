@@ -30,6 +30,8 @@ from punto.providers.base import (
     PROVIDER_DEEPSEEK,
     JsonSchema,
     ModelCompletion,
+    ProviderAuthenticationError,
+    ProviderUnavailableError,
     StructuredModelClient,
     effective_max_tokens,
 )
@@ -37,6 +39,9 @@ from punto.schemas.execution import ModelUsage
 
 #: URL base oficial.
 DEFAULT_BASE_URL: Final[str] = "https://api.deepseek.com"
+
+#: Ruta oficial de la lista de modelos. Es la sonda **más barata** del proveedor: no gasta tokens.
+MODELS_PATH: Final[str] = "/models"
 
 #: Modelo por defecto del Developer.
 DEFAULT_MODEL: Final[str] = "deepseek-v4-pro"
@@ -381,6 +386,44 @@ class DeepSeekClient(StructuredModelClient):
             response, latency_ms=latency_ms, transport_retries=retries, max_tokens=max_tokens
         )
 
+    def health_check(self) -> str:
+        """Comprobación barata y real del proveedor: pide la lista de modelos.
+
+        Es la sonda más barata que DeepSeek expone por su interfaz oficial —la misma que el
+        adaptador de OpenAI usa por el mismo motivo—: **no gasta tokens** y sí ejerce la
+        credencial, así que distingue «conectado», «credencial rechazada» y «proveedor o red no
+        disponible». La credencial la pone el cliente que ya la tiene; aquí no se lee, ni se
+        copia, ni se publica.
+
+        Returns:
+            Detalle acotado de la comprobación, sin credencial.
+
+        Raises:
+            ProviderAuthenticationError: el proveedor rechazó la credencial (401/403).
+            ProviderUnavailableError: la red o el tiempo fallaron, o la sonda no está disponible.
+        """
+        try:
+            response = self._client.get(
+                MODELS_PATH, headers={AUTH_HEADER: f"Bearer {self._config.api_key}"}
+            )
+        except httpx.TimeoutException as exc:
+            raise ProviderUnavailableError(
+                "la comprobación de DeepSeek agotó el tiempo de espera"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                f"fallo de red al comprobar DeepSeek: {type(exc).__name__}"
+            ) from exc
+        if response.status_code in (401, 403):
+            raise ProviderAuthenticationError(
+                f"DeepSeek rechazó la credencial (HTTP {response.status_code})"
+            )
+        if response.status_code >= 400:
+            raise ProviderUnavailableError(
+                f"la lista de modelos de DeepSeek respondió HTTP {response.status_code}"
+            )
+        return "la lista de modelos de DeepSeek respondió"
+
     def _post_with_retries(
         self, payload: dict[str, Any]
     ) -> tuple[httpx.Response, int]:
@@ -613,6 +656,7 @@ __all__ = [
     "DEFAULT_TRANSPORT_RETRIES",
     "DEVELOPER_MODEL_ENV",
     "LEGACY_MODELS",
+    "MODELS_PATH",
     "PLANNER_MODEL_ENV",
     "QA_MODEL_ENV",
     "RETRYABLE_STATUS_CODES",

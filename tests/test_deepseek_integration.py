@@ -31,9 +31,12 @@ from punto.developer.prompts import (
     REPAIR_AFTER_PROPOSAL_REJECTION,
 )
 from punto.developer.sandbox import ContainerSandboxBackend, SandboxLimits, resolve_runtime_binary
+from punto.providers.base import ProviderAuthenticationError, ProviderUnavailableError
+from punto.providers.contract import ProviderHealthStatus
 from punto.providers.deepseek import (
     DEFAULT_BASE_URL,
     LEGACY_MODELS,
+    MODELS_PATH,
     SUPPORTED_MODELS,
     DeepSeekAuthError,
     DeepSeekBalanceError,
@@ -49,6 +52,8 @@ from punto.providers.deepseek import (
     ModelCompletion,
     parse_proposal_json,
 )
+from punto.providers.transport import TransportKind
+from punto.providers.transports.api import APITransport
 from punto.schemas.audit import AuditEventType
 from punto.schemas.execution import (
     CommandSpec,
@@ -385,6 +390,99 @@ def test_402_is_a_balance_error() -> None:
 
     with pytest.raises(DeepSeekBalanceError):
         client.complete_json(system_prompt="s", user_prompt="u")
+
+
+# ---------------------------------------------------------------------------
+# Sonda de conexion del dashboard (POST /providers/{id}/test)
+# ---------------------------------------------------------------------------
+def test_health_check_usa_la_lista_de_modelos_sin_gastar_tokens() -> None:
+    """La sonda real es ``GET /models`` con la credencial del cliente: cero tokens."""
+    vistas: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        vistas.append(request)
+        return json_response(200, {"object": "list", "data": [{"id": "deepseek-v4-pro"}]})
+
+    client = DeepSeekClient(DeepSeekConfig(api_key=FAKE_KEY), transport=make_transport(handler))
+
+    detalle = client.health_check()
+
+    assert len(vistas) == 1
+    assert vistas[0].method == "GET"
+    assert vistas[0].url.path.endswith(MODELS_PATH)
+    assert vistas[0].headers["Authorization"] == f"Bearer {FAKE_KEY}"
+    assert "modelos" in detalle
+    assert FAKE_KEY not in detalle
+    assert "/chat/completions" not in str(vistas[0].url)
+
+
+@pytest.mark.parametrize("status", (401, 403))
+def test_health_check_con_credencial_rechazada_es_auth_failed(status: int) -> None:
+    """401/403 se declaran como credencial rechazada, con la clase del contrato."""
+    client = DeepSeekClient(
+        DeepSeekConfig(api_key=FAKE_KEY),
+        transport=make_transport(lambda _r: json_response(status, {"error": {"message": "no"}})),
+    )
+
+    with pytest.raises(ProviderAuthenticationError) as error:
+        client.health_check()
+
+    assert str(status) in str(error.value)
+    assert FAKE_KEY not in str(error.value)
+
+
+def test_health_check_con_proveedor_no_disponible() -> None:
+    """Un HTTP de error o una caída de red dejan el proveedor como no disponible."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sin ruta al proveedor")
+
+    caido = DeepSeekClient(
+        DeepSeekConfig(api_key=FAKE_KEY),
+        transport=make_transport(handler),
+    )
+    con_error = DeepSeekClient(
+        DeepSeekConfig(api_key=FAKE_KEY),
+        transport=make_transport(lambda _r: json_response(503, {"error": {"message": "down"}})),
+    )
+
+    with pytest.raises(ProviderUnavailableError):
+        caido.health_check()
+    with pytest.raises(ProviderUnavailableError):
+        con_error.health_check()
+
+
+def test_el_transporte_deepseek_mapea_la_sonda_al_contrato() -> None:
+    """``APITransport.health_check`` devuelve CONNECTED/AUTH_FAILED con este adaptador.
+
+    Es la costura exacta que usa el dashboard en *Test connection*: antes de este saneamiento el
+    transporte no encontraba sonda y declaraba UNAVAILABLE aunque el proveedor estuviera conectado.
+    """
+
+    def sano(_request: httpx.Request) -> httpx.Response:
+        return json_response(200, {"object": "list", "data": []})
+
+    def rechazado(_request: httpx.Request) -> httpx.Response:
+        return json_response(401, {"error": {"message": "Authentication Fails"}})
+
+    conectado = APITransport(
+        client=DeepSeekClient(DeepSeekConfig(api_key=FAKE_KEY), transport=make_transport(sano)),
+        kind=TransportKind.EXISTING,
+    )
+    sin_credencial = APITransport(
+        client=DeepSeekClient(
+            DeepSeekConfig(api_key=FAKE_KEY), transport=make_transport(rechazado)
+        ),
+        kind=TransportKind.EXISTING,
+    )
+
+    salud = conectado.health_check()
+    fallo = sin_credencial.health_check()
+
+    assert salud.status is ProviderHealthStatus.CONNECTED
+    assert salud.detail and FAKE_KEY not in salud.detail
+    assert fallo.status is ProviderHealthStatus.AUTH_FAILED
+    assert FAKE_KEY not in fallo.detail
 
 
 @pytest.mark.parametrize("status", [429, 500, 503])

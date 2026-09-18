@@ -20,6 +20,11 @@ htmlcov/
 .env.*
 !.env.example
 
+# Configuración local generada por el dashboard de proveedores: es de esta máquina y de este
+# usuario (transporte, modelo, roles y proveedores nuevos), no del repositorio. No contiene
+# credenciales: las claves viven en el almacén de secretos, fuera del árbol.
+config/providers.local.yaml
+
 # Artefactos de construcción
 dist/
 build/

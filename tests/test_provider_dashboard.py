@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -463,3 +464,57 @@ def test_la_pagina_no_contiene_secretos_ni_estado_hardcodeado() -> None:
     assert 'id="status-openai"' not in texto
     assert "sk-" not in texto
     assert "/providers" in texto and "/roles" in texto
+
+
+# ---------------------------------------------------------------------------
+# Test connection con la sonda real del adaptador (DeepSeek)
+# ---------------------------------------------------------------------------
+def _sonda_deepseek(status: int) -> httpx.MockTransport:
+    """Transporte simulado que responde a la sonda de DeepSeek con el estado indicado."""
+    cuerpo = (
+        {"object": "list", "data": [{"id": "deepseek-v4-pro"}]}
+        if status == 200
+        else {"error": {"message": "rechazado"}}
+    )
+    return httpx.MockTransport(lambda _request: httpx.Response(status, json=cuerpo))
+
+
+def _deepseek_con_sonda(status: int):
+    """Cliente de DeepSeek con transporte simulado, sin red y sin credencial real."""
+    from punto.providers.deepseek import DeepSeekClient, DeepSeekConfig
+
+    return DeepSeekClient(
+        DeepSeekConfig(api_key=TEST_KEY, model="deepseek-v4-pro"),
+        transport=_sonda_deepseek(status),
+    )
+
+
+def test_t15_test_connection_de_deepseek_usa_su_sonda_real(
+    dashboard: tuple[TestClient, ProviderRegistry], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Test connection`` de DeepSeek informa CONNECTED desde la sonda real del adaptador.
+
+    Antes del saneamiento, el adaptador no exponía sonda y el transporte declaraba ``UNAVAILABLE``
+    aunque el proveedor estuviera conectado. Ahora la comprobación se hace de verdad —``GET
+    /models`` con la credencial del cliente— y se distinguen éxito y credencial rechazada.
+    """
+    client, _ = dashboard
+
+    monkeypatch.setattr(
+        "punto.providers.transport_registry._api_client_for",
+        lambda _provider, model, *, api_key="": _deepseek_con_sonda(200),
+    )
+    conectado = client.post("/providers/deepseek/test", json={}).json()
+
+    monkeypatch.setattr(
+        "punto.providers.transport_registry._api_client_for",
+        lambda _provider, model, *, api_key="": _deepseek_con_sonda(401),
+    )
+    rechazado = client.post("/providers/deepseek/test", json={}).json()
+
+    assert conectado["status"] == "CONNECTED"
+    assert conectado["connected"] is True
+    assert "modelos" in conectado["detail"]
+    assert rechazado["status"] == "NOT_AUTHENTICATED"
+    assert rechazado["connected"] is False
+    assert TEST_KEY not in json.dumps([conectado, rechazado])

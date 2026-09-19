@@ -82,8 +82,9 @@ destino real, con dos propuestas aceptadas y el destino intacto. La fase **no** 
 - La primera ejecución real encontró un **defecto real del propio motor** (un tipo MIME como
   `application/json` se interpretaba como ruta inexistente y invalidaba una propuesta buena). Se
   corrigió, se añadieron dos pruebas de regresión (G6/G7) y la misma solicitud volvió a aceptarse.
-- Números: **60 pruebas nuevas** en verde, **377 regresiones relevantes** en verde, `ruff` limpio en
-  todo el repositorio, `mypy` estricto limpio en **181 ficheros**.
+- Números: **60 pruebas nuevas** en verde, **suite completa 3 760 en verde / 1 omitida / 1 fallo
+  preexistente ajeno a esta fase**, directorio de casos 20/20, `ruff` limpio en todo el repositorio y
+  `mypy` estricto limpio en **181 ficheros**.
 - Lo que **no** se hizo, a propósito: aplicar propuestas, reparar, emitir efectos, saltar un Human
   Gate, escribir experiencia automáticamente o tocar el destino.
 
@@ -448,21 +449,21 @@ de que no debía inferirlos sin evidencia adicional.
 | `pytest tests/test_build_cycle.py` | 60 pruebas nuevas | 60 en verde |
 | Regresiones relevantes | PELL (2 ficheros), proveedores de workflow (2), auditoría de reparación, importaciones en frío, enrutado de modelo, contrato de proveedores, comprobaciones de seguridad | **377 en verde** |
 | Suites de API y dashboard de proveedores | `test_api.py`, `test_provider_dashboard.py`, `test_multi_provider.py` | 62 en verde |
-| Suite amplia | `pytest tests` excluyendo los ficheros que exigen contenedor (sandbox de QA/desarrollo y los E2E de proyecto) | **3 536 en verde, 1 omitida, 1 fallo preexistente** |
-| Suite completa con contenedores | `pytest tests` (incluye los E2E con podman) | No terminó dentro de la ventana de la fase; dominada por el arranque de contenedores. Se declara **no concluyente** |
+| Suite completa (`pytest tests`, no-integration) | **Todo** el repositorio, incluidos los E2E con contenedor y el directorio de casos | **3 760 en verde, 1 omitida, 1 fallo preexistente** (43 min 32 s) |
+| Suite amplia sin contenedores | `pytest tests` sin los ficheros que exigen podman | 3 536 en verde, 1 omitida, el mismo fallo preexistente |
+| Directorio de casos | 20 casos (AUTHORITY, RESOURCE_CONTAINMENT, HUMAN_GATE, MEMORY, PROVIDER, TRANSPORT, …) | 20 PASS / 0 FAIL / 0 SKIP |
 
-**Sobre el único fallo de la suite amplia:** `test_workflow_policy.py::test_known_actions_es_espejo_del_catalogo_real`
+**Sobre el único fallo de la suite completa:** `test_workflow_policy.py::test_known_actions_es_espejo_del_catalogo_real`
 comprueba que la tabla de impacto del workflow cubre exactamente el catálogo de política. Falla
 porque el catálogo incluye acciones de la fase DB AUTHORITY EXECUTOR v0 (`db_migration_apply`,
 `db_seed`, `db_connect_check`, `db_safe_read`, `db_mass_data_change`, `external_resource_create`) que
 la tabla no declara. **No es una regresión de PILOT-03:** se reprodujo idéntico en un árbol de trabajo
 limpio sobre la base `64ddb0461eac7d553dba96b187b293dce5546f59`, anterior a cualquier cambio de esta
 fase, y ninguno de los ficheros implicados (catálogo de política y `known_actions`) está entre los
-modificados aquí. Queda como hallazgo heredado, fuera del alcance de esta fase.
+modificados aquí. Queda como hallazgo heredado (F-9), fuera del alcance de esta fase.
 
-La suite completa con contenedores se lanzó en segundo plano y seguía ejecutándose al cerrar el
-informe; su resultado se declara **UNKNOWN**. Lo anteriormente enumerado cubre todas las áreas que
-esta fase toca (PELL, proveedores, router, auditoría, API y dashboard).
+La única omisión es ambiental y también preexistente: `test_qa_service_dependency.py` no puede crear
+enlaces simbólicos en este sistema.
 
 ---
 

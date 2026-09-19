@@ -407,6 +407,7 @@ de que no debía inferirlos sin evidencia adicional.
 | F-6 | Baja | DEFERRED_NON_BLOCKING | No hay entrada de dashboard para solicitudes de construcción (sección 13). |
 | F-7 | Info | Documentado y probado | Los `5xx` se reintentan en el **transporte** (3 intentos: `1 + transport_retries`), no en el ciclo; el ciclo invoca una sola vez y normaliza el desenlace (`test_h6`). |
 | F-8 | Media | **BLOQUEANTE DE EVIDENCIA** | La consulta de revisión al ARCHITECT no se pudo producir: `LIMIT_REACHED` de la suscripción en dos intentos (evidencia adjunta). El artefacto JSON de la consulta de descubrimiento previa no está en disco (el directorio de la fase fue limpiado entre sesiones). Requiere decisión humana: aceptar el registro de la sesión o reejecutar la consulta cuando la cuota se restablezca. |
+| F-9 | Info | **HEREDADO** (fuera de alcance) | `known_actions()` (tabla de impacto del workflow) no cubre las acciones del catálogo de política añadidas en DB AUTHORITY EXECUTOR v0, y la prueba que lo vigila falla desde entonces. Reproducido idéntico en la base `64ddb046` de esta fase; no lo introduce PILOT-03. |
 
 ---
 
@@ -447,11 +448,21 @@ de que no debía inferirlos sin evidencia adicional.
 | `pytest tests/test_build_cycle.py` | 60 pruebas nuevas | 60 en verde |
 | Regresiones relevantes | PELL (2 ficheros), proveedores de workflow (2), auditoría de reparación, importaciones en frío, enrutado de modelo, contrato de proveedores, comprobaciones de seguridad | **377 en verde** |
 | Suites de API y dashboard de proveedores | `test_api.py`, `test_provider_dashboard.py`, `test_multi_provider.py` | 62 en verde |
-| Suite completa (`pytest tests`) | Suite no-integration completa | **EN CURSO al cerrar el informe** (véase más abajo) |
+| Suite amplia | `pytest tests` excluyendo los ficheros que exigen contenedor (sandbox de QA/desarrollo y los E2E de proyecto) | **3 536 en verde, 1 omitida, 1 fallo preexistente** |
+| Suite completa con contenedores | `pytest tests` (incluye los E2E con podman) | No terminó dentro de la ventana de la fase; dominada por el arranque de contenedores. Se declara **no concluyente** |
 
-La suite completa se lanzó en segundo plano y seguía ejecutándose al redactar este informe; su
-resultado se declara **UNKNOWN** en el momento del cierre salvo por lo anteriormente enumerado, que
-cubre todas las áreas que esta fase toca (PELL, proveedores, router, auditoría, API y dashboard).
+**Sobre el único fallo de la suite amplia:** `test_workflow_policy.py::test_known_actions_es_espejo_del_catalogo_real`
+comprueba que la tabla de impacto del workflow cubre exactamente el catálogo de política. Falla
+porque el catálogo incluye acciones de la fase DB AUTHORITY EXECUTOR v0 (`db_migration_apply`,
+`db_seed`, `db_connect_check`, `db_safe_read`, `db_mass_data_change`, `external_resource_create`) que
+la tabla no declara. **No es una regresión de PILOT-03:** se reprodujo idéntico en un árbol de trabajo
+limpio sobre la base `64ddb0461eac7d553dba96b187b293dce5546f59`, anterior a cualquier cambio de esta
+fase, y ninguno de los ficheros implicados (catálogo de política y `known_actions`) está entre los
+modificados aquí. Queda como hallazgo heredado, fuera del alcance de esta fase.
+
+La suite completa con contenedores se lanzó en segundo plano y seguía ejecutándose al cerrar el
+informe; su resultado se declara **UNKNOWN**. Lo anteriormente enumerado cubre todas las áreas que
+esta fase toca (PELL, proveedores, router, auditoría, API y dashboard).
 
 ---
 
@@ -488,8 +499,9 @@ alcance validado, verificación posterior con evidencia (pruebas del destino) y 
 
 **Pendientes que la siguiente fase debe resolver:** F-2 (ratificar la tabla de capacidades o
 corregirla con su propia regresión), F-3 (acceso del proveedor al destino, gobernado), F-4
-(auditoría de rechazos de esquema), F-5 (consumo real por ciclo), F-6 (panel de solicitudes) y F-8
-(evidencia de la consulta al ARCHITECT).
+(auditoría de rechazos de esquema), F-5 (consumo real por ciclo), F-6 (panel de solicitudes), F-8
+(evidencia de la consulta al ARCHITECT) y F-9 (alinear `known_actions()` con el catálogo de política,
+heredado de DB AUTHORITY EXECUTOR v0).
 
 **Condiciones que un humano debe resolver para cerrar PILOT-03:**
 

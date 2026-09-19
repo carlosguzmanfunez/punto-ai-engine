@@ -46,6 +46,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from punto._version import ENGINE_NAME, ENGINE_PHASE, ENGINE_VERSION
 from punto.audit.logger import AuditLogger
+from punto.orchestrator.build_cycle import (
+    BuildCycle,
+    BuildCycleError,
+    default_build_cycle,
+)
 from punto.orchestrator.camus import Camus, RequestOverrides
 from punto.orchestrator.planner import Planner
 from punto.orchestrator.state_machine import InvalidTransitionError, StateMachine
@@ -58,6 +63,7 @@ from punto.policy.human_gate import (
 )
 from punto.policy.policy_engine import PolicyEngine
 from punto.schemas.audit import AuditEvent
+from punto.schemas.build import BuildRequest, BuildResult
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.enums import AuthorityLevel, RiskLevel, TaskPriority, TaskStatus
 from punto.schemas.policy import PolicyDecision
@@ -79,7 +85,9 @@ class Engine:
     de la API y se comparte entre peticiones.
     """
 
-    def __init__(self, *, environment: str = "local") -> None:
+    def __init__(
+        self, *, environment: str = "local", build_cycle: BuildCycle | None = None
+    ) -> None:
         self.environment = environment
         self.audit = AuditLogger()
         self.state_machine = StateMachine()
@@ -95,6 +103,41 @@ class Engine:
             state_machine=self.state_machine,
             planner=self.planner,
         )
+        # El ciclo de construcción gobernada se compone en el primer uso, salvo que se inyecte uno
+        # ya montado (pruebas y composición explícita): un motor sin destinos ni proveedores
+        # configurados puede arrancar y responder al resto de la API, y el ciclo dice lo que le
+        # falta cuando alguien pide trabajo de verdad.
+        self._build_cycle: BuildCycle | None = build_cycle
+        if build_cycle is not None:
+            # El ciclo comparte el registro de auditoría del motor aunque venga montado desde fuera:
+            # así la reconstrucción de un ciclo por ``request_id`` es **una sola** consulta
+            # (``/audit/events?resource_id=...``) y no depende de dónde se compuso el ciclo.
+            build_cycle.audit = self.audit
+        self.build_results: dict[str, BuildResult] = {}
+
+    def build_cycle(self) -> BuildCycle:
+        """Ciclo de construcción gobernada, compuesto con la configuración vigente.
+
+        Raises:
+            BuildCycleError: si la configuración de destinos no se puede leer.
+        """
+        if self._build_cycle is None:
+            self._build_cycle = default_build_cycle(audit=self.audit)
+        return self._build_cycle
+
+    def run_build_request(self, request: BuildRequest) -> BuildResult:
+        """Ejecuta una solicitud y conserva su resultado para poder consultarlo después.
+
+        El resultado se guarda por ``request_id``: es la misma clave con la que se puede
+        reconstruir el ciclo entero desde ``/audit/events``.
+        """
+        result = self.build_cycle().run(request)
+        self.build_results[str(request.request_id)] = result
+        return result
+
+    def build_targets(self) -> tuple[str, ...]:
+        """Claves de destino registradas en la configuración vigente."""
+        return tuple(sorted(self.build_cycle().config.targets))
 
     def health(self) -> dict[str, str]:
         """Información de salud del motor."""
@@ -204,7 +247,9 @@ class PolicyEvaluateRequest(BaseModel):
 # ============================================================================
 # Aplicación
 # ============================================================================
-def create_app(*, environment: str = "local") -> FastAPI:
+def create_app(
+    *, environment: str = "local", build_cycle: BuildCycle | None = None
+) -> FastAPI:
     """Construye la aplicación FastAPI con el motor ensamblado."""
     application = FastAPI(
         title=ENGINE_NAME,
@@ -219,7 +264,7 @@ def create_app(*, environment: str = "local") -> FastAPI:
     )
 
     try:
-        engine = Engine(environment=environment)
+        engine = Engine(environment=environment, build_cycle=build_cycle)
     except ConfigError as exc:
         message = str(exc)
 
@@ -362,6 +407,72 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
             ),
         }
 
+    # ---------------------------------------------------------- build requests
+    @application.get(
+        "/build-targets",
+        tags=["build"],
+        summary="Destinos de construcción registrados",
+    )
+    def list_build_targets() -> dict[str, Any]:
+        """Destinos que PUNTO acepta como destino de una solicitud de construcción.
+
+        La ruta real del repositorio **no** se publica: la solicitud nombra una clave registrada y
+        el motor resuelve la ruta por su cuenta. Publicar esta lista no autoriza a nadie a pedir
+        trabajo: la admisión se decide por solicitud.
+        """
+        cycle = engine.build_cycle()
+        return {
+            "targets": [
+                {
+                    "target_id": target.target_id,
+                    "scope_roots": list(target.scope_roots),
+                }
+                for target in (cycle.config.targets[key] for key in sorted(cycle.config.targets))
+            ],
+            "max_output_tokens": cycle.config.max_output_tokens,
+            "authority": "PROPOSAL_ONLY",
+        }
+
+    @application.post(
+        "/build-requests",
+        tags=["build"],
+        summary="Solicitar una construcción gobernada",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_build_request(payload: BuildRequest) -> dict[str, Any]:
+        """Admite una solicitud, la ejecuta por el ciclo gobernado y devuelve el resultado.
+
+        PUNTO no aplica nada: el proveedor produce una propuesta, PUNTO la valida con sus propias
+        comprobaciones y el resultado sale con ``authority: PROPOSAL_ONLY``. Un fallo del proveedor
+        **no** es un error HTTP: es un estado del resultado (``PROVIDER_FAILED``), porque el ciclo
+        sí se ejecutó y su desenlace es información válida.
+        """
+        result = engine.run_build_request(payload)
+        return {
+            **result.as_public_dict(),
+            "audit_resource": str(result.request_id),
+            "applied": False,
+        }
+
+    @application.get(
+        "/build-requests/{request_id}",
+        tags=["build"],
+        summary="Resultado de una solicitud de construcción",
+    )
+    def get_build_request(request_id: UUID) -> dict[str, Any]:
+        """Devuelve el resultado normalizado de una solicitud ya ejecutada."""
+        stored = engine.build_results.get(str(request_id))
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Solicitud de construcción no encontrada: {request_id}",
+            )
+        return {
+            **stored.as_public_dict(),
+            "audit_resource": str(stored.request_id),
+            "applied": False,
+        }
+
     # -------------------------------------------------------------- human gate
     @application.get("/human-gate", tags=["human-gate"], summary="Listar Human Gates")
     def list_human_gates(
@@ -490,6 +601,24 @@ def _register_routes(application: FastAPI, engine: Engine) -> None:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc), "error": "human_gate_error"},
+        )
+
+    @application.exception_handler(BuildCycleError)
+    def _build_rejected(_request: Request, exc: BuildCycleError) -> JSONResponse:
+        """Una solicitud que la frontera rechaza no se ejecuta: se declara rechazada.
+
+        El rechazo se registra en la auditoría por ``request_id`` (evento
+        ``BUILD_REQUEST_REJECTED``) y no se invoca a ningún proveedor.
+        """
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": str(exc),
+                "error": "build_request_rejected",
+                "status": "REQUEST_REJECTED",
+                "authority": "PROPOSAL_ONLY",
+                "provider_invoked": False,
+            },
         )
 
     @application.exception_handler(ValueError)

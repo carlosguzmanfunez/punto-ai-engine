@@ -25,6 +25,10 @@ htmlcov/
 # credenciales: las claves viven en el almacén de secretos, fuera del árbol.
 config/providers.local.yaml
 
+# Memoria operativa de PELL (conocimiento acumulado por este motor en esta máquina). Es estado de
+# ejecución, no producto: se versiona el código que la lee y escribe, no su contenido.
+.punto-memory/
+
 # Artefactos de construcción
 dist/
 build/

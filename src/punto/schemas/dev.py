@@ -1,0 +1,391 @@
+"""Contrato del ciclo de desarrollo gobernado (PILOT-04).
+
+Extiende el vocabulario de PILOT-03 en vez de reemplazarlo: la **solicitud** sigue siendo
+:class:`~punto.schemas.build.BuildRequest` (objetivo, destino registrado, rol, límites y alcance
+declarado), y lo que se añade aquí es lo que hace falta para **aplicar** cambios de verdad:
+
+- :class:`DevelopmentPlan` — lo que PUNTO va a tocar, declarado **antes** de escribir;
+- :class:`FileChangeProposal` — un cambio concreto con su operación, su precondición y su motivo;
+- :class:`ContextRequest` — una petición de contexto del proveedor, con motivo, que PUNTO concede o
+  deniega;
+- :class:`DevelopmentResult` — el desenlace, con la autoridad limitada a lo local.
+
+Frontera de autoridad de esta fase, escrita en el propio contrato: ``authority`` es
+``LOCAL_APPLY_ONLY`` — PUNTO puede escribir y confirmar **dentro** del workspace gobernado y nada
+más. ``published`` es siempre ``False``: publicar no es una operación de este ciclo, y
+decirlo con un
+campo evita que una fase posterior lo dé por supuesto.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import StrEnum
+from pathlib import PurePosixPath
+from typing import Final, Literal
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from punto.common import utc_now
+from punto.schemas.build import BuildValidationIssue  # el vocabulario de incidencias ya existe
+
+#: Cotas del contrato: un plan es un plan, no un volcado del repositorio.
+MAX_PLAN_ITEMS: Final[int] = 40
+MAX_ITEM_CHARS: Final[int] = 300
+MAX_PATH_CHARS: Final[int] = 400
+MAX_CONTENT_CHARS: Final[int] = 200_000
+MAX_REASON_CHARS: Final[int] = 400
+MAX_RISKS: Final[int] = 10
+MAX_CONTEXT_REQUESTS: Final[int] = 8
+MAX_VERIFICATION_COMMANDS: Final[int] = 8
+
+#: Caracteres de control que nunca forman parte de una ruta declarada.
+_CONTROL_CHARS: Final[tuple[str, ...]] = (
+    *(chr(code) for code in range(0x20)),
+    "\x7f",
+)
+
+
+class RepositoryOperation(StrEnum):
+    """Operaciones que la frontera de recursos puede autorizar, una a una.
+
+    Se autorizan por separado a propósito: leer no implica escribir, ejecutar no implica confirmar.
+    """
+
+    READ = "READ"
+    WRITE = "WRITE"
+    CREATE = "CREATE"
+    DELETE = "DELETE"
+    EXECUTE = "EXECUTE"
+    COMMIT = "COMMIT"
+
+
+class ChangeOperation(StrEnum):
+    """Operación de un cambio propuesto sobre un fichero."""
+
+    CREATE = "CREATE"
+    MODIFY = "MODIFY"
+    DELETE = "DELETE"
+
+
+class PlanStatus(StrEnum):
+    """Veredicto de PUNTO sobre un plan."""
+
+    VALID = "PLAN_VALID"
+    REJECTED = "PLAN_REJECTED"
+
+
+class DevelopmentStatus(StrEnum):
+    """Desenlace del ciclo de desarrollo."""
+
+    COMPLETED = "DEVELOPMENT_COMPLETED"          # cambios aplicados y verificados
+    PLAN_REJECTED = "DEVELOPMENT_PLAN_REJECTED"  # el plan no superó la validación de PUNTO
+    CHANGE_REJECTED = "DEVELOPMENT_CHANGE_REJECTED"
+    VERIFICATION_FAILED = "DEVELOPMENT_VERIFICATION_FAILED"  # agotó las reparaciones
+    ROLLED_BACK = "DEVELOPMENT_ROLLED_BACK"      # se revirtió a propósito
+    PROVIDER_FAILED = "DEVELOPMENT_PROVIDER_FAILED"
+    BLOCKED = "DEVELOPMENT_BLOCKED"              # la frontera denegó algo necesario
+
+
+def _clean_path(value: str) -> str:
+    """Normaliza y valida una ruta declarada: relativa, sin escapes y sin sorpresas.
+
+    Raises:
+        ValueError: si la ruta es absoluta, sube por ``..``, trae esquema URI, byte nulo o
+            caracteres de control.
+    """
+    text = value.strip().replace("\\", "/")
+    if not text:
+        raise ValueError("la ruta no puede estar vacía")
+    if len(text) > MAX_PATH_CHARS:
+        raise ValueError(f"la ruta supera {MAX_PATH_CHARS} caracteres")
+    if any(character in text for character in _CONTROL_CHARS):
+        raise ValueError("la ruta contiene caracteres de control")
+    if "://" in text or text.startswith("file:"):
+        raise ValueError("la ruta no puede ser una URI")
+    if text.startswith("/") or text.startswith("//") or PurePosixPath(text).is_absolute():
+        raise ValueError("la ruta debe ser relativa al destino")
+    parts = PurePosixPath(text).parts
+    if any(part == ".." for part in parts):
+        raise ValueError("la ruta no puede subir con '..'")
+    normalized = PurePosixPath(*[part for part in parts if part not in ("", ".")]).as_posix()
+    if not normalized or normalized == ".":
+        raise ValueError("la ruta no apunta a ningún fichero")
+    return normalized
+
+
+class ContextRequest(BaseModel):
+    """Petición de contexto del proveedor: qué fichero pide y por qué.
+
+    No concede nada por sí misma: PUNTO valida la ruta, el alcance, la frontera de secretos y el
+    presupuesto antes de entregarla.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str = Field(description="Ruta relativa del fichero pedido.")
+    reason: str = Field(
+        default="", max_length=MAX_REASON_CHARS, description="Para qué lo necesita."
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        """Acepta solo rutas declarables."""
+        return _clean_path(value)
+
+
+class FileChangeProposal(BaseModel):
+    """Un cambio concreto propuesto por el BUILDER, listo para ser validado por PUNTO."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str = Field(description="Ruta relativa del fichero.")
+    operation: ChangeOperation = Field(description="Crear, modificar o borrar.")
+    content: str | None = Field(
+        default=None,
+        max_length=MAX_CONTENT_CHARS,
+        description="Contenido exacto para CREATE/MODIFY. Nunca para DELETE.",
+    )
+    expected_sha256: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Huella del contenido que el proveedor leyó; evita escribir sobre algo "
+            "distinto."
+        ),
+    )
+    reason: str = Field(default="", max_length=MAX_REASON_CHARS)
+    acceptance_criterion: str = Field(
+        default="", max_length=MAX_ITEM_CHARS, description="Criterio del encargo que satisface."
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        """Acepta solo rutas declarables."""
+        return _clean_path(value)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> FileChangeProposal:
+        """Un borrado no lleva contenido y una escritura sí.
+
+        Raises:
+            ValueError: si la combinación de operación y contenido no tiene sentido.
+        """
+        if self.operation is ChangeOperation.DELETE:
+            if self.content is not None:
+                raise ValueError("un borrado no lleva contenido")
+            return self
+        if self.content is None:
+            raise ValueError(f"la operación {self.operation.value} exige contenido")
+        if not self.content.strip():
+            raise ValueError("el contenido no puede estar vacío")
+        return self
+
+
+class DevelopmentPlan(BaseModel):
+    """Plan normalizado que PUNTO valida antes de permitir una sola escritura."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    summary: str = Field(default="", max_length=MAX_ITEM_CHARS * 2)
+    files_to_read: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    files_to_modify: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    files_to_create: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    verification_commands: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_VERIFICATION_COMMANDS,
+        description="Nombres del catálogo del destino.",
+    )
+    risks: tuple[str, ...] = Field(default=(), max_length=MAX_RISKS)
+    acceptance_mapping: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+
+    @field_validator("files_to_read", "files_to_modify", "files_to_create")
+    @classmethod
+    def validate_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Normaliza y deduplica rutas declaradas."""
+        cleaned: list[str] = []
+        for item in value:
+            path = _clean_path(item)
+            if path not in cleaned:
+                cleaned.append(path)
+        return tuple(cleaned)
+
+    @field_validator("verification_commands", "risks", "acceptance_mapping")
+    @classmethod
+    def validate_texts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Acota y deduplica textos cortos."""
+        cleaned: list[str] = []
+        for item in value:
+            text = item.strip()
+            if not text:
+                continue
+            if len(text) > MAX_ITEM_CHARS:
+                raise ValueError(f"el elemento supera {MAX_ITEM_CHARS} caracteres")
+            if text not in cleaned:
+                cleaned.append(text)
+        return tuple(cleaned)
+
+    def touched_paths(self) -> tuple[str, ...]:
+        """Rutas que el plan declara escribir, en orden estable."""
+        return tuple(dict.fromkeys((*self.files_to_modify, *self.files_to_create)))
+
+
+class AppliedChange(BaseModel):
+    """Cambio que PUNTO aplicó de verdad, con la evidencia de que quedó escrito."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str
+    operation: ChangeOperation
+    bytes_written: int = Field(ge=0)
+    sha256: str = Field(min_length=64, max_length=64)
+    verified: bool = Field(description="True si la relectura coincide con lo escrito.")
+    round_index: int = Field(
+        default=0, ge=0, description="Ronda de reparación en la que se aplicó."
+    )
+
+
+class CommandEvidence(BaseModel):
+    """Evidencia de un comando de verificación ejecutado por PUNTO."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    argv: tuple[str, ...]
+    exit_code: int
+    duration_ms: int = Field(ge=0)
+    output_excerpt: str = Field(default="", max_length=4_000)
+    truncated: bool = False
+    timed_out: bool = False
+    passed: bool = False
+
+
+class PellInfluence(BaseModel):
+    """Cómo una experiencia recuperada cambió una decisión del ciclo, con efecto observable."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    experience_id: str = Field(min_length=1, max_length=64)
+    decision_point: str = Field(min_length=1, max_length=MAX_ITEM_CHARS)
+    how_used: str = Field(min_length=1, max_length=MAX_ITEM_CHARS)
+    observable_effect: str = Field(min_length=1, max_length=MAX_ITEM_CHARS)
+
+
+class DevelopmentResult(BaseModel):
+    """Desenlace del ciclo de desarrollo, con la autoridad explícita y acotada."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: UUID = Field(default_factory=uuid4)
+    status: DevelopmentStatus
+    target_id: str = Field(default="", max_length=80)
+    branch: str = Field(default="", max_length=120)
+    plan: DevelopmentPlan | None = None
+    plan_status: PlanStatus = PlanStatus.REJECTED
+    plan_issues: tuple[BuildValidationIssue, ...] = ()
+    change_issues: tuple[BuildValidationIssue, ...] = ()
+    applied: tuple[AppliedChange, ...] = ()
+    verification: tuple[CommandEvidence, ...] = ()
+    repair_rounds: int = Field(default=0, ge=0)
+    context_requests_granted: tuple[str, ...] = ()
+    context_requests_denied: tuple[str, ...] = ()
+    checkpoint_id: str = Field(default="", max_length=64)
+    rolled_back: bool = False
+    commit_sha: str = Field(default="", max_length=64)
+    pell_status: str = Field(default="DISABLED", max_length=20)
+    pell_influence: tuple[PellInfluence, ...] = ()
+    provider: str = Field(default="", max_length=40)
+    model: str = Field(default="", max_length=120)
+    duration_ms: int | None = Field(default=None, ge=0)
+    error_kind: str = Field(default="", max_length=40)
+    error: str = Field(default="", max_length=1_000)
+    authority: Literal["LOCAL_APPLY_ONLY"] = "LOCAL_APPLY_ONLY"
+    published: bool = Field(
+        default=False,
+        description="Publicar no es una operación de este ciclo: siempre False y comprobado.",
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def completed(self) -> bool:
+        """True solo si los cambios quedaron aplicados y verificados."""
+        return self.status is DevelopmentStatus.COMPLETED
+
+    def as_public_dict(self) -> dict[str, object]:
+        """Vista serializable, sin contexto interno ni contenido de los ficheros."""
+        return {
+            "request_id": str(self.request_id),
+            "status": self.status.value,
+            "target_id": self.target_id,
+            "branch": self.branch,
+            "plan_status": self.plan_status.value,
+            "plan_issues": [issue.as_text() for issue in self.plan_issues],
+            "change_issues": [issue.as_text() for issue in self.change_issues],
+            "applied": [
+                {
+                    "path": change.path,
+                    "operation": change.operation.value,
+                    "bytes": change.bytes_written,
+                    "sha256": change.sha256,
+                    "verified": change.verified,
+                }
+                for change in self.applied
+            ],
+            "verification": [
+                {
+                    "name": evidence.name,
+                    "argv": list(evidence.argv),
+                    "exit_code": evidence.exit_code,
+                    "passed": evidence.passed,
+                    "duration_ms": evidence.duration_ms,
+                    "truncated": evidence.truncated,
+                }
+                for evidence in self.verification
+            ],
+            "repair_rounds": self.repair_rounds,
+            "context_requests_granted": list(self.context_requests_granted),
+            "context_requests_denied": list(self.context_requests_denied),
+            "checkpoint_id": self.checkpoint_id,
+            "rolled_back": self.rolled_back,
+            "commit_sha": self.commit_sha,
+            "pell_status": self.pell_status,
+            "pell_influence": [
+                {
+                    "experience_id": influence.experience_id,
+                    "decision_point": influence.decision_point,
+                    "how_used": influence.how_used,
+                    "observable_effect": influence.observable_effect,
+                }
+                for influence in self.pell_influence
+            ],
+            "provider": self.provider,
+            "model": self.model,
+            "duration_ms": self.duration_ms,
+            "error_kind": self.error_kind,
+            "error": self.error,
+            "authority": self.authority,
+            "published": self.published,
+        }
+
+
+__all__ = [
+    "MAX_CONTENT_CHARS",
+    "MAX_CONTEXT_REQUESTS",
+    "MAX_ITEM_CHARS",
+    "MAX_PATH_CHARS",
+    "MAX_PLAN_ITEMS",
+    "AppliedChange",
+    "ChangeOperation",
+    "CommandEvidence",
+    "ContextRequest",
+    "DevelopmentPlan",
+    "DevelopmentResult",
+    "DevelopmentStatus",
+    "FileChangeProposal",
+    "PellInfluence",
+    "PlanStatus",
+    "RepositoryOperation",
+]

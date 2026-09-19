@@ -158,6 +158,28 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.BUILD_PROVIDER_SELECTED: "build_provider",
     AuditEventType.BUILD_PROPOSAL_VALIDATED: "build_proposal",
     AuditEventType.BUILD_CYCLE_COMPLETED: "build_cycle",
+    # --- Ciclo de desarrollo gobernado (PILOT-04) -----------------------------
+    #: Se registran sobre el ``request_id``, de modo que ``AuditLogger.by_resource`` reconstruye el
+    #: ciclo de desarrollo completo. Nunca llevan contenido de ficheros ni credenciales: solo rutas
+    #: relativas, operaciones, huellas, conteos y códigos de salida.
+    AuditEventType.DEV_REPOSITORY_DISCOVERED: "dev_repository",
+    AuditEventType.DEV_CONTEXT_GRANTED: "dev_context",
+    AuditEventType.DEV_CONTEXT_DENIED: "dev_context",
+    AuditEventType.DEV_PLAN_CREATED: "dev_plan",
+    AuditEventType.DEV_PLAN_VALIDATED: "dev_plan",
+    AuditEventType.DEV_PLAN_REJECTED: "dev_plan",
+    AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
+    AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
+    AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",
+    AuditEventType.DEV_VERIFICATION_COMPLETED: "dev_verification",
+    AuditEventType.DEV_REPAIR_STARTED: "dev_repair",
+    AuditEventType.DEV_REPAIR_COMPLETED: "dev_repair",
+    AuditEventType.DEV_REPAIR_EXHAUSTED: "dev_repair",
+    AuditEventType.DEV_CHECKPOINT_CREATED: "dev_checkpoint",
+    AuditEventType.DEV_ROLLBACK_COMPLETED: "dev_checkpoint",
+    AuditEventType.DEV_PELL_RETRIEVED: "dev_pell",
+    AuditEventType.DEV_PELL_INFLUENCE: "dev_pell",
+    AuditEventType.DEV_CYCLE_BLOCKED: "dev_cycle",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

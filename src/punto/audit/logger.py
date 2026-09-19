@@ -4681,6 +4681,32 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_dev_event(
+        self,
+        event_type: AuditEventType,
+        action: str,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra un evento del ciclo de desarrollo gobernado (PILOT-04).
+
+        Es la puerta común de la fase: el evento se indexa por ``request_id`` (para poder
+        reconstruir el ciclo entero) y sus metadatos pasan por el mismo saneado que los del ciclo de
+        propuesta, de modo que solo viajan rutas relativas, operaciones, huellas, conteos, códigos
+        de salida y motivos — nunca contenido de ficheros ni credenciales.
+        """
+        return self._log_redacted(
+            event_type,
+            action,
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
     def log_qa_service_started(
         self,
         *,

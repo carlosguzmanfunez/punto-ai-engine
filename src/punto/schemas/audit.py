@@ -280,6 +280,42 @@ class AuditEventType(StrEnum):
     BUILD_PROPOSAL_VALIDATED = "BUILD_PROPOSAL_VALIDATED"
     #: PILOT-03: el ciclo terminó con su desenlace y su estado final.
     BUILD_CYCLE_COMPLETED = "BUILD_CYCLE_COMPLETED"
+    #: PILOT-04: PUNTO inspeccionó el repositorio destino dentro de su alcance.
+    DEV_REPOSITORY_DISCOVERED = "DEV_REPOSITORY_DISCOVERED"
+    #: PILOT-04: PUNTO concedió al proveedor un fichero de contexto que este pidió con su motivo.
+    DEV_CONTEXT_GRANTED = "DEV_CONTEXT_GRANTED"
+    #: PILOT-04: PUNTO denegó una petición de contexto (fuera de alcance, secreto o presupuesto).
+    DEV_CONTEXT_DENIED = "DEV_CONTEXT_DENIED"
+    #: PILOT-04: el ARCHITECT propuso un plan de trabajo normalizado.
+    DEV_PLAN_CREATED = "DEV_PLAN_CREATED"
+    #: PILOT-04: PUNTO validó el plan (alcance, operaciones y criterios).
+    DEV_PLAN_VALIDATED = "DEV_PLAN_VALIDATED"
+    #: PILOT-04: PUNTO rechazó el plan antes de permitir una sola escritura.
+    DEV_PLAN_REJECTED = "DEV_PLAN_REJECTED"
+    #: PILOT-04: PUNTO validó un cambio concreto (ruta, operación, huella y secretos).
+    DEV_CHANGE_VALIDATED = "DEV_CHANGE_VALIDATED"
+    #: PILOT-04: PUNTO rechazó un cambio propuesto.
+    DEV_CHANGE_REJECTED = "DEV_CHANGE_REJECTED"
+    #: PILOT-04: empezó la verificación con los comandos del catálogo del destino.
+    DEV_VERIFICATION_STARTED = "DEV_VERIFICATION_STARTED"
+    #: PILOT-04: terminó la verificación, con el resultado de cada comando.
+    DEV_VERIFICATION_COMPLETED = "DEV_VERIFICATION_COMPLETED"
+    #: PILOT-04: se abrió una ronda de reparación con la evidencia del fallo.
+    DEV_REPAIR_STARTED = "DEV_REPAIR_STARTED"
+    #: PILOT-04: la ronda de reparación dejó los cambios y la verificación en verde.
+    DEV_REPAIR_COMPLETED = "DEV_REPAIR_COMPLETED"
+    #: PILOT-04: se agotaron las rondas de reparación sin resolver el fallo.
+    DEV_REPAIR_EXHAUSTED = "DEV_REPAIR_EXHAUSTED"
+    #: PILOT-04: se creó el checkpoint reversible antes de la primera escritura.
+    DEV_CHECKPOINT_CREATED = "DEV_CHECKPOINT_CREATED"
+    #: PILOT-04: el rollback devolvió el árbol al estado capturado.
+    DEV_ROLLBACK_COMPLETED = "DEV_ROLLBACK_COMPLETED"
+    #: PILOT-04: PUNTO recuperó experiencia de PELL antes de planificar.
+    DEV_PELL_RETRIEVED = "DEV_PELL_RETRIEVED"
+    #: PILOT-04: una experiencia recuperada cambió una decisión, con efecto observable.
+    DEV_PELL_INFLUENCE = "DEV_PELL_INFLUENCE"
+    #: PILOT-04: el ciclo quedó bloqueado por la frontera de autoridad o de recursos.
+    DEV_CYCLE_BLOCKED = "DEV_CYCLE_BLOCKED"
 
 
 class AuditEvent(BaseModel):

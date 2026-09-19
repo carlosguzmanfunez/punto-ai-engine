@@ -262,6 +262,12 @@ class AuditEventType(StrEnum):
     DB_SEED_APPLIED = "DB_SEED_APPLIED"
     #: DB AUTHORITY v0: una consulta de verificación de sólo lectura se ejecutó.
     DB_QUERY_VERIFIED = "DB_QUERY_VERIFIED"
+    #: PILOT-01R.1: se levantó una dependencia de servicio efímera dentro de la red aislada de QA.
+    QA_SERVICE_STARTED = "QA_SERVICE_STARTED"
+    #: PILOT-01R.1: la base efímera quedó preparada (rol de aplicación, migración y seed).
+    QA_SERVICE_PREPARED = "QA_SERVICE_PREPARED"
+    #: PILOT-01R.1: el servicio se destruyó y no quedaron contenedores, redes ni credenciales.
+    QA_SERVICE_DESTROYED = "QA_SERVICE_DESTROYED"
 
 
 class AuditEvent(BaseModel):

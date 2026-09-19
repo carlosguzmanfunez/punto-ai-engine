@@ -4395,6 +4395,32 @@ class AuditLogger:
             metadata=_redacted_metadata(metadata),
         )
 
+    def _log_qa_service(
+        self,
+        event_type: AuditEventType,
+        action: str,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None,
+        result: AuditResult,
+        actor: str | None,
+    ) -> AuditEvent:
+        """Registra un evento de dependencia de servicio de QA con los metadatos saneados.
+
+        Misma frontera que :meth:`_log_database`: el texto pasa por el borrado de credenciales antes
+        de congelarse, así que ni la contraseña efímera ni el DSN de la sesión pueden acabar en el
+        registro aunque quien llama se equivoque. Lo que sí queda registrado es la **huella** de la
+        credencial, que permite comparar sesiones sin revelarlas.
+        """
+        return self.record(
+            event_type,
+            action=action,
+            resource_id=resource_id,
+            result=result,
+            actor=actor,
+            metadata=_redacted_metadata(metadata),
+        )
+
     def log_db_connect_checked(
         self,
         *,
@@ -4515,6 +4541,65 @@ class AuditLogger:
         return self._log_database(
             AuditEventType.DB_QUERY_VERIFIED,
             "db_query_verified",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_qa_service_started(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el arranque de una dependencia de servicio efímera de QA.
+
+        Los metadatos los compone el backend web y **nunca** incluyen la credencial ni el DSN: solo
+        el tipo de servicio, la imagen fijada por digest, el alias interno, los límites y la huella
+        de la credencial de la sesión.
+        """
+        return self._log_qa_service(
+            AuditEventType.QA_SERVICE_STARTED,
+            "qa_service_started",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_qa_service_prepared(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la preparación de la base efímera: rol de aplicación, migración y seed."""
+        return self._log_qa_service(
+            AuditEventType.QA_SERVICE_PREPARED,
+            "qa_service_prepared",
+            resource_id=resource_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_qa_service_destroyed(
+        self,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la destrucción del servicio y el resultado de la comprobación de limpieza."""
+        return self._log_qa_service(
+            AuditEventType.QA_SERVICE_DESTROYED,
+            "qa_service_destroyed",
             resource_id=resource_id,
             metadata=metadata,
             result=result,

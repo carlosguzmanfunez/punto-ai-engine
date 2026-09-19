@@ -143,6 +143,12 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DB_MIGRATION_REJECTED: "database_migration",
     AuditEventType.DB_SEED_APPLIED: "database_seed",
     AuditEventType.DB_QUERY_VERIFIED: "database_query",
+    # --- Dependencias de servicio de QA (PILOT-01R.1) -------------------------
+    #: Se registran sobre el ``task_id`` y llevan la **huella** de la credencial efímera, nunca la
+    #: credencial ni el DSN.
+    AuditEventType.QA_SERVICE_STARTED: "qa_service",
+    AuditEventType.QA_SERVICE_PREPARED: "qa_service",
+    AuditEventType.QA_SERVICE_DESTROYED: "qa_service",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

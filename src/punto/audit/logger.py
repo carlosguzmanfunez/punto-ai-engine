@@ -4547,6 +4547,140 @@ class AuditLogger:
             actor=actor,
         )
 
+    def _log_redacted(
+        self,
+        event_type: AuditEventType,
+        action: str,
+        *,
+        resource_id: str | UUID,
+        metadata: Mapping[str, Any] | None,
+        result: AuditResult,
+        actor: str | None,
+    ) -> AuditEvent:
+        """Registra un evento con metadatos saneados y **sin** texto de terceros.
+
+        Es la frontera común de los eventos del ciclo de construcción gobernada: lo que viaja son
+        identificadores, enums, conteos, huellas y tamaños. El contexto interno, las instrucciones
+        y el texto del proveedor no se copian aquí, así que un secreto que apareciera en ellos no
+        puede llegar al registro por esta vía.
+        """
+        return self.record(
+            event_type,
+            action=action,
+            resource_id=resource_id,
+            result=result,
+            actor=actor,
+            metadata=_redacted_metadata(metadata),
+        )
+
+    def log_build_request_accepted(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que una solicitud de construcción se admitió en la frontera del ciclo."""
+        return self._log_redacted(
+            AuditEventType.BUILD_REQUEST_ACCEPTED,
+            "build_request_accepted",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_build_request_rejected(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.FAILURE,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el rechazo de una solicitud en la frontera (nada se invocó después)."""
+        return self._log_redacted(
+            AuditEventType.BUILD_REQUEST_REJECTED,
+            "build_request_rejected",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_build_request_normalized(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la forma normalizada de la solicitud, por su huella y sus medidas."""
+        return self._log_redacted(
+            AuditEventType.BUILD_REQUEST_NORMALIZED,
+            "build_request_normalized",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_build_provider_selected(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el proveedor resuelto para el rol, sin fallback y con su comprobación."""
+        return self._log_redacted(
+            AuditEventType.BUILD_PROVIDER_SELECTED,
+            "build_provider_selected",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_build_proposal_validated(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el veredicto de PUNTO sobre la salida del proveedor."""
+        return self._log_redacted(
+            AuditEventType.BUILD_PROPOSAL_VALIDATED,
+            "build_proposal_validated",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
+    def log_build_cycle_completed(
+        self,
+        *,
+        request_id: str | UUID,
+        metadata: Mapping[str, Any] | None = None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra el desenlace del ciclo, con el estado final y lo que lo produjo."""
+        return self._log_redacted(
+            AuditEventType.BUILD_CYCLE_COMPLETED,
+            "build_cycle_completed",
+            resource_id=request_id,
+            metadata=metadata,
+            result=result,
+            actor=actor,
+        )
+
     def log_qa_service_started(
         self,
         *,

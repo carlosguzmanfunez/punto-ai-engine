@@ -149,6 +149,15 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.QA_SERVICE_STARTED: "qa_service",
     AuditEventType.QA_SERVICE_PREPARED: "qa_service",
     AuditEventType.QA_SERVICE_DESTROYED: "qa_service",
+    # --- Solicitud de construcción gobernada (PILOT-03) -----------------------
+    #: Se registran sobre el ``request_id``, de modo que ``AuditLogger.by_resource`` reconstruye el
+    #: ciclo completo. Nunca llevan el contexto interno, instrucciones completas ni credenciales.
+    AuditEventType.BUILD_REQUEST_ACCEPTED: "build_request",
+    AuditEventType.BUILD_REQUEST_REJECTED: "build_request",
+    AuditEventType.BUILD_REQUEST_NORMALIZED: "build_request",
+    AuditEventType.BUILD_PROVIDER_SELECTED: "build_provider",
+    AuditEventType.BUILD_PROPOSAL_VALIDATED: "build_proposal",
+    AuditEventType.BUILD_CYCLE_COMPLETED: "build_cycle",
 }
 
 #: Actor por defecto: CAMUS es el orquestador determinista del motor.

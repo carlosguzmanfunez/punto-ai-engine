@@ -268,6 +268,18 @@ class AuditEventType(StrEnum):
     QA_SERVICE_PREPARED = "QA_SERVICE_PREPARED"
     #: PILOT-01R.1: el servicio se destruyó y no quedaron contenedores, redes ni credenciales.
     QA_SERVICE_DESTROYED = "QA_SERVICE_DESTROYED"
+    #: PILOT-03: una solicitud de construcción gobernada se admitió en la frontera del ciclo.
+    BUILD_REQUEST_ACCEPTED = "BUILD_REQUEST_ACCEPTED"
+    #: PILOT-03: la solicitud se rechazó en la frontera (forma inválida o destino no registrado).
+    BUILD_REQUEST_REJECTED = "BUILD_REQUEST_REJECTED"
+    #: PILOT-03: la solicitud quedó normalizada, con su huella y sus medidas.
+    BUILD_REQUEST_NORMALIZED = "BUILD_REQUEST_NORMALIZED"
+    #: PILOT-03: PUNTO resolvió el rol al proveedor configurado (sin fallback).
+    BUILD_PROVIDER_SELECTED = "BUILD_PROVIDER_SELECTED"
+    #: PILOT-03: PUNTO validó la salida del proveedor y fijó su veredicto.
+    BUILD_PROPOSAL_VALIDATED = "BUILD_PROPOSAL_VALIDATED"
+    #: PILOT-03: el ciclo terminó con su desenlace y su estado final.
+    BUILD_CYCLE_COMPLETED = "BUILD_CYCLE_COMPLETED"
 
 
 class AuditEvent(BaseModel):

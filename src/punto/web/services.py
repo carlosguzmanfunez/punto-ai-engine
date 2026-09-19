@@ -77,7 +77,22 @@ TMP_SIZE: Final[str] = "64m"
 SERVICE_CAPABILITIES: Final[str] = "CHOWN,FOWNER,DAC_OVERRIDE,SETUID,SETGID"
 
 #: Única variable que PUNTO inyecta en la preview. No hay canal genérico de entorno.
-ALLOWED_PREVIEW_ENVIRONMENT: Final[tuple[str, ...]] = ("DATABASE_URL",)
+#:
+#: ``DATABASE_URL`` es el DSN efímero (apunta al alias interno de esta sesión) y
+#: ``PUNTO_QA_DATABASE_TRANSPORT`` es la **señal explícita** con la que el proyecto elige su
+#: transporte TCP: sin ella, una aplicación que hable Neon por HTTP no puede alcanzar una base
+#: PostgreSQL normal, y con ella queda claro que el modo alternativo lo pidió PUNTO, no el proyecto.
+ALLOWED_PREVIEW_ENVIRONMENT: Final[tuple[str, ...]] = (
+    "DATABASE_URL",
+    "PUNTO_QA_DATABASE_TRANSPORT",
+)
+
+#: Nombre y valor de la señal de transporte que PUNTO inyecta cuando provee el servicio.
+#: El valor pertenece al vocabulario cerrado del proyecto (``neon-http`` / ``postgres-tcp``) y aquí
+#: solo se emite el que corresponde a un PostgreSQL efímero por TCP: PUNTO no acepta del proyecto
+#: ninguna propuesta de transporte.
+QA_TRANSPORT_ENV_VAR: Final[str] = "PUNTO_QA_DATABASE_TRANSPORT"
+QA_TRANSPORT_VALUE: Final[str] = "postgres-tcp"
 
 #: Ficheros de configuración local que **no** pueden entrar al sandbox de QA: llevan credenciales
 #: reales del proyecto (por ejemplo el DSN de Neon).
@@ -433,8 +448,16 @@ class EphemeralPostgres:
         )
 
     def preview_environment(self) -> dict[str, str]:
-        """Entorno que PUNTO inyecta en la preview: exactamente ``DATABASE_URL``."""
-        return {"DATABASE_URL": self.preview_dsn}
+        """Entorno que PUNTO inyecta en la preview: el DSN efímero y la señal de transporte.
+
+        No hay canal genérico: son exactamente las dos claves de
+        :data:`ALLOWED_PREVIEW_ENVIRONMENT`, y la señal la fija PUNTO con el valor de
+        :data:`QA_TRANSPORT_VALUE`.
+        """
+        return {
+            "DATABASE_URL": self.preview_dsn,
+            QA_TRANSPORT_ENV_VAR: QA_TRANSPORT_VALUE,
+        }
 
     def as_public_dict(self) -> dict[str, Any]:
         """Evidencia del servicio: sin credenciales, con la huella de la sesión."""
@@ -703,6 +726,8 @@ __all__ = [
     "MAX_ARTIFACT_BYTES",
     "POSTGRES_IMAGE_LABEL",
     "POSTGRES_IMAGE_REFERENCE",
+    "QA_TRANSPORT_ENV_VAR",
+    "QA_TRANSPORT_VALUE",
     "SERVICE_ALIAS_PREFIX",
     "SERVICE_CAPABILITIES",
     "SERVICE_CONTAINER_PREFIX",

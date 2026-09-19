@@ -31,11 +31,12 @@ stdout (el host lee estas líneas; se vacían a propósito, ver :func:`_announce
 Entorno inyectado
 -----------------
 El payload puede traer ``environment``: un objeto con **solo** las claves de
-:data:`ALLOWED_ENVIRONMENT_KEYS` (hoy, ``DATABASE_URL``), que se añaden al entorno del contenedor
-para los comandos del proyecto y para la preview. No es un canal genérico: una clave fuera de la
-allowlist invalida el payload. Así la aplicación puede alcanzar la dependencia de servicio efímera
-de la sesión sin que el proyecto reciba credenciales que no le corresponden ni variables capaces de
-alterar cómo se ejecuta (``PATH``, ``LD_PRELOAD``, ``NODE_OPTIONS``).
+:data:`ALLOWED_ENVIRONMENT_KEYS` (hoy, ``DATABASE_URL`` y ``PUNTO_QA_DATABASE_TRANSPORT``), que se
+añaden al entorno del contenedor para los comandos del proyecto y para la preview. No es un canal
+genérico: una clave fuera de la allowlist invalida el payload. Así la aplicación puede alcanzar la
+dependencia de servicio efímera de la sesión sin que el proyecto reciba credenciales que no le
+corresponden ni variables capaces de alterar cómo se ejecuta (``PATH``, ``LD_PRELOAD``,
+``NODE_OPTIONS``).
 
 ``diagnostics.json`` en ``/tmp`` (nunca en el workspace): se escribe **siempre**, también al
 fallar, con las versiones reales del entorno, los comandos ejecutados, el estado de la preview y un
@@ -96,10 +97,11 @@ MAX_PREVIEW_LOG_CHARS = 4000
 #: Variables de entorno que el host puede inyectar en los comandos del proyecto y en la preview.
 #:
 #: Es una **allowlist**, no una lista de sugerencias: cualquier otra clave invalida el payload. El
-#: host solo manda ``DATABASE_URL``, construida por PUNTO y apuntando a la dependencia de servicio
-#: efímera de esta sesión; esta comprobación es la segunda barrera, para que ni un fallo del host
-#: pueda convertir el payload en un canal de entorno arbitrario hacia la zona no confiable.
-ALLOWED_ENVIRONMENT_KEYS = frozenset({"DATABASE_URL"})
+#: host manda el DSN efímero de la dependencia de servicio de esta sesión y la señal explícita de
+#: transporte (``PUNTO_QA_DATABASE_TRANSPORT``); esta comprobación es la segunda barrera, para que
+#: ni un fallo del host pueda convertir el payload en un canal de entorno arbitrario hacia la zona
+#: no confiable.
+ALLOWED_ENVIRONMENT_KEYS = frozenset({"DATABASE_URL", "PUNTO_QA_DATABASE_TRANSPORT"})
 
 #: Máximo de variables aceptadas en el payload.
 MAX_ENVIRONMENT_KEYS = 4

@@ -39,10 +39,13 @@ from punto.providers.transport import REDACTED
 from punto.schemas.audit import AuditEventType
 from punto.web.sandbox import WebSandboxBackend
 from punto.web.services import (
+    ALLOWED_PREVIEW_ENVIRONMENT,
     ALLOWED_SERVICE_IMAGES,
     ARTIFACT_MOUNT,
     POSTGRES_IMAGE_LABEL,
     POSTGRES_IMAGE_REFERENCE,
+    QA_TRANSPORT_ENV_VAR,
+    QA_TRANSPORT_VALUE,
     EphemeralPostgres,
     QaPostgresCredentials,
     QaPostgresSpec,
@@ -299,14 +302,29 @@ def test_the_public_view_of_the_service_has_no_credentials() -> None:
     assert public["credential_fingerprint"] == service.credentials.fingerprint()
 
 
-def test_the_preview_receives_exactly_one_variable() -> None:
-    """No hay canal de entorno genérico: la preview recibe ``DATABASE_URL`` y nada más."""
+def test_the_preview_receives_exactly_the_authorized_variables() -> None:
+    """No hay canal de entorno genérico: la preview recibe el DSN y la señal de transporte."""
     service = _credential_service(ScriptedRuntime())
     environment = service.preview_environment()
 
-    assert list(environment) == ["DATABASE_URL"]
+    assert sorted(environment) == ["DATABASE_URL", "PUNTO_QA_DATABASE_TRANSPORT"]
     assert environment["DATABASE_URL"] == service.preview_dsn
     assert "PASSWORD" not in environment["DATABASE_URL"]
+
+
+def test_the_transport_signal_is_the_one_the_project_expects() -> None:
+    """El nombre y el valor de la señal son el contrato con el proyecto: no se improvisan.
+
+    El proyecto (Punto Inmobiliario HN) acepta exactamente ``PUNTO_QA_DATABASE_TRANSPORT`` con el
+    valor ``postgres-tcp``; cualquier otro valor suyo falla cerrado. Este extremo de la frontera
+    tiene que emitir justo eso.
+    """
+    service = _credential_service(ScriptedRuntime())
+
+    assert QA_TRANSPORT_ENV_VAR == "PUNTO_QA_DATABASE_TRANSPORT"
+    assert QA_TRANSPORT_VALUE == "postgres-tcp"
+    assert QA_TRANSPORT_ENV_VAR in ALLOWED_PREVIEW_ENVIRONMENT
+    assert service.preview_environment()[QA_TRANSPORT_ENV_VAR] == QA_TRANSPORT_VALUE
 
 
 # ---------------------------------------------------------------------------

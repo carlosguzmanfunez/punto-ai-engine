@@ -172,9 +172,10 @@ class TraceStore:
 class RudeClient(StructuredModelClient):
     """Adaptador que **no** sanea su salida: el ciclo no puede fiarse de su educación."""
 
-    def __init__(self, content: str, capture: Capture) -> None:
+    def __init__(self, content: str, capture: Capture, *, usage_zeros: bool = False) -> None:
         self._content = content
         self._capture = capture
+        self._usage_zeros = usage_zeros
 
     @property
     def provider(self) -> str:
@@ -198,10 +199,15 @@ class RudeClient(StructuredModelClient):
         del user_prompt, json_schema, max_output_tokens
         self._capture.calls += 1
         self._capture.bodies.append({"system": system_prompt})
+        usage = (
+            ModelUsage()
+            if self._usage_zeros
+            else ModelUsage(prompt_tokens=5, completion_tokens=7, total_tokens=12)
+        )
         return ModelCompletion(
             content=self._content,
             model="gpt-5-codex",
-            usage=ModelUsage(prompt_tokens=5, completion_tokens=7, total_tokens=12),
+            usage=usage,
             latency_ms=1,
         )
 
@@ -621,12 +627,65 @@ def test_f2_la_propuesta_se_publica_recortada_y_sin_espacios_sobrantes(tmp_path:
     assert result.proposal == PROPOSAL
 
 
+def test_f5_el_consumo_no_reportado_no_se_lee_como_cero(tmp_path: Path) -> None:
+    """Un transporte que no declara consumo no se interpreta como «gastó cero».
+
+    El proveedor de esta prueba devuelve ceros (que es lo que hace un transporte de suscripción al
+    proyectarse sobre el contrato). El ciclo lo normaliza a «desconocido» y lo declara
+    explícitamente en la auditoría, sin estimarlo ni inventarlo.
+    """
+    capture = Capture()
+    router = ProviderRouter()
+    router.register_provider(
+        "openai", lambda _model: RudeClient(PROPOSAL, capture, usage_zeros=True)
+    )
+    cycle, _, logger = _cycle(tmp_path, capture=capture, router=router)
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is BuildRequestStatus.ACCEPTED
+    assert result.usage is None
+    assert result.as_public_dict()["usage"] is None
+    completed = _metadata(logger, str(request.request_id), "BUILD_CYCLE_COMPLETED")
+    assert completed["usage_status"] == "USAGE_NOT_REPORTED"
+    assert completed["total_tokens"] is None
+
+
+def test_f6_el_consumo_reportado_se_conserva(tmp_path: Path) -> None:
+    """Cuando el proveedor sí declara consumo, se conserva tal cual (sin tocarlo)."""
+    cycle, _, logger = _cycle(tmp_path)
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.usage is not None and result.usage.total_tokens == 34
+    completed = _metadata(logger, str(request.request_id), "BUILD_CYCLE_COMPLETED")
+    assert completed["usage_status"] == "USAGE_REPORTED"
+    assert completed["total_tokens"] == 34
+
+
+def test_f7_el_consumo_parcial_no_se_descarta(tmp_path: Path) -> None:
+    """Un contador a cero con otro positivo es un dato real: no se confunde con «no reportado»."""
+    from punto.orchestrator.build_cycle import reported_usage
+
+    assert reported_usage(None) is None
+    assert reported_usage(ModelUsage()) is None
+    assert reported_usage(ModelUsage(prompt_tokens=10, completion_tokens=0, total_tokens=10)) == (
+        ModelUsage(prompt_tokens=10, completion_tokens=0, total_tokens=10)
+    )
+    assert reported_usage(ModelUsage(completion_tokens=3, total_tokens=3)) == ModelUsage(
+        completion_tokens=3, total_tokens=3
+    )
+
+
 def test_f3_la_tabla_declarativa_de_capacidades_es_evidencia_no_veto(tmp_path: Path) -> None:
     """La pareja rol/proveedor se contrasta con la tabla declarativa y se registra tal cual.
 
-    ``openai`` no declara roles en esa tabla, pero el transporte configurado sí atiende ARCHITECT.
-    Quien decide —y quien falla cerrado— es el router; lo que se guarda es lo que PUNTO sabía antes
-    de gastar la llamada.
+    Tras la reconciliación de F-2 la tabla **sí** declara que ``openai`` cubre ``ARCHITECT`` (es lo
+    que dice la configuración y lo que el transporte hace), así que ``capability_declared`` es
+    ``True``. Lo que la declaración no hace —ni antes ni ahora— es decidir: quien elige, invoca y
+    falla cerrado es el router, y la evidencia declarativa acompaña al evento sin vetar nada.
     """
     from punto.workflow.providers import default_capabilities
 
@@ -638,7 +697,34 @@ def test_f3_la_tabla_declarativa_de_capacidades_es_evidencia_no_veto(tmp_path: P
 
     assert capture.calls == 1
     assert result.status is BuildRequestStatus.ACCEPTED
+    assert result.capability_declared is True
     selected = _metadata(logger, str(request.request_id), "BUILD_PROVIDER_SELECTED")
+    assert selected["capability_declared"] is True
+    # La declaración reconoce el rol y, a la vez, dice que su modelo de credenciales de API no puede
+    # acreditarlo: las dos cosas se registran juntas, sin convertir la duda en un veto.
+    assert selected["capability_table"] == "DECLARED"
+    assert selected["workflow_role"] == "ARCHITECT"
+    assert selected["capability_available"] is False
+    assert selected["fallback"] is False
+
+
+def test_f4_un_proveedor_que_no_declara_el_rol_se_registra_sin_bloquear(tmp_path: Path) -> None:
+    """Si la tabla no reconociera la pareja, el ciclo lo registra y el router sigue decidiendo."""
+    from punto.workflow.providers import default_capabilities
+
+    cycle, capture, logger = _cycle(tmp_path)
+    cycle.capabilities = default_capabilities(env={})
+    # El rol que el router resuelve para BUILDER es deepseek (que sí lo declara); se desplaza la
+    # asignación a anthropic, que declara roles visuales: la tabla no reconocerá la pareja.
+    cycle.router.register_provider("anthropic", _openai_factory(capture))
+    cycle.router.assign_role(ProviderRole.BUILDER, "anthropic")
+
+    result = cycle.run(_request(requested_role=ProviderRole.BUILDER))
+
+    assert result.capability_declared is False
+    assert capture.calls == 1, "la evidencia declarativa no puede vetar la invocación"
+    selected = _metadata(logger, str(result.request_id), "BUILD_PROVIDER_SELECTED")
+    assert selected["provider"] == "anthropic"
     assert selected["capability_declared"] is False
 
 

@@ -253,7 +253,14 @@ class BuildResult(BaseModel):
     pell_status: RetrievalStatus = RetrievalStatus.DISABLED
     trusted_experience_ids: tuple[str, ...] = ()
     failed_experience_ids: tuple[str, ...] = ()
-    usage: ModelUsage | None = None
+    usage: ModelUsage | None = Field(
+        default=None,
+        description=(
+            "Consumo **reportado** por el proveedor. ``None`` significa que no lo reportó (por "
+            "ejemplo, un transporte de suscripción): no es cero consumo y no se estima. La "
+            "auditoría lo declara como USAGE_NOT_REPORTED."
+        ),
+    )
     duration_ms: int | None = None
     error_kind: str = ""
     error: str = ""

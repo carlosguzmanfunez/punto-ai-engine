@@ -199,15 +199,41 @@ def test_require_falla_si_el_proveedor_no_esta_declarado() -> None:
     assert RoleName.ARCHITECT.value in excinfo.value.detail
 
 
-def test_require_falla_con_openai_porque_no_declara_ningun_rol() -> None:
-    """OpenAI está declarado con ``role_support=()``: no cubre ningún rol y no se usa hoy."""
-    registro = _registro(OPENAI_API_KEY=CANARIO)
+def test_require_falla_con_openai_porque_su_credencial_de_api_no_consta() -> None:
+    """OpenAI sí declara el rol ARCHITECT, pero esta tabla no puede acreditarlo como utilizable.
+
+    El rol lo declara porque la configuración se lo asigna (F-2 de PILOT-03). Lo que la tabla no
+    puede hacer es afirmar que hay una clave de API: el transporte configurado es el cliente oficial
+    de suscripción. El fallo lo dice tal cual —declara el rol, falta la credencial— y nombra al
+    proveedor y el rol, sin sustituirlo por otro.
+    """
+    sin_clave = _registro()
+
+    capacidad = sin_clave.get(PROVIDER_OPENAI)
+    assert capacidad is not None and capacidad.supports(RoleName.ARCHITECT)
 
     with pytest.raises(WorkflowProviderUnavailableError) as excinfo:
-        registro.require(RoleName.ARCHITECT, PROVIDER_OPENAI)
+        sin_clave.require(RoleName.ARCHITECT, PROVIDER_OPENAI)
 
-    assert "no declara el rol ARCHITECT" in excinfo.value.detail
+    assert "sin credencial" in excinfo.value.detail
     assert PROVIDER_OPENAI in excinfo.value.detail
+    assert RoleName.ARCHITECT.value in excinfo.value.detail
+    assert "no hay fallback" in excinfo.value.detail
+
+
+def test_require_falla_con_openai_aunque_haya_clave_porque_no_esta_disponible() -> None:
+    """Con clave de API presente tampoco se usa: la declaración no habilita un camino inexistente.
+
+    El transporte de suscripción no se sirve por esta tabla, así que ``available`` sigue en
+    ``False``. Declarar el rol no convierte la declaración en una habilitación.
+    """
+    con_clave = _registro(OPENAI_API_KEY=CANARIO)
+
+    with pytest.raises(WorkflowProviderUnavailableError) as excinfo:
+        con_clave.require(RoleName.ARCHITECT, PROVIDER_OPENAI)
+
+    assert "no disponible" in excinfo.value.detail
+    assert "no hay fallback" in excinfo.value.detail
 
 
 def test_require_no_elige_el_doble_de_prueba_de_forma_implicita() -> None:
@@ -248,6 +274,7 @@ def test_for_role_solo_lista_los_que_declaran_el_rol() -> None:
 
     assert tuple(capacidad.provider for capacidad in ingenieria) == (
         PROVIDER_DEEPSEEK,
+        PROVIDER_OPENAI,
         PROVIDER_FAKE,
     )
     assert tuple(capacidad.provider for capacidad in visuales) == (
@@ -255,7 +282,9 @@ def test_for_role_solo_lista_los_que_declaran_el_rol() -> None:
         PROVIDER_FAKE,
     )
     assert all(capacidad.supports(RoleName.ARCHITECT) for capacidad in ingenieria)
-    assert PROVIDER_OPENAI not in {capacidad.provider for capacidad in ingenieria}
+    # OpenAI declara el rol, pero no está disponible: aparecer aquí no lo habilita para nada.
+    openai = registro.get(PROVIDER_OPENAI)
+    assert openai is not None and openai.available is False
 
 
 def test_capabilities_conserva_el_orden_de_declaracion() -> None:
@@ -362,8 +391,11 @@ def test_las_capacidades_declaradas_son_las_que_el_kernel_espera() -> None:
     assert anthropic.vision is True
     assert anthropic.available is True
 
-    assert openai.role_support == ()
+    # OpenAI declara el rol que la configuración le asigna (F-2 de PILOT-03) y sigue sin
+    # disponibilidad: su autorización es una sesión de suscripción que esta tabla no puede leer.
+    assert openai.role_support == (RoleName.ARCHITECT,)
     assert openai.available is False
+    assert openai.credential_state is _PENDIENTE
 
     assert doble.role_support == tuple(RoleName)
     assert doble.vision is True

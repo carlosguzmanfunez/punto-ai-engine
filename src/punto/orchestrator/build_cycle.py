@@ -73,16 +73,8 @@ from punto.schemas.build import (
     ValidationVerdict,
 )
 from punto.schemas.enums import AuditResult
-from punto.schemas.workflow import RoleName
-
-#: Traducción entre el vocabulario de roles del proveedor y el de la tabla declarativa de
-#: capacidades. Son dos vocabularios distintos del motor (``BUILDER`` frente a ``DEVELOPER``);
-#: confundirlos daría un preflight que falla por el nombre, no por la capacidad.
-_CAPABILITY_ROLE: Final[dict[ProviderRole, RoleName]] = {
-    ProviderRole.ARCHITECT: RoleName.ARCHITECT,
-    ProviderRole.BUILDER: RoleName.DEVELOPER,
-    ProviderRole.VISUAL_QA: RoleName.VISUAL_QA,
-}
+from punto.schemas.execution import ModelUsage
+from punto.workflow.providers import workflow_role_of
 
 #: Tope de tokens de salida por defecto: lo fija PUNTO, no la solicitud.
 DEFAULT_MAX_OUTPUT_TOKENS: Final[int] = 6_000
@@ -226,6 +218,32 @@ def _sanitize_text(text: str) -> str:
     return redact_secret_text(text)
 
 
+def reported_usage(usage: ModelUsage | None) -> ModelUsage | None:
+    """Consumo **reportado** por el proveedor, o ``None`` si no reportó nada.
+
+    Un transporte de suscripción no declara consumo; al proyectarse sobre el contrato se rellena con
+    ceros, que **no** son una medición. Devolver esos ceros como si lo fueran convertiría «no se
+    sabe» en «no se gastó», y esa lectura es peligrosa en cualquier cuenta de coste. Aquí se
+    normaliza a ``None`` (= desconocido) y la auditoría lo declara explícitamente con
+    ``USAGE_NOT_REPORTED``. PUNTO no estima ni inventa consumo.
+
+    Un consumo con **algo** reportado (incluido un cero real en un contador mientras otro es
+    positivo) se conserva tal cual: lo que se descarta es el objeto vacío, no los ceros legítimos.
+    """
+    if usage is None:
+        return None
+    counters = (
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens,
+        usage.prompt_cache_hit_tokens,
+        usage.prompt_cache_miss_tokens,
+    )
+    if all(value in (None, 0) for value in counters):
+        return None
+    return usage
+
+
 @dataclass(slots=True)
 class BuildCycle:
     """Ciclo mínimo de construcción gobernada, compuesto sobre lo que ya existe.
@@ -266,7 +284,9 @@ class BuildCycle:
         role = request.requested_role
         provider = self.router.get_provider_for_role(role)
         declared = self._capability_declared(role, provider)
-        self._audit_provider_selected(request, provider, declared)
+        self._audit_provider_selected(
+            request, provider, declared, self._capability_evidence(role, provider)
+        )
 
         provider_result = self.router.execute(
             role,
@@ -353,24 +373,48 @@ class BuildCycle:
         return self.retriever.retrieve(query)
 
     def _capability_declared(self, role: ProviderRole, provider: str) -> bool | None:
-        """Preflight declarativo: ¿la tabla de capacidades reconoce esta pareja rol/proveedor?
+        """Preflight declarativo: ¿la tabla de capacidades declara cubrir esta pareja rol/proveedor?
 
-        Es **evidencia**, no un veto: la tabla declara capacidades por proveedor y hoy va por detrás
-        de los transportes de suscripción (``openai`` no declara roles, aunque la configuración lo
-        asigne a ARCHITECT y su transporte responda). Quien decide —y quien falla cerrado— es el
-        router, que devuelve el estado normalizado de la invocación real. Lo que se registra aquí es
-        lo que PUNTO sabía **antes** de gastar la llamada.
+        Responde a la pregunta **declarativa** —«¿este proveedor puede con este rol?»— y solo a esa.
+        La otra pregunta, «¿se puede invocar ahora mismo?», la contesta el ``ProviderRouter`` con la
+        invocación real y su fallo normalizado: esta tabla se apoya en un modelo de credenciales de
+        API y no puede acreditar una sesión de suscripción, así que usarla como veto bloquearía
+        trabajo legítimo o afirmaría una credencial que nadie ha visto.
+
+        Es **evidencia para la auditoría**, no un veto y no una autorización: una capacidad
+        declarada no concede permisos ni autoriza efectos. ``None`` significa que no hay tabla que
+        consultar; ``False``, que la tabla existe y no reconoce la pareja.
         """
         if self.capabilities is None:
             return None
-        declared_role = _CAPABILITY_ROLE.get(role)
+        declared_role = workflow_role_of(role)
         if declared_role is None:
             return None
-        try:
-            self.capabilities.require(declared_role, provider)
-        except Exception:  # la tabla no reconoce la pareja: se registra, no bloquea
+        declared = self.capabilities.get(provider)
+        if declared is None:
             return False
-        return True
+        return bool(declared.supports(declared_role))
+
+    def _capability_evidence(self, role: ProviderRole, provider: str) -> dict[str, Any]:
+        """Evidencia declarativa completa de la pareja rol/proveedor, sin decidir nada.
+
+        Separa lo que la tabla sabe de verdad —si declara el rol— de lo que su modelo de
+        credenciales puede decir hoy (``available``, ``credential_state``), para que la auditoría
+        pueda distinguir «no lo declara» de «lo declara y su credencial de API no consta».
+        """
+        if self.capabilities is None:
+            return {"capability_table": "UNAVAILABLE"}
+        declared_role = workflow_role_of(role)
+        declared = self.capabilities.get(provider)
+        if declared is None:
+            return {"capability_table": "PROVIDER_NOT_DECLARED", "workflow_role": None}
+        return {
+            "capability_table": "DECLARED",
+            "workflow_role": None if declared_role is None else declared_role.value,
+            "capability_available": declared.available,
+            "credential_state": declared.credential_state.value,
+            "live_verified": declared.live_verified,
+        }
 
     def _validate(
         self,
@@ -537,7 +581,7 @@ class BuildCycle:
                 item.id for item in context.verified if item.status is ExperienceStatus.VERIFIED
             ),
             failed_experience_ids=tuple(item.id for item in context.failed),
-            usage=provider_result.usage,
+            usage=reported_usage(provider_result.usage),
             duration_ms=duration_ms,
             error_kind=(
                 "" if provider_result.error_kind is None else provider_result.error_kind.value
@@ -629,7 +673,11 @@ class BuildCycle:
         )
 
     def _audit_provider_selected(
-        self, request: BuildRequest, provider: str, declared: bool | None
+        self,
+        request: BuildRequest,
+        provider: str,
+        declared: bool | None,
+        evidence: Mapping[str, Any],
     ) -> None:
         """Evento 3: rol resuelto por la configuración, con la comprobación declarativa."""
         self._log(
@@ -640,6 +688,7 @@ class BuildCycle:
                 "provider": provider,
                 "capability_declared": declared,
                 "fallback": False,
+                **evidence,
             },
             AuditResult.SUCCESS,
         )
@@ -682,6 +731,12 @@ class BuildCycle:
                 "failed_experience": len(result.failed_experience_ids),
                 "duration_ms": result.duration_ms,
                 "authority": result.authority,
+                # Semántica del consumo: ``USAGE_NOT_REPORTED`` significa «el proveedor no declaró
+                # consumo» y **no** «gastó cero». Nunca se estima ni se inventa.
+                "usage_status": (
+                    "USAGE_NOT_REPORTED" if result.usage is None else "USAGE_REPORTED"
+                ),
+                "total_tokens": None if result.usage is None else result.usage.total_tokens,
             },
             AuditResult.SUCCESS if result.accepted else AuditResult.FAILURE,
         )
@@ -797,4 +852,5 @@ __all__ = [
     "BuildValidation",
     "default_build_cycle",
     "load_build_targets",
+    "reported_usage",
 ]

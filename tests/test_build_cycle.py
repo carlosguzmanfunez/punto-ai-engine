@@ -1259,6 +1259,8 @@ def test_cfg2_un_destino_valido_se_lee_con_sus_raices(tmp_path: Path) -> None:
         "[]",
         '{"x": "no-es-objeto"}',
         '{"x": {"repository": "C:/ruta/que/no/existe/jamas"}}',
+        '{"x": {"repository": "."}}',
+        '{"x": {"repository": ""}}',
         '{"x": {"repository": ".", "scope_roots": "docs"}}',
         '{"x": {"repository": ".", "scope_roots": ["../fuera"]}}',
         '{"": {"repository": "."}}',

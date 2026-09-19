@@ -734,7 +734,14 @@ def load_build_targets(environ: Mapping[str, str] | None = None) -> dict[str, Bu
             raise BuildCycleError(f"identificador de destino inválido en {BUILD_TARGETS_ENV}")
         if not isinstance(value, dict):
             raise BuildCycleError(f"el destino {target_id!r} no declara un objeto de configuración")
-        repository = Path(str(value.get("repository", "")).strip())
+        repository_raw = str(value.get("repository", "")).strip()
+        repository = Path(repository_raw)
+        if not repository_raw or not repository.is_absolute():
+            # Una ruta relativa se resolvería contra el directorio de trabajo del motor: el destino
+            # tiene que estar declarado sin ambigüedad, y una cadena vacía no es un destino.
+            raise BuildCycleError(
+                f"el destino {target_id!r} debe declarar una ruta absoluta de repositorio"
+            )
         if not repository.is_dir():
             raise BuildCycleError(
                 f"el destino {target_id!r} no apunta a un directorio existente"

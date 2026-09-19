@@ -31,7 +31,7 @@ Entregado en esta fase:
 | Ciclo gobernado (9 pasos del encargo) | `src/punto/orchestrator/build_cycle.py` (nuevo) | Implementado |
 | Eventos de auditoría del ciclo | `src/punto/schemas/audit.py`, `src/punto/audit/events.py`, `src/punto/audit/logger.py` | 6 eventos nuevos |
 | Superficie HTTP | `src/punto/api/app.py` (`POST /build-requests`, `GET /build-requests/{id}`, `GET /build-targets`) | Implementado |
-| Pruebas A–K + API + configuración + inyección de fallos | `tests/test_build_cycle.py` (nuevo) | 58 en verde |
+| Pruebas A–K + API + configuración + inyección de fallos | `tests/test_build_cycle.py` (nuevo) | 60 en verde |
 | Conocimiento VERIFIED en PELL | `.punto-memory/experiences.jsonl` (memoria local, no versionada) | 6 aprendizajes |
 | Ejecución real sobre el destino | `_punto-pilot-03/real-build-request*.json` | 3 envíos, 2 propuestas aceptadas |
 | Consulta al ARCHITECT | `_punto-pilot-03/architect-review*.json` | **Bloqueada por cuota del proveedor** (F-8) |
@@ -82,7 +82,7 @@ destino real, con dos propuestas aceptadas y el destino intacto. La fase **no** 
 - La primera ejecución real encontró un **defecto real del propio motor** (un tipo MIME como
   `application/json` se interpretaba como ruta inexistente y invalidaba una propuesta buena). Se
   corrigió, se añadieron dos pruebas de regresión (G6/G7) y la misma solicitud volvió a aceptarse.
-- Números: **58 pruebas nuevas** en verde, **377 regresiones relevantes** en verde, `ruff` limpio en
+- Números: **60 pruebas nuevas** en verde, **377 regresiones relevantes** en verde, `ruff` limpio en
   todo el repositorio, `mypy` estricto limpio en **181 ficheros**.
 - Lo que **no** se hizo, a propósito: aplicar propuestas, reparar, emitir efectos, saltar un Human
   Gate, escribir experiencia automáticamente o tocar el destino.
@@ -343,7 +343,7 @@ bloqueante):
 
 ## 14. Pruebas
 
-`tests/test_build_cycle.py` — **58 pruebas en verde**. Los adaptadores son reales y van sobre
+`tests/test_build_cycle.py` — **60 pruebas en verde**. Los adaptadores son reales y van sobre
 `httpx.MockTransport`: se ejercita el código del adaptador, del router y del ciclo sin salir a la red.
 
 | Grupo | Qué demuestra |
@@ -360,7 +360,7 @@ bloqueante):
 | J1–J3 | Cinco eventos por `request_id`, mismo recurso, huellas correctas |
 | K | Slice completo con traza de orden y árbol del destino idéntico |
 | API1–API6 | Destinos, alta por HTTP, consulta del resultado, rechazo 422, esquema 422, 404 |
-| CFG1–CFG4 | Configuración de destinos: vacía, válida y ocho formas inválidas; tope de destinos |
+| CFG1–CFG4 | Configuración de destinos: vacía, válida y diez formas inválidas; tope de destinos |
 
 Inyección de fallos cubierta: credencial ausente (el caso real de `BUILDER` → DeepSeek),
 proveedor no disponible, respuesta malformada, `401`, `500` con reintentos del transporte, memoria
@@ -444,9 +444,9 @@ de que no debía inferirlos sin evidencia adicional.
 |---|---|---|
 | `ruff check .` | Todo el repositorio (incluye `tests/` y los scripts de la fase) | Limpio |
 | `mypy` (`strict`, `files = ["src"]`) | **181 ficheros** de `src` (eran 179) | Sin incidencias |
-| `pytest tests/test_build_cycle.py` | 58 pruebas nuevas | 58 en verde |
+| `pytest tests/test_build_cycle.py` | 60 pruebas nuevas | 60 en verde |
 | Regresiones relevantes | PELL (2 ficheros), proveedores de workflow (2), auditoría de reparación, importaciones en frío, enrutado de modelo, contrato de proveedores, comprobaciones de seguridad | **377 en verde** |
-| Suites de API y dashboard de proveedores | `test_api.py`, `test_provider_dashboard.py`, `test_multi_provider.py` | 118 en verde |
+| Suites de API y dashboard de proveedores | `test_api.py`, `test_provider_dashboard.py`, `test_multi_provider.py` | 62 en verde |
 | Suite completa (`pytest tests`) | Suite no-integration completa | **EN CURSO al cerrar el informe** (véase más abajo) |
 
 La suite completa se lanzó en segundo plano y seguía ejecutándose al redactar este informe; su
@@ -499,5 +499,5 @@ corregirla con su propia regresión), F-3 (acceso del proveedor al destino, gobe
 3. aceptar como no bloqueantes los límites F-3, F-5 y F-6.
 
 Con esas tres decisiones, el material de esta fase queda listo para auditoría final: contrato,
-ciclo, superficie, 58 pruebas, 377 regresiones, dos propuestas reales aceptadas y ninguna escritura
+ciclo, superficie, 60 pruebas, 377 regresiones, dos propuestas reales aceptadas y ninguna escritura
 en el destino.

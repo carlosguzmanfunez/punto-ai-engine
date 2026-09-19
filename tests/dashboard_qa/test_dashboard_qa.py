@@ -10,8 +10,10 @@ Code, así que los estados esperados son los honestos, no un PASS inventado.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -235,6 +237,37 @@ def test_el_dashboard_pasa_su_qa_de_consumidor(
     assert result.evidence.has_screenshot
 
 
+#: Fichero de configuración local del repositorio que una sesión humana del dashboard puede crear.
+#: Está en ``.gitignore``, así que **puede existir**: lo que no puede es aparecer ni cambiar por
+#: efecto de una sesión de QA, que trabaja sobre su propia copia en un workspace temporal.
+LOCAL_PROVIDERS_CONFIG = REPO_ROOT / "config" / "providers.local.yaml"
+
+
+def _local_config_state() -> tuple[int, int, str] | None:
+    """Huella del estado del fichero de configuración local, o ``None`` si no existe."""
+    if not LOCAL_PROVIDERS_CONFIG.is_file():
+        return None
+    stat = LOCAL_PROVIDERS_CONFIG.stat()
+    return (stat.st_mtime_ns, stat.st_size, hashlib.sha256(
+        LOCAL_PROVIDERS_CONFIG.read_bytes()
+    ).hexdigest())
+
+
+def _is_git_ignored(path: Path) -> bool:
+    """True si ``git`` confirma que el fichero está ignorado en este repositorio."""
+    if shutil.which("git") is None:  # pragma: no cover - git está en el entorno de desarrollo
+        return True
+    completed = subprocess.run(
+        ["git", "check-ignore", "-q", "--", str(path)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    return completed.returncode == 0
+
+
 def test_la_clave_guardada_no_vuelve_al_navegador(
     target: QATarget, tmp_path: Path
 ) -> None:
@@ -242,7 +275,14 @@ def test_la_clave_guardada_no_vuelve_al_navegador(
 
     El caso DASH-QA-007 demuestra que la UI muestra el estado en vez del valor; aquí se comprueba
     además dónde vive la clave: en el almacén del workspace temporal, nunca en el repositorio.
+
+    Lo que se afirma del repositorio es lo que la sesión de QA **puede** cambiar: que no crea ni
+    modifica la configuración local. Que el fichero exista o no es un hecho del puesto de trabajo
+    (una sesión humana del dashboard lo crea y está ignorado por git), no un resultado de la QA;
+    exigir su ausencia convertía una decisión legítima de la persona en un fallo del motor.
     """
+    before = _local_config_state()
+
     result = run_consumer_qa(DASH_QA_007, target, evidence_dir=tmp_path / "evidencia")
     assert result.status is QAStatus.PASS, result.reason
 
@@ -250,7 +290,13 @@ def test_la_clave_guardada_no_vuelve_al_navegador(
     assert secrets_file.is_file(), "la clave se guarda en el almacén, no en el repositorio"
     assert TEST_KEY in secrets_file.read_text(encoding="utf-8")
     assert not (REPO_ROOT / ".qa-secrets.json").exists()
-    assert not (REPO_ROOT / "config" / "providers.local.yaml").exists()
+    assert _local_config_state() == before, (
+        "la sesión de QA no puede crear ni tocar la configuración local del repositorio"
+    )
+    if LOCAL_PROVIDERS_CONFIG.exists():
+        assert _is_git_ignored(LOCAL_PROVIDERS_CONFIG), (
+            "si el fichero de configuración local existe, tiene que seguir ignorado por git"
+        )
     assert os.sep.join(("punto-ai-engine", "config", "providers.local.yaml")) not in str(
         secrets_file
     )

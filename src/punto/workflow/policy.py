@@ -211,6 +211,25 @@ _ACTION_IMPACTS: Final[MappingProxyType[str, ActionImpact]] = MappingProxyType(
         # Secretos maestros y seguridad elevada.
         "master_secret_change": _l3_impact(master_secret=True),
         "high_security_risk": _l3_impact(master_secret=True),
+        # ------------------------------------- DB AUTHORITY v0 (hallazgo F-9) ----
+        # Las acciones de base de datos entraron en el catálogo con DB AUTHORITY EXECUTOR v0 y no se
+        # declararon aquí: el espejo quedó incompleto y una acción catalogada caía en *default deny*
+        # al calcular su impacto. Su nivel lo sigue fijando el catálogo revisado por un humano
+        # (``config/permissions.yaml``); aquí solo se declara su impacto, que es lo que esta tabla
+        # representa. Nada de esto concede autoridad: el nivel y las reglas de Human Gate mandan.
+        #
+        # Nivel 0: conectividad, introspección y lectura en la base de **desarrollo**.
+        "db_connect_check": _AUTONOMOUS_IMPACT,
+        "db_introspect": _AUTONOMOUS_IMPACT,
+        "db_safe_read": _AUTONOMOUS_IMPACT,
+        # Nivel 1: cambio de esquema no destructivo y seed, con revisión posterior obligatoria.
+        "db_migration_apply": _AUTONOMOUS_IMPACT,
+        "db_seed": _AUTONOMOUS_IMPACT,
+        # Nivel 3: lo destructivo, lo masivo y la creación de recursos externos. Nunca autónomo.
+        "db_destructive_apply": _l3_impact(),
+        "db_mass_data_change": _l3_impact(),
+        # Crear un recurso externo (proyecto, branch, rol) puede tener coste: es impacto de negocio.
+        "external_resource_create": _l3_impact(business=True),
     }
 )
 

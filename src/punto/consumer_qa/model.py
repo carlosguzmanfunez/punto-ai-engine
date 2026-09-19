@@ -15,10 +15,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 #: Versión del esquema de caso que entiende este consumidor.
 SCHEMA_VERSION = 1
+
+#: Códigos HTTP admitidos en una expectativa de estado exacto.
+MIN_HTTP_STATUS = 100
+MAX_HTTP_STATUS = 599
 
 
 class QAStatus(StrEnum):
@@ -48,6 +52,8 @@ class QAExpectationKind(StrEnum):
     TEXT_CONTAINS = "text_contains"
     URL_MATCHES = "url_matches"
     HTTP_OK = "http_ok"
+    #: Estado HTTP **exacto**: se compara el código que devolvió el servidor, no el contenido.
+    HTTP_STATUS = "http_status"
     NO_CONSOLE_ERRORS = "no_console_errors"
     NO_JS_EXCEPTIONS = "no_js_exceptions"
 
@@ -107,6 +113,11 @@ class QAExpectation(BaseModel):
     kind: QAExpectationKind
     target: str = Field(default="", description="Selector CSS, o texto/URL esperada.")
     value: str = Field(default="", description="Texto esperado, para ``text_contains``.")
+    #: Código HTTP exacto exigido, solo para ``http_status``. Cero significa «no aplica».
+    expected_status: int = Field(
+        default=0,
+        description="Código HTTP exacto que se exige (100-599), solo para ``http_status``.",
+    )
     expected: str = Field(default="", description="Cómo se lee esta expectativa en el informe.")
 
     @field_validator("target")
@@ -117,12 +128,35 @@ class QAExpectation(BaseModel):
             raise ValueError("target no puede estar vacío")
         return value
 
+    @model_validator(mode="after")
+    def _estado_coherente(self) -> QAExpectation:
+        """``expected_status`` existe solo para ``http_status`` y tiene que ser un código real.
+
+        Raises:
+            ValueError: si un ``http_status`` no declara un código válido, o si otra expectativa
+                intenta usar ``expected_status`` (sería una comprobación que nadie evalúa).
+        """
+        if self.kind is QAExpectationKind.HTTP_STATUS:
+            if not MIN_HTTP_STATUS <= self.expected_status <= MAX_HTTP_STATUS:
+                raise ValueError(
+                    f"http_status necesita expected_status entre {MIN_HTTP_STATUS} y "
+                    f"{MAX_HTTP_STATUS}: {self.expected_status}"
+                )
+            return self
+        if self.expected_status:
+            raise ValueError(
+                f"expected_status solo se admite en http_status, no en {self.kind.value}"
+            )
+        return self
+
     def label(self) -> str:
         """Descripción determinista de la expectativa."""
         if self.expected:
             return self.expected
         if self.kind is QAExpectationKind.TEXT_CONTAINS:
             return f"{self.kind.value} {self.target!r} contiene {self.value!r}"
+        if self.kind is QAExpectationKind.HTTP_STATUS:
+            return f"{self.kind.value} {self.target!r} es {self.expected_status}"
         return f"{self.kind.value} {self.target!r}"
 
 

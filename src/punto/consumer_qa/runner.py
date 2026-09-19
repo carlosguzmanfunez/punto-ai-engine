@@ -174,7 +174,13 @@ def _evaluate(
 def _check_host_expectation(
     expectation: QAExpectation, evidence: QAEvidence
 ) -> QAFailure | None:
-    """Comprueba una expectativa con los hechos que la sesión devolvió (URL, HTTP, consola)."""
+    """Comprueba una expectativa con los hechos que la sesión devolvió (URL, HTTP, consola).
+
+    ``HTTP_OK`` sigue significando «2xx o 3xx» (una respuesta correcta, redirecciones incluidas).
+    ``HTTP_STATUS`` es independiente y exige un **código exacto**: son dos preguntas distintas y
+    ninguna de las dos sustituye a la otra. La comparación se hace contra el código que la sesión
+    observó, nunca contra el cuerpo del documento.
+    """
     step = f"expectativa ({expectation.label()})"
     if expectation.kind is QAExpectationKind.URL_MATCHES:
         observed = evidence.final_url or evidence.final_route
@@ -192,6 +198,18 @@ def _check_host_expectation(
         return QAFailure(
             step=step,
             expected="una respuesta HTTP correcta (2xx o 3xx)",
+            observed="sin respuesta" if status is None else f"HTTP {status}",
+            detail=_clip(evidence.load_error),
+        )
+    if expectation.kind is QAExpectationKind.HTTP_STATUS:
+        # Comparación del **código**, no del contenido: es lo que impide que una página de error que
+        # mencione «404» en su cuerpo pase un caso que exige un 404 de verdad.
+        status = evidence.http_status
+        if status == expectation.expected_status:
+            return None
+        return QAFailure(
+            step=step,
+            expected=f"la respuesta HTTP es {expectation.expected_status}",
             observed="sin respuesta" if status is None else f"HTTP {status}",
             detail=_clip(evidence.load_error),
         )

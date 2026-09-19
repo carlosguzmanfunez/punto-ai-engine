@@ -51,6 +51,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,7 @@ from punto.developer.sandbox import (
     build_runtime_client_environment,
     resolve_runtime_binary,
 )
+from punto.schemas.enums import AuditResult
 from punto.schemas.web import (
     DEFAULT_VIEWPORTS,
     MAX_SCREENSHOT_BYTES,
@@ -80,6 +82,17 @@ from punto.schemas.web import (
 )
 from punto.tools.errors import SandboxUnavailableError, WebCommandPolicyError
 from punto.web.routes import normalize_route, route_from_url, route_matches
+from punto.web.services import (
+    SERVICE_ALIAS_PREFIX,
+    SERVICE_CONTAINER_PREFIX,
+    SERVICE_LABEL,
+    EphemeralPostgres,
+    QaPostgresSpec,
+    ServiceProcess,
+    assert_no_local_secrets,
+    service_cleanup_check,
+    stage_artifacts,
+)
 
 if TYPE_CHECKING:
     from punto.audit.logger import AuditLogger
@@ -171,11 +184,41 @@ PROBE_SOURCE_DIR: Final[Path] = (
 #: Directorios temporales del host pendientes de borrar (red de seguridad ante una salida dura).
 _HOST_TEMP_DIRS: list[Path] = []
 
+#: Antigüedad a partir de la cual un directorio temporal de PUNTO se considera **abandonado**.
+#:
+#: El ``atexit`` de este módulo cubre la salida ordenada del proceso que abrió la sesión, pero no
+#: una muerte dura (SIGKILL, corte de energía): esos directorios quedarían con el payload de la
+#: preview dentro, y ese payload lleva el DSN efímero de la sesión. Cualquier sesión viva dura
+#: minutos, así que seis horas es un umbral que no puede alcanzar una sesión legítima en curso.
+STALE_HOST_DIR_SECONDS: Final[float] = 6 * 3600.0
+
+
+def _sweep_stale_host_dirs() -> tuple[str, ...]:
+    """Borra directorios temporales de PUNTO abandonados por un proceso que murió de golpe.
+
+    Devuelve los nombres borrados, para poder afirmarlo en vez de suponerlo.
+    """
+    root = Path(tempfile.gettempdir())
+    cutoff = time.time() - STALE_HOST_DIR_SECONDS
+    removed: list[str] = []
+    for candidate in root.glob("punto-web-*"):
+        if not candidate.is_dir():
+            continue
+        try:
+            if candidate.stat().st_mtime > cutoff:
+                continue
+        except OSError:  # pragma: no cover - carrera con otra limpieza
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
+        removed.append(candidate.name)
+    return tuple(removed)
+
 
 def _cleanup_host_dirs() -> None:
-    """Elimina los directorios temporales del host que hayan quedado pendientes."""
+    """Elimina los directorios temporales del host pendientes y barre los abandonados."""
     while _HOST_TEMP_DIRS:
         shutil.rmtree(_HOST_TEMP_DIRS.pop(), ignore_errors=True)
+    _sweep_stale_host_dirs()
 
 
 atexit.register(_cleanup_host_dirs)
@@ -367,6 +410,22 @@ class WebSessionRun:
         return None
 
 
+class _ServiceRuntimeBridge:
+    """Adapta el backend web al contrato ``ServiceRuntime`` de las dependencias de servicio.
+
+    Existe para que :mod:`punto.web.services` no dependa de este módulo (ni al revés, más allá de
+    esta costura): el ciclo de vida del servicio se prueba con un runtime inyectado y, en
+    producción, el único runtime posible sigue siendo el que este backend ya validó.
+    """
+
+    def __init__(self, backend: WebSandboxBackend) -> None:
+        self._backend = backend
+
+    def run(self, arguments: Sequence[str], *, timeout: float) -> ServiceProcess:
+        """Delega en el backend, con el mismo saneado de entorno y las mismas garantías."""
+        return self._backend.run_service_command(arguments, timeout=timeout)
+
+
 class WebSandboxBackend:
     """Ejecuta una sesión de navegador real dentro del sandbox web.
 
@@ -493,6 +552,7 @@ class WebSandboxBackend:
         preview_port: int = DEFAULT_PREVIEW_PORT,
         task_id: UUID | None = None,
         project_id: UUID | None = None,
+        service: QaPostgresSpec | None = None,
     ) -> WebSessionRun:
         """Ejecuta una sesión web completa dentro del sandbox.
 
@@ -519,6 +579,11 @@ class WebSandboxBackend:
             preview_port: Puerto de loopback de la preview dentro del contenedor.
             task_id: Tarea a la que pertenece la sesión, para poder auditarla.
             project_id: Proyecto al que pertenece, para poder auditarla.
+            service: Dependencia de servicio efímera que la aplicación necesita (PILOT-01R.1). Si se
+                declara, se levanta **dentro** de la red interna de la sesión, se prepara con los
+                artefactos SQL autorizados del proyecto y la preview recibe ``DATABASE_URL``
+                apuntando a ese servicio. La credencial real del proyecto nunca entra al sandbox,
+                así que el workspace tiene que estar saneado (sin ficheros ``.env`` locales).
 
         Returns:
             La sesión con las observaciones, los bytes **verificados** de cada screenshot y el
@@ -595,41 +660,68 @@ class WebSandboxBackend:
         evidence_root = _make_host_dir("evidence")
         (evidence_root / "screenshots").mkdir(parents=True, exist_ok=True)
         _stage_probe(sources, probe_root)
-        _write_payload(
-            probe_root / PREVIEW_PAYLOAD_FILE_NAME,
-            {
-                "project": _as_posix(project),
-                "commands": [list(argv) for argv in project_commands],
-                "preview_argv": [list(argv) for argv in preview_commands],
-                "preview_port": preview_port,
-                "command_timeout_seconds": self._limits.command_timeout_seconds,
-                "preview_timeout_seconds": self._preview_wait(effective_timeout),
-            },
-        )
-        _write_payload(
-            probe_root / MEASURE_PAYLOAD_FILE_NAME,
-            {
-                "base_url": f"http://{alias}:{preview_port}",
-                "route": logical_route,
-                "viewports": [
-                    {
-                        "name": viewport.name.value,
-                        "width": viewport.width,
-                        "height": viewport.height,
-                    }
-                    for viewport in chosen_viewports
-                ],
-                "required_markers": list(markers),
-                "actions": [dict(action) for action in chosen_actions],
-                "output_dir": EVIDENCE_MOUNT,
-                "capture_timeout_seconds": self._limits.capture_timeout_seconds,
-                "preview_timeout_seconds": self._preview_wait(effective_timeout),
-            },
-        )
         expected_probe_digest = _probe_digest(probe_root)
+
+        # Frontera de PILOT-01R.1: si la aplicación necesita una base de datos, se levanta
+        # **dentro** de la red interna de la sesión. El workspace tiene que venir saneado, porque la
+        # preview va a recibir un DSN efímero construido por PUNTO y no debe tener a mano el del
+        # proyecto real.
+        service_dir: Path | None = None
+        ephemeral: EphemeralPostgres | None = None
+        if service is not None:
+            assert_no_local_secrets(safe_workspace)
+            service_dir = _make_host_dir("service")
 
         self._create_network(network)
         try:
+            preview_environment: dict[str, str] = {}
+            if service is not None and service_dir is not None:
+                ephemeral = self._prepare_service(
+                    spec=service,
+                    workspace=safe_workspace,
+                    project_relative=project,
+                    network=network,
+                    suffix=suffix,
+                    staging=service_dir,
+                    task_id=task_id,
+                    project_id=project_id,
+                )
+                preview_environment = ephemeral.preview_environment()
+
+            _write_payload(
+                probe_root / PREVIEW_PAYLOAD_FILE_NAME,
+                {
+                    "project": _as_posix(project),
+                    "commands": [list(argv) for argv in project_commands],
+                    "preview_argv": [list(argv) for argv in preview_commands],
+                    "preview_port": preview_port,
+                    "command_timeout_seconds": self._limits.command_timeout_seconds,
+                    "preview_timeout_seconds": self._preview_wait(effective_timeout),
+                    # Único canal por el que PUNTO le da entorno a la preview, y solo con las claves
+                    # de la allowlist del probe: nunca un ``env`` genérico del proyecto.
+                    "environment": dict(preview_environment),
+                },
+            )
+            _write_payload(
+                probe_root / MEASURE_PAYLOAD_FILE_NAME,
+                {
+                    "base_url": f"http://{alias}:{preview_port}",
+                    "route": logical_route,
+                    "viewports": [
+                        {
+                            "name": viewport.name.value,
+                            "width": viewport.width,
+                            "height": viewport.height,
+                        }
+                        for viewport in chosen_viewports
+                    ],
+                    "required_markers": list(markers),
+                    "actions": [dict(action) for action in chosen_actions],
+                    "output_dir": EVIDENCE_MOUNT,
+                    "capture_timeout_seconds": self._limits.capture_timeout_seconds,
+                    "preview_timeout_seconds": self._preview_wait(effective_timeout),
+                },
+            )
             self._start_container(
                 self._preview_arguments(
                     workspace=safe_workspace,
@@ -719,11 +811,20 @@ class WebSandboxBackend:
                 stderr_excerpt=_excerpt(completed.stderr),
             )
         finally:
+            # El servicio se destruye **antes** que la red: al revés, el runtime rechazaría borrar
+            # una red con un contenedor conectado y quedaría un servicio huérfano con datos vivos.
+            if ephemeral is not None:
+                ephemeral.destroy()
+                self._audit_service_destroyed(
+                    task_id=task_id, project_id=project_id, service=ephemeral, network=network
+                )
             self._force_remove(preview_container)
             self._force_remove(measure_container)
             self._remove_network(network)
             _remove_host_dir(probe_root)
             _remove_host_dir(evidence_root)
+            if service_dir is not None:
+                _remove_host_dir(service_dir)
 
     def _verify_route_identity(
         self,
@@ -833,6 +934,124 @@ class WebSandboxBackend:
                 sha256=artifact.sha256,
             )
 
+    # ------------------------------------------- dependencias de servicio (QA)
+    def _prepare_service(
+        self,
+        *,
+        spec: QaPostgresSpec,
+        workspace: Path,
+        project_relative: Path,
+        network: str,
+        suffix: str,
+        staging: Path,
+        task_id: UUID | None,
+        project_id: UUID | None,
+    ) -> EphemeralPostgres:
+        """Levanta y prepara la dependencia de servicio efímera de la sesión.
+
+        Orden estricto: autorizar los artefactos → copiarlos fuera del workspace → arrancar el
+        contenedor en la red interna → esperar readiness → crear el rol de aplicación sin
+        privilegios → aplicar migración y seed. Cualquier fallo **destruye** el servicio antes de
+        propagar: no queda una base a medias, y la sesión se bloquea en lugar de seguir con datos
+        simulados.
+
+        Raises:
+            QaServicePolicyError: si la petición o los artefactos violan la política.
+            QaServiceUnavailableError: si el servicio no arranca o no llega a estar listo.
+            QaServicePreparationError: si la preparación de la base falla.
+        """
+        ephemeral = EphemeralPostgres(
+            runtime=_ServiceRuntimeBridge(self),
+            workspace=workspace,
+            project_relative=project_relative,
+            network=network,
+            alias=f"{SERVICE_ALIAS_PREFIX}{suffix}",
+            container=f"{SERVICE_CONTAINER_PREFIX}{suffix}",
+            spec=spec,
+        )
+        try:
+            artifacts = ephemeral.plan()
+            stage_artifacts(staging, artifacts)
+            ephemeral.start(staging)
+            self._audit_service_started(
+                task_id=task_id, project_id=project_id, service=ephemeral
+            )
+            ephemeral.wait_ready()
+            ephemeral.create_application_role()
+            ephemeral.prepare()
+            self._audit_service_prepared(
+                task_id=task_id, project_id=project_id, service=ephemeral
+            )
+        except BaseException:
+            # BaseException y no Exception: hasta un Ctrl-C a mitad de la preparación deja el
+            # contenedor limpio. Un servicio huérfano con datos en memoria es justo lo que esta fase
+            # prohíbe.
+            ephemeral.destroy()
+            raise
+        return ephemeral
+
+    def _audit_service_started(
+        self,
+        *,
+        task_id: UUID | None,
+        project_id: UUID | None,
+        service: EphemeralPostgres,
+    ) -> None:
+        """Registra el arranque del servicio con su vista pública (nunca con la credencial)."""
+        if self._audit is None or task_id is None or project_id is None:
+            return
+        self._audit.log_qa_service_started(
+            resource_id=task_id,
+            metadata={"project_id": str(project_id), **service.as_public_dict()},
+        )
+
+    def _audit_service_prepared(
+        self,
+        *,
+        task_id: UUID | None,
+        project_id: UUID | None,
+        service: EphemeralPostgres,
+    ) -> None:
+        """Registra que la base efímera quedó preparada con el rol de aplicación sin privilegios."""
+        if self._audit is None or task_id is None or project_id is None:
+            return
+        self._audit.log_qa_service_prepared(
+            resource_id=task_id,
+            metadata={"project_id": str(project_id), **service.as_public_dict()},
+        )
+
+    def _audit_service_destroyed(
+        self,
+        *,
+        task_id: UUID | None,
+        project_id: UUID | None,
+        service: EphemeralPostgres,
+        network: str,
+    ) -> None:
+        """Registra la destrucción del servicio **y** que no quedó nada vivo.
+
+        La comprobación se hace contra el runtime, no contra la intención de limpiar: el evento dice
+        lo que el runtime responde después de destruir, que es lo único verificable.
+        """
+        if self._audit is None or task_id is None or project_id is None:
+            return
+        check = service_cleanup_check(
+            _ServiceRuntimeBridge(self), service.container, network
+        )
+        self._audit.log_qa_service_destroyed(
+            resource_id=task_id,
+            result=(
+                AuditResult.SUCCESS
+                if check["container_removed"] and check["network_removed"]
+                else AuditResult.FAILURE
+            ),
+            metadata={
+                "project_id": str(project_id),
+                "service": service.as_public_dict(),
+                "cleanup": check,
+            },
+        )
+
     # --------------------------------------------------------------- limpiar
     def list_containers(self) -> tuple[str, ...]:
         """Contenedores web de PUNTO que siguen existiendo (debería ser vacío)."""
@@ -846,11 +1065,30 @@ class WebSandboxBackend:
             return ()
         return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
+    def list_service_containers(self) -> tuple[str, ...]:
+        """Contenedores de **dependencias de servicio** de PUNTO que siguen existiendo.
+
+        Se buscan por su propia etiqueta porque llevan un nombre distinto al de la preview: sin esta
+        consulta, un servicio huérfano (por ejemplo si el proceso murió a mitad de sesión) no lo
+        encontraría :meth:`destroy`, que es la vía de recuperación.
+        """
+        if self._binary is None:
+            return ()
+        result = self._run_runtime(
+            ["ps", "-a", "--filter", f"label={SERVICE_LABEL}", "--format", "{{.Names}}"],
+            timeout=60.0,
+        )
+        if result.returncode != 0:
+            return ()
+        return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+
     def destroy(self) -> None:
         """Elimina los contenedores web de esta sesión, los huérfanos y las redes de PUNTO."""
         for container in tuple(self._containers):
             self._force_remove(container)
         for container in self.list_containers():
+            self._force_remove(container)
+        for container in self.list_service_containers():
             self._force_remove(container)
         self._containers.clear()
         for network in self.list_networks():
@@ -1264,6 +1502,24 @@ class WebSandboxBackend:
             raise WebSandboxUnavailableError(
                 f"{self._runtime_name or DEFAULT_RUNTIME} no ejecutable: {exc}"
             ) from exc
+
+    def run_service_command(self, arguments: Sequence[str], *, timeout: float) -> ServiceProcess:
+        """Costura pública para el ciclo de vida de una dependencia de servicio (PILOT-01R.1).
+
+        :mod:`punto.web.services` necesita ejecutar órdenes del runtime (crear, inspeccionar y
+        destruir el contenedor del servicio) sin conocer el backend. Un runtime que no responde se
+        devuelve como **resultado fallido** en lugar de propagarse como excepción: el ciclo de vida
+        del servicio tiene que poder limpiar y decidir con ese dato, no morir a mitad.
+        """
+        try:
+            completed = self._run_runtime(list(arguments), timeout=timeout)
+        except WebSandboxUnavailableError as exc:
+            return ServiceProcess(returncode=125, stderr=str(exc))
+        return ServiceProcess(
+            returncode=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        )
 
     def _force_remove(self, container: str) -> None:
         """Elimina un contenedor por la fuerza, sin propagar errores (ruta de limpieza)."""

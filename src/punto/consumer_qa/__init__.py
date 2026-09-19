@@ -52,6 +52,7 @@ from punto.consumer_qa.runner import (
     record_failure,
     run_consumer_qa,
 )
+from punto.web.services import QaPostgresSpec
 
 __all__ = [
     "CANONICAL_CASES",
@@ -72,6 +73,7 @@ __all__ = [
     "QAStep",
     "QAStepKind",
     "QATarget",
+    "QaPostgresSpec",
     "case_by_id",
     "failure_as_experience",
     "record_failure",

@@ -38,6 +38,7 @@ from punto.web.sandbox import (
     WebSandboxUnavailableError,
     WebSessionRun,
 )
+from punto.web.services import QaPostgresSpec
 
 #: Viewport por defecto del consumidor: el primero del contrato web (móvil 390x844). El consumidor
 #: comprueba una aplicación como la vería una persona en ese tamaño; otro viewport se pide con el
@@ -55,6 +56,11 @@ class QATarget:
 
     ``preview_argv`` es el servidor de la aplicación, con el mismo mecanismo que usa la capa web:
     se ejecuta **dentro** del contenedor con un ``argv`` controlado, nunca en el host ni por shell.
+
+    ``service`` declara una **dependencia de servicio** de la aplicación (PILOT-01R.1): una base de
+    datos efímera que PUNTO levanta dentro de la misma red interna de la sesión y cuya credencial,
+    generada por sesión, llega a la aplicación por ``DATABASE_URL``. Nunca es la credencial real del
+    proyecto, y el workspace tiene que venir saneado (sin ficheros ``.env`` locales).
     """
 
     workspace: Path
@@ -64,6 +70,8 @@ class QATarget:
     #: Imagen del contenedor que ejecuta la aplicación; vacío significa la del sandbox web.
     preview_image: str = ""
     timeout_seconds: float = 300.0
+    #: Dependencia de servicio efímera, o ``None`` si la aplicación no necesita ninguna.
+    service: QaPostgresSpec | None = None
 
     def __post_init__(self) -> None:
         """Rechaza un objetivo incompleto antes de montar ningún contenedor."""
@@ -157,6 +165,7 @@ def run_browser_session(
             preview_port=target.preview_port,
             preview_image=target.preview_image,
             timeout_seconds=target.timeout_seconds,
+            service=target.service,
         )
     except WebSandboxUnavailableError as error:
         raise QASessionUnavailable(str(error)) from error

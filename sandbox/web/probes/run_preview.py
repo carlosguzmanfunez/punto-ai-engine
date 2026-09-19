@@ -28,6 +28,15 @@ stdout (el host lee estas líneas; se vacían a propósito, ver :func:`_announce
 - ``PUNTO_PREVIEW_READY port=<puerto>``: la preview escucha en ``0.0.0.0`` y este proceso se queda
   vivo sirviéndola hasta que el host lo termine con SIGTERM/SIGINT.
 
+Entorno inyectado
+-----------------
+El payload puede traer ``environment``: un objeto con **solo** las claves de
+:data:`ALLOWED_ENVIRONMENT_KEYS` (hoy, ``DATABASE_URL``), que se añaden al entorno del contenedor
+para los comandos del proyecto y para la preview. No es un canal genérico: una clave fuera de la
+allowlist invalida el payload. Así la aplicación puede alcanzar la dependencia de servicio efímera
+de la sesión sin que el proyecto reciba credenciales que no le corresponden ni variables capaces de
+alterar cómo se ejecuta (``PATH``, ``LD_PRELOAD``, ``NODE_OPTIONS``).
+
 ``diagnostics.json`` en ``/tmp`` (nunca en el workspace): se escribe **siempre**, también al
 fallar, con las versiones reales del entorno, los comandos ejecutados, el estado de la preview y un
 error legible. Es un diagnóstico **no confiable** —lo produce la zona no confiable— así que el host
@@ -56,6 +65,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BufferedReader
 from pathlib import Path
@@ -82,6 +92,17 @@ PREVIEW_READY_MARKER = "PUNTO_PREVIEW_READY"
 MAX_TEXT = 2000
 MAX_COMMAND_OUTPUT_CHARS = 4000
 MAX_PREVIEW_LOG_CHARS = 4000
+
+#: Variables de entorno que el host puede inyectar en los comandos del proyecto y en la preview.
+#:
+#: Es una **allowlist**, no una lista de sugerencias: cualquier otra clave invalida el payload. El
+#: host solo manda ``DATABASE_URL``, construida por PUNTO y apuntando a la dependencia de servicio
+#: efímera de esta sesión; esta comprobación es la segunda barrera, para que ni un fallo del host
+#: pueda convertir el payload en un canal de entorno arbitrario hacia la zona no confiable.
+ALLOWED_ENVIRONMENT_KEYS = frozenset({"DATABASE_URL"})
+
+#: Máximo de variables aceptadas en el payload.
+MAX_ENVIRONMENT_KEYS = 4
 
 #: Puerto por defecto del contrato, usado solo si el payload no trae ``preview_port``.
 DEFAULT_PREVIEW_PORT = 4173
@@ -277,11 +298,45 @@ def _seconds(value: object, field: str, default: float) -> float:
     return float(value)
 
 
+def _environment(value: object) -> dict[str, str]:
+    """Entorno a inyectar en los comandos del proyecto y en la preview, filtrado por allowlist.
+
+    El payload es del host **confiable**, pero esta capa no lo da por hecho: solo se aceptan las
+    claves de :data:`ALLOWED_ENVIRONMENT_KEYS` y valores de texto. Así, aunque el host tuviera un
+    fallo, el payload no puede convertirse en un canal por el que entren variables arbitrarias
+    (``PATH``, ``NODE_OPTIONS``, ``LD_PRELOAD``, credenciales del host) a la zona no confiable.
+
+    Raises:
+        ValueError: si no es un objeto, si trae una clave no autorizada o un valor no textual.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("environment debe ser un objeto de variables")
+    if len(value) > MAX_ENVIRONMENT_KEYS:
+        raise ValueError(f"environment supera el máximo de variables ({MAX_ENVIRONMENT_KEYS})")
+    environment: dict[str, str] = {}
+    for key, item in value.items():
+        name = str(key).strip()
+        if name not in ALLOWED_ENVIRONMENT_KEYS:
+            raise ValueError(f"environment trae la variable no autorizada {name!r}")
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"environment.{name} debe ser una cadena no vacía")
+        environment[name] = item
+    return environment
+
+
 # ---------------------------------------------------------------------------
 # Comandos del proyecto
 # ---------------------------------------------------------------------------
-def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any]:
-    """Ejecuta un comando de proyecto con timeout y salida acotada."""
+def _run_command(
+    argv: list[str], *, cwd: Path, timeout: float, environment: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Ejecuta un comando de proyecto con timeout y salida acotada.
+
+    ``environment`` se **añade** al entorno del contenedor (y solo trae claves de la allowlist del
+    payload): el proceso del proyecto ve las suyas más la dependencia de servicio de la sesión.
+    """
     started = time.monotonic()
     record: dict[str, Any] = {
         "argv": argv,
@@ -303,6 +358,7 @@ def _run_command(argv: list[str], *, cwd: Path, timeout: float) -> dict[str, Any
             timeout=timeout,
             shell=False,
             check=False,
+            env=_child_environment(environment),
         )
     except subprocess.TimeoutExpired as exc:
         record["timed_out"] = True
@@ -376,12 +432,32 @@ def _drain_bounded(stream: BufferedReader | None, handle: IO[str], limit: int) -
         return
 
 
-def _start_preview(argv: list[str], *, cwd: Path, log_path: Path) -> _Preview:
+def _child_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
+    """Entorno del proceso hijo: el del contenedor **más** las variables de la allowlist.
+
+    Se copia el entorno del contenedor porque reemplazarlo dejaría al proyecto sin ``PATH`` ni
+    ``HOME``; lo que se añade son solo las claves ya validadas del payload.
+    """
+    merged = dict(os.environ)
+    for key, value in (environment or {}).items():
+        merged[str(key)] = str(value)
+    return merged
+
+
+def _start_preview(
+    argv: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    environment: Mapping[str, str] | None = None,
+) -> _Preview:
     """Arranca una preview en segundo plano, con su salida acotada a un fichero temporal.
 
     ``start_new_session=True`` le da grupo de procesos propio: así la limpieza mata también a los
     nietos (``npm run start`` lanza un hijo). Nunca hay ``shell=True``: un intérprete intermedio
     volvería a interpretar los argumentos del payload y abriría una inyección de shell.
+
+    ``environment`` es el mismo entorno mínimo y filtrado que reciben los comandos del proyecto.
     """
     handle = log_path.open("w", encoding="utf-8", errors="replace")
     try:
@@ -392,6 +468,7 @@ def _start_preview(argv: list[str], *, cwd: Path, log_path: Path) -> _Preview:
             stderr=subprocess.STDOUT,
             shell=False,
             start_new_session=True,
+            env=_child_environment(environment),
         )
     except OSError:
         handle.close()
@@ -627,10 +704,14 @@ def _run_session(
         preview_timeout = _seconds(
             payload.get("preview_timeout_seconds"), "preview_timeout_seconds", 60.0
         )
+        environment = _environment(payload.get("environment"))
     except ValueError as exc:
         return _fail(diagnostics, EXIT_PAYLOAD_INVALID, f"payload inválido: {exc}")
 
     diagnostics["project"] = project.name
+    # Solo los **nombres** de las variables inyectadas: los valores llevan la credencial efímera de
+    # la sesión y el diagnóstico es contenido que el host puede acabar citando en un mensaje.
+    diagnostics["environment_keys"] = sorted(environment)
 
     # --- versiones reales del entorno no confiable ---------------------------
     runtime_entries = _collect_runtime_versions()
@@ -651,7 +732,7 @@ def _run_session(
         if missing is not None:
             _announce(f"{PROGRAM_MISSING_MARKER} {missing}")
             return _fail(diagnostics, EXIT_PROGRAM_MISSING, f"falta el programa {missing}")
-        record = _run_command(argv, cwd=project, timeout=command_timeout)
+        record = _run_command(argv, cwd=project, timeout=command_timeout, environment=environment)
         diagnostics["commands"].append(record)
         _announce(f"{COMMAND_MARKER} exit={record['exit_code']} argv={' '.join(argv)}")
         if record["timed_out"] or record["exit_code"] != 0:
@@ -677,7 +758,11 @@ def _run_session(
         name = PREVIEW_LOG_NAME if len(preview_argv) == 1 else f"preview-{index}.log"
         log_path = TEMP_DIR / name
         try:
-            previews.append(_start_preview(argv, cwd=project, log_path=log_path))
+            previews.append(
+                _start_preview(
+                    argv, cwd=project, log_path=log_path, environment=environment
+                )
+            )
         except OSError as exc:
             _announce(f"{PREVIEW_FAILED_MARKER} no se pudo arrancar la preview")
             return _fail(
@@ -725,6 +810,7 @@ def main() -> int:
         "exit_code": None,
         "error": "",
         "project": "",
+        "environment_keys": [],
         "runtime": [],
         "commands": [],
         "preview": {

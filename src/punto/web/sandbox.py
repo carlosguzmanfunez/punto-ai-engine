@@ -778,6 +778,7 @@ class WebSandboxBackend:
             evidence_digest = _verify_evidence_digest(completed.stdout, diagnostics_path)
             _verify_probe_digest(completed.stdout, expected_probe_digest)
             observations = _load_observations(evidence_root / "observations.json")
+            _verify_capture_measured(observations)
             artifacts, screenshots = self._verify_evidence(
                 output_dir=evidence_root,
                 diagnostics=diagnostics,
@@ -1689,6 +1690,33 @@ def _load_json_object(path: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise WebSandboxSessionError(f"{path.name} no es un objeto JSON")
     return {str(key): value for key, value in data.items()}
+
+
+def _verify_capture_measured(observations: WebObservations) -> None:
+    """Exige que la captura haya **medido** la página antes de juzgarla.
+
+    Una navegación que agota su tiempo **sin respuesta HTTP** (o con el documento sin llegar a estar
+    listo) significa que el navegador no observó ninguna página: la captura sale en blanco. Juzgar
+    sus expectativas atribuiría al proyecto un fallo que no se midió, y por eso la sesión se rechaza
+    como no disponible. El contrato de QA Consumer ya distingue ese desenlace
+    (``infrastructure``) de un veredicto de producto, así que el hecho se declara en vez de
+    disfrazarse.
+
+    Una página **sí** servida (respuesta observada y documento listo) sigue siendo una medición
+    válida aunque la navegación agote su tiempo: una aplicación con actividad de red permanente
+    nunca alcanza ``networkidle``, y ahí no se rechaza nada.
+
+    Raises:
+        WebSandboxSessionError: si alguna observación declara esa combinación.
+    """
+    for observation in observations.observations:
+        served = observation.http_status is not None
+        if observation.timed_out and not (served and observation.document_ready):
+            raise WebSandboxSessionError(
+                "la captura no midió la página: la navegación agotó su tiempo sin servir un "
+                f"documento (http_status={observation.http_status!r}, "
+                f"document_ready={observation.document_ready})"
+            )
 
 
 def _load_observations(path: Path) -> WebObservations:

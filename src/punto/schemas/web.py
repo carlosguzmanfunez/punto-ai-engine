@@ -416,6 +416,14 @@ class RouteObservation(BaseModel):
     http_status: int | None = Field(default=None, description="Código HTTP observado.")
     load_error: str = Field(default="", description="Error de navegación, si lo hubo.")
     timed_out: bool = Field(default=False, description="True si agotó el tiempo de espera.")
+    document_ready: bool = Field(
+        default=True,
+        description=(
+            "True si el documento llegó a estar listo (`readyState === 'complete'`). Es la "
+            "condición observable que decide si la captura **midió** una página: con la navegación "
+            "agotada y el documento sin estar listo, no se observó nada que juzgar."
+        ),
+    )
     console_errors: tuple[str, ...] = Field(
         default=(), description=f"Mensajes de consola de nivel error (máx. {MAX_CONSOLE_MESSAGES})."
     )

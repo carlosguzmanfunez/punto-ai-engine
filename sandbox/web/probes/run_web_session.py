@@ -790,6 +790,11 @@ def _build_observation(
         "http_status": _as_int_or_none(payload.get("http_status")),
         "load_error": load_error,
         "timed_out": bool(payload.get("timed_out", False)),
+        # Condición observable de la medición: si el documento nunca llegó a estar listo, esta
+        # captura no observó una página y el host no puede juzgar expectativas sobre ella. Un probe
+        # antiguo que no lo declare se interpreta como ``True`` (compatibilidad), y el host mantiene
+        # además su propia comprobación.
+        "document_ready": bool(payload.get("document_ready", True)),
         "console_errors": _as_str_list(payload.get("console_errors"), MAX_CONSOLE_ERRORS),
         "console_warning_count": max(
             0, _as_int_or_none(payload.get("console_warning_count")) or 0

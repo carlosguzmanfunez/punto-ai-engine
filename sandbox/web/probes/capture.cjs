@@ -830,6 +830,13 @@ async function capture(options) {
     result.viewport_clipping = facts.clippingDetails;
     result.accessibility = facts.accessibility;
     result.heading_sequence = facts.headingSequence;
+    // `document_ready` es la condición observable que decide si esta captura **midió** la página:
+    // si la navegación agotó su tiempo y el documento nunca llegó a estar listo, no se observó un
+    // documento (la captura sale en blanco) y juzgar sus expectativas atribuiría al producto un
+    // fallo que no se midió. El host lo comprueba por su cuenta.
+    result.document_ready = await page
+      .evaluate(() => document.readyState === 'complete')
+      .catch(() => false);
 
     fs.mkdirSync(path.dirname(path.resolve(options.png)), { recursive: true });
     await page.screenshot({ path: options.png, fullPage: false });

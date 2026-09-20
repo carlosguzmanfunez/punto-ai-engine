@@ -1166,6 +1166,53 @@ def test_16d_ciclo_real_el_recurso_escalado_no_es_un_hueco_sin_explicar(tmp_path
     assert list(aprobadas[0]["resources"]) == ["src/lib/tipos.ts"]
 
 
+def test_16f_el_ciclo_admitiria_el_cambio_escalado_en_la_misma_respuesta(tmp_path: Path) -> None:
+    """Prueba discriminante del defecto D-5: el ciclo evalúa la ampliación **antes** de los cambios.
+
+    Si la respuesta de resolución pide ``scope_expansion`` para el recurso que mide la verificación
+    y además incluye su cambio, el plan ya está ampliado cuando PUNTO valida los cambios: el caso
+    cierra en **una** reparación. La skill no lo dice, y por eso la corrida real gastó una ronda de
+    más aunque había identificado la causa en la primera.
+    """
+    responses = [
+        _e2e_plan(modify=("src/components/Rejilla.tsx", "src/components/Buscador.tsx")),
+        {"summary": "consumidores", "changes": _consumidores()},
+        {
+            "summary": "consumidores, ampliación y fuente en la misma respuesta",
+            "changes": [
+                *_consumidores(),
+                {
+                    "path": "src/lib/tipos.ts",
+                    "operation": "MODIFY",
+                    "content": "export const TIPOS = ['Casa', 'Apartamento'];\n",
+                    "reason": "la verificación focalizada mide este fichero",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+            ],
+            "root_cause": "la fuente canónica no declara el tipo que la verificación lee",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "la verificación focalizada encuentra el tipo exigido",
+            "scope_expansion": {
+                "trigger": "evidencia de la verificación focalizada",
+                "evidence": ["focused mide src/lib/tipos.ts y el plan no lo autoriza"],
+                "root_cause": "es la fuente canónica del dato que la verificación exige",
+                "resources": ["src/lib/tipos.ts"],
+                "operations": ["MODIFY"],
+                "relationship": "fuente canónica de la misma cadena funcional",
+            },
+        },
+    ]
+    result, detalle, _client = _run_e2e(tmp_path, responses)
+    progreso = _meta(detalle, "DEV_CAUSAL_PROGRESS")
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert result.repair_rounds == 1, "la ampliación y el cambio caben en la misma reparación"
+    assert len(progreso) == 1
+    assert _estados_de(progreso[0])["src/lib/tipos.ts"] == CHANGED
+    assert progreso[0]["verification_result"] == "PASSED"
+    assert _meta(detalle, "DEV_SCOPE_EXPANSION_APPROVED") != []
+
+
 def test_16e_el_arnes_persiste_el_handoff_que_se_envio() -> None:
     """Defecto D-4: si el plan se revisa, el handoff recomputado no es el que se envió."""
     harness = Path(__file__).resolve().parents[1] / "_punto-skill-layer" / "run_baseline.py"

@@ -1,0 +1,379 @@
+{
+  "baseline": {
+    "status": "DEVELOPMENT_VERIFICATION_FAILED",
+    "metrics": {
+      "status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "success": false,
+      "functional_chain_pass": false,
+      "provider_calls": 4,
+      "builder_calls": 0,
+      "repair_rounds": 2,
+      "verification_failures": 2,
+      "scope_expansions": 0,
+      "tool_calls": 4,
+      "files_read": 3,
+      "prompt_chars": 13144,
+      "builder_prompt_chars": 0,
+      "repair_prompt_chars": 0,
+      "causal_handoff_chars": "",
+      "builder_skill_chars": "",
+      "input_tokens": 5440,
+      "output_tokens": 10960,
+      "total_tokens": 16400,
+      "provider_elapsed_ms": 172951,
+      "elapsed_ms": 173536,
+      "human_gates": 0
+    },
+    "first_attempt": {},
+    "record": {
+      "run_id": "75efa979-25f5-4a06-9687-636981103acb",
+      "task_id": "CASE-B",
+      "case_id": "CASE-B",
+      "case_kind": "B",
+      "mode": "REAL",
+      "primary_role": "ARCHITECT",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "started_at": "2026-09-20T06:39:36.671963Z",
+      "finished_at": "2026-09-20T06:42:30.218612Z",
+      "elapsed_ms": 173536,
+      "provider_elapsed_ms": 172951,
+      "verification_elapsed_ms": 122,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 0,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 2,
+      "functional_chain_verifications": 0,
+      "functional_chain_pass": false,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 5440,
+        "output_tokens": 10960,
+        "total_tokens": 16400,
+        "source": "REAL"
+      },
+      "prompt_chars": 13144,
+      "context_chars": 182,
+      "success": false,
+      "final_status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": true,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    },
+    "plan": null,
+    "causal_handoff": "",
+    "calls_detail": []
+  },
+  "builder 0.1.0": {
+    "status": "DEVELOPMENT_VERIFICATION_FAILED",
+    "metrics": {
+      "status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "success": false,
+      "functional_chain_pass": false,
+      "provider_calls": 4,
+      "builder_calls": 3,
+      "repair_rounds": 2,
+      "verification_failures": 2,
+      "scope_expansions": 1,
+      "tool_calls": 4,
+      "files_read": 3,
+      "prompt_chars": 18691,
+      "builder_prompt_chars": 16431,
+      "repair_prompt_chars": 11462,
+      "causal_handoff_chars": 684,
+      "builder_skill_chars": 1108,
+      "input_tokens": 8965,
+      "output_tokens": 13018,
+      "total_tokens": 21983,
+      "provider_elapsed_ms": 217280,
+      "elapsed_ms": 218566,
+      "human_gates": 0
+    },
+    "first_attempt": {
+      "first_attempt_pass": false,
+      "repair_rounds": 2,
+      "builder_calls": 3,
+      "missing_acceptance": [
+        "Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos»."
+      ],
+      "missing_resources": [
+        "src/lib/tipos.ts"
+      ],
+      "declared_root_cause": false,
+      "failed_verifications": [
+        "focused",
+        "chain"
+      ]
+    },
+    "record": {
+      "run_id": "0a40f5cb-3bf8-4dff-a8ac-0b5708882974",
+      "task_id": "CASE-B",
+      "case_id": "CASE-B",
+      "case_kind": "B",
+      "mode": "REAL",
+      "primary_role": "ARCHITECT",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "builder_skill_id": "punto-causal-builder",
+      "builder_skill_version": "0.1.0",
+      "builder_skill_activated": true,
+      "builder_skill_chars": 1108,
+      "causal_handoff_present": true,
+      "causal_handoff_chars": 684,
+      "skill_id": "",
+      "skill_version": "",
+      "skill_activated": false,
+      "started_at": "2026-09-20T07:40:56.592924Z",
+      "finished_at": "2026-09-20T07:44:35.181421Z",
+      "elapsed_ms": 218566,
+      "provider_elapsed_ms": 217280,
+      "verification_elapsed_ms": 148,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 1,
+      "scope_expansions": 1,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 0,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 2,
+      "functional_chain_verifications": 0,
+      "functional_chain_pass": false,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 8965,
+        "output_tokens": 13018,
+        "total_tokens": 21983,
+        "source": "REAL"
+      },
+      "prompt_chars": 18691,
+      "context_chars": 182,
+      "success": false,
+      "final_status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": true,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    },
+    "plan": {
+      "summary": "Centralizar TIPOS en src/lib/tipos.ts y hacer que Buscador y Rejilla consuman esa única fuente canónica, con pruebas de la cadena funcional.",
+      "files_to_read": [
+        "src/lib/tipos.ts",
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx",
+        "tests"
+      ],
+      "files_to_modify": [
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx",
+        "src/lib/tipos.ts"
+      ],
+      "files_to_create": [
+        "tests/tipos-chain.test.ts"
+      ],
+      "files_to_delete": [],
+      "verification_commands": [
+        "focused",
+        "chain"
+      ],
+      "risks": [
+        "La ruta de importación debe ajustarse a la resolución de módulos existente.",
+        "Las pruebas deben validar el uso compartido de TIPOS sin duplicar la lista esperada como una segunda fuente de verdad."
+      ],
+      "acceptance_mapping": [
+        "Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos»."
+      ],
+      "functional_chain": [
+        {
+          "step": "canonical source",
+          "description": "src/lib/tipos.ts conserva TIPOS como la única definición de los tipos disponibles.",
+          "verification": "focused"
+        },
+        {
+          "step": "consumers",
+          "description": "Buscador y Rejilla importan TIPOS en lugar de declarar arreglos locales.",
+          "verification": "chain"
+        },
+        {
+          "step": "behaviour",
+          "description": "Ambos componentes mantienen su comportamiento de devolver la cantidad de tipos desde la fuente compartida.",
+          "verification": "chain"
+        },
+        {
+          "step": "tests",
+          "description": "La prueba enfocada comprueba la fuente canónica y la prueba de cadena verifica que ambos consumidores dependen de ella.",
+          "verification": "focused"
+        },
+        {
+          "step": "build",
+          "description": "La verificación de cadena confirma que las importaciones y el tipado de los consumidores se integran correctamente.",
+          "verification": "chain"
+        }
+      ]
+    },
+    "causal_handoff": "{\"chain\":[{\"step\":\"canonical source\",\"verification\":\"focused\"},{\"step\":\"consumers\",\"verification\":\"chain\"},{\"step\":\"behaviour\",\"verification\":\"chain\"},{\"step\":\"tests\",\"verification\":\"focused\"},{\"step\":\"build\",\"verification\":\"chain\"}],\"done\":[\"Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos».\"],\"goal\":\"Centralizar TIPOS en src/lib/tipos.ts y hacer que Buscador y Rejilla consuman esa única fuente canónica, con pruebas de la cadena funcional.\",\"resources\":[\"src/components/Buscador.tsx\",\"src/components/Rejilla.tsx\",\"src/lib/tipos.ts\",\"tests/tipos-chain.test.ts\"],\"verify\":[\"focused\",\"chain\"]}",
+    "calls_detail": [
+      {
+        "role": "ARCHITECT",
+        "phase": "planning",
+        "status": "SUCCESS",
+        "prompt_chars": 2260,
+        "total_tokens": null,
+        "duration_ms": 13634,
+        "proposal": {
+          "parsed": true,
+          "chars": 1666,
+          "changes": [],
+          "root_cause": "",
+          "scope_expansion": false,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "implementation",
+        "status": "SUCCESS",
+        "prompt_chars": 4969,
+        "total_tokens": 6718,
+        "duration_ms": 58655,
+        "proposal": {
+          "parsed": true,
+          "chars": 1818,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "tests/tipos-chain.test.ts",
+              "operation": "CREATE",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Prueba la cadena funcional: la fuente canónica TIPOS y su consumo por Buscador y Rejilla."
+            }
+          ],
+          "root_cause": "",
+          "scope_expansion": false,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "repair",
+        "status": "SUCCESS",
+        "prompt_chars": 6204,
+        "total_tokens": 7716,
+        "duration_ms": 67707,
+        "proposal": {
+          "parsed": true,
+          "chars": 3245,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "tests/tipos-chain.test.ts",
+              "operation": "CREATE",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Prueba de la cadena funcional: fuente canónica, consumidores y comportamiento."
+            }
+          ],
+          "root_cause": "La fuente canónica src/lib/tipos.ts no incluye 'Apartamento' y los consumidores todavía declaran `tipos` localmente; el archivo de prueba no existe. La verificación exige 'Apartamento' en la fuente e ",
+          "scope_expansion": true,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "repair",
+        "status": "SUCCESS",
+        "prompt_chars": 5258,
+        "total_tokens": 7549,
+        "duration_ms": 77284,
+        "proposal": {
+          "parsed": true,
+          "chars": 2093,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            }
+          ],
+          "root_cause": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información",
+          "scope_expansion": false,
+          "context_requests": 1
+        }
+      }
+    ]
+  }
+}

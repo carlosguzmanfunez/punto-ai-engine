@@ -1,0 +1,978 @@
+[
+  {
+    "case": "CASE-B",
+    "kind": "B",
+    "status": "DEVELOPMENT_VERIFICATION_FAILED",
+    "plan_status": "PLAN_VALID",
+    "error": "la verificación no pasó tras las rondas de reparación",
+    "change_issues": [],
+    "applied": [],
+    "verification": [
+      [
+        "focused",
+        1
+      ],
+      [
+        "chain",
+        1
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.075,
+    "plan": {
+      "summary": "Centralizar TIPOS en src/lib/tipos.ts y hacer que Buscador y Rejilla consuman esa única fuente canónica, con pruebas de la cadena funcional.",
+      "files_to_read": [
+        "src/lib/tipos.ts",
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx",
+        "tests"
+      ],
+      "files_to_modify": [
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx",
+        "src/lib/tipos.ts"
+      ],
+      "files_to_create": [
+        "tests/tipos-chain.test.ts"
+      ],
+      "files_to_delete": [],
+      "verification_commands": [
+        "focused",
+        "chain"
+      ],
+      "risks": [
+        "La ruta de importación debe ajustarse a la resolución de módulos existente.",
+        "Las pruebas deben validar el uso compartido de TIPOS sin duplicar la lista esperada como una segunda fuente de verdad."
+      ],
+      "acceptance_mapping": [
+        "Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos»."
+      ],
+      "functional_chain": [
+        {
+          "step": "canonical source",
+          "description": "src/lib/tipos.ts conserva TIPOS como la única definición de los tipos disponibles.",
+          "verification": "focused"
+        },
+        {
+          "step": "consumers",
+          "description": "Buscador y Rejilla importan TIPOS en lugar de declarar arreglos locales.",
+          "verification": "chain"
+        },
+        {
+          "step": "behaviour",
+          "description": "Ambos componentes mantienen su comportamiento de devolver la cantidad de tipos desde la fuente compartida.",
+          "verification": "chain"
+        },
+        {
+          "step": "tests",
+          "description": "La prueba enfocada comprueba la fuente canónica y la prueba de cadena verifica que ambos consumidores dependen de ella.",
+          "verification": "focused"
+        },
+        {
+          "step": "build",
+          "description": "La verificación de cadena confirma que las importaciones y el tipado de los consumidores se integran correctamente.",
+          "verification": "chain"
+        }
+      ]
+    },
+    "causal_handoff": "{\"chain\":[{\"step\":\"canonical source\",\"verification\":\"focused\"},{\"step\":\"consumers\",\"verification\":\"chain\"},{\"step\":\"behaviour\",\"verification\":\"chain\"},{\"step\":\"tests\",\"verification\":\"focused\"},{\"step\":\"build\",\"verification\":\"chain\"}],\"done\":[\"Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos».\"],\"goal\":\"Centralizar TIPOS en src/lib/tipos.ts y hacer que Buscador y Rejilla consuman esa única fuente canónica, con pruebas de la cadena funcional.\",\"resources\":[\"src/components/Buscador.tsx\",\"src/components/Rejilla.tsx\",\"src/lib/tipos.ts\",\"tests/tipos-chain.test.ts\"],\"verify\":[\"focused\",\"chain\"]}",
+    "causal_handoff_chars": 703,
+    "audit_events": [
+      {
+        "event_type": "BUILD_REQUEST_ACCEPTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "role": "BUILDER",
+          "target_id": "baseline-fixture"
+        }
+      },
+      {
+        "event_type": "BUILD_REQUEST_NORMALIZED",
+        "result": "SUCCESS",
+        "metadata": {
+          "baseline": "742d0d4b8f10db87d4db298a23e2f11ce42aa1dd",
+          "branch": "ai/skill-layer-baseline",
+          "preexisting_changes": 1,
+          "scope_roots": 2
+        }
+      },
+      {
+        "event_type": "DEV_PELL_RETRIEVED",
+        "result": "SUCCESS",
+        "metadata": {
+          "experience_ids": [],
+          "failed": 0,
+          "status": "DISABLED",
+          "verified": 0
+        }
+      },
+      {
+        "event_type": "DEV_REPOSITORY_DISCOVERED",
+        "result": "SUCCESS",
+        "metadata": {
+          "candidates": 3,
+          "pell_ranked": [
+            "src/lib/tipos.ts",
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "selected": [
+            "src/lib/tipos.ts",
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "selected_chars": 182,
+          "unranked_alternative": [
+            "src/lib/tipos.ts",
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ]
+        }
+      },
+      {
+        "event_type": "BUILD_PROVIDER_SELECTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "fallback": false,
+          "provider": "openai",
+          "role": "ARCHITECT"
+        }
+      },
+      {
+        "event_type": "DEV_PLAN_CREATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "touched": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "verification": [
+            "focused",
+            "chain"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 3,
+          "outcome": "ALLOW",
+          "phase": "plan",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_PLAN_VALIDATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "functional_chain": 5,
+          "risks": 2,
+          "touched": 3
+        }
+      },
+      {
+        "event_type": "DEV_CAUSAL_HANDOFF",
+        "result": "SUCCESS",
+        "metadata": {
+          "chars": 684,
+          "keys": [
+            "chain",
+            "done",
+            "goal",
+            "resources",
+            "verify"
+          ],
+          "present": true,
+          "sha256": "b4f13c38df866ca1417d7dead307e29dd78b7fdda2a672e0b80078d9268c6f64"
+        }
+      },
+      {
+        "event_type": "BUILD_PROVIDER_SELECTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "fallback": false,
+          "provider": "deepseek",
+          "role": "BUILDER"
+        }
+      },
+      {
+        "event_type": "DEV_SKILL_ACTIVATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "activated": true,
+          "chars": 1108,
+          "role": "BUILDER",
+          "sha256": "51e578eae2d5bb81fae56633cd5e58c3bced8ea12d5ba6bf48d8aa1a3a31e855",
+          "skill_id": "punto-causal-builder",
+          "skill_reference": "punto-causal-builder@0.1.0",
+          "skill_version": "0.1.0"
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_CHANGE_VALIDATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "changes": 3,
+          "paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_CHECKPOINT_CREATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "fingerprint": "ad9982001352915f9b172d0a8225649dcff934c472c84971e07b24b8337ee774",
+          "paths": 3,
+          "snapshot_id": "ddac115d-5de0-4553-83d0-149d95d907bd"
+        }
+      },
+      {
+        "event_type": "FILE_CHANGED",
+        "result": "SUCCESS",
+        "metadata": {
+          "bytes_written": 91,
+          "operation": "MODIFIED",
+          "path": "src/components/Buscador.tsx",
+          "verified": true,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino\\src\\components"
+        }
+      },
+      {
+        "event_type": "FILE_CHANGED",
+        "result": "SUCCESS",
+        "metadata": {
+          "bytes_written": 90,
+          "operation": "MODIFIED",
+          "path": "src/components/Rejilla.tsx",
+          "verified": true,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino\\src\\components"
+        }
+      },
+      {
+        "event_type": "FILE_CHANGED",
+        "result": "SUCCESS",
+        "metadata": {
+          "bytes_written": 632,
+          "operation": "CREATED",
+          "path": "tests/tipos-chain.test.ts",
+          "verified": true,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino\\tests"
+        }
+      },
+      {
+        "event_type": "DEV_VERIFICATION_STARTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "commands": [
+            "focused",
+            "chain"
+          ]
+        }
+      },
+      {
+        "event_type": "COMMAND_EXECUTED",
+        "result": "FAILURE",
+        "metadata": {
+          "args": [
+            "-c",
+            "import pathlib,sys;texto=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');print('TIPOS:', texto.strip()[:80]);sys.exit(0 if 'Apartamento' in texto else 1)"
+          ],
+          "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino",
+          "duration_ms": 65,
+          "exit_code": 1,
+          "name": "focused",
+          "stderr": "",
+          "timed_out": false,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino"
+        }
+      },
+      {
+        "event_type": "COMMAND_EXECUTED",
+        "result": "FAILURE",
+        "metadata": {
+          "args": [
+            "-c",
+            "import pathlib,sys;fuente=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');consumidores=[pathlib.Path(p) for p in ('src/components/Rejilla.tsx','src/components/Buscador.tsx')];ok=all('@/lib/tipos' in c.read_text(encoding='utf-8') for c in consumidores);print('CADENA:', ok);sys.exit(0 if ok and 'Apartamento' in fuente else 1)"
+          ],
+          "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino",
+          "duration_ms": 66,
+          "exit_code": 1,
+          "name": "chain",
+          "stderr": "",
+          "timed_out": false,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino"
+        }
+      },
+      {
+        "event_type": "DEV_VERIFICATION_COMPLETED",
+        "result": "FAILURE",
+        "metadata": {
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "passed": []
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_PROGRESS",
+        "result": "FAILURE",
+        "metadata": {
+          "changed_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: False",
+          "hypothesis": "",
+          "progress": true,
+          "result": "FAILED",
+          "round": 0,
+          "strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY",
+            "tests/tipos-chain.test.ts:CREATE"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_STARTED",
+        "result": "FAILURE",
+        "metadata": {
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "round": 1
+        }
+      },
+      {
+        "event_type": "BUILD_PROVIDER_SELECTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "fallback": false,
+          "provider": "deepseek",
+          "role": "BUILDER"
+        }
+      },
+      {
+        "event_type": "DEV_ROOT_CAUSE_IDENTIFIED",
+        "result": "SUCCESS",
+        "metadata": {
+          "evidence": [
+            "$ python -c ... exit=1 timed_out=False TIPOS: export const TIPOS = ['Casa'];",
+            "$ python -c ... CADENA: False",
+            "FUNCTIONAL_CHAIN_STEP_UNVERIFIED: canonical source, consumers, behaviour, tests, build"
+          ],
+          "expected_effect": "src/lib/tipos.ts exportará TIPOS incluyendo 'Apartamento'; Buscador y Rejilla importarán esa fuente canónica y devolverán su longitud; tests/tipos-chain.test.ts validará la cadena; las verificaciones ",
+          "root_cause": "La fuente canónica src/lib/tipos.ts no incluye 'Apartamento' y los consumidores todavía declaran `tipos` localmente; el archivo de prueba no existe. La verificación exige 'Apartamento' en la fuente e ",
+          "round": 1
+        }
+      },
+      {
+        "event_type": "DEV_SCOPE_EXPANSION_REQUESTED",
+        "result": "FAILURE",
+        "metadata": {
+          "evidence": [
+            "Verification output: TIPOS: export const TIPOS = ['Casa']; (expected Apartamento)",
+            "Handoff resources list does not include src/lib/tipos.ts"
+          ],
+          "resources": [
+            "src/lib/tipos.ts"
+          ],
+          "root_cause": "La fuente canónica src/lib/tipos.ts debe actualizarse para incluir 'Apartamento' como parte de centralizar TIPOS; está ausente de los recursos autorizados.",
+          "round": 1,
+          "trigger": "La verificación exige 'Apartamento' en src/lib/tipos.ts, pero ese archivo no está en los recursos declarados del plan."
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 4,
+          "outcome": "ALLOW",
+          "phase": "scope_expansion",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_SCOPE_EXPANSION_APPROVED",
+        "result": "SUCCESS",
+        "metadata": {
+          "plan_version": 2,
+          "relationship": "src/lib/tipos.ts es la fuente canónica que Buscador y Rejilla deben importar; sin actualizarla no se puede satisfacer el criterio «una sola fuente de tipos» ni pasar las verificaciones.",
+          "resources": [
+            "src/lib/tipos.ts"
+          ],
+          "risk_after": "LOW",
+          "risk_before": "LOW"
+        }
+      },
+      {
+        "event_type": "DEV_PLAN_REVISED",
+        "result": "SUCCESS",
+        "metadata": {
+          "added_resources": [
+            "src/lib/tipos.ts"
+          ],
+          "parent_version": 1,
+          "plan_version": 2,
+          "touched": 4
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_CHANGE_REJECTED",
+        "result": "FAILURE",
+        "metadata": {
+          "issue_codes": [
+            "CHANGE_ALREADY_EXISTS"
+          ],
+          "round": 1
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_STARTED",
+        "result": "FAILURE",
+        "metadata": {
+          "issue_codes": [
+            "CHANGE_ALREADY_EXISTS"
+          ],
+          "round": 2
+        }
+      },
+      {
+        "event_type": "BUILD_PROVIDER_SELECTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "fallback": false,
+          "provider": "deepseek",
+          "role": "BUILDER"
+        }
+      },
+      {
+        "event_type": "DEV_ROOT_CAUSE_IDENTIFIED",
+        "result": "SUCCESS",
+        "metadata": {
+          "evidence": [
+            "CHANGE_ALREADY_EXISTS: 'tests/tipos-chain.test.ts' ya existe: para cambiarlo la operación es MODIFY, y un CREATE sobre algo existente se rechaza antes de escribir"
+          ],
+          "expected_effect": "Al aplicar los cambios en los componentes y, una vez proporcionado el archivo de pruebas, modificar tests/tipos-chain.test.ts, se eliminarán las declaraciones locales duplicadas y ambos consumidores u",
+          "root_cause": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información",
+          "round": 2
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_RISK_EVALUATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "authority_class": "AUTONOMOUS_LOCAL",
+          "blast_radius": 1,
+          "outcome": "ALLOW",
+          "phase": "change",
+          "required_evidence": [
+            "verificación focalizada del cambio en el entorno"
+          ],
+          "risk": "LOW",
+          "rules": [
+            "local-technical-reversible"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_CHANGE_VALIDATED",
+        "result": "SUCCESS",
+        "metadata": {
+          "changes": 2,
+          "paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ]
+        }
+      },
+      {
+        "event_type": "FILE_CHANGED",
+        "result": "SUCCESS",
+        "metadata": {
+          "bytes_written": 90,
+          "operation": "MODIFIED",
+          "path": "src/components/Buscador.tsx",
+          "verified": true,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino\\src\\components"
+        }
+      },
+      {
+        "event_type": "FILE_CHANGED",
+        "result": "SUCCESS",
+        "metadata": {
+          "bytes_written": 89,
+          "operation": "MODIFIED",
+          "path": "src/components/Rejilla.tsx",
+          "verified": true,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino\\src\\components"
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_COMPLETED",
+        "result": "SUCCESS",
+        "metadata": {
+          "changes": 2,
+          "round": 2
+        }
+      },
+      {
+        "event_type": "DEV_VERIFICATION_STARTED",
+        "result": "SUCCESS",
+        "metadata": {
+          "commands": [
+            "focused",
+            "chain"
+          ]
+        }
+      },
+      {
+        "event_type": "COMMAND_EXECUTED",
+        "result": "FAILURE",
+        "metadata": {
+          "args": [
+            "-c",
+            "import pathlib,sys;texto=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');print('TIPOS:', texto.strip()[:80]);sys.exit(0 if 'Apartamento' in texto else 1)"
+          ],
+          "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino",
+          "duration_ms": 76,
+          "exit_code": 1,
+          "name": "focused",
+          "stderr": "",
+          "timed_out": false,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino"
+        }
+      },
+      {
+        "event_type": "COMMAND_EXECUTED",
+        "result": "FAILURE",
+        "metadata": {
+          "args": [
+            "-c",
+            "import pathlib,sys;fuente=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');consumidores=[pathlib.Path(p) for p in ('src/components/Rejilla.tsx','src/components/Buscador.tsx')];ok=all('@/lib/tipos' in c.read_text(encoding='utf-8') for c in consumidores);print('CADENA:', ok);sys.exit(0 if ok and 'Apartamento' in fuente else 1)"
+          ],
+          "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino",
+          "duration_ms": 72,
+          "exit_code": 1,
+          "name": "chain",
+          "stderr": "",
+          "timed_out": false,
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-real-p1syin4t\\CASE-B\\destino"
+        }
+      },
+      {
+        "event_type": "DEV_VERIFICATION_COMPLETED",
+        "result": "FAILURE",
+        "metadata": {
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "passed": []
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_PROGRESS",
+        "result": "FAILURE",
+        "metadata": {
+          "changed_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: False",
+          "hypothesis": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información",
+          "progress": true,
+          "result": "FAILED",
+          "round": 2,
+          "strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY"
+          ]
+        }
+      },
+      {
+        "event_type": "DEV_REPAIR_EXHAUSTED",
+        "result": "FAILURE",
+        "metadata": {
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "rounds": 2
+        }
+      },
+      {
+        "event_type": "DEV_ROLLBACK_COMPLETED",
+        "result": "SUCCESS",
+        "metadata": {
+          "changes_undone": 5,
+          "code": "",
+          "detail": "restaurados 3 archivo(s) al estado previo a la reparación: src/components/Buscador.tsx, src/components/Rejilla.tsx, tests/tipos-chain.test.ts",
+          "restored": 3,
+          "rolled_back": true
+        }
+      },
+      {
+        "event_type": "BUILD_CYCLE_COMPLETED",
+        "result": "FAILURE",
+        "metadata": {
+          "applied": 0,
+          "authority": "LOCAL_APPLY_ONLY",
+          "commit_sha": "",
+          "published": false,
+          "repair_rounds": 2,
+          "rolled_back": true,
+          "status": "DEVELOPMENT_VERIFICATION_FAILED",
+          "verification_passed": []
+        }
+      }
+    ],
+    "calls_detail": [
+      {
+        "role": "ARCHITECT",
+        "phase": "planning",
+        "status": "SUCCESS",
+        "prompt_chars": 2260,
+        "total_tokens": null,
+        "duration_ms": 13634,
+        "proposal": {
+          "parsed": true,
+          "chars": 1666,
+          "changes": [],
+          "root_cause": "",
+          "scope_expansion": false,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "implementation",
+        "status": "SUCCESS",
+        "prompt_chars": 4969,
+        "total_tokens": 6718,
+        "duration_ms": 58655,
+        "proposal": {
+          "parsed": true,
+          "chars": 1818,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "tests/tipos-chain.test.ts",
+              "operation": "CREATE",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Prueba la cadena funcional: la fuente canónica TIPOS y su consumo por Buscador y Rejilla."
+            }
+          ],
+          "root_cause": "",
+          "scope_expansion": false,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "repair",
+        "status": "SUCCESS",
+        "prompt_chars": 6204,
+        "total_tokens": 7716,
+        "duration_ms": 67707,
+        "proposal": {
+          "parsed": true,
+          "chars": 3245,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "tests/tipos-chain.test.ts",
+              "operation": "CREATE",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Prueba de la cadena funcional: fuente canónica, consumidores y comportamiento."
+            }
+          ],
+          "root_cause": "La fuente canónica src/lib/tipos.ts no incluye 'Apartamento' y los consumidores todavía declaran `tipos` localmente; el archivo de prueba no existe. La verificación exige 'Apartamento' en la fuente e ",
+          "scope_expansion": true,
+          "context_requests": 0
+        }
+      },
+      {
+        "role": "BUILDER",
+        "phase": "repair",
+        "status": "SUCCESS",
+        "prompt_chars": 5258,
+        "total_tokens": 7549,
+        "duration_ms": 77284,
+        "proposal": {
+          "parsed": true,
+          "chars": 2093,
+          "changes": [
+            {
+              "path": "src/components/Buscador.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            },
+            {
+              "path": "src/components/Rejilla.tsx",
+              "operation": "MODIFY",
+              "acceptance_criterion": "una sola fuente de tipos",
+              "reason": "Elimina la declaración local duplicada y consume la fuente canónica TIPOS."
+            }
+          ],
+          "root_cause": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información",
+          "scope_expansion": false,
+          "context_requests": 1
+        }
+      }
+    ],
+    "first_attempt": {
+      "first_attempt_pass": false,
+      "repair_rounds": 2,
+      "builder_calls": 3,
+      "missing_acceptance": [
+        "Elimina las declaraciones locales duplicadas y conecta ambos consumidores con TIPOS de src/lib/tipos.ts, satisfaciendo el criterio «una sola fuente de tipos»."
+      ],
+      "missing_resources": [
+        "src/lib/tipos.ts"
+      ],
+      "declared_root_cause": false,
+      "failed_verifications": [
+        "focused",
+        "chain"
+      ]
+    },
+    "record": {
+      "run_id": "0a40f5cb-3bf8-4dff-a8ac-0b5708882974",
+      "task_id": "CASE-B",
+      "case_id": "CASE-B",
+      "case_kind": "B",
+      "mode": "REAL",
+      "primary_role": "ARCHITECT",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "builder_skill_id": "punto-causal-builder",
+      "builder_skill_version": "0.1.0",
+      "builder_skill_activated": true,
+      "builder_skill_chars": 1108,
+      "causal_handoff_present": true,
+      "causal_handoff_chars": 684,
+      "skill_id": "",
+      "skill_version": "",
+      "skill_activated": false,
+      "started_at": "2026-09-20T07:40:56.592924Z",
+      "finished_at": "2026-09-20T07:44:35.181421Z",
+      "elapsed_ms": 218566,
+      "provider_elapsed_ms": 217280,
+      "verification_elapsed_ms": 148,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 1,
+      "scope_expansions": 1,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 0,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 2,
+      "functional_chain_verifications": 0,
+      "functional_chain_pass": false,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 8965,
+        "output_tokens": 13018,
+        "total_tokens": 21983,
+        "source": "REAL"
+      },
+      "prompt_chars": 18691,
+      "context_chars": 182,
+      "success": false,
+      "final_status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": true,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    }
+  }
+]

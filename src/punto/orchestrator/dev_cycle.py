@@ -209,6 +209,8 @@ class DevelopmentConfig:
     #: (fuente, consumidores, cadena funcional y qué demuestra cada criterio). Configurable para
     #: poder reproducir el control sin él.
     causal_handoff: bool = True
+    #: Skill experimental del BUILDER (``id`` o ``id@version``), declarada por el operador.
+    builder_skill: str = ""
     #: Skill experimental del ARCHITECT (``id`` o ``id@version``), declarada por el operador.
     #:
     #: Vacío significa el comportamiento de siempre: sin skill, las instrucciones del ARCHITECT son
@@ -265,7 +267,7 @@ class DevelopmentCycle:
     _functional_chain_result: str = field(default="", init=False, repr=False)
     _last_root_cause: str = field(default="", init=False, repr=False)
     _last_risk: str = field(default="", init=False, repr=False)
-    _skill_activation: Any = field(default=None, init=False, repr=False)
+    _skill_activations: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -279,7 +281,7 @@ class DevelopmentCycle:
         self._final_plan = None
         self._last_root_cause = ""
         self._last_risk = ""
-        self._skill_activation = None
+        self._skill_activations.clear()
         self._snapshots = None
         self._checkpoint = None
 
@@ -2178,14 +2180,19 @@ daría un
         resultado que no se podría atribuir al experimento. ``SKILL != AUTHORITY``: la skill es
         procedimiento, y nada de lo que diga cambia permisos, presupuestos ni verificaciones.
         """
-        if role is not ProviderRole.ARCHITECT or not self.config.architect_skill.strip():
+        declared = {
+            ProviderRole.ARCHITECT: self.config.architect_skill,
+            ProviderRole.BUILDER: self.config.builder_skill,
+        }.get(role, "")
+        if not declared.strip():
             return WORKER_INSTRUCTIONS
-        if self._skill_activation is None:
+        key = role.value
+        if key not in self._skill_activations:
             from punto.skills import SkillValidationError, activate_skill
 
             try:
                 activation = activate_skill(
-                    self.config.architect_skill,
+                    declared,
                     role=role.value,
                     base_instructions=WORKER_INSTRUCTIONS,
                 )
@@ -2195,7 +2202,8 @@ daría un
                     "dev_skill_activated",
                     request,
                     {
-                        "skill_reference": self.config.architect_skill,
+                        "role": role.value,
+                        "skill_reference": declared,
                         "activated": False,
                         "detail": str(exc)[:300],
                     },
@@ -2204,12 +2212,13 @@ daría un
                 raise DevelopmentCycleError(
                     f"la skill declarada no se pudo activar: {exc}"
                 ) from exc
-            self._skill_activation = activation
+            self._skill_activations[key] = activation
             self._log(
                 AuditEventType.DEV_SKILL_ACTIVATED,
                 "dev_skill_activated",
                 request,
                 {
+                    "role": role.value,
                     "skill_id": activation.skill_id,
                     "skill_version": activation.skill_version,
                     "skill_reference": activation.reference,
@@ -2218,7 +2227,7 @@ daría un
                     "sha256": activation.sha256,
                 },
             )
-        return self._skill_activation.instructions or WORKER_INSTRUCTIONS
+        return self._skill_activations[key].instructions or WORKER_INSTRUCTIONS
 
     def _invoke(
         self,

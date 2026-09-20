@@ -159,9 +159,17 @@ class TrustedLocalBackend(ExecutionBackend):
         started_at = time.perf_counter()
         try:
             # Lista de argumentos y shell=False: sin interpretación de shell.
+            #
+            # La entrada estándar del hijo se fija a ``NUL``: un hijo **no** hereda los manejadores
+            # de la consola del proceso que lo lanza. En un proceso de larga vida cuyo padre ya no
+            # existe (por ejemplo el worker de ``uvicorn`` cuando su recargador muere) esos
+            # manejadores pueden estar cerrados, y un programa que intenta inicializar su consola
+            # —Git para Windows lo hace al arrancar— puede morir **sin escribir nada**, que es
+            # indistinguible de una denegación si nadie lo distingue (AP000-OBS-04-R3).
             completed = subprocess.run(
                 [executable, *request.args],
                 cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

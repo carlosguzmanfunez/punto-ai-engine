@@ -78,6 +78,7 @@ class WorkspaceNotResolvedError(DeveloperExecutionError):
         command: str,
         exit_code: int,
         output: str,
+        probes: int = 1,
         rule: str = "el ciclo solo opera sobre el repositorio Git autorizado del destino",
         resource: str = "workspace autorizado del destino",
         remedy: str = (
@@ -89,17 +90,21 @@ class WorkspaceNotResolvedError(DeveloperExecutionError):
         self.command = command
         self.exit_code = exit_code
         self.output = output.strip()
+        #: Cuántas veces se sondeó el repositorio: si el proceso murió sin decir nada, se reintenta
+        #: una vez antes de denegar, y el número queda en la evidencia.
+        self.probes = probes
         self.rule = rule
         self.resource = resource
         self.remedy = remedy
         salida = self.output[:300] if self.output else "sin salida"
+        intentos = "intento" if probes == 1 else "intentos"
         self.detail = (
             f"el workspace no es un repositorio Git: {command} falló "
-            f"(exit {exit_code}) y devolvió {salida}"
+            f"(exit {exit_code}) y devolvió {salida} en {probes} {intentos}"
         )
         super().__init__(
             f"No se pudo resolver el repositorio Git del workspace {workspace!r}: "
-            f"{command} falló (exit {exit_code}), {salida}"
+            f"{command} falló (exit {exit_code}), {salida}, en {probes} {intentos}"
         )
 
 

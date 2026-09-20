@@ -51,6 +51,16 @@ def slugify(value: str, *, fallback: str = "task") -> str:
     return slug or fallback
 
 
+def _has_output(result: CommandResult) -> bool:
+    """True si el proceso dijo algo por cualquiera de sus dos salidas.
+
+    Un fallo **con** salida es un fallo real del programa (Git explica lo que le pasa); un fallo
+    **sin** salida es un proceso que murió antes de escribir. Distinguirlos es lo que permite no
+    tomar lo segundo por una denegación del repositorio.
+    """
+    return bool(result.stdout.strip() or result.stderr.strip())
+
+
 def task_branch_name(task_id: UUID | str, slug: str) -> str:
     """Nombre canónico de la rama de una tarea: ``ai/<task-id>-<slug>``."""
     return f"{TASK_BRANCH_PREFIX}{task_id}-{slugify(slug)}"
@@ -282,11 +292,7 @@ class GitWorkspace:
         if self._root_checked:
             return
 
-        result = self._shell.run(
-            CommandRequest(executable="git", args=("rev-parse", "--show-toplevel")),
-            name="git_toplevel",
-        )
-        self._results.append(result)
+        result = self._probe_toplevel()
         self._root_checked = True
 
         if result.exit_code != 0:
@@ -298,6 +304,7 @@ class GitWorkspace:
                 command="git rev-parse --show-toplevel",
                 exit_code=result.exit_code,
                 output=result.stderr or result.stdout,
+                probes=len(self._results),
             )
 
         top = result.stdout.strip()
@@ -313,6 +320,27 @@ class GitWorkspace:
                     "repositorio) y vuelve a lanzar la tarea"
                 ),
             )
+
+    def _probe_toplevel(self) -> CommandResult:
+        """Sondea la raíz del repositorio; si el proceso muere en silencio, reintenta una vez.
+
+        Un proceso que sale con error y no escribe nada no es un mensaje de Git —Git explica lo que
+        le pasa: «fatal: not a git repository…», permisos, referencias rotas— sino un proceso que
+        murió antes de escribir (AP000-OBS-04-R3). Confundir esas dos cosas es lo que convertía un
+        repositorio válido en «(sin repositorio Git)» y denegaba un intento legítimo.
+
+        Por eso, solo ante esa firma —código distinto de cero y **las dos salidas vacías**—, se
+        repite **el mismo** sondeo una vez. Si a la segunda ocurre lo mismo, se deniega igual: la
+        frontera no se relaja, y una respuesta real de Git (aunque sea un fallo) nunca se reintenta.
+        """
+        request = CommandRequest(executable="git", args=("rev-parse", "--show-toplevel"))
+        result = self._shell.run(request, name="git_toplevel")
+        self._results.append(result)
+        if result.exit_code == 0 or _has_output(result):
+            return result
+        segundo = self._shell.run(request, name="git_toplevel_retry")
+        self._results.append(segundo)
+        return segundo
 
     def _run(self, name: str, args: list[str], label: str) -> str:
         """Ejecuta un comando Git y exige éxito."""

@@ -76,8 +76,12 @@ class GitWorkspace:
         return tuple(self._results)
 
     def status(self) -> str:
-        """Estado del árbol en formato ``--porcelain`` (estable y parseable)."""
-        return self._run("status", ["status", "--porcelain"], "git status").strip()
+        """Estado del árbol en formato ``--porcelain`` (estable y parseable).
+
+        Se recorta **solo el final**: las columnas de estado de la primera línea pueden empezar por
+        un espacio (fichero modificado) y perderlo rompía el análisis de rutas de quien lo lee.
+        """
+        return self._run("status", ["status", "--porcelain"], "git status").rstrip()
 
     def status_lines(self) -> tuple[str, ...]:
         """Estado del árbol como líneas, sin líneas vacías."""

@@ -192,6 +192,20 @@ class RepositoryPolicy:
         raise OperationNotAuthorizedError(f"el comando {rendered!r} no está autorizado")
 
 
+def _porcelain_path(line: str) -> str:
+    """Ruta de una línea de ``git status --porcelain``, sin las dos columnas de estado.
+
+    Descarta el par de columnas y recorta el separador, en vez de cortar un desplazamiento fijo: una
+    línea de fichero modificado empieza por espacio y el corte fijo perdía el primer carácter de la
+    ruta. Un renombrado se resuelve por su ruta nueva.
+    """
+    resto = line[2:].strip() if len(line) > 2 else ""
+    resto = resto.strip('"')
+    if " -> " in resto:
+        resto = resto.split(" -> ", maxsplit=1)[1].strip().strip('"')
+    return resto.replace("\\", "/")
+
+
 @dataclass(slots=True)
 class GovernedRepository:
     """Acceso gobernado a un repositorio destino, con alcance, secretos y autoridad."""
@@ -285,11 +299,16 @@ class GovernedRepository:
         return self._git.head_sha()
 
     def changed_paths(self) -> tuple[str, ...]:
-        """Rutas que difieren del baseline: las del árbol de trabajo y las ya confirmadas."""
+        """Rutas que difieren del baseline: las del árbol de trabajo y las ya confirmadas.
+
+        El análisis descarta las dos columnas de estado y recorta el separador en vez de cortar un
+        desplazamiento fijo: un fichero modificado empieza por espacio y un desplazamiento fijo se
+        comía el primer carácter de su ruta (`src/...` → `rc/...`).
+        """
         working = [
-            line[3:].strip().strip('"').replace("\\", "/")
+            _porcelain_path(line)
             for line in self.status_lines()
-            if line[3:].strip()
+            if _porcelain_path(line)
         ]
         try:
             committed = list(self._git.diff_names(self._baseline_sha, "HEAD"))

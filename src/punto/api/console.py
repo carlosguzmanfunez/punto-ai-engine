@@ -1,4 +1,4 @@
-"""Consola humana local: crea tareas, sigue su etapa, atiende Human Gates y publica a producción.
+﻿"""Consola humana local: crea tareas, sigue su etapa, atiende Human Gates y publica a producción.
 
 Se registra **sobre la aplicación FastAPI que ya existe** (`punto.api.app`) y **reutiliza** la
 maquinaria del motor, sin construir un sistema paralelo:

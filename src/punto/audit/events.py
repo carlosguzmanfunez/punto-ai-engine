@@ -200,6 +200,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_ACCEPTANCE_GROUNDED: "dev_acceptance",
     AuditEventType.DEV_ACCEPTANCE_VERIFIED: "dev_acceptance",
     AuditEventType.DEV_ACCEPTANCE_FAILED: "dev_acceptance",
+    AuditEventType.DEV_CLAIMS_EVALUATED: "dev_claims",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
     AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",

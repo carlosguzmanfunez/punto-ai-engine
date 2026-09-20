@@ -1,4 +1,4 @@
-"""Evidencia de aceptación contra la superficie solicitada (AP000-OBS-02).
+﻿"""Evidencia de aceptación contra la superficie solicitada (AP000-OBS-02).
 
 Casos deterministas de A a G sobre un repositorio de prueba con la forma del caso real: la
 **homepage** contiene un ``PLACEHOLDER_MAP`` y otra ruta contiene una implementación de mapa. Una
@@ -511,12 +511,12 @@ def _solicitud_mapa() -> BuildRequest:
     """Solicitud con la forma de la Task real del mapa."""
     return BuildRequest(
         objective=(
-            "Reemplazar el placeholder actual del mapa de cobertura nacional por un mapa "
-            "cartografico real e interactivo de Honduras"
+            "Reemplazar el placeholder actual del mapa de cobertura nacional por una "
+            "implementacion de mapa interactivo de Honduras"
         ),
         target_repository="punto-inmobiliario-hn",
         requested_role=ProviderRole.BUILDER,
-        acceptance_criteria=("el mapa real es visible en la portada",),
+        acceptance_criteria=("el mapa es visible en la portada",),
         scope_paths=("src",),
     )
 

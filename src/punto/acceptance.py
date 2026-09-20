@@ -30,15 +30,22 @@ from typing import Any, Final
 
 __all__ = [
     "AcceptanceRecord",
+    "ClaimKind",
+    "ClaimRecord",
     "ElementKind",
     "LocatedSurface",
     "RequestIntent",
     "RequestReference",
+    "SemanticClaim",
+    "VisualCapability",
+    "claims_result",
+    "extract_claims",
     "extract_references",
     "ground_request",
     "measurable",
     "tokens",
     "verify_acceptance",
+    "verify_claims",
 ]
 
 #: Tope de superficies localizadas por referencia (las mejores, en orden determinista).
@@ -743,3 +750,294 @@ def _contains(read_text: Callable[[str], str], path: str, needle: str) -> bool:
         return normalize(needle) in normalize(read_text(path))
     except Exception:
         return False
+
+
+# ===========================================================================
+# AP000-OBS-03: afirmaciones factuales/semánticas y su evidencia
+# ===========================================================================
+class ClaimKind(StrEnum):
+    """Propiedad que la solicitud afirma y que no se demuestra con la presencia de algo."""
+
+    CARTOGRAPHIC_CORRECTNESS = "CARTOGRAPHIC_CORRECTNESS"
+    VISUAL_APPEARANCE = "VISUAL_APPEARANCE"
+
+
+#: Marcas de corrección (frente a mera presencia) en una frase.
+CORRECTNESS_MARKERS: Final[tuple[str, ...]] = (
+    "real",
+    "reales",
+    "correctamente",
+    "correcta",
+    "correcto",
+    "exacta",
+    "exacto",
+    "fiel",
+    "representa",
+    "representan",
+    "representados correctamente",
+    "corresponde",
+    "coincide",
+    "verdadera",
+)
+
+#: Sujetos geográficos/cartográficos: la frase habla del territorio representado.
+GEO_SUBJECTS: Final[tuple[str, ...]] = (
+    "mapa",
+    "map",
+    "cartograf",
+    "geometr",
+    "departamento",
+    "poligono",
+    "territorio",
+)
+
+#: Sujetos visuales: la frase habla del aspecto, no de los datos.
+VISUAL_SUBJECTS: Final[tuple[str, ...]] = (
+    "integra",
+    "visual",
+    "diseno",
+    "aspecto",
+    "estilo",
+    "responsive",
+)
+
+#: Marcas de que la frase juzga el **aspecto** (no basta con mencionar el diseño).
+VISUAL_MARKERS: Final[tuple[str, ...]] = (
+    "visual",
+    "visualmente",
+    "integra",
+    "integrad",
+    "estetic",
+    "aspecto",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticClaim:
+    """Afirmación factual/semántica de la solicitud, con la evidencia que exige."""
+
+    sentence: str
+    kind: str
+    evidence_required: str
+    required: bool = True
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable."""
+        return {
+            "sentence": self.sentence,
+            "kind": self.kind,
+            "evidence_required": self.evidence_required,
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRecord:
+    """Evidencia de una afirmación: resultado y por qué."""
+
+    sentence: str
+    kind: str
+    result: str
+    evidence: str
+    required: bool = True
+
+    @property
+    def satisfied(self) -> bool:
+        """True solo si la afirmación quedó demostrada."""
+        return self.result == "SATISFIED"
+
+    @property
+    def unsatisfied(self) -> bool:
+        """True si se midió y no se cumple: es reparable."""
+        return self.result == "UNSATISFIED"
+
+    @property
+    def not_verified(self) -> bool:
+        """True si no hay evidencia disponible: no se inventa un PASS."""
+        return self.result == "NOT_VERIFIED"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable."""
+        return {
+            "sentence": self.sentence,
+            "kind": self.kind,
+            "result": self.result,
+            "evidence": self.evidence,
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VisualCapability:
+    """Capacidad real del transporte asignado a VISUAL_QA para recibir imágenes."""
+
+    available: bool
+    detail: str
+    provider: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable."""
+        return {
+            "available": self.available,
+            "detail": self.detail,
+            "provider": self.provider,
+        }
+
+
+def extract_claims(
+    objective: str, criteria: Iterable[str] = ()
+) -> tuple[SemanticClaim, ...]:
+    """Extrae las afirmaciones factuales/semánticas de la solicitud.
+
+    Solo se consideran afirmaciones que **hablan de corrección** sobre un sujeto geográfico o
+    visual: «el mapa real», «los 18 departamentos representados correctamente», «integrado
+    visualmente». Una petición funcional no genera ninguna: no se inventan afirmaciones que
+    PUNTO no pueda demostrar.
+    """
+    claims: list[SemanticClaim] = []
+    for text in (objective, *criteria):
+        for sentence in _sentences(text):
+            plain = normalize(sentence)
+            aspecto = any(subject in plain for subject in VISUAL_SUBJECTS) and any(
+                marker in plain for marker in VISUAL_MARKERS
+            )
+            if not aspecto and not any(marker in plain for marker in CORRECTNESS_MARKERS):
+                continue
+            # El aspecto manda sobre el sujeto: «el mapa se integra visualmente» es una afirmación
+            # de apariencia, no de datos, aunque la frase mencione el mapa.
+            if aspecto:
+                claims.append(
+                    SemanticClaim(
+                        sentence=sentence[:300],
+                        kind=ClaimKind.VISUAL_APPEARANCE.value,
+                        evidence_required=(
+                            "evidencia visual del resultado renderizado (imagen) o atestación "
+                            "humana explícita"
+                        ),
+                    )
+                )
+                continue
+            if any(subject in plain for subject in GEO_SUBJECTS):
+                claims.append(
+                    SemanticClaim(
+                        sentence=sentence[:300],
+                        kind=ClaimKind.CARTOGRAPHIC_CORRECTNESS.value,
+                        evidence_required=(
+                            "dataset administrativo real de Honduras con los 18 departamentos, "
+                            "mapeado a la taxonomía del proyecto y usado por la interfaz"
+                        ),
+                    )
+                )
+            if len(claims) >= MAX_REFERENCES:
+                return tuple(claims)
+    return tuple(claims)
+
+
+def verify_claims(
+    claims: Sequence[SemanticClaim],
+    *,
+    datasets: Sequence[Any] = (),
+    rendered: tuple[bool, str] = (False, "no se comprobó el uso del dataset"),
+    visual: VisualCapability | None = None,
+    attestation: str = "",
+) -> tuple[ClaimRecord, ...]:
+    """Mide cada afirmación con la evidencia disponible, sin inventar PASS.
+
+    Args:
+        claims: Afirmaciones extraídas de la solicitud.
+        datasets: Informes de integridad de los datasets encontrados en el repositorio.
+        rendered: Si el código modificado usa el dataset real, con su evidencia.
+        visual: Capacidad real del transporte de VISUAL_QA (imágenes).
+        attestation: Atestación humana explícita de la apariencia visual, si existe.
+
+    Returns:
+        Un registro por afirmación con ``SATISFIED``, ``UNSATISFIED`` (reparable) o
+        ``NOT_VERIFIED`` (no hay evidencia disponible).
+    """
+    records: list[ClaimRecord] = []
+    validos = [item for item in datasets if getattr(item, "valid", False)]
+    for claim in claims:
+        if claim.kind == ClaimKind.CARTOGRAPHIC_CORRECTNESS.value:
+            records.append(_cartographic_record(claim, validos, rendered))
+            continue
+        records.append(_visual_record(claim, visual, attestation))
+    return tuple(records)
+
+
+def _cartographic_record(
+    claim: SemanticClaim, validos: Sequence[Any], rendered: tuple[bool, str]
+) -> ClaimRecord:
+    """La corrección cartográfica se demuestra con un dataset válido **usado** por el producto."""
+    if not validos:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence=(
+                "no hay ningún dataset administrativo válido de Honduras con los 18 departamentos "
+                "en el repositorio: la geometría propia no es evidencia cartográfica"
+            ),
+        )
+    dataset = validos[0]
+    if not rendered[0]:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence=(
+                f"existe un dataset válido ({dataset.path}) pero el cambio no lo usa: {rendered[1]}"
+            ),
+        )
+    return ClaimRecord(
+        sentence=claim.sentence,
+        kind=claim.kind,
+        result="SATISFIED",
+        evidence=(
+            f"dataset {dataset.path} válido: {len(dataset.units)} departamentos, fuente "
+            f"{dataset.source or 'declarada'}, licencia {dataset.license or 'declarada'}; "
+            f"{rendered[1]}"
+        ),
+    )
+
+
+def _visual_record(
+    claim: SemanticClaim, visual: VisualCapability | None, attestation: str
+) -> ClaimRecord:
+    """La apariencia se demuestra con imagen evaluada o con atestación humana, no por suposición."""
+    if attestation.strip():
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="SATISFIED",
+            evidence=f"atestación humana explícita: {attestation.strip()[:200]}",
+        )
+    capability = visual or VisualCapability(available=False, detail="capacidad no comprobada")
+    if not capability.available:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="NOT_VERIFIED",
+            evidence=(
+                "no hay capacidad de QA visual con imágenes en la configuración actual "
+                f"({capability.detail}); el criterio queda sin verificar y exige evidencia"
+            ),
+        )
+    return ClaimRecord(
+        sentence=claim.sentence,
+        kind=claim.kind,
+        result="NOT_VERIFIED",
+        evidence=(
+            "el transporte puede recibir imágenes pero no se aportó ninguna para este resultado"
+        ),
+    )
+
+
+def claims_result(records: Sequence[ClaimRecord]) -> str:
+    """Resultado global de las afirmaciones: FAILED, EVIDENCE_REQUIRED, SATISFIED o NONE."""
+    if not records:
+        return "NONE"
+    if any(item.unsatisfied for item in records if item.required):
+        return "FAILED"
+    if any(item.not_verified for item in records if item.required):
+        return "EVIDENCE_REQUIRED"
+    return "SATISFIED"

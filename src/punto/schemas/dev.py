@@ -399,6 +399,24 @@ class AcceptanceEvidence(BaseModel):
     result: str = Field(default="", max_length=20)
 
 
+class ClaimEvidence(BaseModel):
+    """Evidencia de una afirmación factual/semántica de la solicitud (AP000-OBS-03).
+
+    Una propiedad como «el mapa representa Honduras» o «integrado visualmente» no se demuestra con
+    la presencia de algo: exige evidencia (dataset real, imagen o atestación humana). Este registro
+    dice qué se afirmó, con qué evidencia y con qué resultado, incluido ``NOT_VERIFIED`` cuando no
+    hay forma de demostrarlo.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sentence: str = Field(default="", max_length=300)
+    kind: str = Field(default="", max_length=40)
+    result: str = Field(default="", max_length=20)
+    evidence: str = Field(default="", max_length=600)
+    required: bool = True
+
+
 class PellInfluence(BaseModel):
     """Cómo una experiencia recuperada cambió una decisión del ciclo, con efecto observable."""
 
@@ -451,6 +469,11 @@ class DevelopmentResult(BaseModel):
     acceptance: tuple[AcceptanceEvidence, ...] = ()
     #: ``SATISFIED`` | ``FAILED`` | ``NOT_MEASURED`` (sin referencias medibles).
     acceptance_result: str = Field(default="NOT_MEASURED", max_length=20)
+    #: AP000-OBS-03: afirmaciones factuales/semánticas y su evidencia. Un criterio requerido que
+    #: queda ``NOT_VERIFIED`` impide declarar el desarrollo completado.
+    claims: tuple[ClaimEvidence, ...] = ()
+    #: ``SATISFIED`` | ``FAILED`` | ``EVIDENCE_REQUIRED`` | ``NONE``.
+    claims_result: str = Field(default="NONE", max_length=20)
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)

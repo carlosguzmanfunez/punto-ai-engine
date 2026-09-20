@@ -44,11 +44,18 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from punto.acceptance import (
+    ClaimRecord,
     RequestReference,
+    SemanticClaim,
+    VisualCapability,
+    claims_result,
+    extract_claims,
     ground_request,
     verify_acceptance,
+    verify_claims,
 )
 from punto.audit.logger import AuditLogger
+from punto.cartography import find_department_datasets, renders_from_dataset
 from punto.memory.experience import ExperienceResult, ExperienceStatus
 from punto.memory.retrieval import (
     MemoryRetriever,
@@ -106,6 +113,7 @@ from punto.schemas.dev import (
     AppliedChange,
     AuthorityDecisionRecord,
     ChangeOperation,
+    ClaimEvidence,
     CommandEvidence,
     ContextRequest,
     DevelopmentPlan,
@@ -321,6 +329,10 @@ class DevelopmentCycle:
     _structural_corrections: int = field(default=0, init=False, repr=False)
     #: AP000-OBS-02: superficies localizadas antes del build (precondición de aceptación).
     _grounding: tuple[RequestReference, ...] = field(default=(), init=False, repr=False)
+    #: AP000-OBS-03: afirmaciones factuales/semánticas de la solicitud y su evidencia.
+    _claims: tuple[SemanticClaim, ...] = field(default=(), init=False, repr=False)
+    #: Ficheros candidatos del inventario, para buscar datasets entre ellos.
+    _inventory_paths: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -340,6 +352,9 @@ class DevelopmentCycle:
         self._checkpoint = None
         #: AP000-OBS-02: superficies localizadas antes del build (precondición de aceptación).
         self._grounding = ()
+        #: AP000-OBS-03: afirmaciones factuales/semánticas y su evidencia.
+        self._claims = ()
+        self._inventory_paths = ()
 
     @property
     def envelope(self) -> AdaptiveAuthorityEnvelope:
@@ -443,6 +458,10 @@ class DevelopmentCycle:
         # que se medirá después. Sin esto, una implementación relacionada en otra superficie podía
         # pasar por satisfacer la solicitud.
         self._grounding = self._ground(request, target, repository, inventory)
+        # AP000-OBS-03: afirmaciones factuales/semánticas de la solicitud. Se extraen aquí para
+        # que la verificación sepa **qué** hay que demostrar, no solo qué superficie tocar.
+        self._inventory_paths = tuple(inventory["paths"])
+        self._claims = extract_claims(request.objective, request.acceptance_criteria)
 
         plan, plan_issues = self._plan(
             request, target, inventory["selected"], retrieval, repository
@@ -528,6 +547,8 @@ class DevelopmentCycle:
             functional_chain_result=outcome["functional_chain_result"],
             acceptance=tuple(outcome["acceptance"]),
             acceptance_result=outcome["acceptance_result"],
+            claims=tuple(outcome["claims"]),
+            claims_result=outcome["claims_result"],
         )
 
     # ------------------------------------------------------------------ destinos
@@ -740,6 +761,121 @@ class DevelopmentCycle:
             },
         )
         return True, (), evidence
+
+    def _visual_capability(self) -> VisualCapability:
+        """Capacidad **real** del transporte asignado a VISUAL_QA para recibir imágenes.
+
+        No se supone: se pregunta al transporte que el router usaría. Si no se puede comprobar,
+        la respuesta es «no disponible» (fail closed) y el criterio visual quedará ``NOT_VERIFIED``.
+        """
+        from punto.providers.contract import ProviderRole
+        from punto.providers.transport_registry import transport_client
+
+        try:
+            provider = self.router.get_provider_for_role(ProviderRole.VISUAL_QA)
+            model = self.router.model_of(provider)
+            cliente = transport_client(provider, model=model)
+            soporta = bool(getattr(cliente, "supports_images", False))
+            consulta = getattr(cliente, "capabilities", None)
+            detalle = str(getattr(consulta(), "detail", "") or "") if callable(consulta) else ""
+            return VisualCapability(
+                available=soporta,
+                detail=detalle[:200],
+                provider=provider,
+            )
+        except Exception as exc:  # sin transporte resoluble: no hay evidencia visual
+            return VisualCapability(
+                available=False,
+                detail=f"no se pudo comprobar el transporte de VISUAL_QA: {type(exc).__name__}",
+            )
+
+    def _dataset_candidates(
+        self, repository: GovernedRepository, target: DevelopmentTarget
+    ) -> tuple[str, ...]:
+        """Ficheros donde puede vivir un dataset cartográfico: los cambiados y los del repositorio.
+
+        Se recorren los ficheros de datos del destino (bounded, sin `.git`/`node_modules`/`.next`)
+        porque el dataset puede estar fuera de las raíces de alcance del código: es un activo, no
+        código que el ciclo vaya a escribir.
+        """
+        encontrados: list[str] = []
+        for candidate in sorted(target.repository.rglob("*")):
+            if len(encontrados) >= MAX_DISCOVERY_FILES:
+                break
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(target.repository).as_posix()
+            if relative.split("/", maxsplit=1)[0] in {
+                ".git",
+                ".next",
+                "node_modules",
+                ".vercel",
+                ".punto-repair-snapshots",
+            }:
+                continue
+            if candidate.suffix.lower() in {".geojson", ".json"}:
+                encontrados.append(relative)
+        return tuple(dict.fromkeys((*repository.changed_paths(), *encontrados)))
+
+    def _verify_semantic_claims(
+        self, request: BuildRequest, repository: GovernedRepository, target: DevelopmentTarget
+    ) -> tuple[str, tuple[BuildValidationIssue, ...], tuple[ClaimRecord, ...]]:
+        """Mide las afirmaciones factuales/semánticas con la evidencia disponible.
+
+        Devuelve el resultado global (``SATISFIED`` / ``FAILED`` / ``EVIDENCE_REQUIRED`` /
+        ``NONE``), los problemas reparables (``CLAIM_NOT_SATISFIED``) y la evidencia.
+        """
+        if not self._claims:
+            return "NONE", (), ()
+        candidatos = self._dataset_candidates(repository, target)
+        datasets = find_department_datasets(candidatos, repository.read_text)
+        rendered = (False, "no se modificó ningún fichero que use un dataset")
+        if datasets:
+            rendered = renders_from_dataset(
+                repository.changed_paths(), repository.read_text, datasets[0].path
+            )
+        visual = self._visual_capability()
+        registros = verify_claims(
+            self._claims, datasets=datasets, rendered=rendered, visual=visual
+        )
+        resultado = claims_result(registros)
+        self._log(
+            AuditEventType.DEV_CLAIMS_EVALUATED,
+            "dev_claims_evaluated",
+            request,
+            {
+                "result": resultado,
+                "claims": [item.kind for item in registros],
+                "results": [item.result for item in registros],
+                "evidence": [item.evidence[:200] for item in registros],
+                "datasets": [item.as_dict() for item in datasets[:2]],
+                "visual_capability": visual.as_dict(),
+            },
+            AuditResult.SUCCESS if resultado in {"SATISFIED", "NONE"} else AuditResult.FAILURE,
+        )
+        issues = tuple(
+            BuildValidationIssue(
+                code="CLAIM_NOT_SATISFIED",
+                detail=f"{item.kind}: {item.evidence}"[:300],
+            )
+            for item in registros
+            if item.unsatisfied and item.required
+        )
+        return resultado, issues, registros
+
+    @staticmethod
+    def _claim_evidence(records: Sequence[ClaimRecord]) -> tuple[ClaimEvidence, ...]:
+        """Traduce los registros de afirmaciones a la evidencia del resultado."""
+        return tuple(
+            ClaimEvidence(
+                sentence=item.sentence,
+                kind=item.kind,
+                result=item.result,
+                evidence=item.evidence,
+                required=item.required,
+            )
+            for item in records
+        )
 
     @staticmethod
     def _acceptance_result(evidence: Sequence[AcceptanceEvidence]) -> str:
@@ -1976,6 +2112,40 @@ class DevelopmentCycle:
             acceptance_ok, acceptance_issues, acceptance_evidence = self._verify_acceptance(
                 request, repository
             )
+            # AP000-OBS-03: las afirmaciones factuales/semánticas se miden con evidencia real.
+            # Un criterio requerido sin evidencia no se convierte en PASS: se para y se pide.
+            claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
+                request, repository, target
+            )
+            claim_evidence = self._claim_evidence(claim_records)
+            if claims_outcome == "EVIDENCE_REQUIRED":
+                rolled_back = False
+                return self._outcome(
+                    status=DevelopmentStatus.BLOCKED,
+                    error_kind="EVIDENCE_REQUIRED",
+                    error=(
+                        "hay un criterio factual/semántico requerido que no se puede demostrar con "
+                        "la evidencia disponible: "
+                        + "; ".join(
+                            item.evidence for item in claim_records if item.not_verified
+                        )[:400]
+                    ),
+                    provider=provider,
+                    model=model,
+                    applied=applied,
+                    verification=verification,
+                    repair_rounds=rounds,
+                    granted=granted,
+                    denied=denied,
+                    checkpoint=checkpoint,
+                    influence=influence,
+                    rolled_back=rolled_back,
+                    change_issues=(),
+                    acceptance=acceptance_evidence,
+                    acceptance_result=self._acceptance_result(acceptance_evidence),
+                    claims=claim_evidence,
+                    claims_result=claims_outcome,
+                )
             # El progreso causal se registra **antes** de decidir: la ronda que resuelve el fallo
             # también es evidencia (qué recurso lo resolvió), no solo la que vuelve a fallar.
             signature = _failure_signature(verification)
@@ -1992,7 +2162,12 @@ class DevelopmentCycle:
                     if item
                 )
             )
-            passed = all(item.passed for item in verification) and chain_ok and acceptance_ok
+            passed = (
+                all(item.passed for item in verification)
+                and chain_ok
+                and acceptance_ok
+                and claims_outcome in {"SATISFIED", "NONE"}
+            )
             self._record_resolution_progress(
                 request=request,
                 rounds=rounds,
@@ -2033,11 +2208,15 @@ class DevelopmentCycle:
                     change_issues=(),
                     acceptance=acceptance_evidence,
                     acceptance_result=self._acceptance_result(acceptance_evidence),
+                    claims=claim_evidence,
+                    claims_result=claims_outcome,
                 )
             if chain_issues:
                 change_issues = (*change_issues, *chain_issues)
             if acceptance_issues:
                 change_issues = (*change_issues, *acceptance_issues)
+            if claim_issues:
+                change_issues = (*change_issues, *claim_issues)
             stagnated = (
                 bool(previous_signature)
                 and signature == previous_signature
@@ -2097,6 +2276,14 @@ class DevelopmentCycle:
             if chain_issues:
                 failure_evidence += "\nFUNCTIONAL CHAIN INCOMPLETE:\n" + "\n".join(
                     f"- {issue.code}: {issue.detail}" for issue in chain_issues
+                )
+            if claim_issues:
+                failure_evidence += (
+                    "\nFACTUAL/SEMANTIC CLAIM NOT SATISFIED (the requested property is not proven "
+                    "by the implementation):\n"
+                    + "\n".join(f"- {issue.detail}" for issue in claim_issues)
+                    + "\nProvide real evidence for the claim (an authoritative dataset that the "
+                    "code actually uses), not an approximation."
                 )
             if acceptance_issues:
                 failure_evidence += (
@@ -2911,6 +3098,8 @@ class DevelopmentCycle:
             "functional_chain_result": self._functional_chain_result,
             "acceptance": kwargs.get("acceptance", ()),
             "acceptance_result": kwargs.get("acceptance_result", "NOT_MEASURED"),
+            "claims": kwargs.get("claims", ()),
+            "claims_result": kwargs.get("claims_result", "NONE"),
             "plan": self._final_plan,
         }
 
@@ -2950,6 +3139,8 @@ class DevelopmentCycle:
         functional_chain_result: str = "",
         acceptance: Sequence[AcceptanceEvidence] = (),
         acceptance_result: str = "NOT_MEASURED",
+        claims: Sequence[ClaimEvidence] = (),
+        claims_result: str = "NONE",
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -3020,6 +3211,8 @@ class DevelopmentCycle:
             functional_chain_result=functional_chain_result,
             acceptance=tuple(acceptance),
             acceptance_result=acceptance_result,
+            claims=tuple(claims),
+            claims_result=claims_result,
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,

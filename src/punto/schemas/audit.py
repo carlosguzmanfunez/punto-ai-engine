@@ -372,6 +372,9 @@ class AuditEventType(StrEnum):
     DEV_ACCEPTANCE_VERIFIED = "DEV_ACCEPTANCE_VERIFIED"
     #: AP000-OBS-02: algún criterio determinista no se cumplió en la superficie solicitada.
     DEV_ACCEPTANCE_FAILED = "DEV_ACCEPTANCE_FAILED"
+    #: AP000-OBS-03: se evaluaron las afirmaciones factuales/semánticas de la solicitud y su
+    #: evidencia (dataset real, capacidad visual, atestación), con su resultado.
+    DEV_CLAIMS_EVALUATED = "DEV_CLAIMS_EVALUATED"
 
 
 class AuditEvent(BaseModel):

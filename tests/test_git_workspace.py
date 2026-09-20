@@ -1,4 +1,4 @@
-"""GitWorkspace: ramas de tarea, protección de main y ausencia de remoto.
+﻿"""GitWorkspace: ramas de tarea, protección de main y ausencia de remoto.
 
 Mandato §14, §15 y casos §25.14-18, §25.25-26.
 """
@@ -15,6 +15,7 @@ from punto.developer.context import ExecutionContext
 from punto.tools.errors import BranchPolicyViolationError, WorkspaceViolationError
 from punto.tools.git import GitWorkspace, slugify, task_branch_name
 from punto.tools.shell import ShellRunner
+from punto.workspace.repository import _porcelain_path
 
 
 @pytest.fixture
@@ -202,3 +203,38 @@ def test_git_operations_cannot_target_a_parent_repository(tmp_path: Path) -> Non
 
     with pytest.raises(WorkspaceViolationError, match="no es el workspace autorizado"):
         workspace.current_branch()
+
+
+# ---------------------------------------------------------------------------
+# AP000-OBS-03 - el estado del árbol no puede perder la ruta
+# ---------------------------------------------------------------------------
+def test_el_estado_del_arbol_no_pierde_el_primer_caracter_de_la_ruta(
+    git_workspace: GitWorkspace, workspace: Path
+) -> None:
+    """Defecto corregido: la primera línea de `git status` empieza por espacio.
+
+    Un corte de desplazamiento fijo sobre esa línea convertía `src/components/x.tsx` en
+    `rc/components/x.tsx`, y cualquier verificación que comparase rutas dejaba de ver el cambio.
+    """
+    objetivo = next(
+        path for path in sorted(workspace.rglob("*.py")) if ".git" not in path.parts
+    )
+    relativa = objetivo.relative_to(workspace).as_posix()
+    objetivo.write_text(
+        objetivo.read_text(encoding="utf-8") + "\n# cambio de la prueba\n", encoding="utf-8"
+    )
+
+    lineas = git_workspace.status_lines()
+
+    assert lineas, "el árbol tiene un cambio"
+    assert any(_porcelain_path(line) == relativa for line in lineas), lineas
+    assert any(line[:2].strip() for line in lineas), "la columna de estado se conserva"
+
+
+def test_las_columnas_de_estado_se_descartan_sin_cortar_la_ruta() -> None:
+    """El análisis descarta las dos columnas y el separador, también en renombrados."""
+    assert _porcelain_path(" M src/app/page.tsx") == "src/app/page.tsx"
+    assert _porcelain_path("M  src/lib/honduras.ts") == "src/lib/honduras.ts"
+    assert _porcelain_path("?? src/lib/dataset.geojson") == "src/lib/dataset.geojson"
+    assert _porcelain_path('R  "viejo.ts" -> "nuevo.ts"') == "nuevo.ts"
+    assert _porcelain_path("") == ""

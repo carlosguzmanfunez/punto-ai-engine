@@ -25,6 +25,11 @@ htmlcov/
 # credenciales: las claves viven en el almacén de secretos, fuera del árbol.
 config/providers.local.yaml
 
+# Destinos de desarrollo locales a esta máquina: el archivo que hace aparecer el repositorio real en
+# el selector de tareas del dashboard. Declara la ruta absoluta de un repositorio local, así que es
+# configuración de esta máquina, no del repositorio; la ruta nunca viaja en una solicitud.
+config/targets.local.yaml
+
 # Memoria operativa de PELL (conocimiento acumulado por este motor en esta máquina). Es estado de
 # ejecución, no producto: se versiona el código que la lee y escribe, no su contenido.
 .punto-memory/

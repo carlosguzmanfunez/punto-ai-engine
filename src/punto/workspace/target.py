@@ -12,6 +12,12 @@ Extiende el registro de PILOT-03 (``BuildTarget`` + ``PUNTO_BUILD_TARGETS``) con
 
 Los destinos viven en configuración (``PUNTO_DEV_TARGETS``), no en la solicitud y no en el código:
 una ruta local no se escribe nunca en el motor.
+
+Además de la variable de entorno, el motor lee un archivo **local a la máquina**
+(``<config>/targets.local.yaml``, la misma convención que ``providers.local.yaml``): así el
+dashboard ofrece el destino sin que nadie tenga que exportar la variable en cada arranque, y la
+ruta del repositorio sigue viviendo en configuración confiable — nunca en la solicitud ni en el
+navegador.
 """
 
 from __future__ import annotations
@@ -24,10 +30,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+import yaml
+
 from punto.schemas.dev import RepositoryOperation
 
 #: Variable de entorno que declara los destinos de desarrollo, en JSON.
 DEV_TARGETS_ENV: Final[str] = "PUNTO_DEV_TARGETS"
+
+#: Archivo de destinos local a esta máquina (no se versiona). Su raíz declara la clave ``targets``
+#: con la misma forma que un destino de ``PUNTO_DEV_TARGETS``.
+LOCAL_TARGETS_FILE: Final[str] = "targets.local.yaml"
+
+#: Variables con las que se localiza el directorio de configuración al leer el archivo local.
+CONFIG_DIR_ENV: Final[str] = "PUNTO_CONFIG_DIR"
+REPO_ROOT_ENV: Final[str] = "PUNTO_REPO_ROOT"
 
 #: Cota de destinos declarables.
 MAX_DEV_TARGETS: Final[int] = 8
@@ -87,6 +103,9 @@ class DevelopmentTarget:
     target_id: str
     repository: Path
     baseline_sha: str
+    #: Nombre humano del destino, para la interfaz. La ruta no se muestra: el nombre es lo que una
+    #: persona elige y PUNTO resuelve la clave a su repositorio declarado.
+    display_name: str = ""
     scope_roots: tuple[str, ...] = ()
     allowed_operations: frozenset[RepositoryOperation] = frozenset(
         {
@@ -115,6 +134,11 @@ class DevelopmentTarget:
     def publishable(self) -> bool:
         """True si el destino declara dónde publicar y cómo comprobarlo."""
         return bool(self.production_branch and self.production_url)
+
+    @property
+    def human_name(self) -> str:
+        """Nombre humano del destino: el declarado, o su clave si no declara ninguno."""
+        return self.display_name or self.target_id
 
     def command(self, name: str) -> VerificationCommand:
         """Comando de verificación por nombre.
@@ -295,6 +319,7 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         target_id=target_id,
         repository=repository,
         baseline_sha=baseline,
+        display_name=str(value.get("display_name", "")).strip()[:80],
         scope_roots=tuple(roots),
         allowed_operations=operations,
         verification=verification,
@@ -315,32 +340,127 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
 def load_development_targets(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, DevelopmentTarget]:
-    """Lee los destinos de desarrollo de la configuración del entorno.
+    """Lee los destinos de desarrollo de la configuración vigente.
+
+    Orden de resolución:
+
+    1. ``PUNTO_DEV_TARGETS`` (JSON): la declaración explícita del operador manda.
+    2. ``<config>/targets.local.yaml``: la declaración local de esta máquina, para que el dashboard
+       ofrezca el destino sin exportar nada. El directorio se resuelve con ``PUNTO_CONFIG_DIR``,
+       ``PUNTO_REPO_ROOT`` o el ``config/`` del repositorio; si no se puede resolver, o el archivo
+       no existe, simplemente **no hay destinos** (no es un error).
+
+    Cuando se pasa un entorno explícito, la búsqueda del directorio usa **solo** ese entorno: así
+    una prueba (o un arranque con entorno filtrado) no lee la configuración de la máquina.
 
     Raises:
-        DevelopmentTargetError: si la variable no es JSON válido, no tiene la forma esperada o un
-            destino no se puede usar.
+        DevelopmentTargetError: si la declaración existe (variable o archivo) pero no se puede usar.
     """
     source = os.environ if environ is None else environ
     raw = source.get(DEV_TARGETS_ENV, "").strip()
-    if not raw:
+    if raw:
+        return _targets_from_json(raw)
+    config_dir = _default_config_dir() if environ is None else _config_dir_from(source)
+    if config_dir is None:
         return {}
+    return load_local_development_targets(config_dir)
+
+
+def _targets_from_json(raw: str) -> dict[str, DevelopmentTarget]:
+    """Destinos declarados en la variable de entorno.
+
+    Raises:
+        DevelopmentTargetError: si el JSON no es válido o un destino no se puede usar.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise DevelopmentTargetError(f"{DEV_TARGETS_ENV} no es JSON válido: {exc}") from exc
     if not isinstance(data, dict):
         raise DevelopmentTargetError(f"{DEV_TARGETS_ENV} debe ser un objeto JSON de destinos")
+    return _targets_from_mapping(data, source=DEV_TARGETS_ENV)
+
+
+def load_local_development_targets(config_dir: Path) -> dict[str, DevelopmentTarget]:
+    """Lee los destinos declarados en ``<config>/targets.local.yaml``.
+
+    La raíz del archivo declara la clave ``targets``: un mapeo de clave de destino → destino, con
+    la misma forma que un destino de ``PUNTO_DEV_TARGETS`` y las **mismas validaciones** (ruta
+    absoluta, repositorio Git real, baseline con forma de SHA, operaciones conocidas y catálogo de
+    verificación por allowlist).
+
+    Args:
+        config_dir: Directorio de configuración ya resuelto.
+
+    Returns:
+        Destinos declarados; vacío si el archivo no existe.
+
+    Raises:
+        DevelopmentTargetError: si el archivo existe pero no se puede usar.
+    """
+    path = config_dir / LOCAL_TARGETS_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise DevelopmentTargetError(f"{LOCAL_TARGETS_FILE} no es YAML válido: {exc}") from exc
+    except OSError as exc:  # pragma: no cover - depende del sistema de ficheros
+        raise DevelopmentTargetError(f"{LOCAL_TARGETS_FILE} no se pudo leer: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, Mapping):
+        raise DevelopmentTargetError(f"{LOCAL_TARGETS_FILE} debe ser un objeto YAML")
+    if "targets" not in data:
+        raise DevelopmentTargetError(
+            f"{LOCAL_TARGETS_FILE} debe declarar la clave 'targets' con los destinos"
+        )
+    declared = data["targets"]
+    if not isinstance(declared, Mapping):
+        raise DevelopmentTargetError(f"'targets' de {LOCAL_TARGETS_FILE} debe ser un objeto")
+    return _targets_from_mapping(declared, source=LOCAL_TARGETS_FILE)
+
+
+def _targets_from_mapping(
+    data: Mapping[object, object], *, source: str
+) -> dict[str, DevelopmentTarget]:
+    """Valida y construye los destinos de una declaración.
+
+    Raises:
+        DevelopmentTargetError: si hay demasiados destinos o alguno no se puede usar.
+    """
     if len(data) > MAX_DEV_TARGETS:
         raise DevelopmentTargetError(
-            f"{DEV_TARGETS_ENV} declara {len(data)} destinos; el máximo es {MAX_DEV_TARGETS}"
+            f"{source} declara {len(data)} destinos; el máximo es {MAX_DEV_TARGETS}"
         )
     targets: dict[str, DevelopmentTarget] = {}
     for key, value in data.items():
+        target_id = str(key).strip()
         if not isinstance(value, Mapping):
-            raise DevelopmentTargetError(f"el destino {key!r} no declara un objeto")
-        targets[str(key).strip()] = target_from_mapping(str(key).strip(), value)
+            raise DevelopmentTargetError(f"el destino {target_id!r} no declara un objeto")
+        targets[target_id] = target_from_mapping(target_id, value)
     return targets
+
+
+def _default_config_dir() -> Path | None:
+    """Directorio de configuración del motor, o ``None`` si no se puede resolver."""
+    from punto.policy.config_loader import ConfigError, find_config_dir
+
+    try:
+        return find_config_dir()
+    except ConfigError:
+        return None
+
+
+def _config_dir_from(environ: Mapping[str, str]) -> Path | None:
+    """Directorio de configuración declarado en un entorno explícito, si lo hay."""
+    explicit = str(environ.get(CONFIG_DIR_ENV, "")).strip()
+    if explicit:
+        return Path(explicit)
+    root = str(environ.get(REPO_ROOT_ENV, "")).strip()
+    if root:
+        return Path(root) / "config"
+    return None
 
 
 @dataclass(slots=True)
@@ -378,6 +498,7 @@ class DevelopmentTargetRegistry:
 __all__ = [
     "DEV_TARGETS_ENV",
     "FORBIDDEN_VERIFICATION_ARGS",
+    "LOCAL_TARGETS_FILE",
     "MAX_DEV_TARGETS",
     "VERIFICATION_PROGRAMS",
     "DevelopmentTarget",
@@ -385,5 +506,6 @@ __all__ = [
     "DevelopmentTargetRegistry",
     "VerificationCommand",
     "load_development_targets",
+    "load_local_development_targets",
     "target_from_mapping",
 ]

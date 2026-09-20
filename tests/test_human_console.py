@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
+import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -45,6 +47,7 @@ from punto.workspace.target import (
     DevelopmentTarget,
     DevelopmentTargetRegistry,
     VerificationCommand,
+    load_development_targets,
 )
 
 TARGET_ID = "punto-inmobiliario-hn"
@@ -276,8 +279,13 @@ def _app(
     respuestas: Sequence[Any],
     fetch: Any = _fetch_ok,
     allow_remote: bool = True,
+    targets: Mapping[str, DevelopmentTarget] | None = None,
 ) -> tuple[TestClient, AuditLogger, DevelopmentTarget, Any]:
-    """Aplicación con la consola montada, ejecución en línea y sonda de producción inyectada."""
+    """Aplicación con la consola montada, ejecución en línea y sonda de producción inyectada.
+
+    ``targets`` permite registrar exactamente lo que devuelve la configuración local (la cadena
+    configuración → registro → consola → selector), en vez del destino suelto de la prueba.
+    """
     audit = AuditLogger()
     cycle = _ciclo(target, respuestas, audit)
     gates = HumanGate()
@@ -309,7 +317,7 @@ def _app(
         gates=gates,
         audit=audit,
         policy=policy,
-        targets={TARGET_ID: target},
+        targets=dict(targets) if targets is not None else {TARGET_ID: target},
         publisher_factory=fabrica,
         run_inline=True,
         environ={},
@@ -992,6 +1000,118 @@ def test_h_la_pagina_lleva_el_recorrido_y_los_proveedores_siguen_igual() -> None
     assert "sk-" not in pagina, "ni claves ni estados con forma de secreto"
     assert client.get("/providers").status_code == 200
     assert client.get("/dashboard").status_code == 200
+
+
+# ------------------------------------------- registro del destino real en la consola
+def test_el_selector_lista_el_destino_por_su_nombre_humano_sin_exponer_la_ruta(
+    tmp_path: Path,
+) -> None:
+    """El destino se ofrece por nombre; la ruta del repositorio no viaja a la interfaz."""
+    repo, remoto = _repos(tmp_path)
+    target = replace(_target(repo, remoto=remoto), display_name="Punto Inmobiliario HN")
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+
+    destinos = client.get("/console/targets").json()["targets"]
+
+    assert len(destinos) == 1
+    destino = destinos[0]
+    assert destino["name"] == "Punto Inmobiliario HN"
+    assert destino["target_id"] == TARGET_ID, "la clave es lo único que viaja en la solicitud"
+    assert "repository" not in destino and "path" not in destino
+    assert str(repo) not in json.dumps(destinos), "ni la ruta absoluta ni el nombre del puesto"
+    # El selector del dashboard pinta ese nombre humano.
+    pagina = client.get("/console").text
+    assert "target.name || target.target_id" in pagina
+
+
+def test_la_configuracion_local_llega_al_selector_y_resuelve_al_repositorio_declarado(
+    tmp_path: Path,
+) -> None:
+    """configuración → registro → consola: la clave declarada resuelve al repositorio declarado."""
+    repo, remoto = _repos(tmp_path)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "targets.local.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "targets": {
+                    TARGET_ID: {
+                        "display_name": "Punto Inmobiliario HN",
+                        "repository": str(repo),
+                        "baseline_sha": _git(repo, "rev-parse", "HEAD"),
+                        "scope_roots": ["src"],
+                        "allowed_operations": [
+                            "READ",
+                            "WRITE",
+                            "CREATE",
+                            "DELETE",
+                            "EXECUTE",
+                            "COMMIT",
+                        ],
+                        "work_branch": WORK_BRANCH,
+                        "production_branch": "main",
+                        "production_url": "https://produccion.local/",
+                        "production_marker": "PUNTO-OK",
+                        "publish_remote": str(remoto),
+                        "verification": {
+                            "focused": {"argv": ["python", "-c", FOCUSED], "timeout_seconds": 60.0}
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    registrados = load_development_targets({"PUNTO_CONFIG_DIR": str(config_dir)})
+    client, _audit, _target_obj, deps = _app(
+        target=_target(repo, remoto=remoto), respuestas=[_plan(), _cambio()], targets=registrados
+    )
+
+    destino = deps.targets[TARGET_ID]
+    destinos = client.get("/console/targets").json()["targets"]
+
+    assert destino.repository == repo, "la clave resuelve a la ruta declarada, no a otra"
+    assert destino.human_name == "Punto Inmobiliario HN"
+    assert destino.baseline_sha == _git(repo, "rev-parse", "HEAD")
+    assert destino.command_names() == ("focused",)
+    assert [item["name"] for item in destinos] == ["Punto Inmobiliario HN"]
+    assert destinos[0]["publishable"] is True, "el destino declara su producción; no se adivina"
+
+
+def test_un_destino_no_registrado_no_concede_acceso_a_otro_directorio(tmp_path: Path) -> None:
+    """Un valor arbitrario del navegador no abre ningún directorio: solo hay claves registradas."""
+    repo, remoto = _repos(tmp_path)
+    ajeno, _ajeno_remoto = _repos(tmp_path / "ajeno")
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+
+    intentos = (
+        "otro-repo",
+        "../otro",
+        f"{TARGET_ID}/../ajeno",
+        "C:/Windows",
+        "punto-inmobiliario-hn ",
+    )
+    for intento in intentos:
+        respuesta = client.post(
+            "/console/tasks", json={"objective": "tocar otro repositorio", "target_id": intento}
+        )
+        assert respuesta.status_code == 400, intento
+        assert str(repo) not in respuesta.text, "el rechazo no revela el repositorio registrado"
+        assert str(ajeno) not in respuesta.text, "ni la ruta del repositorio ajeno"
+    # Una ruta arbitrariamente larga ni siquiera entra: el campo del selector está acotado.
+    larga = str(ajeno)
+    assert len(larga) > 80
+    acotado = client.post(
+        "/console/tasks", json={"objective": "tocar otro repositorio", "target_id": larga}
+    )
+    assert acotado.status_code == 422
+
+    # Nada se creó y nada se ejecutó: la frontera no concede trabajo sobre el repositorio ajeno.
+    assert client.get("/console/tasks").json()["total"] == 0
+    assert client.get("/console/targets").json()["targets"][0]["target_id"] == TARGET_ID
+    assert _git(ajeno, "rev-parse", "--abbrev-ref", "HEAD") == "ai/console-fixture"
 
 
 def _refs(remoto: Path) -> dict[str, str]:

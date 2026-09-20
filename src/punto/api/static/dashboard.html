@@ -727,7 +727,7 @@
         consoleState.targets = payload.targets;
         document.getElementById("tarea-target").innerHTML = payload.targets.length
           ? payload.targets
-              .map((target) => `<option value="${target.target_id}">${target.target_id}${target.publishable ? " · publicable" : ""}</option>`)
+              .map((target) => `<option value="${target.target_id}">${target.name || target.target_id}${target.publishable ? " · publicable" : ""}</option>`)
               .join("")
           : `<option value="">(sin destinos registrados)</option>`;
       }

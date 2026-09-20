@@ -309,11 +309,16 @@ def register_human_console(
 
     @application.get("/console/targets", tags=["console"], summary="Destinos disponibles")
     def console_targets() -> dict[str, Any]:
-        """Destinos declarados: dónde puede trabajar PUNTO y si son publicables."""
+        """Destinos declarados: dónde puede trabajar PUNTO y si son publicables.
+
+        Se expone el **nombre humano** y la clave del destino, nunca la ruta del repositorio: el
+        navegador elige una clave registrada y PUNTO resuelve a su repositorio declarado.
+        """
         return {
             "targets": [
                 {
                     "target_id": target.target_id,
+                    "name": target.human_name,
                     "scope_roots": list(target.scope_roots),
                     "publishable": target.publishable,
                     "production_branch": target.production_branch,

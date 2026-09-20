@@ -253,15 +253,20 @@ def _cycle(
     store: ExperienceStore | None = None,
     audit: AuditLogger | None = None,
     max_context_files: int | None = None,
+    max_repair_rounds: int = 0,
 ) -> tuple[DevelopmentCycle, ScriptedClient, AuditLogger, DevelopmentTarget]:
-    """Ciclo compuesto con router real, proveedor guionizado y auditoría en memoria."""
+    """Ciclo compuesto con router real, proveedor guionizado y auditoría en memoria.
+
+    Por defecto **sin** rondas de reparación: así las pruebas de rechazo comprueban el motivo exacto
+    del rechazo. Las pruebas del bucle de reparación piden las rondas que necesitan.
+    """
     router = ProviderRouter()
     client = ScriptedClient(router, responses)
     for role in ProviderRole:
         router.assign_role(role, "guionizado")
     target = _target(root, verification=verification)
     logger = audit if audit is not None else AuditLogger()
-    options: dict[str, Any] = {}
+    options: dict[str, Any] = {"max_repair_rounds": max_repair_rounds}
     if max_context_files is not None:
         options["max_context_files"] = max_context_files
     cycle = DevelopmentCycle(
@@ -383,6 +388,95 @@ def test_un_plan_fuera_de_alcance_se_rechaza_sin_escribir(tmp_path: Path) -> Non
     assert "DEV_CHECKPOINT_CREATED" not in _events(logger, request.request_id)
 
 
+def test_un_plan_con_forma_benigna_se_normaliza(tmp_path: Path) -> None:
+    """Un plan con listas como objetos de una clave o un texto suelto no se tira: se normaliza.
+
+    El ARCHITECT real devolvió ``risks`` como ``[{"risk": "..."}]``; rechazar el plan entero por
+    cómo empaqueta sus frases dejaría al ciclo sin trabajo y sin motivo.
+    """
+    root = _repo(tmp_path)
+    cycle, _, _, _ = _cycle(
+        root,
+        responses=[
+            _plan(
+                files_to_modify="src/lib/opciones.ts",
+                risks=[{"risk": "el parser puede romper"}, "otra cosa"],
+                acceptance_mapping=[{"criterio": "una sola fuente de tipos"}],
+            ),
+            _change(),
+        ],
+    )
+
+    result = cycle.run(_request())
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert result.plan is not None
+    assert result.plan.files_to_modify == ("src/lib/opciones.ts",)
+    assert result.plan.risks == ("el parser puede romper", "otra cosa")
+    assert result.plan.acceptance_mapping == ("una sola fuente de tipos",)
+
+
+def test_un_crear_sobre_algo_existente_se_rechaza_sin_caerse(tmp_path: Path) -> None:
+    """Un `CREATE` sobre un fichero que ya existe se rechaza antes de escribir, sin excepción."""
+    root = _repo(tmp_path)
+    cycle, _, logger, _ = _cycle(
+        root,
+        responses=[
+            _plan(files_to_modify=[], files_to_create=["src/lib/opciones.ts"]),
+            _change(
+                changes=[
+                    {
+                        "path": "src/lib/opciones.ts",
+                        "operation": "CREATE",
+                        "content": "export const TIPOS_UI = ['Casa'];\n",
+                    }
+                ]
+            ),
+        ],
+    )
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.CHANGE_REJECTED
+    assert "CHANGE_ALREADY_EXISTS" in [issue.code for issue in result.change_issues]
+    assert result.applied == ()
+    assert "export const TIPOS_UI = ['Casa', 'Oficina'];" in (
+        root / "src" / "lib" / "opciones.ts"
+    ).read_text(encoding="utf-8")
+    assert "DEV_CHANGE_REJECTED" in _events(logger, request.request_id)
+
+
+def test_una_propuesta_duplicada_se_rechaza(tmp_path: Path) -> None:
+    """El mismo fichero dos veces en una propuesta se rechaza: no se aplica dos veces."""
+    root = _repo(tmp_path)
+    cycle, _, _, _ = _cycle(
+        root,
+        responses=[
+            _plan(),
+            _change(
+                changes=[
+                    {
+                        "path": "src/lib/opciones.ts",
+                        "operation": "MODIFY",
+                        "content": "export const TIPOS_UI = ['Casa', 'Apartamento'];\n",
+                    },
+                    {
+                        "path": "src/lib/opciones.ts",
+                        "operation": "MODIFY",
+                        "content": "export const TIPOS_UI = ['Casa'];\n",
+                    },
+                ]
+            ),
+        ],
+    )
+
+    result = cycle.run(_request())
+
+    assert result.status is DevelopmentStatus.CHANGE_REJECTED
+    assert "CHANGE_DUPLICATED" in [issue.code for issue in result.change_issues]
+
+
 def test_un_plan_sin_verificacion_no_se_aplica(tmp_path: Path) -> None:
     """Un plan que no declara cómo se verifica no se acepta."""
     root = _repo(tmp_path)
@@ -400,7 +494,11 @@ def test_una_verificacion_desconocida_no_se_acepta(tmp_path: Path) -> None:
     """El proveedor no puede inventarse un comando: solo nombrar los del catálogo."""
     root = _repo(tmp_path)
     cycle, _, _, _ = _cycle(
-        root, responses=[_plan(verification_commands=["focused", "rm -rf /"])]
+        root,
+        responses=[
+            _plan(verification_commands=["focused", "rm -rf /"]),
+            _plan(verification_commands=["focused", "rm -rf /"]),
+        ],
     )
 
     result = cycle.run(_request())
@@ -532,6 +630,7 @@ def test_una_peticion_de_contexto_dentro_de_autoridad_se_concede(tmp_path: Path)
             _change(),
         ],
         max_context_files=2,
+        max_repair_rounds=2,
     )
     request = _request()
 
@@ -597,6 +696,7 @@ def test_el_fallo_de_verificacion_se_repara_en_una_ronda(tmp_path: Path) -> None
             # Segunda: añade el tipo que la verificación exige.
             _change(),
         ],
+        max_repair_rounds=3,
     )
     request = _request()
 
@@ -633,6 +733,7 @@ def test_la_reparacion_tiene_limite_y_entonces_revierte(tmp_path: Path) -> None:
                 for index in range(5)
             ],
         ],
+        max_repair_rounds=3,
     )
     request = _request()
 

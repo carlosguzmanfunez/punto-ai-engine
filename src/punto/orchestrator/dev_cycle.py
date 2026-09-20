@@ -94,7 +94,12 @@ from punto.workspace.target import (
 )
 
 #: Tope de tokens de salida por invocación, fijado por PUNTO.
-DEFAULT_MAX_OUTPUT_TOKENS: Final[int] = 8_000
+#:
+#: Se aplica a las dos invocaciones del ciclo. El plan cabe en poco, pero los cambios **repiten el
+#: contenido** de los ficheros que tocan, y un modelo con razonamiento gasta parte del presupuesto
+#: en pensar: con un tope corto la respuesta llega truncada (`finish_reason='length'`) y el ciclo se
+#: queda sin cambios. El valor sale del que ya usa el motor para planificar.
+DEFAULT_MAX_OUTPUT_TOKENS: Final[int] = 32_000
 
 #: Ficheros que el descubrimiento inspecciona como candidatos, y cuántos entran al contexto.
 MAX_DISCOVERY_FILES: Final[int] = 400
@@ -122,6 +127,16 @@ RELEVANT_SUFFIXES: Final[frozenset[str]] = frozenset(
 #: Cercas de código que el proveedor añade a veces alrededor del JSON.
 _FENCE: Final[re.Pattern[str]] = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 
+#: Campos del plan que son listas de textos (se normalizan antes de validar).
+_TEXT_TUPLE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"risks", "acceptance_mapping", "verification_commands"}
+)
+
+#: Campos del plan que son listas de rutas (una ruta suelta es una lista de una).
+_PATH_TUPLE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"files_to_read", "files_to_modify", "files_to_create"}
+)
+
 #: Palabras vacías para el ranking determinista de candidatos.
 _STOPWORDS: Final[frozenset[str]] = frozenset(
     {
@@ -133,6 +148,20 @@ _STOPWORDS: Final[frozenset[str]] = frozenset(
 
 class DevelopmentCycleError(RuntimeError):
     """El ciclo no se puede ejecutar con lo que se le ha dado."""
+
+
+class _ApplyAborted(RuntimeError):
+    """La frontera denegó una escritura a mitad de la aplicación.
+
+    Es un control de flujo interno: el bucle lo captura, deshace lo aplicado y termina el ciclo con
+    su estado. Nunca sale del ciclo como excepción.
+    """
+
+    def __init__(self, *, code: str, detail: str, applied: tuple[AppliedChange, ...]) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.applied = applied
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +205,8 @@ class DevelopmentCycle:
     actor: str = "punto-dev-cycle"
     _snapshots: FileRepairSnapshots | None = field(default=None, init=False, repr=False)
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
+    _last_provider: str = field(default="", init=False, repr=False)
+    _last_model: str = field(default="", init=False, repr=False)
 
     # ------------------------------------------------------------------ público
     def run(self, request: BuildRequest) -> DevelopmentResult:
@@ -482,28 +513,46 @@ class DevelopmentCycle:
         context_files: Sequence[ContextFile],
         retrieval: RetrievalOutcome,
     ) -> tuple[DevelopmentPlan | None, tuple[BuildValidationIssue, ...]]:
-        """Pide el plan al ARCHITECT y lo valida con las reglas de PUNTO."""
-        prompt = self._plan_prompt(request, target, context_files, retrieval)
-        result = self._invoke(ProviderRole.ARCHITECT, request, prompt, PLAN_SCHEMA)
-        if result.status is not ProviderStatus.SUCCESS:
-            return None, (
-                BuildValidationIssue(
-                    code="ARCHITECT_UNAVAILABLE",
-                    detail=f"el ARCHITECT no respondió: {result.error or result.status.value}",
-                ),
+        """Pide el plan al ARCHITECT y lo valida con las reglas de PUNTO.
+
+        Se pide **una vez** y, si la respuesta no es un plan interpretable, se vuelve a pedir una
+        sola vez explicando por qué se rechazó: un transporte puede ignorar el JSON Schema, así que
+        el contrato también va escrito en el prompt, y una segunda respuesta con el motivo del
+        rechazo delante es más útil que rendirse. El límite es una reintención, no un bucle.
+        """
+        issues: tuple[BuildValidationIssue, ...] = ()
+        plan: DevelopmentPlan | None = None
+        for attempt in range(2):
+            prompt = self._plan_prompt(
+                request, target, context_files, retrieval, rejection=issues, attempt=attempt
             )
-        payload = _json_object(result.content)
-        if payload is None:
-            return None, (
-                BuildValidationIssue(
-                    code="PLAN_NOT_JSON", detail="el ARCHITECT no devolvió un plan interpretable"
-                ),
-            )
-        try:
-            plan = DevelopmentPlan.model_validate(_plan_payload(payload))
-        except Exception as exc:  # el contrato del plan es la primera validación
-            return None, (BuildValidationIssue(code="PLAN_INVALID", detail=str(exc)[:300]),)
-        return plan, self._validate_plan(plan, target, request)
+            result = self._invoke(ProviderRole.ARCHITECT, request, prompt, PLAN_SCHEMA)
+            if result.status is not ProviderStatus.SUCCESS:
+                issues = (
+                    BuildValidationIssue(
+                        code="ARCHITECT_UNAVAILABLE",
+                        detail=f"el ARCHITECT no respondió: {result.error or result.status.value}",
+                    ),
+                )
+                return None, issues
+            payload = _json_object(result.content)
+            if payload is None:
+                issues = (
+                    BuildValidationIssue(
+                        code="PLAN_NOT_JSON",
+                        detail="el ARCHITECT no devolvió un plan interpretable",
+                    ),
+                )
+                continue
+            try:
+                plan = DevelopmentPlan.model_validate(_plan_payload(payload))
+            except Exception as exc:  # el contrato del plan es la primera validación
+                issues = (BuildValidationIssue(code="PLAN_INVALID", detail=str(exc)[:300]),)
+                continue
+            issues = self._validate_plan(plan, target, request)
+            if not issues:
+                return plan, ()
+        return plan, issues
 
     def _validate_plan(
         self, plan: DevelopmentPlan, target: DevelopmentTarget, request: BuildRequest
@@ -666,24 +715,45 @@ class DevelopmentCycle:
                     AuditEventType.DEV_CHANGE_REJECTED,
                     "dev_change_rejected",
                     request,
-                    {"issue_codes": [issue.code for issue in issues]},
+                    {
+                        "issue_codes": [issue.code for issue in issues],
+                        "round": rounds,
+                    },
                     AuditResult.FAILURE,
                 )
-                return self._outcome(
-                    status=DevelopmentStatus.CHANGE_REJECTED,
-                    error_kind="CHANGE_REJECTED",
-                    error="; ".join(issue.detail for issue in issues)[:500],
-                    provider=provider,
-                    model=model,
-                    applied=applied,
-                    verification=verification,
-                    repair_rounds=rounds,
-                    granted=granted,
-                    denied=denied,
-                    checkpoint=checkpoint,
-                    influence=influence,
-                    change_issues=issues,
+                if rounds >= self.config.max_repair_rounds:
+                    return self._outcome(
+                        status=DevelopmentStatus.CHANGE_REJECTED,
+                        error_kind="CHANGE_REJECTED",
+                        error="; ".join(issue.detail for issue in issues)[:500],
+                        provider=provider,
+                        model=model,
+                        applied=applied,
+                        verification=verification,
+                        repair_rounds=rounds,
+                        granted=granted,
+                        denied=denied,
+                        checkpoint=checkpoint,
+                        influence=influence,
+                        change_issues=issues,
+                    )
+                # Un cambio rechazado es una corrección pendiente, no el final del ciclo: se le
+                # devuelve al proveedor el motivo exacto y se le da otra ronda acotada.
+                rounds += 1
+                failure_evidence = "REJECTED CHANGES (fix these and answer again):\n" + "\n".join(
+                    f"- {issue.code}: {issue.detail}" for issue in issues
                 )
+                self._log(
+                    AuditEventType.DEV_REPAIR_STARTED,
+                    "dev_change_repair_started",
+                    request,
+                    {
+                        "round": rounds,
+                        "issue_codes": [issue.code for issue in issues],
+                    },
+                    AuditResult.FAILURE,
+                )
+                continue
 
             if checkpoint is None:
                 checkpoint = self._create_checkpoint(request, target, repository, validated)
@@ -702,7 +772,40 @@ class DevelopmentCycle:
                     influence=influence,
                 )
 
-            applied.extend(self._apply(repository, validated, round_index=rounds))
+            try:
+                applied.extend(self._apply(repository, validated, round_index=rounds))
+            except _ApplyAborted as aborted:
+                change_issues = (
+                    BuildValidationIssue(
+                        code=aborted.code, detail=f"{aborted.detail[:300]} (aplicación abortada)"
+                    ),
+                )
+                self._log(
+                    AuditEventType.DEV_CHANGE_REJECTED,
+                    "dev_change_rejected",
+                    request,
+                    {"issue_codes": [aborted.code], "applied_before": len(aborted.applied)},
+                    AuditResult.FAILURE,
+                )
+                rolled_back = self._rollback(
+                    request, checkpoint, repository, aborted.applied
+                )
+                return self._outcome(
+                    status=DevelopmentStatus.CHANGE_REJECTED,
+                    error_kind=aborted.code,
+                    error=aborted.detail,
+                    provider=provider,
+                    model=model,
+                    applied=() if rolled_back else aborted.applied,
+                    verification=verification,
+                    repair_rounds=rounds,
+                    granted=granted,
+                    denied=denied,
+                    checkpoint=checkpoint,
+                    influence=influence,
+                    change_issues=change_issues,
+                    rolled_back=rolled_back,
+                )
             if rounds > 0:
                 self._log(
                     AuditEventType.DEV_REPAIR_COMPLETED,
@@ -848,8 +951,18 @@ class DevelopmentCycle:
         issues: list[BuildValidationIssue] = []
         validated: list[FileChangeProposal] = []
         declared = set(plan.touched_paths())
+        seen: set[str] = set()
         for proposal in proposals:
             path = proposal.path.replace("\\", "/")
+            if path in seen:
+                issues.append(
+                    BuildValidationIssue(
+                        code="CHANGE_DUPLICATED",
+                        detail=f"{path!r} aparece dos veces en la misma propuesta",
+                    )
+                )
+                continue
+            seen.add(path)
             if path not in declared:
                 issues.append(
                     BuildValidationIssue(
@@ -871,6 +984,26 @@ class DevelopmentCycle:
                 continue
             try:
                 current = repository.sha256(path)
+                exists = repository.exists(path)
+                if proposal.operation is ChangeOperation.CREATE and exists:
+                    issues.append(
+                        BuildValidationIssue(
+                            code="CHANGE_ALREADY_EXISTS",
+                            detail=(
+                                f"{path!r} ya existe: para cambiarlo la operación es MODIFY, y un "
+                                "CREATE sobre algo existente se rechaza antes de escribir"
+                            ),
+                        )
+                    )
+                    continue
+                if proposal.operation is ChangeOperation.MODIFY and not exists:
+                    issues.append(
+                        BuildValidationIssue(
+                            code="CHANGE_MISSING_FILE",
+                            detail=f"{path!r} no existe: para crearlo la operación es CREATE",
+                        )
+                    )
+                    continue
                 if proposal.expected_sha256 and proposal.expected_sha256 != current:
                     issues.append(
                         BuildValidationIssue(
@@ -957,23 +1090,39 @@ class DevelopmentCycle:
         *,
         round_index: int,
     ) -> tuple[AppliedChange, ...]:
-        """Aplica los cambios validados por la única puerta de escritura."""
+        """Aplica los cambios validados por la única puerta de escritura.
+
+        Una denegación de la frontera **no escapa** del ciclo: se registra, se deshace lo aplicado y
+        el ciclo termina con su estado. Dejar salir la excepción convertiría una decisión de
+        autoridad en una caída del motor.
+
+        Raises:
+            RepositoryDenied: propagada solo a través de :class:`_ApplyAborted` para que la maneje
+                el bucle, nunca el llamante.
+        """
         applied: list[AppliedChange] = []
         for proposal in validated:
             path = proposal.path.replace("\\", "/")
-            if proposal.operation is ChangeOperation.DELETE:
-                change = repository.delete_file(path, expected_sha256=proposal.expected_sha256)
-                digest = ""
-                written = 0
-            else:
-                change = repository.write_text(
-                    path,
-                    proposal.content or "",
-                    operation=proposal.operation,
-                    expected_sha256=proposal.expected_sha256,
-                )
-                digest = repository.sha256(path)
-                written = change.bytes_written
+            try:
+                if proposal.operation is ChangeOperation.DELETE:
+                    change = repository.delete_file(path, expected_sha256=proposal.expected_sha256)
+                    digest = ""
+                    written = 0
+                else:
+                    change = repository.write_text(
+                        path,
+                        proposal.content or "",
+                        operation=proposal.operation,
+                        expected_sha256=proposal.expected_sha256,
+                    )
+                    digest = repository.sha256(path)
+                    written = change.bytes_written
+            except RepositoryDenied as exc:
+                raise _ApplyAborted(
+                    code=getattr(exc, "code", "CHANGE_DENIED"),
+                    detail=exc.detail,
+                    applied=tuple(applied),
+                ) from exc
             applied.append(
                 AppliedChange(
                     path=path,
@@ -1071,26 +1220,45 @@ class DevelopmentCycle:
         target: DevelopmentTarget,
         context_files: Sequence[ContextFile],
         retrieval: RetrievalOutcome,
+        *,
+        rejection: Sequence[BuildValidationIssue] = (),
+        attempt: int = 0,
     ) -> str:
-        """Contexto gobernado del ARCHITECT, con el inventario y la experiencia previa."""
+        """Contexto gobernado del ARCHITECT, con el inventario y la experiencia previa.
+
+        El contrato JSON va **escrito en el prompt** además de en el esquema: un transporte de
+        suscripción puede ignorar el ``json_schema``, y entonces el único contrato que el modelo ve
+        es este texto. Sin él, la respuesta llega sin las claves que PUNTO valida.
+        """
         lines = [
-            f"TARGET: {target.target_id} ({len(target.scope_roots)} raíces de alcance)",
+            f"TARGET: {target.target_id}",
             f"OBJECTIVE: {request.objective}",
         ]
         if request.acceptance_criteria:
             lines.append("ACCEPTANCE CRITERIA: " + " | ".join(request.acceptance_criteria))
         if request.constraints:
             lines.append("CONSTRAINTS: " + " | ".join(request.constraints))
-        lines.append("VERIFICATION CATALOG: " + " | ".join(target.command_names()))
-        lines.append("FILES THAT EXIST (alcance {}): ".format(", ".join(target.scope_roots)))
+        lines.append(
+            "VERIFICATION CATALOG (usa exactamente estos nombres): "
+            + " | ".join(target.command_names())
+        )
+        lines.append(
+            "ALLOWED PATHS: " + (" | ".join(target.scope_roots) or "(todo el repositorio)")
+        )
         for item in context_files:
             lines.append(f"\n===== {item.path} (sha256={item.sha256[:12]}) =====\n{item.content}")
         block = render_experience_block(retrieval.context)
         if block.strip():
             lines.append(block)
-        lines.append(
-            "DELIVERABLE: a plan for a small, verifiable change. You have no authority to apply it."
-        )
+        if rejection:
+            lines.append(
+                "YOUR PREVIOUS ANSWER WAS REJECTED: "
+                + " | ".join(f"{issue.code}: {issue.detail}" for issue in rejection)
+                + ". Answer again with the exact JSON object."
+            )
+        if attempt > 0:
+            lines.append("This is a retry: return ONLY the JSON object, with no prose around it.")
+        lines.append(PLAN_CONTRACT)
         return "\n".join(lines)
 
     def _build_prompt(
@@ -1120,9 +1288,11 @@ class DevelopmentCycle:
             lines.append("VERIFICATION FAILED AND MUST BE FIXED:\n" + failure_evidence)
         lines.append(
             "DELIVERABLE: the exact file changes as JSON. You write nothing yourself: PUNTO "
-            "validates and applies them. If you need another file, ask for it in context_requests "
-            "with its path and a reason instead of inventing its content."
+            "validates and applies them. Keep each change MINIMAL: modify only what the task "
+            "needs and repeat the rest of the file unchanged. If you need another file, ask for "
+            "it in context_requests with its path and a reason instead of inventing its content."
         )
+        lines.append(BUILD_CONTRACT)
         return "\n".join(lines)
 
     def _invoke(
@@ -1154,12 +1324,15 @@ class DevelopmentCycle:
             context=prompt,
             metadata={"target_id": request.target_repository, "phase": "PILOT-04"},
         )
-        return self.router.execute(
+        result = self.router.execute(
             role,
             provider_request,
             json_schema=schema,
             max_output_tokens=self.config.max_output_tokens,
         )
+        self._last_provider = result.provider or self._last_provider
+        self._last_model = result.model or self._last_model
+        return result
 
     # ------------------------------------------------------------- resultado
     def _outcome(self, **kwargs: Any) -> dict[str, Any]:
@@ -1265,8 +1438,8 @@ class DevelopmentCycle:
             commit_sha=final_commit,
             pell_status=retrieval.status.value,
             pell_influence=tuple(final_influence),
-            provider=provider,
-            model=model,
+            provider=provider or self._last_provider,
+            model=model or self._last_model,
             duration_ms=int((time.perf_counter() - started) * 1000),
             error_kind=error_kind,
             error=error,
@@ -1424,13 +1597,49 @@ def _json_object(text: str) -> Mapping[str, Any] | None:
 
 
 def _plan_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Filtra la respuesta del ARCHITECT a los campos del contrato del plan.
+    """Normaliza la respuesta del ARCHITECT a los campos del contrato del plan.
 
-    Un proveedor puede añadir campos de más (``notes``, ``explanation``…). El plan se queda con los
-    que el contrato declara: lo demás no se interpreta ni se guarda.
+    Un proveedor puede añadir campos de más (``notes``, ``explanation``…) y puede devolver una lista
+    de textos como objetos de una sola clave (``[{"risk": "..."}]``) o un único texto suelto en vez
+    de una lista. Eso es una variación de forma **benigna e interpretable**: se normaliza en vez
+    de tirar el plan entero, porque rechazar un plan correcto por cómo empaqueta sus frases
+    dejaría al ciclo sin trabajo y sin motivo. Lo que no se interpreta se descarta aquí y lo
+    valida el contrato.
     """
     allowed = set(DevelopmentPlan.model_fields)
-    return {key: value for key, value in payload.items() if key in allowed}
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key not in allowed:
+            continue
+        if key in _TEXT_TUPLE_FIELDS or key in _PATH_TUPLE_FIELDS:
+            normalized[key] = _as_text_tuple(value)
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def _as_text_tuple(value: Any) -> tuple[str, ...]:
+    """Convierte una lista (o un texto suelto) en una tupla de textos.
+
+    Acepta ``"x"``, ``["x", "y"]`` y ``[{"risk": "x"}]``: en el último caso la clave es una
+    etiqueta del proveedor y el valor es el texto que declara.
+    """
+    if value is None:
+        return ()
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, (list, tuple)):
+        return ()
+    texts: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            texts.append(item)
+            continue
+        if isinstance(item, Mapping):
+            for candidate in item.values():
+                if isinstance(candidate, str):
+                    texts.append(candidate)
+                    break
+    return tuple(texts)
 
 
 def _context_requests(payload: Mapping[str, Any]) -> tuple[ContextRequest, ...]:
@@ -1448,6 +1657,35 @@ def _context_requests(payload: Mapping[str, Any]) -> tuple[ContextRequest, ...]:
             continue
     return tuple(requests)
 
+
+#: Contrato de los cambios, escrito en el prompt además de en el ``json_schema``.
+BUILD_CONTRACT: Final[str] = (
+    "DELIVERABLE: a JSON object with EXACTLY these keys:\n"
+    '{"summary": "one sentence", '
+    '"changes": [{"path": "relative/path", "operation": "CREATE|MODIFY|DELETE", '
+    '"content": "the FULL new file content", "reason": "why", '
+    '"acceptance_criterion": "which criterion it satisfies"}], '
+    '"context_requests": [{"path": "relative/path", "reason": "why you need it"}]}\n'
+    "Rules: only paths declared in the validated plan; DELETE must not carry content; every change "
+    "needs the full file content and a reason; do not touch files outside the plan; do not include "
+    "credentials. You do not apply anything: PUNTO validates and applies."
+)
+
+#: Contrato del plan, escrito en el prompt además de en el ``json_schema``.
+PLAN_CONTRACT: Final[str] = (
+    "DELIVERABLE: a plan for a small, verifiable change, as a JSON object with EXACTLY these "
+    "keys:\n"
+    '{"summary": "one sentence", '
+    '"files_to_read": ["relative/path"], '
+    '"files_to_modify": ["relative/path"], '
+    '"files_to_create": ["relative/path"], '
+    '"verification_commands": ["<nombre del catálogo>"], '
+    '"risks": ["risk as text"], '
+    '"acceptance_mapping": ["which acceptance criterion this satisfies"]}\n'
+    "Rules: every key is mandatory (use [] for none); every path is relative to the repository "
+    "root and inside the allowed paths; files_to_modify must be non-empty; verification_commands "
+    "must name catalog entries, never a shell command. You have no authority to apply the plan."
+)
 
 #: Instrucciones del worker: su papel no confiable y el formato de su entrega.
 WORKER_INSTRUCTIONS: Final[str] = (

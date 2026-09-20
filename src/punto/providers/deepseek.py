@@ -178,6 +178,28 @@ PLANNING_MAX_TOKENS_ENV: Final[str] = "PUNTO_PLANNING_MAX_TOKENS"
 #: La API acepta este valor sin objeción (comprobado hasta 131 072).
 DEFAULT_PLANNING_MAX_TOKENS: Final[int] = 65_536
 
+#: Variable de entorno del tope de salida del **cliente** genérico de DeepSeek.
+#:
+#: Es el tope que el adaptador aplica cuando la invocación no autoriza uno menor. Estaba fijo en
+#: 8 192, y eso truncaba trabajo legítimo: un cambio que repite el contenido de un fichero
+#: mediano (más el razonamiento, que consume del mismo presupuesto) no cabía, y el error que
+#: llegaba al motor era «respuesta truncada» con el tope autorizado por encima y sin efecto. El
+#: tope del cliente es configuración, como el de OpenAI (``PUNTO_OPENAI_MAX_TOKENS``) y el de
+#: Anthropic.
+CLIENT_MAX_TOKENS_ENV: Final[str] = "PUNTO_DEEPSEEK_MAX_TOKENS"
+
+#: Tope de salida por defecto del cliente genérico de DeepSeek.
+DEFAULT_CLIENT_MAX_TOKENS: Final[int] = 32_768
+
+
+def resolve_client_max_tokens(env_var: str = CLIENT_MAX_TOKENS_ENV) -> int:
+    """Tope de salida del cliente de DeepSeek, resuelto desde el entorno.
+
+    Raises:
+        ValueError: si la variable no es un entero positivo.
+    """
+    return resolve_max_tokens(env_var, default=DEFAULT_CLIENT_MAX_TOKENS)
+
 
 def resolve_max_tokens(env_var: str, *, default: int = DEFAULT_PLANNING_MAX_TOKENS) -> int:
     """Resuelve el presupuesto de salida desde el entorno, validándolo.
@@ -651,7 +673,9 @@ __all__ = [
     "API_KEY_ENV",
     "ARCHITECT_MODEL_ENV",
     "AUTH_HEADER",
+    "CLIENT_MAX_TOKENS_ENV",
     "DEFAULT_BASE_URL",
+    "DEFAULT_CLIENT_MAX_TOKENS",
     "DEFAULT_MODEL",
     "DEFAULT_TRANSPORT_RETRIES",
     "DEVELOPER_MODEL_ENV",
@@ -678,5 +702,6 @@ __all__ = [
     "config_from_environment",
     "parse_proposal_json",
     "redact_secrets",
+    "resolve_client_max_tokens",
     "resolve_model",
 ]

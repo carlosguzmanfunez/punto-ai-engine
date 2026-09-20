@@ -206,11 +206,20 @@ def _api_client_for(provider: str, model: str, *, api_key: str = "") -> Structur
             AnthropicConfig(api_key=api_key or _required_key("ANTHROPIC_API_KEY"), model=model)
         )
     if provider == "deepseek":
-        from punto.providers.deepseek import DeepSeekClient, DeepSeekConfig
+        from punto.providers.deepseek import (
+            DeepSeekClient,
+            DeepSeekConfig,
+            resolve_client_max_tokens,
+        )
 
         return DeepSeekClient(
             DeepSeekConfig(
-                api_key=api_key or _required_key("DEEPSEEK_API_KEY"), model=model, max_tokens=8192
+                api_key=api_key or _required_key("DEEPSEEK_API_KEY"),
+                model=model,
+                # El tope del cliente es **configuración**: con un valor fijo, un cambio real que
+                # repite el contenido de los ficheros llega truncado por `finish_reason='length'`
+                # antes de que el tope autorizado por la invocación pueda mandar.
+                max_tokens=resolve_client_max_tokens(),
             )
         )
     raise TransportConfigError(f"no hay cliente de API para el proveedor {provider!r}")

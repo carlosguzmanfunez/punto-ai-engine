@@ -21,9 +21,10 @@ declaran aquí porque **no existían** y son el objeto de esta cadena.
 from __future__ import annotations
 
 import json
-import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -339,15 +340,26 @@ class GitPublisher:
 def _default_git_runner(
     argv: tuple[str, ...], root: Path, timeout: float
 ) -> tuple[int, str]:
-    """Ejecuta Git en el repositorio, sin prompt interactivo y sin exponer credenciales.
+    """Ejecuta Git en el repositorio con el entorno **saneado** del motor.
 
-    El prompt interactivo se desactiva para que un remoto sin credenciales falle rápido en vez de
-    quedarse esperando. La credencial, si existe, la aporta el gestor de credenciales del sistema:
-    PUNTO nunca la lee ni la guarda.
+    El proceso hijo **no hereda** el entorno del host: se construye con
+    ``build_sanitized_environment`` (lista blanca de variables de sistema, ``PATH`` reconstruido y
+    ``TEMP``/``TMP`` redirigidos), la misma frontera que usa el resto de PUNTO. Así el push no
+    recibe credenciales del puesto de trabajo, ni un token de Vercel, ni la cadena de conexión de
+    la base de datos. El prompt interactivo se desactiva para que un remoto sin credenciales falle
+    rápido en vez de quedarse esperando.
     """
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    from punto.tools.shell_policy import build_controlled_path, build_sanitized_environment
+
+    git_dir: Path | None = None
+    found = shutil.which("git")
+    if found:
+        git_dir = Path(found).parent
+    temporary = Path(tempfile.mkdtemp(prefix="punto-push-"))
     try:
+        env = build_sanitized_environment(controlled_temp=temporary, executable_dir=git_dir)
+        env["PATH"] = build_controlled_path(git_dir)
+        env["GIT_TERMINAL_PROMPT"] = "0"
         completed = subprocess.run(
             list(argv),
             cwd=str(root),
@@ -362,6 +374,8 @@ def _default_git_runner(
         )
     except (OSError, subprocess.SubprocessError) as exc:  # git ausente o sin respuesta
         return 1, f"no se pudo ejecutar git: {exc}"
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
     return completed.returncode, f"{completed.stdout}\n{completed.stderr}".strip()
 
 

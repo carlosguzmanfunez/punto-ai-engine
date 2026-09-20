@@ -231,7 +231,10 @@ class ConsoleDependencies:
     targets: Mapping[str, DevelopmentTarget]
     publisher_factory: Callable[[DevelopmentTarget], PublicationService] | None = None
     run_inline: bool = False
-    environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    #: Entorno del que se lee el interlock de publicación (``PUNTO_PRODUCTION_PUSH``). Es una
+    #: **lectura** de configuración del proceso, no el entorno de un comando hijo: la frontera de
+    #: ejecución la construye ``build_sanitized_environment`` cuando de verdad se lanza un proceso.
+    environ: Mapping[str, str] = field(default_factory=os.environ.copy)
 
 
 def _publication_service(

@@ -62,6 +62,7 @@ from punto.orchestrator.focused_resolution import (
     ResolutionState,
     causal_progress,
     declared_unchanged,
+    escalation_resources,
     failure_map,
     normalize_path,
     resolution_block,
@@ -1215,15 +1216,16 @@ class DevelopmentCycle:
         signature: str,
         previous_signature: str,
         still_failing: tuple[str, ...],
+        escalated: tuple[str, ...] = (),
         passed: bool = False,
     ) -> None:
         """Registra qué hizo una ronda con el fallo: sin esto, «cambiar el parche» parece progreso.
 
         La ronda de implementación inicial no es una reparación, pero sus recursos cuentan como ya
         tocados: la brecha causal se mide contra **todo** lo intentado antes, no contra la ronda
-        inmediatamente anterior. Si una reparación repite el mismo fallo sin abordar ni explicar
-        ningún recurso relevante nuevo, se registra ``CAUSAL_STAGNATION`` y la ronda siguiente lo
-        recibe por escrito: no se repite la estrategia en silencio.
+        inmediatamente anterior. Si una reparación repite el mismo fallo sin abordar, explicar ni
+        escalar ningún recurso relevante nuevo, se registra ``CAUSAL_STAGNATION`` y la ronda
+        siguiente lo recibe por escrito: no se repite la estrategia en silencio.
         """
         if failure is None:
             state.touched.update(touched_now)
@@ -1233,6 +1235,7 @@ class DevelopmentCycle:
             touched=touched_now,
             declared=dict(declared_unchanged(payload)),
             authorized=plan.touched_paths(),
+            escalated=escalated,
         )
         if rounds == 0:
             state.touched.update(touched_now)
@@ -1253,6 +1256,7 @@ class DevelopmentCycle:
             previously_explained=state.explained,
             explained_now=explained_now,
             still_failing=still_failing,
+            escalated=escalated,
         )
         state.record(record, explained=explained_now)
         self._log(
@@ -1488,6 +1492,7 @@ class DevelopmentCycle:
 
             # Expansión de alcance: solo con evidencia causal y dentro de la misma clase de riesgo.
             expansion = _scope_expansion(payload)
+            expansion_status = ""
             if expansion is not None:
                 plan, expansion_status = self._handle_scope_expansion(
                     request=request,
@@ -1676,6 +1681,13 @@ class DevelopmentCycle:
                 previous_signature=previous_signature,
                 still_failing=tuple(
                     item.name for item in verification if not item.passed
+                ),
+                # Ampliar el alcance con evidencia es una de las salidas legítimas de una
+                # reparación: cuenta como progreso causal solo si PUNTO la aprobó en esta ronda.
+                escalated=(
+                    escalation_resources(payload)
+                    if expansion_status == "APPROVED"
+                    else ()
                 ),
                 passed=passed,
             )

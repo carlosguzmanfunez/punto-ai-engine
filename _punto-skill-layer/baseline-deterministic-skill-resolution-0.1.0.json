@@ -35,7 +35,7 @@
       "build_contract": 1391
     },
     "dirty_preserved": true,
-    "overhead_ms": 0.121,
+    "overhead_ms": 0.129,
     "plan": {
       "summary": "unificar la lista de tipos en una sola fuente",
       "files_to_read": [
@@ -74,6 +74,18 @@
     },
     "causal_handoff": "{\"chain\":[{\"step\":\"fuente canónica\",\"verification\":\"focused\"},{\"step\":\"consumidores\",\"verification\":\"chain\"}],\"done\":[\"una sola fuente de tipos\"],\"goal\":\"unificar la lista de tipos en una sola fuente\",\"resources\":[\"src/lib/tipos.ts\",\"src/components/Rejilla.tsx\",\"src/components/Buscador.tsx\"],\"verify\":[\"focused\",\"chain\"]}",
     "causal_handoff_chars": 322,
+    "causal_handoff_sent": {
+      "chars": 322,
+      "sha256": "b1f7a19054e830f035326b992e896d9367162ff872e2a4efae80508756fae159",
+      "keys": [
+        "chain",
+        "done",
+        "goal",
+        "resources",
+        "verify"
+      ]
+    },
+    "causal_handoff_matches_final_plan": true,
     "audit_events": [
       {
         "event_type": "BUILD_REQUEST_ACCEPTED",
@@ -87,7 +99,7 @@
         "event_type": "BUILD_REQUEST_NORMALIZED",
         "result": "SUCCESS",
         "metadata": {
-          "baseline": "5dabefdf91d47d4670b0d9dd0fed8d99b8a22b2c",
+          "baseline": "54701b0df63f4bb7fd746a7f5b478499f2f5b08f",
           "branch": "ai/skill-layer-baseline",
           "preexisting_changes": 1,
           "scope_roots": 2
@@ -236,7 +248,7 @@
         "metadata": {
           "fingerprint": "86696f07921af5da9c0c6ce70d54816b4a661ba03e05a53604200ce3f3236783",
           "paths": 1,
-          "snapshot_id": "29e62c1c-5a8d-40a8-a36a-5bda68ffd875"
+          "snapshot_id": "74073348-1d35-47f7-87e0-d1845f268c58"
         }
       },
       {
@@ -247,7 +259,7 @@
           "operation": "MODIFIED",
           "path": "src/lib/tipos.ts",
           "verified": true,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino\\src\\lib"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino\\src\\lib"
         }
       },
       {
@@ -269,13 +281,13 @@
             "import pathlib,sys;texto=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');print('TIPOS:', texto.strip()[:80]);sys.exit(0 if 'Apartamento' in texto else 1)"
           ],
           "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
-          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino",
-          "duration_ms": 60,
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino",
+          "duration_ms": 67,
           "exit_code": 1,
           "name": "focused",
           "stderr": "",
           "timed_out": false,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino"
         }
       },
       {
@@ -287,13 +299,13 @@
             "import pathlib,sys;fuente=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');consumidores=[pathlib.Path(p) for p in ('src/components/Rejilla.tsx','src/components/Buscador.tsx')];ok=all('@/lib/tipos' in c.read_text(encoding='utf-8') for c in consumidores);print('CADENA:', ok);sys.exit(0 if ok and 'Apartamento' in fuente else 1)"
           ],
           "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
-          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino",
-          "duration_ms": 62,
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino",
+          "duration_ms": 65,
           "exit_code": 1,
           "name": "chain",
           "stderr": "",
           "timed_out": false,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino"
         }
       },
       {
@@ -473,7 +485,7 @@
           "operation": "MODIFIED",
           "path": "src/lib/tipos.ts",
           "verified": true,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino\\src\\lib"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino\\src\\lib"
         }
       },
       {
@@ -484,7 +496,7 @@
           "operation": "MODIFIED",
           "path": "src/components/Rejilla.tsx",
           "verified": true,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino\\src\\components"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino\\src\\components"
         }
       },
       {
@@ -495,7 +507,7 @@
           "operation": "MODIFIED",
           "path": "src/components/Buscador.tsx",
           "verified": true,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino\\src\\components"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino\\src\\components"
         }
       },
       {
@@ -525,13 +537,13 @@
             "import pathlib,sys;texto=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');print('TIPOS:', texto.strip()[:80]);sys.exit(0 if 'Apartamento' in texto else 1)"
           ],
           "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
-          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino",
-          "duration_ms": 57,
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino",
+          "duration_ms": 56,
           "exit_code": 0,
           "name": "focused",
           "stderr": "",
           "timed_out": false,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino"
         }
       },
       {
@@ -543,13 +555,13 @@
             "import pathlib,sys;fuente=pathlib.Path('src/lib/tipos.ts').read_text(encoding='utf-8');consumidores=[pathlib.Path(p) for p in ('src/components/Rejilla.tsx','src/components/Buscador.tsx')];ok=all('@/lib/tipos' in c.read_text(encoding='utf-8') for c in consumidores);print('CADENA:', ok);sys.exit(0 if ok and 'Apartamento' in fuente else 1)"
           ],
           "command": "C:\\Users\\Carlos Funez\\Desktop\\punto-ai-engine\\.venv\\Scripts\\python.exe",
-          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino",
-          "duration_ms": 57,
+          "cwd": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino",
+          "duration_ms": 97,
           "exit_code": 0,
           "name": "chain",
           "stderr": "",
           "timed_out": false,
-          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-ly7axlqd\\CASE-A\\destino"
+          "workspace": "C:\\Users\\Carlos Funez\\AppData\\Local\\Temp\\punto-baseline-deterministic-j4nokqh1\\CASE-A\\destino"
         }
       },
       {
@@ -583,6 +595,7 @@
         "metadata": {
           "causal_gap": [],
           "causal_stagnation": false,
+          "escalated_failure_resources": [],
           "failure_resources": [
             "src/lib/tipos.ts",
             "src/components/Rejilla.tsx",
@@ -625,7 +638,7 @@
         "result": "SUCCESS",
         "metadata": {
           "branch": "ai/skill-layer-baseline",
-          "commit_sha": "af74fc32d0cd2cbf296a9d07b585f03f3f57fd1c",
+          "commit_sha": "38bfd48542a4caab987798ac0699886dccb84293",
           "message": "feat(punto): la lista de tipos debe salir de una sola fuente y la verific"
         }
       },
@@ -635,7 +648,7 @@
         "metadata": {
           "applied": 4,
           "authority": "LOCAL_APPLY_ONLY",
-          "commit_sha": "af74fc32d0cd2cbf296a9d07b585f03f3f57fd1c",
+          "commit_sha": "38bfd48542a4caab987798ac0699886dccb84293",
           "published": false,
           "repair_rounds": 1,
           "rolled_back": false,
@@ -774,6 +787,7 @@
         {
           "causal_gap": [],
           "causal_stagnation": false,
+          "escalated_failure_resources": [],
           "failure_resources": [
             "src/lib/tipos.ts",
             "src/components/Rejilla.tsx",
@@ -835,7 +849,7 @@
       "phase": "resolution"
     },
     "record": {
-      "run_id": "3ec6b373-f27f-4fb3-8cce-b6b5130d194f",
+      "run_id": "97a2ba92-1379-4cfe-b3f9-10a9c5ae74d4",
       "task_id": "CASE-A",
       "case_id": "CASE-A",
       "case_kind": "A",
@@ -857,11 +871,11 @@
       "skill_id": "",
       "skill_version": "",
       "skill_activated": false,
-      "started_at": "2026-09-20T08:09:42.096908Z",
-      "finished_at": "2026-09-20T08:09:42.783072Z",
-      "elapsed_ms": 690,
+      "started_at": "2026-09-20T08:20:34.801863Z",
+      "finished_at": "2026-09-20T08:20:35.587868Z",
+      "elapsed_ms": 786,
       "provider_elapsed_ms": 0,
-      "verification_elapsed_ms": 114,
+      "verification_elapsed_ms": 153,
       "provider_calls": 3,
       "provider_calls_by_role": {
         "ARCHITECT": 1,

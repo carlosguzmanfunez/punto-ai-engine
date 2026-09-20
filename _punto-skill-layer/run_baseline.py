@@ -21,6 +21,7 @@ Uso:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -579,12 +580,34 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
     from punto.orchestrator.dev_cycle import causal_handoff
 
     handoff = causal_handoff(result.plan) if result.plan is not None else ""
+    # El handoff que **viajó** es el del plan vigente al empezar la construcción: si una ampliación
+    # de alcance revisa el plan a mitad del ciclo, recomputarlo desde el plan final daría un texto
+    # que el proveedor nunca vio (defecto detectado en la corrida real). Se persiguen las dos cosas:
+    # el texto recomputado y la huella del que se envió.
+    enviado = next(
+        (
+            dict(e.metadata)
+            for e in events
+            if e.event_type.value == "DEV_CAUSAL_HANDOFF"
+        ),
+        {},
+    )
+    huella_enviada = str(enviado.get("sha256", ""))
     return {
         "record": record,
         "status": result.status.value,
         "plan": result.plan.model_dump(mode="json") if result.plan is not None else None,
         "causal_handoff": handoff,
         "causal_handoff_chars": len(handoff),
+        "causal_handoff_sent": {
+            "chars": int(enviado.get("chars", 0) or 0),
+            "sha256": huella_enviada,
+            "keys": [str(item) for item in (enviado.get("keys") or ())],
+        },
+        "causal_handoff_matches_final_plan": (
+            bool(huella_enviada)
+            and huella_enviada == hashlib.sha256(handoff.encode("utf-8")).hexdigest()
+        ),
         "calls_detail": calls_detail,
         "first_attempt": _first_attempt(result, calls_detail, handoff),
         "first_repair": resolution,
@@ -771,6 +794,10 @@ def main() -> int:
                     "plan": item.get("plan"),
                     "causal_handoff": item.get("causal_handoff", ""),
                     "causal_handoff_chars": item.get("causal_handoff_chars", 0),
+                    "causal_handoff_sent": item.get("causal_handoff_sent", {}),
+                    "causal_handoff_matches_final_plan": item.get(
+                        "causal_handoff_matches_final_plan", None
+                    ),
                     "audit_events": item.get("audit_events", []),
                     "calls_detail": item.get("calls_detail", []),
                     "first_attempt": item.get("first_attempt", {}),

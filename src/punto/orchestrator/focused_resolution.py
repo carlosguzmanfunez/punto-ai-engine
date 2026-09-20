@@ -35,7 +35,6 @@ __all__ = [
     "CAUSAL_STAGNATION_LABEL",
     "CHANGED",
     "IMPLEMENTATION_PHASE",
-    "PLAN_CHAIN",
     "RELATION_PLAN_CHAIN",
     "RELATION_VERIFICATION_ARGV",
     "RESOLUTION_CONTRACT",
@@ -43,7 +42,6 @@ __all__ = [
     "RESOLUTION_PHASE",
     "UNCHANGED_BY_EVIDENCE",
     "UNEXPLAINED",
-    "VERIFICATION_ARGV",
     "FailureMap",
     "FailureResource",
     "ProgressRecord",
@@ -53,6 +51,7 @@ __all__ = [
     "causal_progress",
     "declared_unchanged",
     "duplicated_chars",
+    "escalation_resources",
     "failure_map",
     "normalize_path",
     "resolution_block",
@@ -64,9 +63,6 @@ __all__ = [
 RELATION_VERIFICATION_ARGV: Final[str] = "VERIFICATION_ARGV"
 #: Relación **declarada** por el plan: el recurso implementa el eslabón que cita esa verificación.
 RELATION_PLAN_CHAIN: Final[str] = "PLAN_CHAIN"
-#: Alias corto, para leer el estado persistido sin abreviaturas ambiguas.
-VERIFICATION_ARGV: Final[str] = RELATION_VERIFICATION_ARGV
-PLAN_CHAIN: Final[str] = RELATION_PLAN_CHAIN
 
 #: Estados posibles de un recurso relevante para el fallo.
 CHANGED: Final[str] = "CHANGED"
@@ -255,6 +251,27 @@ def declared_unchanged(payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...
     return tuple(out)
 
 
+def escalation_resources(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Recursos cuyo alcance pide ampliar el BUILDER en esta ronda, ya normalizados.
+
+    ``scope_expansion`` es la vía legítima cuando la evidencia demuestra que el recurso necesario
+    está fuera de alcance (y no una forma de tocar de más): sin recursos declarados, no hay nada que
+    considerar ampliado.
+    """
+    raw = payload.get("scope_expansion")
+    if not isinstance(raw, Mapping):
+        return ()
+    resources = raw.get("resources")
+    if not isinstance(resources, list):
+        return ()
+    out: list[str] = []
+    for item in resources:
+        path = normalize_path(str(item))
+        if path and path not in out:
+            out.append(path)
+    return tuple(out)
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceStatus:
     """Qué hizo la reparación con un recurso relevante para el fallo."""
@@ -274,15 +291,22 @@ def resource_statuses(
     touched: Sequence[str],
     declared: Mapping[str, str],
     authorized: Iterable[str],
+    escalated: Iterable[str] = (),
 ) -> tuple[ResourceStatus, ...]:
     """Estado de cada recurso relevante: cambiado, explicado, bloqueado o sin explicar.
 
     ``authorized`` son los recursos que el plan vigente permite escribir. Un recurso relevante que
     no está ahí y que la reparación no tocó queda ``BLOCKED_BY_SCOPE``: la salida correcta es pedir
     ``scope_expansion`` con evidencia, no escribir fuera de alcance.
+
+    ``escalated`` son los recursos cuyo alcance se amplió **en esta misma ronda**: el parche no
+    podía tocarlos cuando se formuló (por eso pidió la ampliación) y el cambio llega en la ronda
+    siguiente. Se distinguen del hueco sin explicar porque ya hay evidencia y una decisión de
+    autoridad detrás (defecto detectado al leer la corrida real: salían como ``UNEXPLAINED``).
     """
     changed = {normalize_path(item) for item in touched}
     allowed = {normalize_path(item) for item in authorized}
+    ampliados = {normalize_path(item) for item in escalated}
     out: list[ResourceStatus] = []
     for path in resources:
         key = normalize_path(path)
@@ -290,6 +314,15 @@ def resource_statuses(
             out.append(ResourceStatus(key, CHANGED))
         elif declared.get(key):
             out.append(ResourceStatus(key, UNCHANGED_BY_EVIDENCE, declared[key][:300]))
+        elif key in ampliados:
+            out.append(
+                ResourceStatus(
+                    key,
+                    BLOCKED_BY_SCOPE,
+                    "fuera del plan al formularse el parche; alcance ampliado con evidencia "
+                    "en esta ronda: el cambio llega en la ronda siguiente",
+                )
+            )
         elif key not in allowed:
             out.append(ResourceStatus(key, BLOCKED_BY_SCOPE))
         else:
@@ -320,6 +353,7 @@ class ProgressRecord:
     new_causal_evidence: bool
     causal_stagnation: bool
     verifications_still_failing: tuple[str, ...] = ()
+    escalated_failure_resources: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """Vista serializable, sin contenido de ficheros."""
@@ -338,6 +372,7 @@ class ProgressRecord:
             "new_causal_evidence": self.new_causal_evidence,
             "causal_stagnation": self.causal_stagnation,
             "verifications_still_failing": list(self.verifications_still_failing),
+            "escalated_failure_resources": list(self.escalated_failure_resources),
         }
 
 
@@ -353,19 +388,23 @@ def causal_progress(
     previously_explained: Iterable[str],
     explained_now: Iterable[str],
     still_failing: Sequence[str] = (),
+    escalated: Iterable[str] = (),
 ) -> ProgressRecord:
     """Decide si una ronda de reparación hizo **progreso causal**, no solo un parche distinto.
 
-    Progreso causal es una de dos cosas: haber abordado un recurso relevante que ninguna reparación
-    anterior tocó, o haber aportado evidencia nueva sobre un recurso que seguía sin explicación.
-    Cambiar de ficheros sin tocar el recurso que la verificación mide no es progreso, y repetir el
-    recurso ya tocado sin evidencia nueva tampoco: en ambos casos el fallo sigue igual.
+    Progreso causal es una de tres cosas: haber abordado un recurso relevante que ninguna reparación
+    anterior tocó, haber aportado evidencia nueva sobre un recurso que seguía sin explicación, o
+    haber pedido con evidencia la ampliación de alcance del recurso que el parche no podía tocar
+    (que es la vía legítima cuando el recurso necesario está fuera de autoridad). Cambiar de
+    ficheros sin tocar el recurso que la verificación mide no es progreso, y repetir el recurso ya
+    tocado sin evidencia nueva tampoco: en ambos casos el fallo sigue igual.
     """
     failure_set = tuple(dict.fromkeys(str(item) for item in failure_resources))
     touched_tuple = tuple(dict.fromkeys(str(item) for item in touched))
     before_touched = {str(item) for item in previously_touched}
     before_explained = {str(item) for item in previously_explained}
     explained = {str(item) for item in explained_now}
+    escalated_set = {normalize_path(str(item)) for item in escalated}
     intersection = tuple(item for item in touched_tuple if item in failure_set)
     newly_addressed = tuple(
         item for item in intersection if item not in before_touched
@@ -375,6 +414,14 @@ def causal_progress(
         item
         for item in failure_set
         if item in explained and item not in before_explained
+    )
+    newly_escalated = tuple(
+        item
+        for item in failure_set
+        if item in escalated_set
+        and item not in before_touched
+        and item not in touched_tuple
+        and item not in before_explained
     )
     gap = tuple(
         item
@@ -387,7 +434,7 @@ def causal_progress(
     same_failure = (
         bool(previous_failure_signature) and failure_signature == previous_failure_signature
     )
-    new_evidence = bool(newly_addressed or newly_explained)
+    new_evidence = bool(newly_addressed or newly_explained or newly_escalated)
     return ProgressRecord(
         round_index=round_index,
         failure_signature=failure_signature,
@@ -403,6 +450,7 @@ def causal_progress(
         new_causal_evidence=new_evidence,
         causal_stagnation=same_failure and not new_evidence,
         verifications_still_failing=tuple(str(item) for item in still_failing),
+        escalated_failure_resources=newly_escalated,
     )
 
 
@@ -445,17 +493,6 @@ class ResolutionState:
             )
         self.stagnation = record.causal_stagnation
         return record
-
-    def as_dict(self) -> dict[str, Any]:
-        """Vista serializable del estado acumulado."""
-        return {
-            "failure_resources": list(self.resources),
-            "touched_resources": sorted(self.touched),
-            "explained_resources": sorted(self.explained),
-            "causal_gap": list(self.causal_gap()),
-            "causal_stagnation": self.stagnation,
-            "records": [item.as_dict() for item in self.records],
-        }
 
 
 def resolution_block(

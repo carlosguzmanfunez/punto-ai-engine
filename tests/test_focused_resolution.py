@@ -48,6 +48,7 @@ from punto.orchestrator.focused_resolution import (
     causal_progress,
     declared_unchanged,
     duplicated_chars,
+    escalation_resources,
     failure_map,
     resolution_block,
     resource_statuses,
@@ -500,6 +501,57 @@ def test_12b_una_declaracion_malformada_no_se_interpreta() -> None:
     )
 
 
+def test_12c_una_ampliacion_aprobada_cuenta_como_progreso_y_no_como_hueco() -> None:
+    """Defecto D-3 (detectado en la corrida real): el recurso escalado no es ``UNEXPLAINED``.
+
+    El parche no podía tocar ese recurso cuando se formuló —pidió ampliar el alcance con evidencia—
+    y el cambio llega en la ronda siguiente. Marcarlo como hueco sin explicar describía mal lo que
+    pasó; y la ampliación aprobada es una de las salidas legítimas, así que cuenta como progreso.
+    """
+    assert escalation_resources(
+        {
+            "scope_expansion": {
+                "resources": ["src/lib/tipos.ts", "src/lib/tipos.ts"],
+                "evidence": ["x"],
+            }
+        }
+    ) == ("src/lib/tipos.ts",)
+    assert escalation_resources({"scope_expansion": {"evidence": ["x"]}}) == ()
+    assert escalation_resources({"changes": []}) == ()
+
+    estados = resource_statuses(
+        resources=("src/lib/tipos.ts", "src/components/Rejilla.tsx"),
+        touched=("src/components/Rejilla.tsx",),
+        declared={},
+        authorized=("src/lib/tipos.ts", "src/components/Rejilla.tsx"),
+        escalated=("src/lib/tipos.ts",),
+    )
+    por_ruta = {item.path: item for item in estados}
+
+    assert por_ruta["src/lib/tipos.ts"].status == BLOCKED_BY_SCOPE
+    assert "ampliado" in por_ruta["src/lib/tipos.ts"].evidence
+    assert por_ruta["src/components/Rejilla.tsx"].status == CHANGED
+
+    record = causal_progress(
+        round_index=1,
+        failure_signature="focused:1:TIPOS: Casa",
+        previous_failure_signature="focused:1:TIPOS: Casa",
+        strategy=("src/components/Rejilla.tsx:MODIFY",),
+        touched=("src/components/Rejilla.tsx",),
+        failure_resources=("src/lib/tipos.ts", "src/components/Rejilla.tsx"),
+        previously_touched=("src/components/Rejilla.tsx",),
+        previously_explained=(),
+        explained_now=(),
+        escalated=("src/lib/tipos.ts",),
+    )
+
+    assert record.escalated_failure_resources == ("src/lib/tipos.ts",)
+    assert record.new_causal_evidence is True
+    assert record.causal_stagnation is False, "escalar con evidencia es una salida legítima"
+    # El recurso sigue en la brecha: la ampliación no aplica el cambio, solo lo autoriza.
+    assert record.causal_gap == ("src/lib/tipos.ts",)
+
+
 # ------------------------------------------------- 13..15 y 18..20: invariantes y fronteras
 def test_13_la_skill_no_expande_autoridad(tmp_path: Path) -> None:
     """Punto 13: la skill es procedimiento; una que pida autoridad no se carga."""
@@ -904,8 +956,12 @@ def _por_contenido(client: _RecordingClient, needle: str) -> str:
 
 def _estados(detalle: Sequence[Mapping[str, Any]]) -> dict[str, str]:
     """Estado de cada recurso relevante según el primer registro de progreso causal."""
-    crudo = _meta(detalle, "DEV_CAUSAL_PROGRESS")[0]["resources_status"]
-    return dict(item.split("=", 1) for item in crudo)
+    return _estados_de(_meta(detalle, "DEV_CAUSAL_PROGRESS")[0])
+
+
+def _estados_de(registro: Mapping[str, Any]) -> dict[str, str]:
+    """Estado de cada recurso a partir de un registro de progreso causal."""
+    return dict(item.split("=", 1) for item in registro["resources_status"])
 
 
 def test_16_ciclo_real_la_resolucion_aborda_el_recurso_discriminante(tmp_path: Path) -> None:
@@ -1035,6 +1091,92 @@ def test_16b_ciclo_real_repetir_el_mismo_parche_es_estancamiento(tmp_path: Path)
     assert estados["src/components/Rejilla.tsx"] == CHANGED
     assert estados["src/components/Buscador.tsx"] == CHANGED
     assert estados["src/lib/tipos.ts"] == UNEXPLAINED
+
+
+def test_16d_ciclo_real_el_recurso_escalado_no_es_un_hueco_sin_explicar(tmp_path: Path) -> None:
+    """Defecto D-3 sobre el ciclo real: la reparación que pide alcance avanza, y no es un hueco.
+
+    Reproduce la forma de la corrida real de CASE-B: el plan no incluye la fuente canónica que la
+    verificación mide, el primer parche toca los consumidores y **pide ampliar el alcance** para la
+    fuente (PUNTO lo aprueba con la evidencia de la verificación), y la segunda reparación aplica el
+    cambio del recurso que quedaba en la brecha.
+    """
+    responses = [
+        _e2e_plan(modify=("src/components/Rejilla.tsx", "src/components/Buscador.tsx")),
+        {"summary": "consumidores", "changes": _consumidores()},
+        {
+            "summary": "consumidores y ampliación",
+            "changes": _consumidores(),
+            "root_cause": "la fuente canónica no declara el tipo que la verificación lee",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "con la fuente autorizada, la verificación puede pasar",
+            "scope_expansion": {
+                "trigger": "evidencia de la verificación focalizada",
+                "evidence": ["focused mide src/lib/tipos.ts y el plan no lo autoriza"],
+                "root_cause": "es la fuente canónica del dato que la verificación exige",
+                "resources": ["src/lib/tipos.ts"],
+                "operations": ["MODIFY"],
+                "relationship": "fuente canónica de la misma cadena funcional",
+            },
+        },
+        {
+            "summary": "fuente canónica",
+            "changes": [
+                {
+                    "path": "src/lib/tipos.ts",
+                    "operation": "MODIFY",
+                    "content": "export const TIPOS = ['Casa', 'Apartamento'];\n",
+                    "reason": "la verificación focalizada mide este fichero",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                }
+            ],
+            "root_cause": "la fuente canónica no declaraba el tipo que la verificación lee",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "la verificación focalizada encuentra el tipo exigido",
+            "unchanged_resources": [
+                {
+                    "path": "src/components/Rejilla.tsx",
+                    "evidence": "ya consume la fuente; chain solo fallaba por la fuente",
+                },
+                {
+                    "path": "src/components/Buscador.tsx",
+                    "evidence": "ya consume la fuente; chain solo fallaba por la fuente",
+                },
+            ],
+        },
+    ]
+    result, detalle, _client = _run_e2e(tmp_path, responses)
+    progreso = _meta(detalle, "DEV_CAUSAL_PROGRESS")
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert result.repair_rounds == 2
+    assert len(progreso) == 2
+    assert _estados_de(progreso[0])["src/lib/tipos.ts"] == BLOCKED_BY_SCOPE
+    assert progreso[0]["escalated_failure_resources"] == ("src/lib/tipos.ts",)
+    assert progreso[0]["causal_stagnation"] is False, "escalar con evidencia no es estancarse"
+    assert _meta(detalle, "DEV_CAUSAL_STAGNATION") == []
+    # La ampliación no aplica el cambio: el recurso sigue en la brecha que guía la ronda siguiente.
+    assert progreso[0]["causal_gap"] == ("src/lib/tipos.ts",)
+    assert _estados_de(progreso[1])["src/lib/tipos.ts"] == CHANGED
+    assert progreso[1]["verification_result"] == "PASSED"
+
+    aprobadas = _meta(detalle, "DEV_SCOPE_EXPANSION_APPROVED")
+    assert len(aprobadas) == 1
+    assert aprobadas[0]["plan_version"] == 2
+    assert list(aprobadas[0]["resources"]) == ["src/lib/tipos.ts"]
+
+
+def test_16e_el_arnes_persiste_el_handoff_que_se_envio() -> None:
+    """Defecto D-4: si el plan se revisa, el handoff recomputado no es el que se envió."""
+    harness = Path(__file__).resolve().parents[1] / "_punto-skill-layer" / "run_baseline.py"
+    texto = harness.read_text(encoding="utf-8")
+
+    for clave in (
+        '"causal_handoff_sent"',
+        '"causal_handoff_matches_final_plan"',
+        "DEV_CAUSAL_HANDOFF",
+    ):
+        assert clave in texto, f"el arnés no persiste {clave}"
 
 
 def test_16c_el_recurso_relevante_que_el_plan_no_autoriza_queda_bloqueado(tmp_path: Path) -> None:

@@ -1,0 +1,287 @@
+{
+  "brazos": [
+    "control",
+    "architect-0.1.0",
+    "architect-0.2.0+handoff",
+    "builder-0.1.0",
+    "resolution-0.1.0"
+  ],
+  "metricas": {
+    "status": {
+      "control": "DEVELOPMENT_VERIFICATION_FAILED",
+      "architect-0.1.0": "DEVELOPMENT_VERIFICATION_FAILED",
+      "architect-0.2.0+handoff": "DEVELOPMENT_VERIFICATION_FAILED",
+      "builder-0.1.0": "DEVELOPMENT_VERIFICATION_FAILED",
+      "resolution-0.1.0": "DEVELOPMENT_COMPLETED"
+    },
+    "success": {
+      "control": false,
+      "architect-0.1.0": false,
+      "architect-0.2.0+handoff": false,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": true
+    },
+    "functional_chain_pass": {
+      "control": false,
+      "architect-0.1.0": false,
+      "architect-0.2.0+handoff": false,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": true
+    },
+    "provider_calls": {
+      "control": 4,
+      "architect-0.1.0": 4,
+      "architect-0.2.0+handoff": 4,
+      "builder-0.1.0": 4,
+      "resolution-0.1.0": 4
+    },
+    "architect_calls": {
+      "control": 1,
+      "architect-0.1.0": 1,
+      "architect-0.2.0+handoff": 1,
+      "builder-0.1.0": 1,
+      "resolution-0.1.0": 1
+    },
+    "builder_calls": {
+      "control": 3,
+      "architect-0.1.0": 3,
+      "architect-0.2.0+handoff": 3,
+      "builder-0.1.0": 3,
+      "resolution-0.1.0": 3
+    },
+    "repair_rounds": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 2
+    },
+    "scope_expansions": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 1,
+      "builder-0.1.0": 1,
+      "resolution-0.1.0": 1
+    },
+    "tool_calls": {
+      "control": 4,
+      "architect-0.1.0": 4,
+      "architect-0.2.0+handoff": 4,
+      "builder-0.1.0": 4,
+      "resolution-0.1.0": 6
+    },
+    "files_read": {
+      "control": 3,
+      "architect-0.1.0": 3,
+      "architect-0.2.0+handoff": 3,
+      "builder-0.1.0": 3,
+      "resolution-0.1.0": 3
+    },
+    "files_changed": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 0,
+      "builder-0.1.0": 0,
+      "resolution-0.1.0": 6
+    },
+    "verification_count": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 2
+    },
+    "verification_failures": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 0
+    },
+    "human_gates": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 0,
+      "builder-0.1.0": 0,
+      "resolution-0.1.0": 0
+    },
+    "prompt_chars": {
+      "control": 13144,
+      "architect-0.1.0": 15906,
+      "architect-0.2.0+handoff": 16924,
+      "builder-0.1.0": 18691,
+      "resolution-0.1.0": 21581
+    },
+    "initial_builder_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 3992
+    },
+    "resolution_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 15329
+    },
+    "input_tokens": {
+      "control": 5440,
+      "architect-0.1.0": 5391,
+      "architect-0.2.0+handoff": 6187,
+      "builder-0.1.0": 8965,
+      "resolution-0.1.0": 9543
+    },
+    "output_tokens": {
+      "control": 10960,
+      "architect-0.1.0": 10128,
+      "architect-0.2.0+handoff": 23111,
+      "builder-0.1.0": 13018,
+      "resolution-0.1.0": 10849
+    },
+    "total_tokens": {
+      "control": 16400,
+      "architect-0.1.0": 15519,
+      "architect-0.2.0+handoff": 29298,
+      "builder-0.1.0": 21983,
+      "resolution-0.1.0": 20392
+    },
+    "provider_elapsed_ms": {
+      "control": 172951,
+      "architect-0.1.0": 201751,
+      "architect-0.2.0+handoff": 364336,
+      "builder-0.1.0": 217280,
+      "resolution-0.1.0": 219520
+    },
+    "elapsed_ms": {
+      "control": 173536,
+      "architect-0.1.0": 203032,
+      "architect-0.2.0+handoff": 365021,
+      "builder-0.1.0": 218566,
+      "resolution-0.1.0": 220502
+    }
+  },
+  "metricas_resolucion": {
+    "first_attempt_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": false
+    },
+    "first_repair_attempted": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true
+    },
+    "first_repair_strategy_changed": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true
+    },
+    "first_repair_addressed_failure_resource": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false
+    },
+    "first_repair_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false
+    },
+    "causal_stagnation_events": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 0
+    },
+    "repair_2_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": 5258,
+      "resolution-0.1.0": 7727
+    }
+  },
+  "propuestas": {
+    "control": [],
+    "architect-0.1.0": [],
+    "architect-0.2.0+handoff": [],
+    "builder-0.1.0": [
+      {
+        "phase": "implementation",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [],
+        "root_cause": ""
+      },
+      {
+        "phase": "repair",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "La fuente canónica src/lib/tipos.ts no incluye 'Apartamento' y los consumidores todavía declaran `tipos` localmente; el archivo de prueba no existe. La verificación exige 'Apartamento' en la fuente e "
+      },
+      {
+        "phase": "repair",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información"
+      }
+    ],
+    "resolution-0.1.0": [
+      {
+        "phase": "implementation",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [
+          "src/lib/tipos.ts"
+        ],
+        "root_cause": ""
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "El recurso canónico src/lib/tipos.ts no contiene 'Apartamento' y los consumidores aún definen arreglos locales, por lo que la verificación centrada en el eslabón 'canonical source' falla y la cadena f"
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/lib/tipos.ts"
+        ],
+        "unchanged_resources": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "root_cause": "src/lib/tipos.ts no incluye el literal 'Apartamento' que la verificación focused comprueba, por lo que la cadena funcional completa falla incluso aunque los consumidores ya importan '@/lib/tipos'."
+      }
+    ]
+  }
+}

@@ -19,6 +19,24 @@ mientras el resultado principal seguía mostrando el `REPOSITORY_DENIED` histór
 
 ## 1. Causa exacta
 
+### 1.0 La evidencia que dejó el intento 3 (estado durable del operador)
+
+Extraída del estado persistido real (`.punto-memory/console-state.json`, fichero que **no** se tocó):
+
+```
+written_at        2026-09-20T21:04:09.918748Z
+runs              3
+attempts[0]       run 3 · started_at 21:04:09.888550Z · status CYCLE_ERROR
+                  error_kind "el ciclo falló: Ruta fuera del workspace"  (40 caracteres)
+                  commit_sha "" · duration_ms null
+result.created_at 2026-09-20T20:31:42.727370Z      <- el resultado PRINCIPAL es del intento 2
+result.error_kind REPOSITORY_DENIED
+```
+
+Es decir: el intento 3 quedó registrado como tal (21:04:09.888) y, sin embargo, el resultado
+operativo principal seguía siendo el del intento anterior (20:31:42) — la desincronización que este
+encargo describe, con sus dos marcas de tiempo.
+
 ### 1.1 Dónde el repositorio real se convierte en «(sin repositorio Git)»
 
 En `GitWorkspace._assert_repo_root` (`src/punto/tools/git.py`). Antes de cualquier operación de Git,
@@ -102,7 +120,8 @@ evento `DEV_CYCLE_BLOCKED`. El ciclo ya no propaga la excepción: el intento tie
 **c) El resultado principal es siempre el del intento** (`src/punto/api/console.py`): si aun así el
 ciclo lanza (excepción no gobernada), la consola construye el resultado real de ese intento
 (`_cycle_failure_result`: código del error si lo trae, causa, y regla/recurso/acción) y **reemplaza**
-`task.result`. Los intentos anteriores quedan solo en `attempts`/`notes`, como historial.
+`task.result`, con la **duración real** medida desde que se abrió el intento. Los intentos anteriores
+quedan solo en `attempts`/`notes`, como historial.
 
 ## 3. Estado antes / después
 
@@ -162,7 +181,7 @@ intactos (probado). El estado real del operador sigue cargando y conserva la Tas
 | `src/punto/tools/errors.py` | `WorkspaceViolationError` con código, regla, recurso y acción; **nuevo** `WorkspaceNotResolvedError` (orden, código de salida y salida del sondeo) |
 | `src/punto/tools/git.py` | `_assert_repo_root`: el sondeo fallido denuncia lo que pasó; la raíz que no es el workspace sigue siendo violación, con su regla |
 | `src/punto/orchestrator/dev_cycle.py` | la denegación de workspace/repositorio se devuelve como bloqueo gobernado (no se propaga) |
-| `src/punto/api/console.py` | `_cycle_failure_result`: el intento siempre reemplaza el resultado principal, con la causa real |
+| `src/punto/api/console.py` | `_cycle_failure_result`: el intento siempre reemplaza el resultado principal, con la causa real y su duración medida |
 | `tests/test_console_rerun_workspace.py` | **nuevo**: las 15 pruebas de esta intervención |
 | `docs/AP000.md` | OBS-04-R2 registrada |
 
@@ -180,7 +199,7 @@ Aprendizaje causal reutilizable registrado y verificado (**1** experiencia, `c0b
 | | |
 | --- | --- |
 | HEAD inicial | `a412331` |
-| HEAD final | `ce89ed5` (implementación y pruebas) + el commit de este informe; **local**, sin push |
+| HEAD final | `ce89ed5` (implementación y pruebas) + `bbdf46f` (duración real del intento fallido) + el commit de este informe; **local**, sin push |
 | repositorio del destino | sin cambios: `ai/punto-inmobiliario-hn-tasks` en `864a314`, solo el ` M .gitignore` preexistente |
 | push / deploy / producción | **NO** |
 | Human Gates | ninguno aprobado ni rechazado |

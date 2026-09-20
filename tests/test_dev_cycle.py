@@ -26,6 +26,7 @@ from punto.memory.experience import ExperienceMemory, ExperienceResult, Experien
 from punto.memory.retrieval import MemoryRetriever
 from punto.memory.store import ExperienceStore
 from punto.orchestrator.dev_cycle import DevelopmentConfig, DevelopmentCycle
+from punto.policy.policy_engine import PolicyEngine
 from punto.providers.base import ModelCompletion
 from punto.providers.contract import (
     ModelUsage,
@@ -56,6 +57,10 @@ from punto.workspace.target import (
 TARGET_ID = "destino-fixture"
 WORK_BRANCH = "ai/pilot-04-fixture"
 SOURCE = "export const TIPOS = ['Casa', 'Apartamento'];\n"
+
+#: Catálogo de autoridad **real** del motor: las pruebas del ciclo se evalúan contra él, no contra
+#: un objeto sin política. Sin esto, el techo de archivos por nivel de autoridad no se ejercía.
+_POLICY_ENGINE = PolicyEngine.from_config()
 
 
 def _git(root: Path, *args: str) -> str:
@@ -276,6 +281,7 @@ def _cycle(
         retriever=retriever,
         store=store,
         audit=logger,
+        policy_engine=_POLICY_ENGINE,
     )
     return cycle, client, logger, target
 
@@ -386,6 +392,94 @@ def test_un_plan_fuera_de_alcance_se_rechaza_sin_escribir(tmp_path: Path) -> Non
     assert (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8") == before
     assert "DEV_PLAN_REJECTED" in _events(logger, request.request_id)
     assert "DEV_CHECKPOINT_CREATED" not in _events(logger, request.request_id)
+
+
+def test_un_plan_que_excede_la_autoridad_autonoma_se_rechaza_sin_escribir(tmp_path: Path) -> None:
+    """El sobre agregado del plan se comprueba **antes** de aplicar, no al confirmar.
+
+    El ciclo escribe fichero a fichero y cada escritura cabe por separado. La operación que agrega
+    el trabajo es la confirmación, y el techo de archivos por nivel de autoridad es un techo duro
+    (nivel 0 = 5): un plan de 6 ficheros no cabe, y tiene que rechazarse en la validación en vez de
+    descubrirlo al confirmar, con el trabajo aplicado y sin poder cerrarlo.
+    """
+    root = _repo(tmp_path)
+    before = {
+        name: (root / "src" / "lib" / name).read_text(encoding="utf-8")
+        for name in ("opciones.ts", *(f"relleno-{index:02d}.ts" for index in range(1, 6)))
+    }
+    plan = _plan(
+        files_to_modify=[
+            "src/lib/opciones.ts",
+            *(f"src/lib/relleno-{index:02d}.ts" for index in range(1, 6)),
+        ]
+    )
+    assert len(plan["files_to_modify"]) == 6
+    cycle, client, logger, _ = _cycle(root, responses=[plan, plan])
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.PLAN_REJECTED
+    assert result.applied == ()
+    assert result.commit_sha == ""
+    codes = [issue.code for issue in result.plan_issues]
+    assert codes == ["PLAN_OUTSIDE_AUTHORITY"]
+    detail = result.plan_issues[0].detail
+    assert "6 fichero(s)" in detail
+    assert "máximo autorizado de 5" in detail
+    # El rechazo se le dice al ARCHITECT en la reintención, por si puede encoger el plan…
+    assert client.calls == 2
+    assert "PLAN_OUTSIDE_AUTHORITY" in client.prompts[1]
+    # …pero no se pide ni un cambio al BUILDER: no hay escritura que revertir.
+    assert all("VALIDATED PLAN:" not in prompt for prompt in client.prompts)
+    for name, content in before.items():
+        assert (root / "src" / "lib" / name).read_text(encoding="utf-8") == content
+    events = _events(logger, request.request_id)
+    assert "DEV_PLAN_REJECTED" in events
+    assert "DEV_CHECKPOINT_CREATED" not in events
+    rejection = next(
+        event
+        for event in logger.by_resource(str(request.request_id))
+        if event.event_type.value == "DEV_PLAN_REJECTED"
+    )
+    assert any(
+        "máximo autorizado de 5" in item
+        for item in dict(rejection.metadata).get("issue_details", [])
+    )
+
+
+def test_un_plan_de_cinco_ficheros_cabe_en_la_autoridad_y_se_confirma(tmp_path: Path) -> None:
+    """Control del límite: 5 ficheros caben en el nivel 0 y el ciclo cierra con commit real."""
+    root = _repo(tmp_path)
+    names = ["opciones.ts", *(f"relleno-{index:02d}.ts" for index in range(1, 5))]
+    plan = _plan(files_to_modify=[f"src/lib/{name}" for name in names])
+    assert len(plan["files_to_modify"]) == 5
+    changes = []
+    for name in names:
+        content = (
+            "export const TIPOS_UI = ['Casa', 'Apartamento'];\n"
+            if name == "opciones.ts"
+            else f"export const RELLENO = '{name}';\n"
+        )
+        changes.append(
+            {
+                "path": f"src/lib/{name}",
+                "operation": "MODIFY",
+                "content": content,
+                "reason": "unificar la fuente de tipos",
+                "acceptance_criterion": "una sola fuente de tipos",
+            }
+        )
+    cycle, _, _, _ = _cycle(
+        root, responses=[plan, _change(summary="cinco ficheros", changes=changes)]
+    )
+
+    result = cycle.run(_request())
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert len(result.applied) == 5
+    assert result.commit_sha
+    assert all(item.passed for item in result.verification)
 
 
 def test_un_plan_con_forma_benigna_se_normaliza(tmp_path: Path) -> None:
@@ -852,6 +946,31 @@ def test_el_proveedor_no_puede_ampliar_el_alcance(tmp_path: Path) -> None:
                 "punto.schemas.dev", fromlist=["ChangeOperation"]
             ).ChangeOperation.MODIFY
         )
+
+
+def test_cada_comando_recibe_el_entorno_de_su_propio_ejecutable(tmp_path: Path) -> None:
+    """El entorno saneado se construye por comando: el `PATH` del primero no condena a los demás.
+
+    Defecto real de PILOT-04: el backend memoriza el entorno con el directorio del **primer**
+    ejecutable. Como el ciclo usa `git` antes que `node`/`npm`, el `PATH` quedaba sin el runtime de
+    Node y sus *shims* fallaban con «node no se reconoce».
+    """
+    root = _repo(tmp_path)
+    policy = RepositoryPolicy(
+        allowed_operations=frozenset({RepositoryOperation.EXECUTE}),
+        allowed_commands=frozenset({"git", "node"}),
+        allowed_command_lines=(("git", "--version"), ("node", "--version")),
+    )
+    repository = GovernedRepository(
+        root=root, task_id=_request().request_id, policy=policy, branch=WORK_BRANCH
+    )
+
+    git = repository.run(("git", "--version"), name="git")
+    node = repository.run(("node", "--version"), name="node")
+
+    assert git.exit_code == 0, git.stderr
+    assert node.exit_code == 0, node.stderr
+    assert node.stdout.strip().startswith("v")
 
 
 def test_un_fichero_de_secretos_no_se_lee(tmp_path: Path) -> None:

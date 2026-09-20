@@ -37,6 +37,7 @@ from typing import Final
 from uuid import UUID
 
 from punto.audit.logger import AuditLogger
+from punto.developer.backend import TrustedLocalBackend
 from punto.developer.context import ExecutionContext
 from punto.memory.experience import ExperienceSecretError, assert_no_secrets
 from punto.policy.policy_engine import PolicyEngine
@@ -135,6 +136,15 @@ class PolicyDeniedError(RepositoryDenied):
     """El catálogo de autoridad no permite la operación."""
 
     code = "POLICY_DENIED"
+
+    def __init__(self, detail: str, *, reason: str = "") -> None:
+        """Guarda, además del detalle, la razón textual que dio el Policy Engine.
+
+        La razón es lo que un llamante puede citar sin arrastrar la lista entera de rutas: el
+        detalle nombra todas las rutas de la operación y puede ser enorme.
+        """
+        super().__init__(detail)
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,7 +459,9 @@ class GovernedRepository:
             raise PolicyDeniedError(
                 f"la política no permite {operation.value} sobre "
                 f"{', '.join(paths) or '(sin rutas)'}: acción {action!r} "
-                f"({decision.authority_level.name}, human={decision.requires_human})"
+                f"({decision.authority_level.name}, human={decision.requires_human}): "
+                f"{decision.reason}",
+                reason=decision.reason,
             )
 
     # ---------------------------------------------------------------- escritura
@@ -518,6 +530,12 @@ class GovernedRepository:
     ) -> CommandResult:
         """Ejecuta un comando autorizado, con allowlist, entorno saneado y sin shell.
 
+        Cada comando se ejecuta con un backend **propio**: el entorno saneado del motor se construye
+        con el directorio del ejecutable que va a correr, y el backend lo memoriza. Reutilizar el
+        mismo backend para todo el ciclo congelaba el ``PATH`` del **primer** programa usado (por
+        ejemplo ``git``) y dejaba sin runtime a los siguientes (``node``, ``npm``): sus *shims*
+        fallaban con «node no se reconoce». Un entorno por comando resuelve la causa, no el síntoma.
+
         Raises:
             OperationNotAuthorizedError: si la operación o el ``argv`` no están autorizados.
             PolicyDeniedError: si el catálogo de autoridad no permite ejecutar.
@@ -529,7 +547,7 @@ class GovernedRepository:
             args=tuple(argv[1:]),
             timeout_seconds=timeout_seconds or self.policy.command_timeout_seconds,
         )
-        result = self._shell.run(request, name=name)
+        result = ShellRunner(self.context, backend=TrustedLocalBackend()).run(request, name=name)
         if self.audit is not None:
             self.audit.log_command_executed(
                 task_id=self.task_id, result=result, actor=self.actor

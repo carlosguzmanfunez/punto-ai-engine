@@ -268,13 +268,20 @@ class DevelopmentCycle:
             },
         )
 
-        plan, plan_issues = self._plan(request, target, inventory["selected"], retrieval)
+        plan, plan_issues = self._plan(
+            request, target, inventory["selected"], retrieval, repository
+        )
         if plan is None or plan_issues:
             self._log(
                 AuditEventType.DEV_PLAN_REJECTED,
                 "dev_plan_rejected",
                 request,
-                {"issue_codes": [issue.code for issue in plan_issues]},
+                {
+                    "issue_codes": [issue.code for issue in plan_issues],
+                    "issue_details": [
+                        f"{issue.code}: {issue.detail[:200]}" for issue in plan_issues
+                    ],
+                },
                 AuditResult.FAILURE,
             )
             return self._result(
@@ -512,6 +519,7 @@ class DevelopmentCycle:
         target: DevelopmentTarget,
         context_files: Sequence[ContextFile],
         retrieval: RetrievalOutcome,
+        repository: GovernedRepository,
     ) -> tuple[DevelopmentPlan | None, tuple[BuildValidationIssue, ...]]:
         """Pide el plan al ARCHITECT y lo valida con las reglas de PUNTO.
 
@@ -519,6 +527,10 @@ class DevelopmentCycle:
         sola vez explicando por qué se rechazó: un transporte puede ignorar el JSON Schema, así que
         el contrato también va escrito en el prompt, y una segunda respuesta con el motivo del
         rechazo delante es más útil que rendirse. El límite es una reintención, no un bucle.
+
+        La validación incluye el **sobre agregado** del plan contra el catálogo de autoridad del
+        motor: si el plan no cabe en la autoridad autónoma, se rechaza aquí, antes de escribir un
+        solo fichero, en vez de descubrirlo al confirmar con el trabajo ya hecho.
         """
         issues: tuple[BuildValidationIssue, ...] = ()
         plan: DevelopmentPlan | None = None
@@ -550,6 +562,9 @@ class DevelopmentCycle:
                 issues = (BuildValidationIssue(code="PLAN_INVALID", detail=str(exc)[:300]),)
                 continue
             issues = self._validate_plan(plan, target, request)
+            envelope = self._envelope_issue(plan, repository)
+            if envelope is not None:
+                issues = (*issues, envelope)
             if not issues:
                 return plan, ()
         return plan, issues
@@ -608,6 +623,40 @@ class DevelopmentCycle:
                     )
                 )
         return tuple(issues)
+
+    def _envelope_issue(
+        self, plan: DevelopmentPlan, repository: GovernedRepository
+    ) -> BuildValidationIssue | None:
+        """Comprueba el sobre agregado del plan contra la autoridad del motor.
+
+        El ciclo escribe fichero a fichero, y cada escritura cabe por separado en la autoridad
+        autónoma. La operación que **agrega** el trabajo es la confirmación (``COMMIT``), así que
+        es ella la que se evalúa con el inventario completo del plan antes de tocar nada: el techo
+        de archivos por nivel de autoridad es un techo duro, y un plan que no cabe se rechaza en la
+        validación en vez de dejar el trabajo aplicado y sin poder confirmar.
+
+        Returns:
+            La incidencia si el catálogo de autoridad no admite el plan; ``None`` si cabe.
+        """
+        touched = plan.touched_paths()
+        if not touched:
+            return None
+        try:
+            repository.authorize(
+                RepositoryOperation.COMMIT,
+                paths=touched,
+                description="validación del sobre agregado del plan antes de aplicar",
+            )
+        except RepositoryDenied as exc:
+            reason = getattr(exc, "reason", "") or exc.detail
+            return BuildValidationIssue(
+                code="PLAN_OUTSIDE_AUTHORITY",
+                detail=(
+                    f"el plan toca {len(touched)} fichero(s) y la autoridad del motor no "
+                    f"alcanza para confirmarlos: {reason}"
+                )[:300],
+            )
+        return None
 
     # ------------------------------------------------------------ build + apply
     def _build_and_apply(
@@ -1244,6 +1293,10 @@ class DevelopmentCycle:
         )
         lines.append(
             "ALLOWED PATHS: " + (" | ".join(target.scope_roots) or "(todo el repositorio)")
+        )
+        lines.append(
+            "MAX FILES YOU MAY TOUCH: "
+            f"{min(self.config.max_files_changed, target.max_files_changed)}"
         )
         for item in context_files:
             lines.append(f"\n===== {item.path} (sha256={item.sha256[:12]}) =====\n{item.content}")

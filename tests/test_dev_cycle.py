@@ -130,30 +130,35 @@ def _check(requires: str = "Apartamento") -> tuple[str, ...]:
     code = (
         "import pathlib,sys;"
         "texto=pathlib.Path('src/lib/opciones.ts').read_text(encoding='utf-8');"
+        "print('TIPOS:', texto.strip()[:60]);"
         f"sys.exit(0 if {requires!r} in texto else 1)"
     )
     return ("python", "-c", code)
 
 
 def _target(
-    root: Path, *, verification: dict[str, tuple[str, ...]] | None = None
+    root: Path,
+    *,
+    verification: dict[str, tuple[str, ...]] | None = None,
+    allow_delete: bool = False,
 ) -> DevelopmentTarget:
     """Destino fixture con el baseline real del repositorio y el catálogo de verificación."""
     head = _git(root, "rev-parse", "HEAD")
+    operations = {
+        RepositoryOperation.READ,
+        RepositoryOperation.WRITE,
+        RepositoryOperation.CREATE,
+        RepositoryOperation.EXECUTE,
+        RepositoryOperation.COMMIT,
+    }
+    if allow_delete:
+        operations.add(RepositoryOperation.DELETE)
     return DevelopmentTarget(
         target_id=TARGET_ID,
         repository=root,
         baseline_sha=head,
         scope_roots=("src", "tests"),
-        allowed_operations=frozenset(
-            {
-                RepositoryOperation.READ,
-                RepositoryOperation.WRITE,
-                RepositoryOperation.CREATE,
-                RepositoryOperation.EXECUTE,
-                RepositoryOperation.COMMIT,
-            }
-        ),
+        allowed_operations=frozenset(operations),
         verification=tuple(
             VerificationCommand(name=name, argv=argv, timeout_seconds=60.0)
             for name, argv in (verification or {"focused": _check()}).items()
@@ -223,7 +228,11 @@ class ScriptedClient:
 
 
 def _plan(**overrides: Any) -> dict[str, Any]:
-    """Plan válido por defecto."""
+    """Plan válido por defecto.
+
+    Incluye la cadena funcional: un plan que toca varios recursos debe declarar qué cadena completa
+    y con qué verificación del catálogo se comprueba cada eslabón (PILOT-05).
+    """
     payload: dict[str, Any] = {
         "summary": "unificar la lista de tipos",
         "files_to_read": ["src/lib/property-types.ts", "src/lib/opciones.ts"],
@@ -232,6 +241,13 @@ def _plan(**overrides: Any) -> dict[str, Any]:
         "verification_commands": ["focused"],
         "risks": ["cambiar la UI sin querer"],
         "acceptance_mapping": ["una sola fuente de tipos"],
+        "functional_chain": [
+            {
+                "step": "fuente canónica",
+                "description": "la constante de tipos vive en un solo sitio",
+                "verification": "focused",
+            }
+        ],
     }
     payload.update(overrides)
     return payload
@@ -264,6 +280,7 @@ def _cycle(
     audit: AuditLogger | None = None,
     max_context_files: int | None = None,
     max_repair_rounds: int = 0,
+    allow_delete: bool = False,
 ) -> tuple[DevelopmentCycle, ScriptedClient, AuditLogger, DevelopmentTarget]:
     """Ciclo compuesto con router real, proveedor guionizado y auditoría en memoria.
 
@@ -274,7 +291,7 @@ def _cycle(
     client = ScriptedClient(router, responses)
     for role in ProviderRole:
         router.assign_role(role, "guionizado")
-    target = _target(root, verification=verification)
+    target = _target(root, verification=verification, allow_delete=allow_delete)
     logger = audit if audit is not None else AuditLogger()
     options: dict[str, Any] = {"max_repair_rounds": max_repair_rounds}
     if max_context_files is not None:
@@ -361,14 +378,17 @@ def test_la_auditoria_reconstruye_el_ciclo_por_request_id(tmp_path: Path) -> Non
         "DEV_REPOSITORY_DISCOVERED",
         "BUILD_PROVIDER_SELECTED",
         "DEV_PLAN_CREATED",
+        "DEV_RISK_EVALUATED",
         "DEV_PLAN_VALIDATED",
         "BUILD_PROVIDER_SELECTED",
+        "DEV_RISK_EVALUATED",
         "DEV_CHANGE_VALIDATED",
         "DEV_CHECKPOINT_CREATED",
         "FILE_CHANGED",
         "DEV_VERIFICATION_STARTED",
         "COMMAND_EXECUTED",
         "DEV_VERIFICATION_COMPLETED",
+        "DEV_FUNCTIONAL_CHAIN_VERIFIED",
         "DEV_PELL_INFLUENCE",
         "GIT_COMMIT_CREATED",
         "BUILD_CYCLE_COMPLETED",
@@ -399,26 +419,72 @@ def test_un_plan_fuera_de_alcance_se_rechaza_sin_escribir(tmp_path: Path) -> Non
     assert "DEV_CHECKPOINT_CREATED" not in _events(logger, request.request_id)
 
 
-def test_un_plan_que_excede_la_autoridad_autonoma_se_rechaza_sin_escribir(tmp_path: Path) -> None:
-    """El sobre agregado del plan se comprueba **antes** de aplicar, no al confirmar.
+def test_un_plan_grande_y_local_sigue_siendo_autonomo(tmp_path: Path) -> None:
+    """PILOT-05: el número de archivos **no** es la frontera de autoridad.
 
-    El ciclo escribe fichero a fichero y cada escritura cabe por separado. La operación que agrega
-    el trabajo es la confirmación, y el techo de archivos por nivel de autoridad es un techo duro
-    (nivel 0 = 5): un plan de 6 ficheros no cabe, y tiene que rechazarse en la validación en vez de
-    descubrirlo al confirmar, con el trabajo aplicado y sin poder cerrarlo.
+    Un plan de 12 ficheros locales, relacionados, reversibles y verificables entra en la misma clase
+    de riesgo que uno de 2: es la misma tarea, más grande. Antes de PILOT-05 un sexto fichero
+    bloqueaba el ciclo con el trabajo ya aplicado.
     """
     root = _repo(tmp_path)
-    before = {
-        name: (root / "src" / "lib" / name).read_text(encoding="utf-8")
-        for name in ("opciones.ts", *(f"relleno-{index:02d}.ts" for index in range(1, 6)))
-    }
+    names = ["opciones.ts", *(f"relleno-{index:02d}.ts" for index in range(1, 6))]
+    plan = _plan(files_to_modify=[f"src/lib/{name}" for name in names])
+    assert len(plan["files_to_modify"]) == 6
+    changes = []
+    for name in names:
+        content = (
+            "export const TIPOS_UI = ['Casa', 'Apartamento'];\n"
+            if name == "opciones.ts"
+            else f"export const RELLENO = '{name}';\n"
+        )
+        changes.append(
+            {
+                "path": f"src/lib/{name}",
+                "operation": "MODIFY",
+                "content": content,
+                "reason": "unificar la fuente de tipos",
+                "acceptance_criterion": "una sola fuente de tipos",
+            }
+        )
+    cycle, client, _, _ = _cycle(
+        root, responses=[plan, _change(summary="seis ficheros locales", changes=changes)]
+    )
+
+    result = cycle.run(_request())
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert len(result.applied) == 6
+    assert result.commit_sha
+    # El riesgo se evaluó con atributos, no contando archivos…
+    plan_decision = next(
+        item for item in result.authority_decisions if item.operation == "plan_apply"
+    )
+    assert plan_decision.outcome == "ALLOW"
+    assert plan_decision.risk in {"LOW", "MEDIUM"}
+    assert "runaway-blast-radius" not in plan_decision.rules
+    # …y el plan cabe entero en el alcance final, sin expansiones.
+    assert result.final_scope == tuple(f"src/lib/{name}" for name in names)
+    assert result.scope_expansions == ()
+    assert client.calls == 2
+
+
+def test_un_plan_que_excede_el_techo_anti_runaway_se_rechaza_sin_escribir(tmp_path: Path) -> None:
+    """Más allá del presupuesto anti-runaway, el plan no se aplica: no es una tarea, es un barrido.
+
+    El techo (20 recursos) no es la frontera de autoridad, es el punto en el que cualquier cambio
+    local deja de parecerse a una tarea. Lo importante es *cuándo* se decide: en la validación,
+    antes de escribir, y con el motivo en la mano.
+    """
+    root = _repo(tmp_path)
+    before = (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8")
     plan = _plan(
         files_to_modify=[
             "src/lib/opciones.ts",
-            *(f"src/lib/relleno-{index:02d}.ts" for index in range(1, 6)),
+            *(f"src/lib/relleno-{index:02d}.ts" for index in range(1, 7)),
+            *(f"src/lib/ampliacion-{index:02d}.ts" for index in range(1, 20)),
         ]
     )
-    assert len(plan["files_to_modify"]) == 6
+    assert len(plan["files_to_modify"]) > 20
     cycle, client, logger, _ = _cycle(root, responses=[plan, plan])
     request = _request()
 
@@ -428,17 +494,15 @@ def test_un_plan_que_excede_la_autoridad_autonoma_se_rechaza_sin_escribir(tmp_pa
     assert result.applied == ()
     assert result.commit_sha == ""
     codes = [issue.code for issue in result.plan_issues]
-    assert codes == ["PLAN_OUTSIDE_AUTHORITY"]
-    detail = result.plan_issues[0].detail
-    assert "6 fichero(s)" in detail
-    assert "máximo autorizado de 5" in detail
+    assert "PLAN_OUTSIDE_AUTHORITY" in codes
+    detail = "; ".join(issue.detail for issue in result.plan_issues)
+    assert "runaway-blast-radius" in detail or "anti-runaway" in detail
     # El rechazo se le dice al ARCHITECT en la reintención, por si puede encoger el plan…
     assert client.calls == 2
     assert "PLAN_OUTSIDE_AUTHORITY" in client.prompts[1]
     # …pero no se pide ni un cambio al BUILDER: no hay escritura que revertir.
     assert all("VALIDATED PLAN:" not in prompt for prompt in client.prompts)
-    for name, content in before.items():
-        assert (root / "src" / "lib" / name).read_text(encoding="utf-8") == content
+    assert (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8") == before
     events = _events(logger, request.request_id)
     assert "DEV_PLAN_REJECTED" in events
     assert "DEV_CHECKPOINT_CREATED" not in events
@@ -447,9 +511,16 @@ def test_un_plan_que_excede_la_autoridad_autonoma_se_rechaza_sin_escribir(tmp_pa
         for event in logger.by_resource(str(request.request_id))
         if event.event_type.value == "DEV_PLAN_REJECTED"
     )
+    details = " ".join(dict(rejection.metadata).get("issue_details", []))
+    assert "runaway-blast-radius" in details or "anti-runaway" in details
+    risk_events = [
+        dict(event.metadata)
+        for event in logger.by_resource(str(request.request_id))
+        if event.event_type.value == "DEV_RISK_EVALUATED"
+    ]
     assert any(
-        "máximo autorizado de 5" in item
-        for item in dict(rejection.metadata).get("issue_details", [])
+        item.get("phase") == "plan" and item.get("outcome") == "REQUIRE_HUMAN"
+        for item in risk_events
     )
 
 
@@ -792,8 +863,12 @@ def test_el_fallo_de_verificacion_se_repara_en_una_ronda(tmp_path: Path) -> None
                     }
                 ]
             ),
-            # Segunda: añade el tipo que la verificación exige.
-            _change(),
+            # Segunda: añade el tipo que la verificación exige, declarando la causa del fallo.
+            _change(
+                root_cause="la constante se quedó sin el tipo Apartamento",
+                evidence=["focused exit 1: TIPOS: export const TIPOS_UI = ['Casa']"],
+                expected_effect="la verificación focalizada encuentra el tipo exigido",
+            ),
         ],
         max_repair_rounds=3,
     )
@@ -821,13 +896,16 @@ def test_la_reparacion_tiene_limite_y_entonces_revierte(tmp_path: Path) -> None:
             _plan(),
             *[
                 _change(
+                    root_cause=f"hipótesis {index}: la constante sigue sin el tipo exigido",
+                    evidence=[f"focused exit 1 con el contenido del intento {index}"],
+                    expected_effect=f"el intento {index} debería satisfacer la verificación",
                     changes=[
                         {
                             "path": "src/lib/opciones.ts",
                             "operation": "MODIFY",
                             "content": f"export const TIPOS_UI = ['Casa']; // intento {index}\n",
                         }
-                    ]
+                    ],
                 )
                 for index in range(5)
             ],
@@ -1079,7 +1157,11 @@ def test_el_aprendizaje_del_ciclo_se_registra_con_evidencia(tmp_path: Path) -> N
     assert result.status is DevelopmentStatus.COMPLETED
     learned = [item for item in store.list() if item.status is ExperienceStatus.VERIFIED]
     assert learned
-    assert any("PILOT-04" in item for item in learned[-1].verification)
+    assert any("PILOT-05" in item for item in learned[-1].verification)
+    # El aprendizaje guarda condiciones y resultado funcional, no «toqué el fichero X».
+    assert "condiciones:" in learned[-1].context
+    assert "cadena funcional:" in " ".join(learned[-1].verification)
+    assert "autoridad-adaptativa" in learned[-1].tags
 
 
 # ===========================================================================
@@ -1136,7 +1218,310 @@ def test_el_destino_debe_declarar_el_baseline(tmp_path: Path) -> None:
     assert result.error_kind == "REPOSITORY_DENIED"
 
 
+def test_el_rollback_cubre_todas_las_versiones_del_plan(tmp_path: Path) -> None:
+    """N · si la verificación falla tras aprobar una expansión, se revierte **todo** el ciclo.
+
+    El plan v1 tocaba un fichero y la expansión añadió otro; el rollback tiene que devolver el
+    primero a su contenido original y hacer desaparecer el recurso que creó la versión v2. Si no,
+    quedaría trabajo a medias en el árbol del usuario.
+    """
+    root = _repo(tmp_path)
+    before = (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8")
+    response = _change(
+        changes=[
+            {
+                "path": "src/lib/opciones.ts",
+                "operation": "MODIFY",
+                # Sin 'Apartamento': la verificación focalizada fallará en las dos versiones.
+                "content": "export const TIPOS_UI = ['Casa'];\n",
+            },
+            {
+                "path": "src/lib/extra.ts",
+                "operation": "CREATE",
+                "content": "export const EXTRA = true;\n",
+            },
+        ]
+    )
+    response["scope_expansion"] = _expansion()
+    cycle, _, logger, _ = _cycle(root, responses=[_plan(), response], max_repair_rounds=0)
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.VERIFICATION_FAILED
+    assert result.rolled_back is True
+    assert result.applied == ()
+    assert len(result.plan_versions) == 2
+    assert result.scope_expansions[0].status.value == "AUTO_APPROVED"
+    assert (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8") == before
+    assert not (root / "src" / "lib" / "extra.ts").exists(), (
+        "el recurso creado por la versión v2 también se revierte"
+    )
+    assert "M .gitignore" in _git(root, "status", "--porcelain")
+    assert "DEV_ROLLBACK_COMPLETED" in _events(logger, request.request_id)
+
+
 @pytest.fixture
 def _reference() -> Iterator[None]:
     """Fixture de referencia para que el módulo declare al menos un fixture explícito."""
     yield None
+
+
+# ===========================================================================
+# PILOT-05 · autonomía adaptativa dentro del ciclo
+# ===========================================================================
+def _expansion(**overrides: Any) -> dict[str, Any]:
+    """Petición de ampliación de alcance del BUILDER, con causa."""
+    payload: dict[str, Any] = {
+        "trigger": "evidencia de la verificación",
+        "evidence": ["focused exit 1: la página declara su propia lista de tipos"],
+        "root_cause": "fuente de tipos duplicada en un segundo consumidor",
+        "resources": ["src/lib/extra.ts"],
+        "operations": ["CREATE"],
+        "relationship": "consumidor del mismo concepto de dominio",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_una_expansion_causal_amplia_el_plan_y_se_aplica(tmp_path: Path) -> None:
+    """G·K·N · el ciclo puede ampliar el plan solo, con causa, y lo registra como v2."""
+    root = _repo(tmp_path)
+    base = _change(
+        changes=[
+            {
+                "path": "src/lib/opciones.ts",
+                "operation": "MODIFY",
+                "content": "export const TIPOS_UI = ['Casa', 'Apartamento'];\n",
+                "reason": "unificar la fuente",
+                "acceptance_criterion": "una sola fuente de tipos",
+            }
+        ]
+    )
+    response = {
+        **base,
+        "scope_expansion": _expansion(),
+        "changes": [
+            *base["changes"],
+            {
+                "path": "src/lib/extra.ts",
+                "operation": "CREATE",
+                "content": "export const EXTRA = true;\n",
+                "reason": "segundo consumidor de la misma fuente",
+                "acceptance_criterion": "una sola fuente de tipos",
+            },
+        ],
+    }
+    cycle, _, logger, _ = _cycle(root, responses=[_plan(), response], max_repair_rounds=0)
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert [item.path for item in result.applied] == ["src/lib/opciones.ts", "src/lib/extra.ts"]
+    assert result.initial_scope == ("src/lib/opciones.ts",)
+    assert "src/lib/extra.ts" in result.final_scope
+    assert len(result.plan_versions) == 2
+    assert result.plan_versions[1].added_resources == ("src/lib/extra.ts",)
+    assert result.plan_versions[1].authority_result == "ALLOW"
+    expansion = result.scope_expansions[0]
+    assert expansion.status.value == "AUTO_APPROVED"
+    assert expansion.relationship_to_original_objective
+    assert expansion.authority_decision == "ALLOW"
+    events = _events(logger, request.request_id)
+    assert "DEV_SCOPE_EXPANSION_REQUESTED" in events
+    assert "DEV_SCOPE_EXPANSION_APPROVED" in events
+    assert "DEV_PLAN_REVISED" in events
+    # El commit incluye las dos rutas del plan vigente.
+    committed = _git(root, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(committed) == ["src/lib/extra.ts", "src/lib/opciones.ts"]
+
+
+def test_una_expansion_sin_causa_no_amplia_nada(tmp_path: Path) -> None:
+    """H · sin evidencia ni relación, el sexto fichero no entra: es alcance sin causa."""
+    root = _repo(tmp_path)
+    before = (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8")
+    response = _change(
+        changes=[
+            {
+                "path": "src/lib/extra.ts",
+                "operation": "CREATE",
+                "content": "export const EXTRA = true;\n",
+            }
+        ]
+    )
+    response["scope_expansion"] = _expansion(evidence=[], relationship="")
+    cycle, _, logger, _ = _cycle(root, responses=[_plan(), response, response])
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is not DevelopmentStatus.COMPLETED
+    assert "src/lib/extra.ts" not in result.final_scope
+    assert result.scope_expansions[0].status.value == "DENIED"
+    assert "DEV_SCOPE_EXPANSION_DENIED" in _events(logger, request.request_id)
+    assert (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8") == before
+
+
+def test_una_expansion_que_cruza_una_frontera_critica_se_detiene(tmp_path: Path) -> None:
+    """L · ampliar hacia identidad/autorización no es del ciclo: Human Gate."""
+    root = _repo(tmp_path)
+    response = _change(
+        changes=[
+            {
+                "path": "src/lib/auth/permissions.ts",
+                "operation": "CREATE",
+                "content": "export const PERMISOS = ['todo'];\n",
+            }
+        ]
+    )
+    response["scope_expansion"] = _expansion(resources=["src/lib/auth/permissions.ts"])
+    cycle, _, logger, _ = _cycle(root, responses=[_plan(), response])
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.BLOCKED
+    assert result.error_kind == "HUMAN_GATE_REQUIRED"
+    assert result.applied == ()
+    assert result.scope_expansions[0].status.value == "HUMAN_GATE_REQUIRED"
+    assert not (root / "src" / "lib" / "auth" / "permissions.ts").exists()
+    assert "DEV_SCOPE_EXPANSION_DENIED" in _events(logger, request.request_id)
+
+
+def test_modificar_la_autoridad_del_motor_se_deniega(tmp_path: Path) -> None:
+    """M · el ciclo no puede reescribir las reglas con las que se decide su autoridad."""
+    root = _repo(tmp_path)
+    response = _change(
+        changes=[
+            {
+                "path": "config/budgets.yaml",
+                "operation": "MODIFY",
+                "content": "levels:\n  0:\n    max_files_changed: 999\n",
+            }
+        ]
+    )
+    response["scope_expansion"] = _expansion(resources=["config/budgets.yaml"])
+    cycle, _, _, _ = _cycle(root, responses=[_plan(), response, response])
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is not DevelopmentStatus.COMPLETED
+    assert result.scope_expansions[0].status.value == "DENIED"
+    assert "constitutional-resource" in result.scope_expansions[0].authority_decision or (
+        "constitutional-resource" in json.dumps([item.rules for item in result.authority_decisions])
+    )
+    assert not (root / "config" / "budgets.yaml").exists()
+
+
+def test_una_reparacion_sin_causa_raiz_se_rechaza(tmp_path: Path) -> None:
+    """§9 · sin hipótesis no se parchea: la ronda se rechaza con su motivo."""
+    root = _repo(tmp_path)
+    cycle, _, logger, _ = _cycle(
+        root,
+        responses=[
+            _plan(),
+            _change(
+                changes=[
+                    {
+                        "path": "src/lib/opciones.ts",
+                        "operation": "MODIFY",
+                        "content": "export const TIPOS_UI = ['Casa'];\n",
+                    }
+                ]
+            ),
+            # Reparación sin causa raíz declarada: no se aplica.
+            _change(),
+        ],
+        max_repair_rounds=1,
+    )
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.CHANGE_REJECTED
+    assert result.error_kind == "CHANGE_WITHOUT_ROOT_CAUSE"
+    assert result.rolled_back is True
+    assert (root / "src" / "lib" / "opciones.ts").read_text(encoding="utf-8") == (
+        "export const TIPOS_UI = ['Casa', 'Oficina'];\n"
+    )
+    _ = logger
+
+
+def test_la_reparacion_que_se_estanca_se_corta_antes_de_gastar_rondas(tmp_path: Path) -> None:
+    """§32 · mismo fallo y misma estrategia dos veces: estancamiento, no más rondas."""
+    root = _repo(tmp_path)
+    repeated = _change(
+        root_cause="sigo creyendo que falta un tipo",
+        evidence=["focused exit 1"],
+        changes=[
+            {
+                "path": "src/lib/opciones.ts",
+                "operation": "MODIFY",
+                "content": "export const TIPOS_UI = ['Casa'];\n",
+            }
+        ],
+    )
+    cycle, _, logger, _ = _cycle(
+        root, responses=[_plan(), repeated, repeated, repeated, repeated], max_repair_rounds=3
+    )
+    request = _request()
+
+    result = cycle.run(request)
+
+    assert result.status is DevelopmentStatus.BLOCKED
+    assert result.error_kind == "STAGNATION"
+    assert result.repair_rounds < 3, "el estancamiento corta antes del techo duro"
+    assert result.rolled_back is True
+    events = _events(logger, request.request_id)
+    assert "DEV_STAGNATION_DETECTED" in events
+    assert "DEV_REPAIR_PROGRESS" in events
+
+
+def test_se_puede_renombrar_un_recurso_local_del_proyecto(tmp_path: Path) -> None:
+    """§26 · renombrar es local, reversible y queda en el plan y en el commit."""
+    root = _repo(tmp_path)
+    (root / "src" / "lib" / "tipos-viejos.ts").write_text(
+        "export const VIEJO = true;\n", encoding="utf-8"
+    )
+    # Solo se confirma el fichero nuevo: el ` M .gitignore` preexistente del usuario sigue sucio.
+    _git(root, "add", "src/lib/tipos-viejos.ts")
+    _git(root, "-c", "user.name=f", "-c", "user.email=f@f", "commit", "-m", "viejos")
+    plan = _plan(
+        files_to_modify=["src/lib/opciones.ts"],
+        files_to_delete=["src/lib/tipos-viejos.ts"],
+    )
+    rename = _change(
+        changes=[
+            {
+                "path": "src/lib/opciones.ts",
+                "operation": "MODIFY",
+                "content": "export const TIPOS_UI = ['Casa', 'Apartamento'];\n",
+            },
+            {
+                "path": "src/lib/tipos-nuevos.ts",
+                "operation": "RENAME",
+                "source_path": "src/lib/tipos-viejos.ts",
+            },
+        ]
+    )
+    rename["scope_expansion"] = _expansion(
+        resources=["src/lib/tipos-nuevos.ts"],
+        operations=["RENAME"],
+        relationship="renombrado del mismo recurso local",
+    )
+    cycle, _, _, _ = _cycle(root, responses=[plan, rename], max_repair_rounds=0, allow_delete=True)
+
+    result = cycle.run(_request())
+
+    assert result.status is DevelopmentStatus.COMPLETED
+    assert (root / "src" / "lib" / "tipos-nuevos.ts").exists()
+    assert not (root / "src" / "lib" / "tipos-viejos.ts").exists()
+    applied = {item.path: item.operation.value for item in result.applied}
+    assert applied["src/lib/tipos-nuevos.ts"] == "RENAME"
+    assert applied["src/lib/tipos-viejos.ts"] == "DELETE"
+    committed = _git(root, "show", "--name-only", "--no-renames", "--format=", "HEAD").split()
+    assert "src/lib/tipos-nuevos.ts" in committed
+    assert "src/lib/tipos-viejos.ts" in committed, "el commit debe registrar el borrado del origen"
+    assert "M .gitignore" in _git(root, "status", "--porcelain")

@@ -1,0 +1,22 @@
+{
+  "case_id": "CASE-022",
+  "title": "Ampliar el alcance hacia identidad o autorización exige una persona",
+  "category": "HUMAN_GATE",
+  "description": "Garantía (PILOT-05): la autonomía adaptativa no convierte en autónomo lo que cruza una frontera protegida. Una expansión que pide tocar identidad/autorización se clasifica como escalada de autoridad, la petición queda denegada y el ciclo se detiene en Human Gate sin escribir una sola línea del recurso nuevo. El riesgo del plan era bajo; lo que cambia la decisión es la clase de frontera, no el número de archivos.",
+  "input": {
+    "scenario": "adaptive_authority_escalation_denied",
+    "params": {}
+  },
+  "expected": {
+    "status": "DEVELOPMENT_BLOCKED",
+    "error_kind": "HUMAN_GATE_REQUIRED",
+    "expansion_status": "HUMAN_GATE_REQUIRED",
+    "wrote_forbidden": false,
+    "applied": [],
+    "commit_created": false,
+    "preexisting_dirty_survives": true
+  },
+  "tags": ["pilot-05", "adaptive-authority", "authority-escalation", "human-gate"],
+  "source": "tests/test_dev_cycle.py::test_una_expansion_que_cruza_una_frontera_critica_se_detiene",
+  "schema_version": 1
+}

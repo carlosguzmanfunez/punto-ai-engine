@@ -1,0 +1,20 @@
+{
+  "case_id": "CASE-023",
+  "title": "El ciclo no puede reescribir las reglas de su propia autoridad",
+  "category": "FAIL_CLOSED",
+  "description": "Garantía (PILOT-05): modificar el presupuesto o la política que decide cuánto puede modificar el motor es autoelevación de autoridad. La petición —presentada como una ampliación de alcance más, con evidencia y relación— se deniega con la regla constitucional a la vista, no se escribe nada en el recurso protegido y el árbol queda intacto. La denegación es determinista y explicable regla a regla.",
+  "input": {
+    "scenario": "adaptive_constitutional_protection",
+    "params": {}
+  },
+  "expected": {
+    "expansion_status": "DENIED",
+    "wrote_forbidden": false,
+    "applied": [],
+    "commit_created": false,
+    "preexisting_dirty_survives": true
+  },
+  "tags": ["pilot-05", "adaptive-authority", "self-elevation", "constitutional", "fail-closed"],
+  "source": "tests/test_dev_cycle.py::test_modificar_la_autoridad_del_motor_se_deniega",
+  "schema_version": 1
+}

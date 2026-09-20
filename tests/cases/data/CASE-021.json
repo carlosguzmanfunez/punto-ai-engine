@@ -1,0 +1,23 @@
+{
+  "case_id": "CASE-021",
+  "title": "Una expansión de alcance con causa entra sola y deja la cadena funcional verificada",
+  "category": "AUTHORITY",
+  "description": "Garantía (PILOT-05): cuando la evidencia de la verificación demuestra que otro recurso pertenece a la misma cadena funcional, el ciclo amplía el plan de forma autónoma (v1 → v2), recalcula el riesgo, aplica el cambio nuevo y confirma que la cadena completa quedó verificada. No hace falta una persona para trabajar más en el mismo problema de bajo riesgo, y el plan revisado queda registrado con su delta.",
+  "input": {
+    "scenario": "adaptive_causal_scope_expansion",
+    "params": {}
+  },
+  "expected": {
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_versions": 2,
+    "expansion_status": "AUTO_APPROVED",
+    "expansion_resources": ["src/lib/extra.ts"],
+    "chain": "VERIFIED",
+    "authority_outcomes": ["ALLOW"],
+    "commit_created": true,
+    "preexisting_dirty_survives": true
+  },
+  "tags": ["pilot-05", "adaptive-authority", "scope-expansion", "functional-chain"],
+  "source": "tests/test_dev_cycle.py::test_una_expansion_causal_amplia_el_plan_y_se_aplica",
+  "schema_version": 1
+}

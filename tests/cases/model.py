@@ -20,6 +20,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 #: Versión del esquema que entiende este runner. Un caso con otra versión es inválido.
 SCHEMA_VERSION = 1
 
+#: Hechos de PILOT-05: alcance, versiones del plan, expansión con su delta de riesgo, niveles de
+#: riesgo y resultado de la cadena funcional del ciclo de desarrollo gobernado.
+_DEVELOPMENT_EXPECTATION_KEYS: frozenset[str] = frozenset(
+    {
+        "applied",
+        "authority_outcomes",
+        "chain",
+        "commit_created",
+        "denied_rules",
+        "error_kind",
+        "expansion_resources",
+        "expansion_status",
+        "plan_versions",
+        "preexisting_dirty_survives",
+        "risk_levels",
+        "status",
+        "wrote_forbidden",
+    }
+)
+
 #: Vocabulario cerrado de ``expected``: lo que el runner sabe comparar contra los hechos.
 EXPECTATION_KEYS: frozenset[str] = frozenset(
     {
@@ -62,6 +82,7 @@ EXPECTATION_KEYS: frozenset[str] = frozenset(
         "secret_visible_in_ui",
         "subscription_api_fallback_used",
         "subscription_error_kind",
+        *_DEVELOPMENT_EXPECTATION_KEYS,
     }
 )
 

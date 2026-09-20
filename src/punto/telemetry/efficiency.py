@@ -139,6 +139,13 @@ class EfficiencyRecord(BaseModel):
     builder_skill_activated: bool = False
     builder_skill_chars: int = Field(default=0, ge=0)
 
+    #: Skill de **resolución** (EXPERIMENTO 03): la que solo actúa cuando una verificación real ya
+    #: falló. Se registra aparte de la del BUILDER para que no se puedan confundir.
+    resolution_skill_id: str = Field(default="", max_length=80)
+    resolution_skill_version: str = Field(default="", max_length=20)
+    resolution_skill_activated: bool = False
+    resolution_skill_chars: int = Field(default=0, ge=0)
+
     #: Handoff causal plan → BUILDER: si viajó y cuánto ocupó (SKILL-LAYER-0, ronda 2).
     causal_handoff_present: bool = False
     causal_handoff_chars: int = Field(default=0, ge=0)
@@ -182,6 +189,10 @@ class EfficiencyRecord(BaseModel):
 
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     prompt_chars: int = Field(default=0, ge=0)
+    #: Prompt de la **primera** implementación y de las invocaciones de **resolución**, medidos por
+    #: separado: es la única forma de comparar el coste de resolver contra el de implementar.
+    initial_builder_prompt_chars: int = Field(default=0, ge=0)
+    resolution_prompt_chars: int = Field(default=0, ge=0)
     context_chars: int = Field(default=0, ge=0)
 
     success: bool = False
@@ -231,6 +242,21 @@ def _role_counts(calls: tuple[ProviderCall, ...]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _prompt_chars_for_phase(calls: tuple[ProviderCall, ...], phase: str) -> int:
+    """Caracteres de prompt enviados en una fase observable, sumando las llamadas de esa fase."""
+    return sum(call.prompt_chars for call in calls if call.phase == phase)
+
+
+def _first_prompt_chars(
+    calls: tuple[ProviderCall, ...], role: str, phases: frozenset[str]
+) -> int:
+    """Caracteres del prompt de la primera llamada de un rol en las fases indicadas."""
+    for call in calls:
+        if call.role == role and call.phase in phases:
+            return call.prompt_chars
+    return 0
+
+
 def build_record(
     evidence: RunEvidence,
     *,
@@ -243,6 +269,10 @@ def build_record(
     builder_skill_version: str = "",
     builder_skill_activated: bool = False,
     builder_skill_chars: int = 0,
+    resolution_skill_id: str = "",
+    resolution_skill_version: str = "",
+    resolution_skill_activated: bool = False,
+    resolution_skill_chars: int = 0,
     causal_handoff_present: bool = False,
     causal_handoff_chars: int = 0,
     skill_id: str = "",
@@ -273,6 +303,10 @@ def build_record(
         builder_skill_version=builder_skill_version,
         builder_skill_activated=builder_skill_activated,
         builder_skill_chars=builder_skill_chars,
+        resolution_skill_id=resolution_skill_id,
+        resolution_skill_version=resolution_skill_version,
+        resolution_skill_activated=resolution_skill_activated,
+        resolution_skill_chars=resolution_skill_chars,
         causal_handoff_present=causal_handoff_present,
         causal_handoff_chars=causal_handoff_chars,
         skill_id=skill_id,
@@ -306,6 +340,10 @@ def build_record(
         human_gates=evidence.human_gates,
         tokens=_aggregate_tokens(calls),
         prompt_chars=sum(call.prompt_chars for call in calls),
+        initial_builder_prompt_chars=_first_prompt_chars(
+            calls, "BUILDER", frozenset({"implementation"})
+        ),
+        resolution_prompt_chars=_prompt_chars_for_phase(calls, "resolution"),
         context_chars=evidence.context_chars or sum(call.context_chars for call in calls),
         success=evidence.success,
         final_status=evidence.final_status,

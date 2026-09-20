@@ -157,7 +157,15 @@ class _ObservedRouter:
 
 
 def _phase_of(prompt: str, context: str) -> str:
-    """Fase observable de una invocación, derivada del contrato que PUNTO escribió en el prompt."""
+    """Fase observable de una invocación, derivada del contrato que PUNTO escribió en el prompt.
+
+    La resolución se reconoce por su bloque de entrada: es la única fase que existe **después** de
+    un fallo real medido, y por eso la skill de resolución solo puede activarse ahí.
+    """
+    from punto.orchestrator.focused_resolution import RESOLUTION_INPUT_LABEL
+
+    if RESOLUTION_INPUT_LABEL in prompt or RESOLUTION_INPUT_LABEL in context:
+        return "resolution"
     if '"functional_chain"' in prompt or "files_to_modify" in prompt:
         return "planning"
     if "VERIFICATION FAILED" in context or "REJECTED CHANGES" in context:
@@ -215,7 +223,9 @@ def _proposal_summary(content: str) -> dict[str, Any]:
     """Resumen **estructurado** de lo que propuso el BUILDER, sin contenido de ficheros.
 
     Es lo que permite diagnosticar qué criterio o recurso quedó sin cubrir sin volver a llamar al
-    proveedor: rutas, operaciones, criterio de aceptación citado y si declaró causa raíz.
+    proveedor: rutas, operaciones, criterio de aceptación citado y si declaró causa raíz. En una
+    resolución incluye además qué recursos declaró sin cambio (``unchanged_resources``): es la
+    diferencia entre explicar y simplemente no tocar.
     """
     import json as _json
 
@@ -226,6 +236,7 @@ def _proposal_summary(content: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"parsed": False, "chars": len(content)}
     changes = payload.get("changes")
+    sin_cambio = payload.get("unchanged_resources")
     resumen = {
         "parsed": True,
         "chars": len(content),
@@ -240,6 +251,10 @@ def _proposal_summary(content: str) -> dict[str, Any]:
             if isinstance(item, dict)
         ],
         "root_cause": str(payload.get("root_cause", ""))[:200],
+        "unchanged_resources": [
+            str(item.get("path", "")) if isinstance(item, dict) else str(item)
+            for item in (sin_cambio if isinstance(sin_cambio, list) else [])
+        ],
         "scope_expansion": bool(payload.get("scope_expansion")),
         "context_requests": len(payload.get("context_requests") or []),
     }
@@ -273,6 +288,66 @@ def _first_attempt(result: Any, calls_detail: list[dict[str, Any]], handoff: str
         "missing_resources": [item for item in recursos if item not in tocados],
         "declared_root_cause": bool(primera.get("root_cause")),
         "failed_verifications": [item.name for item in result.verification if not item.passed],
+    }
+
+
+def _resolution_evidence(
+    events: list[Any], calls: list[dict[str, Any]], result: Any
+) -> dict[str, Any]:
+    """Evidencia de la fase de resolución y **métrica principal** del experimento 03.
+
+    La pregunta del encargo no es si el primer intento acierta (no es el trabajo de esta skill),
+    sino si **la primera reparación posterior a un fallo real** aborda el recurso que la
+    verificación mide. Todo se deriva de la auditoría del ciclo, sin volver a llamar a nadie.
+    """
+    entradas = [
+        dict(e.metadata) for e in events if e.event_type.value == "DEV_RESOLUTION_INPUT"
+    ]
+    progreso = [
+        dict(e.metadata) for e in events if e.event_type.value == "DEV_CAUSAL_PROGRESS"
+    ]
+    estancamiento = [
+        dict(e.metadata) for e in events if e.event_type.value == "DEV_CAUSAL_STAGNATION"
+    ]
+    previas = [
+        dict(e.metadata)
+        for e in events
+        if e.event_type.value == "DEV_REPAIR_PROGRESS" and dict(e.metadata).get("round") == 0
+    ]
+    estrategia_previa = (
+        "|".join(str(item) for item in previas[-1].get("strategy", ())) if previas else ""
+    )
+    primera = progreso[0] if progreso else {}
+    return {
+        "resolution_inputs": entradas,
+        "progress_records": progreso,
+        "causal_stagnation_events": len(estancamiento),
+        "first_repair_attempted": bool(progreso),
+        "first_repair_strategy_changed": (
+            bool(progreso)
+            and str(primera.get("strategy_signature", "")) != estrategia_previa
+        ),
+        "first_repair_addressed_failure_resource": bool(
+            primera.get("newly_addressed_failure_resources")
+        ),
+        "first_repair_pass": bool(primera)
+        and primera.get("verification_result") == "PASSED",
+        "first_repair_causal_gap": list(primera.get("causal_gap", ())),
+        "previous_strategy": estrategia_previa,
+        "resolution_prompt_chars": sum(
+            item["prompt_chars"] for item in calls if item["phase"] == "resolution"
+        ),
+        "initial_builder_prompt_chars": next(
+            (
+                item["prompt_chars"]
+                for item in calls
+                if item["role"] == "BUILDER" and item["phase"] == "implementation"
+            ),
+            0,
+        ),
+        "resolution_block_chars": [int(item.get("block_chars", 0) or 0) for item in entradas],
+        "builder_calls": sum(1 for item in calls if item["role"] == "BUILDER"),
+        "repair_rounds": int(getattr(result, "repair_rounds", 0) or 0),
     }
 
 
@@ -330,6 +405,7 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
     audit = AuditLogger()
     skill_reference = os.environ.get("PUNTO_ARCHITECT_SKILL", "").strip()
     builder_skill_reference = os.environ.get("PUNTO_BUILDER_SKILL", "").strip()
+    resolution_skill_reference = os.environ.get("PUNTO_RESOLUTION_SKILL", "").strip()
     cycle = DevelopmentCycle(
         router=observed,  # type: ignore[arg-type]
         targets=DevelopmentTargetRegistry({TARGET_ID: target}),
@@ -337,6 +413,7 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
             max_repair_rounds=2,
             architect_skill=skill_reference,
             builder_skill=builder_skill_reference,
+            resolution_skill=resolution_skill_reference,
         ),
         audit=audit,
     )
@@ -393,7 +470,24 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
     activation = next(
         (item for item in activations if item.get("role", "ARCHITECT") == "ARCHITECT"), {}
     )
-    builder_activation = next((item for item in activations if item.get("role") == "BUILDER"), {})
+    # La skill del BUILDER (implementación) y la de **resolución** se registran por separado: si no,
+    # una corrida de resolución parecería una corrida con skill de implementación.
+    builder_activation = next(
+        (
+            item
+            for item in activations
+            if item.get("role") == "BUILDER" and item.get("phase") != "resolution"
+        ),
+        {},
+    )
+    resolution_activation = next(
+        (
+            item
+            for item in activations
+            if item.get("role") == "BUILDER" and item.get("phase") == "resolution"
+        ),
+        {},
+    )
     verification_failures = sum(1 for item in result.verification if not item.passed)
     calls_detail = [
         {
@@ -437,6 +531,7 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
         notes=(f"proveedores: {sorted({item['provider'] for item in observed.calls})}",),
     )
     recorded_ms = time.perf_counter()
+    resolution = _resolution_evidence(events, observed.calls, result)
     record = build_record(
         evidence,
         task_id=case["case_id"],
@@ -451,6 +546,11 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
         builder_skill_version=str(builder_activation.get("skill_version", "")),
         builder_skill_activated=bool(builder_activation.get("activated", False)),
         builder_skill_chars=int(builder_activation.get("chars", 0) or 0),
+        resolution_skill_id=str(resolution_activation.get("skill_id", "")),
+        resolution_skill_version=str(resolution_activation.get("skill_version", "")),
+        resolution_skill_activated=bool(resolution_activation.get("activated", False)),
+        resolution_skill_chars=int(resolution_activation.get("chars", 0) or 0),
+        stagnation_events=resolution["causal_stagnation_events"],
         causal_handoff_present=bool(
             next(
                 (
@@ -487,6 +587,15 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
         "causal_handoff_chars": len(handoff),
         "calls_detail": calls_detail,
         "first_attempt": _first_attempt(result, calls_detail, handoff),
+        "first_repair": resolution,
+        "resolution_skill": {
+            "skill_id": resolution_activation.get("skill_id", ""),
+            "skill_version": resolution_activation.get("skill_version", ""),
+            "activated": bool(resolution_activation.get("activated", False)),
+            "chars": int(resolution_activation.get("chars", 0) or 0),
+            "sha256": resolution_activation.get("sha256", ""),
+            "phase": resolution_activation.get("phase", ""),
+        },
         "audit_events": [
             {
                 "event_type": event.event_type.value,
@@ -603,7 +712,12 @@ def main() -> int:
         cases = [item for item in cases if item["case_id"] == wanted]
     results: list[dict[str, Any]] = []
     root = Path(tempfile.mkdtemp(prefix=f"punto-baseline-{mode.lower()}-"))
-    print(f"modo={mode} casos={[c['case_id'] for c in cases]} skill={skill or '(ninguna)'}")
+    print(
+        f"modo={mode} casos={[c['case_id'] for c in cases]} "
+        f"architect={skill or '(ninguna)'} "
+        f"builder={os.environ.get('PUNTO_BUILDER_SKILL', '').strip() or '(ninguna)'} "
+        f"resolution={os.environ.get('PUNTO_RESOLUTION_SKILL', '').strip() or '(ninguna)'}"
+    )
     for case in cases:
         case_root = root / case["case_id"]
         case_root.mkdir(parents=True, exist_ok=True)
@@ -613,24 +727,29 @@ def main() -> int:
             outcome = _run_case(case, mode=mode, root=case_root)
         results.append({"case": case["case_id"], "kind": case["kind"], **outcome})
         record = outcome["record"]
+        reparacion = outcome.get("first_repair", {})
         print(
             f"[{case['case_id']}] {outcome['status']:24} "
             f"elapsed={record.elapsed_ms:6}ms calls={record.provider_calls} "
             f"repairs={record.repair_rounds} prompt={record.prompt_chars}c "
             f"ctx={record.context_chars}c tokens={record.tokens.source} "
-            f"chain={record.functional_chain_pass}"
+            f"chain={record.functional_chain_pass} "
+            f"first_repair_pass={reparacion.get('first_repair_pass', 'N/A')} "
+            f"gap={reparacion.get('first_repair_causal_gap', [])}"
         )
     EVIDENCE.mkdir(exist_ok=True)
-    # El nombre lleva la versión de la skill: sin ella, una corrida nueva pisaría la evidencia
-    # de la anterior y se perdería el control (defecto detectado en la ronda 2).
     # El nombre lleva la versión de **cada** skill declarada: mirar solo la del ARCHITECT hizo que
-    # una corrida del BUILDER pisara la evidencia del control (defecto detectado en el experimento 02).
+    # una corrida del BUILDER pisara la evidencia del control (defecto detectado en el experimento
+    # 02) y que una corrida de resolución pisara la de la implementación.
     partes: list[str] = []
     if skill:
         partes.append(f"architect-{skill.partition('@')[2] or 'sin-version'}")
     if os.environ.get("PUNTO_BUILDER_SKILL", "").strip():
         builder = os.environ["PUNTO_BUILDER_SKILL"].strip()
         partes.append(f"builder-{builder.partition('@')[2] or 'sin-version'}")
+    if os.environ.get("PUNTO_RESOLUTION_SKILL", "").strip():
+        resolution_ref = os.environ["PUNTO_RESOLUTION_SKILL"].strip()
+        partes.append(f"resolution-{resolution_ref.partition('@')[2] or 'sin-version'}")
     suffix = f"-skill-{'-'.join(partes)}" if partes else ""
     evidence_name = f"baseline-{mode.lower()}{suffix}.json"
     (EVIDENCE / evidence_name).write_text(
@@ -655,6 +774,8 @@ def main() -> int:
                     "audit_events": item.get("audit_events", []),
                     "calls_detail": item.get("calls_detail", []),
                     "first_attempt": item.get("first_attempt", {}),
+                    "first_repair": item.get("first_repair", {}),
+                    "resolution_skill": item.get("resolution_skill", {}),
                     "record": item["record"].as_dict(),
                 }
                 for item in results

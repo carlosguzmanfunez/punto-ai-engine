@@ -1,0 +1,19 @@
+{
+  "skill_id": "punto-focused-resolution",
+  "skill_version": "0.1.0",
+  "skill_role": "BUILDER",
+  "skill_sha256": "a0486da6454f4a8ea6b62020e229a6ec7023769ef3ccffc7cf34dee0a9a64f2e",
+  "resolution_skill_chars": 1286,
+  "resolution_context_chars": 1146,
+  "causal_handoff_chars": 322,
+  "expected_resolution_prompt_chars": 4210,
+  "expected_initial_prompt_chars": 3064,
+  "duplicated_procedural_chars": 0,
+  "duplicated_context_chars": 0,
+  "resolution_lines": 12,
+  "labels_present_once": {
+    "resolution_input": true,
+    "causal_handoff": true
+  },
+  "resolution_block": "RESOLUTION INPUT (real verification failure; fix the cause, do not repeat the previous strategy):\nROUND: 1\nFAILED VERIFICATIONS: focused | chain\nRELEVANT RESOURCES (what each failed verification measures):\n- src/lib/tipos.ts [VERIFICATION_ARGV] <- focused, chain\n- src/components/Rejilla.tsx [VERIFICATION_ARGV] <- chain\n- src/components/Buscador.tsx [VERIFICATION_ARGV] <- chain\nFAILURE EVIDENCE: see VERIFICATION FAILED AND MUST BE FIXED above (excerpts).\nPREVIOUS PATCH (already changed): src/components/Buscador.tsx | src/components/Rejilla.tsx\nPREVIOUS STRATEGY: src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY\nCAUSAL GAP (relevant resource never changed and never explained): src/lib/tipos.ts\nRESOLUTION CONTRACT: answer with \"root_cause\" (one operational hypothesis), \"evidence\" (the verification output that supports it) and \"expected_effect\", plus the minimal \"changes\" that resolve it. For every relevant resource you do NOT change, declare it in \"unchanged_resources\" as {\"path\": \"...\", \"evidence\": \"why it needs no change\"}; if it is outside the plan, ask for scope_expansion with evidence instead of assuming it."
+}

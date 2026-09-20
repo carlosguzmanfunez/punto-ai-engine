@@ -338,6 +338,12 @@ class AuditEventType(StrEnum):
     DEV_CAUSAL_HANDOFF = "DEV_CAUSAL_HANDOFF"
     #: SKILL-LAYER-0: se activó una skill para un rol, con su identificador, versión y huella.
     DEV_SKILL_ACTIVATED = "DEV_SKILL_ACTIVATED"
+    #: EXPERIMENTO 03: entrada de resolución de un fallo real (qué mide cada verificación fallida).
+    DEV_RESOLUTION_INPUT = "DEV_RESOLUTION_INPUT"
+    #: EXPERIMENTO 03: progreso causal de una ronda (¿tocó el recurso del fallo o solo el parche?).
+    DEV_CAUSAL_PROGRESS = "DEV_CAUSAL_PROGRESS"
+    #: EXPERIMENTO 03: el mismo fallo siguió sin abordar ni explicar el recurso relevante.
+    DEV_CAUSAL_STAGNATION = "DEV_CAUSAL_STAGNATION"
 
 
 class AuditEvent(BaseModel):

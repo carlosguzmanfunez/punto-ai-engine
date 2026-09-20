@@ -54,6 +54,19 @@ from punto.memory.retrieval import (
     render_experience_block,
 )
 from punto.memory.store import ExperienceStore
+from punto.orchestrator.focused_resolution import (
+    IMPLEMENTATION_PHASE,
+    RESOLUTION_PHASE,
+    UNCHANGED_BY_EVIDENCE,
+    FailureMap,
+    ResolutionState,
+    causal_progress,
+    declared_unchanged,
+    failure_map,
+    normalize_path,
+    resolution_block,
+    resource_statuses,
+)
 from punto.policy.config_loader import ConfigLoader
 from punto.policy.envelope import (
     AUTONOMOUS_MAX_FILES,
@@ -96,6 +109,7 @@ from punto.schemas.enums import AuditResult
 from punto.schemas.execution import CommandResult
 from punto.schemas.repair import RepairSnapshot
 from punto.security.deterministic import SECRET_PATTERNS
+from punto.skills import SkillActivation
 from punto.workflow.snapshots import FileRepairSnapshots
 from punto.workspace.repository import (
     GovernedRepository,
@@ -211,6 +225,10 @@ class DevelopmentConfig:
     causal_handoff: bool = True
     #: Skill experimental del BUILDER (``id`` o ``id@version``), declarada por el operador.
     builder_skill: str = ""
+    #: Skill experimental de **resolución** (EXPERIMENTO 03): se activa **solo** cuando existe un
+    #: fallo real de verificación, nunca en el prompt del ARCHITECT ni en la implementación inicial.
+    #: Así la variable medida es la resolución posterior al fallo, no la primera implementación.
+    resolution_skill: str = ""
     #: Skill experimental del ARCHITECT (``id`` o ``id@version``), declarada por el operador.
     #:
     #: Vacío significa el comportamiento de siempre: sin skill, las instrucciones del ARCHITECT son
@@ -267,7 +285,9 @@ class DevelopmentCycle:
     _functional_chain_result: str = field(default="", init=False, repr=False)
     _last_root_cause: str = field(default="", init=False, repr=False)
     _last_risk: str = field(default="", init=False, repr=False)
-    _skill_activations: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _skill_activations: dict[str, SkillActivation] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -1181,6 +1201,89 @@ class DevelopmentCycle:
         return True, ()
 
     # ------------------------------------------------------------ build + apply
+    def _record_resolution_progress(
+        self,
+        *,
+        request: BuildRequest,
+        rounds: int,
+        state: ResolutionState,
+        failure: FailureMap | None,
+        plan: DevelopmentPlan,
+        payload: Mapping[str, Any],
+        touched_now: tuple[str, ...],
+        strategy: tuple[str, ...],
+        signature: str,
+        previous_signature: str,
+        still_failing: tuple[str, ...],
+        passed: bool = False,
+    ) -> None:
+        """Registra qué hizo una ronda con el fallo: sin esto, «cambiar el parche» parece progreso.
+
+        La ronda de implementación inicial no es una reparación, pero sus recursos cuentan como ya
+        tocados: la brecha causal se mide contra **todo** lo intentado antes, no contra la ronda
+        inmediatamente anterior. Si una reparación repite el mismo fallo sin abordar ni explicar
+        ningún recurso relevante nuevo, se registra ``CAUSAL_STAGNATION`` y la ronda siguiente lo
+        recibe por escrito: no se repite la estrategia en silencio.
+        """
+        if failure is None:
+            state.touched.update(touched_now)
+            return
+        statuses = resource_statuses(
+            resources=failure.paths,
+            touched=touched_now,
+            declared=dict(declared_unchanged(payload)),
+            authorized=plan.touched_paths(),
+        )
+        if rounds == 0:
+            state.touched.update(touched_now)
+            return
+        explained_now = {
+            item.path: item.evidence
+            for item in statuses
+            if item.status == UNCHANGED_BY_EVIDENCE
+        }
+        record = causal_progress(
+            round_index=rounds,
+            failure_signature=signature,
+            previous_failure_signature=previous_signature,
+            strategy=strategy,
+            touched=touched_now,
+            failure_resources=failure.paths,
+            previously_touched=state.touched,
+            previously_explained=state.explained,
+            explained_now=explained_now,
+            still_failing=still_failing,
+        )
+        state.record(record, explained=explained_now)
+        self._log(
+            AuditEventType.DEV_CAUSAL_PROGRESS,
+            "dev_causal_progress",
+            request,
+            {
+                **record.as_dict(),
+                # Lista plana y legible: los metadatos de auditoría se congelan, no se anidan.
+                "resources_status": [
+                    f"{item.path}={item.status}" for item in statuses
+                ],
+                "verification_result": "PASSED" if passed else "FAILED",
+            },
+            AuditResult.SUCCESS if passed else AuditResult.FAILURE,
+        )
+        if record.causal_stagnation:
+            self._log(
+                AuditEventType.DEV_CAUSAL_STAGNATION,
+                "dev_causal_stagnation",
+                request,
+                {
+                    "round": rounds,
+                    "failure_signature": signature,
+                    "strategy_signature": record.strategy_signature,
+                    "causal_gap": list(record.causal_gap),
+                    "repeated_failure_resources": list(record.repeated_failure_resources),
+                },
+                AuditResult.FAILURE,
+            )
+
     def _build_and_apply(
         self,
         *,
@@ -1238,12 +1341,69 @@ class DevelopmentCycle:
         previous_signature = ""
         previous_strategy: tuple[str, ...] = ()
         stagnation_streak = 0
+        # EXPERIMENTO 03: estado acumulado de la resolución (qué se tocó, qué se explicó y si el
+        # fallo dejó de avanzar). Es local a la ejecución: un ciclo nuevo empieza sin memoria.
+        resolution = ResolutionState()
 
         for _ in range(self.config.max_repair_rounds + 1):
-            prompt = self._build_prompt(
-                request, target, plan, context_files, pell_block, failure_evidence
+            # La skill de resolución solo actúa sobre un **fallo real ya medido**: sin verificación
+            # fallida no hay nada que resolver, y la implementación inicial no la recibe.
+            failed_now = tuple(item for item in verification if not item.passed)
+            resolution_phase = bool(failed_now)
+            current_failure = (
+                failure_map(verification, target, plan) if resolution_phase else None
             )
-            result = self._invoke(ProviderRole.BUILDER, request, prompt, BUILD_SCHEMA)
+            block = ""
+            if current_failure is not None:
+                causal_gap = resolution.observe_failure(current_failure)
+                block = resolution_block(
+                    round_index=rounds,
+                    failure=current_failure,
+                    previous_patch=sorted(resolution.touched),
+                    previous_strategy=(
+                        resolution.records[-1].strategy_signature if resolution.records else ""
+                    ),
+                    causal_gap=causal_gap,
+                    stagnation=resolution.stagnation,
+                )
+                # Los metadatos de auditoría se congelan (una lista se vuelve tupla y un objeto se
+                # vuelve pares), así que la evidencia se registra en listas planas y legibles.
+                self._log(
+                    AuditEventType.DEV_RESOLUTION_INPUT,
+                    "dev_resolution_input",
+                    request,
+                    {
+                        "round": rounds,
+                        "failed": list(current_failure.failed),
+                        "resource_paths": list(current_failure.paths),
+                        "resource_relations": [
+                            f"{item.path}={item.relation}"
+                            for item in current_failure.resources
+                        ],
+                        "unmapped": list(current_failure.unmapped),
+                        "previous_patch": sorted(resolution.touched),
+                        "causal_gap": list(causal_gap),
+                        "causal_stagnation": resolution.stagnation,
+                        "block_chars": len(block),
+                    },
+                    AuditResult.FAILURE,
+                )
+            prompt = self._build_prompt(
+                request,
+                target,
+                plan,
+                context_files,
+                pell_block,
+                failure_evidence,
+                resolution=block,
+            )
+            result = self._invoke(
+                ProviderRole.BUILDER,
+                request,
+                prompt,
+                BUILD_SCHEMA,
+                phase=RESOLUTION_PHASE if resolution_phase else IMPLEMENTATION_PHASE,
+            )
             provider = result.provider or provider
             model = result.model or model
             if result.status is not ProviderStatus.SUCCESS:
@@ -1486,7 +1646,40 @@ class DevelopmentCycle:
                 )
             verification = self._verify(repository, target, plan, request)
             chain_ok, chain_issues = self._verify_functional_chain(plan, verification, request)
-            if all(item.passed for item in verification) and chain_ok:
+            # El progreso causal se registra **antes** de decidir: la ronda que resuelve el fallo
+            # también es evidencia (qué recurso lo resolvió), no solo la que vuelve a fallar.
+            signature = _failure_signature(verification)
+            strategy = tuple(
+                f"{item.path}:{item.operation.value}" for item in round_applied
+            )
+            # Recursos que este parche tocó de verdad (incluido el origen de un RENAME/MOVE, que se
+            # borra: contar solo el destino dejaría fuera un recurso modificado).
+            touched_now = tuple(
+                dict.fromkeys(
+                    normalize_path(item)
+                    for proposal in validated
+                    for item in (proposal.path, proposal.source_path)
+                    if item
+                )
+            )
+            passed = all(item.passed for item in verification) and chain_ok
+            self._record_resolution_progress(
+                request=request,
+                rounds=rounds,
+                state=resolution,
+                failure=current_failure,
+                plan=plan,
+                payload=payload,
+                touched_now=touched_now,
+                strategy=strategy,
+                signature=signature,
+                previous_signature=previous_signature,
+                still_failing=tuple(
+                    item.name for item in verification if not item.passed
+                ),
+                passed=passed,
+            )
+            if passed:
                 return self._outcome(
                     status=DevelopmentStatus.COMPLETED,
                     error_kind="",
@@ -1504,10 +1697,6 @@ class DevelopmentCycle:
                 )
             if chain_issues:
                 change_issues = (*change_issues, *chain_issues)
-            signature = _failure_signature(verification)
-            strategy = tuple(
-                f"{item.path}:{item.operation.value}" for item in round_applied
-            )
             stagnated = (
                 bool(previous_signature)
                 and signature == previous_signature
@@ -2143,8 +2332,16 @@ class DevelopmentCycle:
         context_files: Sequence[ContextFile],
         pell_block: str,
         failure_evidence: str,
+        *,
+        resolution: str = "",
     ) -> str:
-        """Contexto gobernado del BUILDER: plan validado, ficheros y evidencia del fallo."""
+        """Contexto gobernado del BUILDER: plan validado, ficheros y evidencia del fallo.
+
+        ``resolution`` es el bloque compacto que convierte un fallo medido en una reparación
+        discriminante (qué recurso mide cada verificación fallida, qué tocó ya el parche anterior y
+        qué brecha causal queda abierta). Va vacío en la implementación inicial: sin fallo real no
+        hay resolución, y la skill asociada no se activa.
+        """
         lines = [
             f"TARGET: {target.target_id}",
             f"OBJECTIVE: {request.objective}",
@@ -2162,6 +2359,8 @@ class DevelopmentCycle:
             lines.append(pell_block)
         if failure_evidence:
             lines.append("VERIFICATION FAILED AND MUST BE FIXED:\n" + failure_evidence)
+        if resolution:
+            lines.append(resolution)
         lines.append(
             "DELIVERABLE: the exact file changes as JSON. You write nothing yourself: PUNTO "
             "validates and applies them. Keep each change MINIMAL: modify only what the task "
@@ -2171,63 +2370,90 @@ class DevelopmentCycle:
         lines.append(BUILD_CONTRACT)
         return "\n".join(lines)
 
-    def _instructions_for(self, role: ProviderRole, request: BuildRequest) -> str:
-        """Instrucciones del rol: las de siempre, más la skill activada si el operador la declaró.
+    def _skill_reference(self, role: ProviderRole, *, phase: str = "") -> str:
+        """Skill declarada para un rol **y una fase**: la resolución tiene la suya, separada.
 
-        La activación es explícita y **solo** para el ARCHITECT en este experimento. Una skill
-        declarada que no valide **no se ignora**: se falla cerrado, porque ejecutar sin ella
-daría un
-        resultado que no se podría atribuir al experimento. ``SKILL != AUTHORITY``: la skill es
-        procedimiento, y nada de lo que diga cambia permisos, presupuestos ni verificaciones.
+        Que la resolución sea una referencia distinta es lo que hace medible la variable: el
+        ARCHITECT y la implementación inicial no reciben la skill de resolución, y durante la
+        resolución no se activa ninguna otra.
         """
-        declared = {
-            ProviderRole.ARCHITECT: self.config.architect_skill,
-            ProviderRole.BUILDER: self.config.builder_skill,
-        }.get(role, "")
-        if not declared.strip():
-            return WORKER_INSTRUCTIONS
-        key = role.value
-        if key not in self._skill_activations:
-            from punto.skills import SkillValidationError, activate_skill
+        if role is ProviderRole.ARCHITECT:
+            return self.config.architect_skill
+        if role is ProviderRole.BUILDER:
+            if phase == RESOLUTION_PHASE:
+                return self.config.resolution_skill
+            return self.config.builder_skill
+        return ""
 
-            try:
-                activation = activate_skill(
-                    declared,
-                    role=role.value,
-                    base_instructions=WORKER_INSTRUCTIONS,
-                )
-            except SkillValidationError as exc:
-                self._log(
-                    AuditEventType.DEV_SKILL_ACTIVATED,
-                    "dev_skill_activated",
-                    request,
-                    {
-                        "role": role.value,
-                        "skill_reference": declared,
-                        "activated": False,
-                        "detail": str(exc)[:300],
-                    },
-                    AuditResult.FAILURE,
-                )
-                raise DevelopmentCycleError(
-                    f"la skill declarada no se pudo activar: {exc}"
-                ) from exc
+    def _activation(
+        self, role: ProviderRole, request: BuildRequest, *, phase: str = ""
+    ) -> SkillActivation:
+        """Constancia de la skill del rol en esa fase, activándola como mucho una vez.
+
+        Sin skill declarada se conserva el comportamiento previo y **no se registra activación**:
+        solo se audita una skill real. Una skill declarada que no valide **no se ignora**: se falla
+        cerrado, porque ejecutar sin ella daría un resultado que no se podría atribuir al
+        experimento. ``SKILL != AUTHORITY``: la skill es procedimiento, y nada de lo que diga cambia
+        permisos, presupuestos ni verificaciones.
+        """
+        key = f"{role.value}:{phase or IMPLEMENTATION_PHASE}"
+        cached = self._skill_activations.get(key)
+        if cached is not None:
+            return cached
+        declared = self._skill_reference(role, phase=phase)
+        if not declared.strip():
+            activation = SkillActivation(instructions=WORKER_INSTRUCTIONS)
             self._skill_activations[key] = activation
+            return activation
+        from punto.skills import SkillValidationError, activate_skill
+
+        try:
+            activation = activate_skill(
+                declared,
+                role=role.value,
+                base_instructions=WORKER_INSTRUCTIONS,
+            )
+        except SkillValidationError as exc:
             self._log(
                 AuditEventType.DEV_SKILL_ACTIVATED,
                 "dev_skill_activated",
                 request,
                 {
                     "role": role.value,
-                    "skill_id": activation.skill_id,
-                    "skill_version": activation.skill_version,
-                    "skill_reference": activation.reference,
-                    "activated": activation.activated,
-                    "chars": activation.chars,
-                    "sha256": activation.sha256,
+                    "phase": phase or IMPLEMENTATION_PHASE,
+                    "skill_reference": declared,
+                    "activated": False,
+                    "detail": str(exc)[:300],
                 },
+                AuditResult.FAILURE,
             )
-        return self._skill_activations[key].instructions or WORKER_INSTRUCTIONS
+            raise DevelopmentCycleError(
+                f"la skill declarada no se pudo activar: {exc}"
+            ) from exc
+        self._skill_activations[key] = activation
+        self._log(
+            AuditEventType.DEV_SKILL_ACTIVATED,
+            "dev_skill_activated",
+            request,
+            {
+                "role": role.value,
+                "phase": phase or IMPLEMENTATION_PHASE,
+                "skill_id": activation.skill_id,
+                "skill_version": activation.skill_version,
+                "skill_reference": activation.reference,
+                "activated": activation.activated,
+                "chars": activation.chars,
+                "sha256": activation.sha256,
+            },
+        )
+        return activation
+
+    def _instructions_for(
+        self, role: ProviderRole, request: BuildRequest, *, phase: str = ""
+    ) -> str:
+        """Instrucciones del rol: las de siempre, más la skill activada para ese rol y esa fase."""
+        activation = self._activation(role, request, phase=phase)
+        return activation.instructions or WORKER_INSTRUCTIONS
 
     def _invoke(
         self,
@@ -2235,11 +2461,14 @@ daría un
         request: BuildRequest,
         prompt: str,
         schema: Mapping[str, Any],
+        *,
+        phase: str = IMPLEMENTATION_PHASE,
     ) -> ProviderResult:
         """Invoca a un rol por el router, con el JSON Schema declarado.
 
         Antes de invocar se registra **qué proveedor** atiende el rol según la configuración: es
-        evidencia de la decisión, no autoridad, y deja el ciclo auditable por rol.
+        evidencia de la decisión, no autoridad, y deja el ciclo auditable por rol. La fase decide
+        qué skill recibe el rol: la de resolución solo existe cuando hay un fallo que resolver.
         """
         try:
             selected = self.router.get_provider_for_role(role)
@@ -2249,11 +2478,11 @@ daría un
             AuditEventType.BUILD_PROVIDER_SELECTED,
             "dev_provider_selected",
             request,
-            {"role": role.value, "provider": selected, "fallback": False},
+            {"role": role.value, "provider": selected, "fallback": False, "phase": phase},
         )
         provider_request = ProviderRequest(
             role=role,
-            instructions=self._instructions_for(role, request),
+            instructions=self._instructions_for(role, request, phase=phase),
             request_id=str(request.request_id),
             context=prompt,
             metadata={"target_id": request.target_repository, "phase": "PILOT-04"},
@@ -2659,6 +2888,8 @@ BUILD_CONTRACT: Final[str] = (
     '"root_cause": "REQUIRED when fixing a failure: its cause, not the symptom", '
     '"evidence": ["the verification output that proves the cause"], '
     '"expected_effect": "what will change once the cause is fixed", '
+    '"unchanged_resources": [{"path": "relative/path", '
+    '"evidence": "why it needs no change"}], '
     '"scope_expansion": {"trigger": "what revealed the need", '
     '"evidence": ["environment evidence"], "root_cause": "why it belongs to this objective", '
     '"resources": ["relative/path"], "operations": ["MODIFY"], '
@@ -2766,6 +2997,17 @@ BUILD_SCHEMA: Final[Mapping[str, Any]] = {
         "root_cause": {"type": "string"},
         "evidence": {"type": "array", "items": {"type": "string"}},
         "expected_effect": {"type": "string"},
+        "unchanged_resources": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["path", "evidence"],
+            },
+        },
         "scope_expansion": {
             "type": "object",
             "properties": {

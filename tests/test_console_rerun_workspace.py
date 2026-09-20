@@ -308,6 +308,7 @@ def test_un_ciclo_que_lanza_reemplaza_el_resultado_principal(tmp_path: Path) -> 
     assert reanudada["blocked"]["code"] == "CYCLE_ERROR"
     assert reanudada["blocked"]["rule"] and reanudada["blocked"]["remedy"]
     assert reanudada["attempts"][-1]["error_kind"] == "CYCLE_ERROR"
+    assert reanudada["attempts"][-1]["duration_ms"] is not None
     assert reanudada["attempts"][0]["error_kind"] == "REPOSITORY_DENIED"
 
 

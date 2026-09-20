@@ -820,7 +820,12 @@ def register_human_console(
                     # El desenlace operativo tiene que ser el de **este** intento: si el ciclo lanza
                     # una excepción en vez de devolver un resultado, la tarea no puede seguir
                     # mostrando el del intento anterior (AP000-OBS-04-R2).
-                    result = _cycle_failure_result(request, exc, deps.targets.get(task.target_id))
+                    result = _cycle_failure_result(
+                        request,
+                        exc,
+                        deps.targets.get(task.target_id),
+                        duration_ms=_elapsed_ms(task),
+                    )
                     task.result = result
                     task.set_stage(
                         ConsoleStage.DEVELOPMENT_FAILED, result.error_kind or "CYCLE_ERROR"
@@ -1128,7 +1133,11 @@ def _log_state_event(
 
 
 def _cycle_failure_result(
-    request: BuildRequest, exc: Exception, target: DevelopmentTarget | None
+    request: BuildRequest,
+    exc: Exception,
+    target: DevelopmentTarget | None,
+    *,
+    duration_ms: int | None = None,
 ) -> DevelopmentResult:
     """Resultado real de un intento en el que el ciclo lanzó una excepción.
 
@@ -1155,6 +1164,7 @@ def _cycle_failure_result(
         request_id=request.request_id,
         status=DevelopmentStatus.BLOCKED,
         target_id=target.target_id if target is not None else request.target_repository,
+        duration_ms=duration_ms,
         error_kind=code[:40],
         error=detail[:1_000],
         blocked=BlockedEvidence(
@@ -1165,6 +1175,13 @@ def _cycle_failure_result(
             remedy=remedy[:300],
         ),
     )
+
+
+def _elapsed_ms(task: ConsoleTask) -> int | None:
+    """Tiempo real transcurrido desde que se abrió el intento (``None`` si no se abrió)."""
+    if task.attempt_started_at is None:
+        return None
+    return max(int((utc_now() - task.attempt_started_at).total_seconds() * 1000), 0)
 
 
 def _open_attempt(task: ConsoleTask) -> None:

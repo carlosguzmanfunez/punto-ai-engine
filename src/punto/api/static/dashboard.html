@@ -101,16 +101,91 @@
         color: var(--muted);
       }
       .cap.on { color: var(--text); border-color: var(--accent); }
+      .tabs { display: flex; gap: 12px; margin-left: auto; }
+      .tabs a { color: var(--muted); text-decoration: none; font-size: 13px; }
+      .tabs a:hover { color: var(--text); }
+      .stage {
+        font-size: 11px;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 2px 9px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .stage.DEVELOPMENT_COMPLETED, .stage.PRODUCTION_VALIDATED { color: var(--ok); border-color: var(--ok); }
+      .stage.WAITING_HUMAN, .stage.WAITING_PRODUCTION_APPROVAL, .stage.PUBLISHING,
+      .stage.DEPLOYMENT_VERIFICATION { color: var(--warn); border-color: var(--warn); }
+      .stage.DEVELOPMENT_FAILED, .stage.REJECTED, .stage.PUBLICATION_FAILED,
+      .stage.DEPLOYMENT_NOT_VERIFIED, .stage.BLOCKED_NOT_PUBLISHABLE { color: var(--bad); border-color: var(--bad); }
+      .list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+      .item { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }
+      .item code { color: var(--text); }
+      textarea {
+        font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+        border-radius: 7px; padding: 7px 9px; width: 100%; min-height: 64px;
+      }
       footer { color: var(--muted); font-size: 12px; padding: 0 24px 32px; max-width: 1180px; margin: 0 auto; }
     </style>
   </head>
   <body>
     <header>
       <h1>PUNTO AI ENGINE</h1>
-      <span class="crumb">Configuración · Proveedores IA</span>
+      <span class="crumb">Consola humana · Tareas, Human Gates y Configuración de proveedores</span>
+      <nav class="tabs">
+        <a href="#tasks" data-console="tasks">Tareas</a>
+        <a href="#gates" data-console="gates">Human Gates</a>
+        <a href="#providers-section">Proveedores</a>
+      </nav>
     </header>
     <main>
-      <section>
+      <section id="tasks">
+        <h2>Tareas</h2>
+        <div class="card">
+          <div class="form-grid">
+            <div class="field" style="grid-column: 1 / -1">
+              <label for="tarea-objective">Solicitud</label>
+              <input id="tarea-objective" placeholder="Unificar los tipos de propiedad y que los filtros usen la fuente canónica" />
+            </div>
+            <div class="field">
+              <label for="tarea-target">Repositorio / destino</label>
+              <select id="tarea-target" data-testid="tarea-target"></select>
+            </div>
+            <div class="field">
+              <label for="tarea-acceptance">Criterios de aceptación (separados por coma)</label>
+              <input id="tarea-acceptance" placeholder="una sola fuente de tipos" />
+            </div>
+            <div class="field">
+              <label for="tarea-paths">Alcance (rutas separadas por coma)</label>
+              <input id="tarea-paths" value="src" />
+            </div>
+          </div>
+          <div class="actions">
+            <button id="create-task" data-testid="create-task">Crear y ejecutar</button>
+            <button class="secondary" id="refresh-tasks" data-testid="refresh-tasks">Actualizar</button>
+          </div>
+          <div id="tarea-note" class="note">
+            La consola no concede autoridad: crea una tarea y PUNTO decide con su política, su riesgo
+            y su Human Gate. La publicación en producción exige una aprobación humana explícita.
+          </div>
+        </div>
+        <div id="tasks-list" class="grid" data-testid="tasks-list" style="margin-top: 16px">
+          <div class="note">Los datos de la consola se cargan al usarla (Actualizar, crear una tarea
+          o abrir esta sección). Necesita el motor configurado en esta instancia.</div>
+        </div>
+      </section>
+
+      <section id="gates">
+        <h2>Human Gates</h2>
+        <div id="gates-list" data-testid="gates-list" class="grid">
+          <div class="note">Sin cargar: pulsa Actualizar o abre la sección de Tareas.</div>
+        </div>
+        <div id="gates-note" class="note">
+          Cada solicitud pertenece a una operación real y está ligada a su decisión de política.
+          Aprobar autoriza esa operación; rechazar la impide. Sin aprobación no hay publicación.
+        </div>
+      </section>
+      <section id="providers-section">
         <h2>Proveedores</h2>
         <div id="providers" class="grid" data-testid="providers"></div>
       </section>
@@ -470,6 +545,213 @@
         document.getElementById("providers").innerHTML =
           `<div class="note bad">no se pudo cargar el catálogo: ${error.message || error}</div>`;
       });
+
+      // ------------------------------------------------------------------ consola
+      const consoleState = { targets: [], tasks: [], gates: [], timer: null };
+
+      function stageBadge(stage) {
+        return `<span class="stage ${stage}">${stage}</span>`;
+      }
+
+      function taskCard(task) {
+        const dev = task.development || {};
+        const publication = task.publication;
+        const verification = (dev.verification || [])
+          .map((item) => `<div class="item"><span>${item.name}</span><code>${item.passed ? "PASS" : "FAIL"} (${item.exit_code})</code></div>`)
+          .join("");
+        const production = publication && publication.production
+          ? `<div class="item"><span>producción</span><code>HTTP ${publication.production.status_code} · marcador ${publication.production.marker_found ? "sí" : "no"}</code></div>`
+          : "";
+        const push = publication && publication.push
+          ? `<div class="item"><span>push</span><code>${publication.push.pushed ? "ok" : "falló"} → ${publication.push.ref}</code></div>`
+          : "";
+        const gates = (task.gates || []).length
+          ? `<div class="item"><span>gates</span><code>${task.gates.length}</code></div>`
+          : "";
+        const canPublish = dev.status === "DEVELOPMENT_COMPLETED" && dev.commit_sha;
+        const notes = (task.notes || []).map((text) => `<div class="note">${text}</div>`).join("");
+        return `
+          <article class="card" data-task="${task.task_id}" data-testid="tarea-${task.task_id}">
+            <h3>${task.objective.slice(0, 90)}</h3>
+            <div class="sub">${task.target_id} · <code>${task.task_id.slice(0, 8)}</code></div>
+            <div class="row"><span class="label">Etapa</span><span class="value">${stageBadge(task.stage)}
+              ${task.publication_stage && task.publication_stage !== task.stage ? stageBadge(task.publication_stage) : ""}</span></div>
+            ${dev.status ? `<div class="row"><span class="label">Desarrollo</span><span class="value">${dev.status}</span></div>` : ""}
+            ${dev.commit_sha ? `<div class="row"><span class="label">Commit local</span><code>${dev.commit_sha.slice(0, 10)}</code></div>` : ""}
+            ${dev.functional_chain_result ? `<div class="row"><span class="label">Cadena</span><span class="value">${dev.functional_chain_result}</span></div>` : ""}
+            ${dev.repair_rounds !== undefined ? `<div class="row"><span class="label">Reparaciones</span><span class="value">${dev.repair_rounds} (+${dev.structural_corrections || 0} estructurales)</span></div>` : ""}
+            <div class="list">${verification}${push}${production}${gates}</div>
+            ${notes}
+            <div class="actions">
+              <button class="secondary" data-refresh="${task.task_id}">Ver</button>
+              ${canPublish ? `<button data-production="${task.task_id}">Pedir gate de publicación</button>` : ""}
+              ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
+              ${publication && publication.approval_id && publication.stage !== "PRODUCTION_VALIDATED" && publication.stage !== "WAITING_PRODUCTION_APPROVAL" ? `<button data-publish="${task.task_id}">Publicar</button>` : ""}
+            </div>
+          </article>`;
+      }
+
+      function gateCard(gate) {
+        const pending = gate.is_pending;
+        const destination = gate.destination || {};
+        return `
+          <article class="card" data-gate="${gate.approval_id}" data-testid="gate-${gate.approval_id}">
+            <h3>${gate.kind === "publication" ? "Publicación a producción" : "Autorización de desarrollo"}</h3>
+            <div class="sub">${gate.objective || gate.task_id}</div>
+            <div class="row"><span class="label">Estado</span><span class="value">${gate.status}</span></div>
+            <div class="row"><span class="label">Acción</span><span class="value"><code>${gate.action}</code></span></div>
+            <div class="row"><span class="label">Riesgo</span><span class="value">${gate.risk}</span></div>
+            <div class="row"><span class="label">Motivo</span><span class="value">${gate.reason}</span></div>
+            <div class="row"><span class="label">Destino</span><span class="value">${destination.kind === "production"
+              ? `${destination.target_id} · ${destination.production_branch} · ${destination.production_url}`
+              : destination.target_id}</span></div>
+            ${destination.commit_sha ? `<div class="row"><span class="label">Commit</span><code>${destination.commit_sha.slice(0, 10)}</code></div>` : ""}
+            <div class="row"><span class="label">Decisión de política</span><span class="value"><code>${gate.policy_outcome || "—"}</code></span></div>
+            ${(gate.verification || []).length ? `<div class="list">${gate.verification
+              .map((item) => `<div class="item"><span>${item.name}</span><code>${item.passed ? "PASS" : "FAIL"}</code></div>`)
+              .join("")}</div>` : ""}
+            ${pending ? `
+            <div class="field" style="margin-top: 10px">
+              <label for="note-${gate.approval_id}">Nota (opcional)</label>
+              <input id="note-${gate.approval_id}" placeholder="por qué apruebas o rechazas" />
+            </div>
+            <div class="actions">
+              <button data-approve="${gate.approval_id}" data-testid="approve-${gate.approval_id}">APPROVE</button>
+              <button class="secondary" data-reject="${gate.approval_id}" data-testid="reject-${gate.approval_id}">REJECT</button>
+            </div>` : `<div class="note">resuelto por ${gate.resolved_by || "—"}${gate.resolution_note ? ": " + gate.resolution_note : ""}</div>`}
+          </article>`;
+      }
+
+      async function ensureTargets() {
+        if (consoleState.targets.length) return;
+        const payload = await api("/console/targets");
+        consoleState.targets = payload.targets;
+        document.getElementById("tarea-target").innerHTML = payload.targets.length
+          ? payload.targets
+              .map((target) => `<option value="${target.target_id}">${target.target_id}${target.publishable ? " · publicable" : ""}</option>`)
+              .join("")
+          : `<option value="">(sin destinos registrados)</option>`;
+      }
+
+      // La consola carga sus datos **al usarla**: el dashboard de proveedores funciona aunque esta
+      // instancia corra sin el motor de tareas configurado, y no se piden endpoints que no existan.
+      async function refreshConsole() {
+        await ensureTargets();
+        await Promise.all([loadTasks(), loadGates()]);
+      }
+
+      async function loadTasks() {
+        const payload = await api("/console/tasks");
+        consoleState.tasks = payload.items;
+        document.getElementById("tasks-list").innerHTML = payload.items.length
+          ? payload.items.map(taskCard).join("")
+          : `<div class="note">todavía no hay tareas</div>`;
+        document.querySelectorAll("[data-production]").forEach((button) =>
+          button.addEventListener("click", () => requestProductionGate(button.dataset.production)));
+        document.querySelectorAll("[data-publish]").forEach((button) =>
+          button.addEventListener("click", () => publishTask(button.dataset.publish)));
+        document.querySelectorAll("[data-refresh]").forEach((button) =>
+          button.addEventListener("click", () => refreshConsole()));
+      }
+
+      async function loadGates() {
+        const payload = await api("/console/human-gates");
+        consoleState.gates = payload.items;
+        document.getElementById("gates-list").innerHTML = payload.items.length
+          ? payload.items.map(gateCard).join("")
+          : `<div class="note">no hay solicitudes humanas</div>`;
+        document.querySelectorAll("[data-approve]").forEach((button) =>
+          button.addEventListener("click", () => resolveGate(button.dataset.approve, true)));
+        document.querySelectorAll("[data-reject]").forEach((button) =>
+          button.addEventListener("click", () => resolveGate(button.dataset.reject, false)));
+      }
+
+      function consoleNote(text, kind) {
+        const element = document.getElementById("tarea-note");
+        element.className = "note" + (kind ? " " + kind : "");
+        element.textContent = text;
+      }
+
+      async function createTask() {
+        const objective = document.getElementById("tarea-objective").value.trim();
+        const acceptance = document.getElementById("tarea-acceptance").value.split(",").map((item) => item.trim()).filter(Boolean);
+        const scope = document.getElementById("tarea-paths").value.split(",").map((item) => item.trim()).filter(Boolean);
+        consoleNote("preparando la tarea…");
+        try {
+          await ensureTargets();
+          const target = document.getElementById("tarea-target").value;
+          if (!target) throw new Error("no hay ningún destino registrado en esta instancia");
+          consoleNote("ejecutando el ciclo de PUNTO…");
+          const task = await api("/console/tasks", {
+            method: "POST",
+            body: JSON.stringify({ objective, target_id: target, acceptance_criteria: acceptance, scope_paths: scope, run: true }),
+          });
+          consoleNote(`tarea ${task.task_id.slice(0, 8)} creada · etapa ${task.stage}`, "ok");
+          await Promise.all([loadTasks(), loadGates()]);
+          pollWhileRunning();
+        } catch (error) {
+          consoleNote(String(error.message || error), "bad");
+        }
+      }
+
+      function pollWhileRunning() {
+        if (consoleState.timer) clearInterval(consoleState.timer);
+        consoleState.timer = setInterval(async () => {
+          await Promise.all([loadTasks(), loadGates()]);
+          const running = consoleState.tasks.some((task) =>
+            ["QUEUED", "DEVELOPING", "PUBLISHING", "DEPLOYMENT_VERIFICATION"].includes(task.stage));
+          if (!running) { clearInterval(consoleState.timer); consoleState.timer = null; }
+        }, 3000);
+      }
+
+      async function requestProductionGate(taskId) {
+        try {
+          const task = await api(`/console/tasks/${taskId}/production-gate`, { method: "POST" });
+          consoleNote(`gate de publicación solicitado · etapa ${task.stage}`, "ok");
+          await Promise.all([loadTasks(), loadGates()]);
+        } catch (error) {
+          consoleNote(String(error.message || error), "bad");
+        }
+      }
+
+      async function publishTask(taskId) {
+        try {
+          const task = await api(`/console/tasks/${taskId}/publish`, { method: "POST" });
+          consoleNote(`publicación · etapa ${task.stage}`, task.stage === "PRODUCTION_VALIDATED" ? "ok" : "warn");
+          await Promise.all([loadTasks(), loadGates()]);
+          pollWhileRunning();
+        } catch (error) {
+          consoleNote(String(error.message || error), "bad");
+        }
+      }
+
+      async function resolveGate(approvalId, approved) {
+        const field = document.getElementById(`note-${approvalId}`);
+        const note = field ? field.value : "";
+        try {
+          const payload = await api(`/console/human-gates/${approvalId}/${approved ? "approve" : "reject"}`, {
+            method: "POST",
+            body: JSON.stringify({ resolved_by: "humano-local", note }),
+          });
+          consoleNote(`${approved ? "aprobado" : "rechazado"} · ${payload.status}`, approved ? "ok" : "warn");
+          await Promise.all([loadTasks(), loadGates()]);
+          if (approved) pollWhileRunning();
+        } catch (error) {
+          consoleNote(String(error.message || error), "bad");
+        }
+      }
+
+      document.getElementById("create-task").addEventListener("click", createTask);
+      document.getElementById("refresh-tasks").addEventListener("click", () => {
+        refreshConsole().catch((error) => {
+          document.getElementById("tasks-list").innerHTML =
+            `<div class="note bad">no se pudo cargar la consola: ${error.message || error}</div>`;
+        });
+      });
+      document.querySelectorAll('nav.tabs a[data-console]').forEach((link) =>
+        link.addEventListener("click", () => {
+          refreshConsole().catch((error) => consoleNote(String(error.message || error), "bad"));
+        }));
     </script>
   </body>
 </html>

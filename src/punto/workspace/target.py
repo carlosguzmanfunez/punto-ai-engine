@@ -103,6 +103,18 @@ class DevelopmentTarget:
     command_timeout_seconds: float = 600.0
     max_repair_rounds: int = 3
     max_read_bytes: int = 200_000
+    #: Publicación a producción del destino (opcional). Sin rama **y** URL declaradas, el destino no
+    #: es publicable: PUNTO no adivina dónde vive producción. ``publish_remote`` es el nombre del
+    #: remoto Git que se usa para integrar el commit aprobado.
+    production_branch: str = ""
+    production_url: str = ""
+    production_marker: str = ""
+    publish_remote: str = "origin"
+
+    @property
+    def publishable(self) -> bool:
+        """True si el destino declara dónde publicar y cómo comprobarlo."""
+        return bool(self.production_branch and self.production_url)
 
     def command(self, name: str) -> VerificationCommand:
         """Comando de verificación por nombre.
@@ -293,6 +305,10 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         command_timeout_seconds=default_timeout,
         max_repair_rounds=_as_int(value.get("max_repair_rounds"), 3, "max_repair_rounds"),
         max_read_bytes=_as_int(value.get("max_read_bytes"), 200_000, "max_read_bytes", minimum=1),
+        production_branch=str(value.get("production_branch", "")).strip(),
+        production_url=str(value.get("production_url", "")).strip(),
+        production_marker=str(value.get("production_marker", "")).strip()[:200],
+        publish_remote=str(value.get("publish_remote", "origin")).strip() or "origin",
     )
 
 

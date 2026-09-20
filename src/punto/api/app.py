@@ -290,6 +290,11 @@ def create_app(
     from punto.api.dashboard import register_dashboard
 
     register_dashboard(application)
+    # CONSOLA HUMANA LOCAL: la misma pagina pasa a ser consola de tareas, Human Gates y publicacion
+    # a produccion. Reutiliza el ciclo, los gates, la politica y la auditoria del motor.
+    from punto.api.console import register_human_console
+
+    register_human_console(application)
     return application
 
 

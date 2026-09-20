@@ -1653,10 +1653,21 @@ class DevelopmentCycle:
                     },
                     AuditResult.FAILURE,
                 )
-                if rounds >= self.config.max_repair_rounds:
+                # Una operación que exige autoridad humana no se arregla reescribiéndola: insistir
+                # con otra ronda gasta proveedor y presupuesto de reparación para acabar en el mismo
+                # sitio. Se corta aquí, con su código, para que la persona decida (Human Gate).
+                human_kind = next(
+                    (
+                        issue.code
+                        for issue in issues
+                        if issue.code in _HUMAN_REQUIRED_CHANGE_CODES
+                    ),
+                    "",
+                )
+                if human_kind or rounds >= self.config.max_repair_rounds:
                     return self._outcome(
                         status=DevelopmentStatus.CHANGE_REJECTED,
-                        error_kind="CHANGE_REJECTED",
+                        error_kind=human_kind or "CHANGE_REJECTED",
                         error="; ".join(issue.detail for issue in issues)[:500],
                         provider=provider,
                         model=model,
@@ -3188,6 +3199,13 @@ def _scope_expansion(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
     return raw
+
+
+#: Códigos con los que el ciclo pide autoridad humana para un cambio. Insistir con otra ronda no
+#: cambia una decisión de autoridad: solo gasta proveedor, así que el ciclo se detiene aquí.
+_HUMAN_REQUIRED_CHANGE_CODES: Final[frozenset[str]] = frozenset(
+    {"CHANGE_REQUIRES_HUMAN", "CHANGE_OUTSIDE_AUTHORITY"}
+)
 
 
 def _bounded(items: Any, *, limit: int = MAX_PLAN_ITEMS) -> tuple[str, ...]:

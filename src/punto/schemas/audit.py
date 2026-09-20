@@ -347,6 +347,20 @@ class AuditEventType(StrEnum):
     #: RESOLUTION PIPELINE HARDENING: la propuesta traía una inconsistencia estructural medible y se
     #: devolvió al proveedor para corregirla **sin** consumir una ronda funcional de reparación.
     DEV_PROPOSAL_PREFLIGHT_FAILED = "DEV_PROPOSAL_PREFLIGHT_FAILED"
+    #: CONSOLA HUMANA: una persona creó una tarea desde el dashboard local.
+    CONSOLE_TASK_CREATED = "CONSOLE_TASK_CREATED"
+    #: CONSOLA HUMANA: la tarea cambió de etapa (desarrollo o publicación).
+    CONSOLE_TASK_STAGE_CHANGED = "CONSOLE_TASK_STAGE_CHANGED"
+    #: PUBLICACIÓN: se solicitó publicar un commit aprobado en producción.
+    PUBLICATION_REQUESTED = "PUBLICATION_REQUESTED"
+    #: PUBLICACIÓN: el commit aprobado llegó a la rama de producción.
+    PUBLICATION_PUSHED = "PUBLICATION_PUSHED"
+    #: PUBLICACIÓN: la publicación se detuvo antes o durante la integración.
+    PUBLICATION_FAILED = "PUBLICATION_FAILED"
+    #: PUBLICACIÓN: producción sirvió lo esperado y quedó validada.
+    PRODUCTION_VERIFIED = "PRODUCTION_VERIFIED"
+    #: PUBLICACIÓN: el push ocurrió pero producción no confirma el despliegue.
+    PRODUCTION_NOT_VERIFIED = "PRODUCTION_NOT_VERIFIED"
 
 
 class AuditEvent(BaseModel):

@@ -1,0 +1,594 @@
+"""Cadena de publicación a producción: gate humano → push gobernado → verificación real.
+
+Estados (los que el encargo pide, sin inventar los que ya existen):
+
+```
+DEVELOPMENT_COMPLETED   (ya existe: DevelopmentStatus.COMPLETED, cambio local verificado)
+        ↓
+WAITING_PRODUCTION_APPROVAL
+        ↓ APPROVE (HumanGate)
+PUBLISHING                       → PUBLICATION_FAILED
+        ↓
+DEPLOYMENT_VERIFICATION          → DEPLOYMENT_NOT_VERIFIED
+        ↓
+PRODUCTION_VALIDATED
+```
+
+Los tres primeros viven en ``DevelopmentStatus``/``TaskStatus`` del motor; los de publicación se
+declaran aquí porque **no existían** y son el objeto de esta cadena.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Final
+from uuid import UUID
+
+from punto.common import utc_now
+from punto.providers.secrets import redact_secret_text
+
+__all__ = [
+    "MAX_PUSH_OUTPUT_CHARS",
+    "GitPublisher",
+    "ProductionEvidence",
+    "ProductionProbe",
+    "PublicationRecord",
+    "PublicationRefused",
+    "PublicationService",
+    "PublicationStage",
+    "PushEvidence",
+    "PushPlan",
+    "default_fetch",
+]
+
+#: Cota de la salida de ``git push`` que se conserva como evidencia.
+MAX_PUSH_OUTPUT_CHARS: Final[int] = 1_200
+
+#: Cota de la respuesta de producción que se conserva como evidencia.
+MAX_BODY_CHARS: Final[int] = 200_000
+
+_SHA_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
+_BRANCH_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
+#: El remoto puede ser un nombre, una ruta (con espacios: las rutas reales los tienen) o una URL.
+#: Lo que **no** puede ser es un argumento de Git: eso se comprueba aparte (nada que
+#: empiece por ``-`` y nada con caracteres de control), porque el remoto viaja como
+#: elemento propio del ``argv``.
+_MAX_REMOTE_CHARS: Final[int] = 300
+
+#: Esquema de un remoto de red: lo que **nunca** es una ruta local.
+_SCHEME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(?:https?|ssh|git|ftps?):", re.IGNORECASE)
+
+#: Opciones de ``git push`` que jamás se usan: reescribir historia, mover todo o borrar remoto.
+_FORBIDDEN_PUSH_OPTIONS: Final[tuple[str, ...]] = (
+    "--force",
+    "--force-with-lease",
+    "--force-if-includes",
+    "--tags",
+    "--all",
+    "--mirror",
+    "--delete",
+    "--prune",
+    "--atomic",
+    "--set-upstream",
+)
+
+
+class PublicationRefused(RuntimeError):
+    """La publicación se rechazó antes de tocar nada, con un motivo gobernado."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        self.kind = kind
+        self.detail = detail
+        super().__init__(f"{kind}: {detail}")
+
+
+class PublicationStage(StrEnum):
+    """Etapas de la publicación a producción (las que no existían en el motor)."""
+
+    BLOCKED_NOT_PUBLISHABLE = "BLOCKED_NOT_PUBLISHABLE"
+    WAITING_PRODUCTION_APPROVAL = "WAITING_PRODUCTION_APPROVAL"
+    PUBLISHING = "PUBLISHING"
+    PUBLICATION_FAILED = "PUBLICATION_FAILED"
+    DEPLOYMENT_VERIFICATION = "DEPLOYMENT_VERIFICATION"
+    DEPLOYMENT_NOT_VERIFIED = "DEPLOYMENT_NOT_VERIFIED"
+    PRODUCTION_VALIDATED = "PRODUCTION_VALIDATED"
+
+
+@dataclass(frozen=True, slots=True)
+class PushEvidence:
+    """Resultado del push gobernado: qué se empujó, a dónde y con qué salida."""
+
+    remote: str
+    ref: str
+    sha: str
+    argv: tuple[str, ...]
+    exit_code: int
+    output: str
+    pushed: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable, con la salida redactada."""
+        return {
+            "remote": self.remote,
+            "ref": self.ref,
+            "sha": self.sha,
+            "argv": list(self.argv),
+            "exit_code": self.exit_code,
+            "output": redact_secret_text(self.output)[:MAX_PUSH_OUTPUT_CHARS],
+            "pushed": self.pushed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionEvidence:
+    """Resultado de la comprobación de producción: qué respondió el destino real."""
+
+    url: str
+    marker: str
+    attempts: int
+    status_code: int
+    marker_found: bool
+    detail: str
+
+    @property
+    def validated(self) -> bool:
+        """True solo si producción respondió bien **y** mostró lo que se esperaba."""
+        return self.status_code == 200 and (not self.marker or self.marker_found)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable."""
+        return {
+            "url": self.url,
+            "marker": self.marker,
+            "attempts": self.attempts,
+            "status_code": self.status_code,
+            "marker_found": self.marker_found,
+            "validated": self.validated,
+            "detail": self.detail[:300],
+        }
+
+
+@dataclass(slots=True)
+class PublicationRecord:
+    """Expediente de la publicación de una tarea: etapa, evidencia y motivo."""
+
+    task_id: str
+    request_id: str
+    target_id: str
+    commit_sha: str
+    approval_id: str = ""
+    stage: PublicationStage = PublicationStage.WAITING_PRODUCTION_APPROVAL
+    error_kind: str = ""
+    error: str = ""
+    push: PushEvidence | None = None
+    production: ProductionEvidence | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
+
+    def advance(self, stage: PublicationStage, detail: str = "") -> PublicationStage:
+        """Cambia de etapa dejando constancia del momento y del motivo."""
+        self.stage = stage
+        self.history.append(
+            {"stage": stage.value, "at": utc_now().isoformat(), "detail": detail[:300]}
+        )
+        return stage
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable, sin secretos."""
+        return {
+            "task_id": self.task_id,
+            "request_id": self.request_id,
+            "target_id": self.target_id,
+            "commit_sha": self.commit_sha,
+            "approval_id": self.approval_id,
+            "stage": self.stage.value,
+            "error_kind": self.error_kind,
+            "error": self.error[:300],
+            "push": self.push.as_dict() if self.push is not None else None,
+            "production": self.production.as_dict() if self.production is not None else None,
+            "history": list(self.history),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PushPlan:
+    """Plan mínimo del push: un remoto, una rama y un commit concreto."""
+
+    remote: str
+    branch: str
+    sha: str
+
+    @property
+    def ref(self) -> str:
+        """Referencia de destino completa."""
+        return f"refs/heads/{self.branch}"
+
+    @property
+    def refspec(self) -> str:
+        """Refspec explícito: el sha aprobado a la rama de producción, y nada más."""
+        return f"{self.sha}:{self.ref}"
+
+    def validate(self) -> None:
+        """Comprueba la forma del plan antes de construir ningún comando.
+
+        La lista blanca es la que impide que un remoto o una rama se conviertan en un argumento de
+        Git: aquí no hay ``--force``, ni tags, ni espejo, ni borrados, ni comodines. El remoto sí
+        admite espacios, porque una ruta de repositorio real los tiene: viaja como un
+        elemento propio del ``argv``, sin shell de por medio.
+
+        Raises:
+            PublicationRefused: si el remoto, la rama o el sha no tienen la forma esperada.
+        """
+        if not self._remote_valido():
+            raise PublicationRefused("PUSH_PLAN_INVALID", f"remoto inválido: {self.remote!r}")
+        if not _BRANCH_PATTERN.match(self.branch) or self.branch.endswith("/"):
+            raise PublicationRefused("PUSH_PLAN_INVALID", f"rama inválida: {self.branch!r}")
+        if ".." in self.branch or "*" in self.branch:
+            raise PublicationRefused("PUSH_PLAN_INVALID", "la rama no admite comodines")
+        if not _SHA_PATTERN.match(self.sha):
+            raise PublicationRefused("PUSH_PLAN_INVALID", "el commit a publicar debe ser un sha")
+        for option in _FORBIDDEN_PUSH_OPTIONS:
+            if self.remote == option or self.branch == option:
+                raise PublicationRefused(
+                    "PUSH_PLAN_INVALID", "el plan contiene una opción prohibida"
+                )
+
+    def _remote_valido(self) -> bool:
+        """True si el remoto es una ruta, un nombre o una URL y no un argumento de Git."""
+        remote = self.remote
+        if not remote or len(remote) > _MAX_REMOTE_CHARS:
+            return False
+        if remote.startswith("-"):
+            return False
+        return not any(character in remote for character in "\r\n\t\x00")
+
+    def argv(self) -> tuple[str, ...]:
+        """``argv`` exacto del push: sin opciones, sin comodines, sin ambigüedad."""
+        self.validate()
+        return ("git", "push", "--porcelain", self.remote, self.refspec)
+
+
+def _is_local_remote(remote: str) -> bool:
+    """True si el remoto es local (ruta, ``file://``) o apunta a la propia máquina.
+
+    Un remoto con esquema (``https:``, ``ssh:``, ``git:``) **nunca** es local, aunque llegue con una
+    sola barra o con barras invertidas: confundirlo con una ruta autorizaría un push remoto sin
+    autorización del operador. Solo ``localhost``/``127.0.0.1``/``[::1]`` cuentan como locales.
+    """
+    normalized = remote.replace("\\", "/").strip()
+    if normalized.lower().startswith("file://"):
+        return True
+    if _SCHEME_PATTERN.match(normalized):
+        host = normalized.split(":", 1)[1].lstrip("/").split("/", 1)[0].split("@")[-1]
+        return host.startswith(("localhost", "127.0.0.1", "[::1]"))
+    return True
+
+
+class GitPublisher:
+    """Push gobernado de **un** commit a **una** rama de **un** remoto.
+
+    No es el shell del motor: es una capacidad de primera parte con ``argv`` construido por lista
+    blanca, la misma idea que ``GovernedRepository`` para las operaciones locales. La política de
+    shell sigue prohibiendo ``git push`` para los flujos no confiables; esto no la toca.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        timeout_seconds: float = 180.0,
+        runner: Callable[[tuple[str, ...], Path, float], tuple[int, str]] | None = None,
+    ) -> None:
+        self._root = Path(root)
+        self._timeout = timeout_seconds
+        self._runner = runner or _default_git_runner
+
+    @property
+    def root(self) -> Path:
+        """Repositorio sobre el que se publica."""
+        return self._root
+
+    def has_commit(self, sha: str) -> bool:
+        """True si el commit existe en el repositorio local."""
+        code, _ = self._runner(
+            ("git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"),
+            self._root,
+            self._timeout,
+        )
+        return code == 0
+
+    def push(self, plan: PushPlan, *, allow_remote: bool = False) -> PushEvidence:
+        """Ejecuta el push y devuelve la evidencia, sin declarar nada sobre producción.
+
+        Raises:
+            PublicationRefused: si el plan no es válido, si el commit no existe o si el remoto no es
+                local y el operador no ha autorizado explícitamente el push remoto.
+        """
+        argv = plan.argv()
+        if not _is_local_remote(plan.remote) and not allow_remote:
+            raise PublicationRefused(
+                "REMOTE_PUSH_NOT_AUTHORIZED",
+                "el remoto no es local y el push remoto no está autorizado por el operador "
+                "(PUNTO_PRODUCTION_PUSH=1)",
+            )
+        if not self.has_commit(plan.sha):
+            raise PublicationRefused(
+                "COMMIT_NOT_FOUND", f"el commit {plan.sha[:12]}… no existe en el repositorio local"
+            )
+        code, output = self._runner(argv, self._root, self._timeout)
+        return PushEvidence(
+            remote=plan.remote,
+            ref=plan.ref,
+            sha=plan.sha,
+            argv=argv,
+            exit_code=code,
+            output=output,
+            pushed=code == 0,
+        )
+
+
+def _default_git_runner(
+    argv: tuple[str, ...], root: Path, timeout: float
+) -> tuple[int, str]:
+    """Ejecuta Git en el repositorio, sin prompt interactivo y sin exponer credenciales.
+
+    El prompt interactivo se desactiva para que un remoto sin credenciales falle rápido en vez de
+    quedarse esperando. La credencial, si existe, la aporta el gestor de credenciales del sistema:
+    PUNTO nunca la lee ni la guarda.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        completed = subprocess.run(
+            list(argv),
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # git ausente o sin respuesta
+        return 1, f"no se pudo ejecutar git: {exc}"
+    return completed.returncode, f"{completed.stdout}\n{completed.stderr}".strip()
+
+
+def default_fetch(url: str, timeout: float) -> tuple[int, str]:
+    """GET acotado con la biblioteca estándar: sin dependencias nuevas.
+
+    Returns:
+        ``(status_code, cuerpo)``; ``(0, motivo)`` si no se pudo medir.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "punto-production-probe/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(MAX_BODY_CHARS).decode("utf-8", errors="replace")
+            return int(response.status), body
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(MAX_BODY_CHARS).decode("utf-8", errors="replace")
+        except Exception:  # la respuesta no se pudo leer: el código sigue siendo evidencia
+            body = ""
+        return int(exc.code), body
+    except Exception as exc:
+        return 0, f"sin respuesta: {exc}"
+
+
+class ProductionProbe:
+    """Comprueba que producción sirve lo que se esperaba, con reintentos acotados.
+
+    Un despliegue tarda: por eso hay varios intentos y una espera entre ellos. Lo que **no** hay es
+    optimismo: si la respuesta no es 200 o el marcador esperado no aparece, producción no está
+    validada.
+    """
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        marker: str = "",
+        attempts: int = 6,
+        delay_seconds: float = 5.0,
+        timeout_seconds: float = 15.0,
+        fetch: Callable[[str, float], tuple[int, str]] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+    ) -> None:
+        self._url = url
+        self._marker = marker
+        self._attempts = max(1, attempts)
+        self._delay = delay_seconds
+        self._timeout = timeout_seconds
+        self._fetch = fetch or default_fetch
+        self._sleep = sleeper or time.sleep
+
+    def check(self) -> ProductionEvidence:
+        """Comprueba producción y devuelve la evidencia de lo observado."""
+        status = 0
+        marker_found = False
+        detail = ""
+        attempts = 0
+        for index in range(self._attempts):
+            attempts = index + 1
+            status, body = self._fetch(self._url, self._timeout)
+            marker_found = bool(self._marker) and self._marker in body
+            detail = (body or "")[:300]
+            if status == 200 and (not self._marker or marker_found):
+                break
+            if attempts < self._attempts:
+                self._sleep(self._delay)
+        return ProductionEvidence(
+            url=self._url,
+            marker=self._marker,
+            attempts=attempts,
+            status_code=status,
+            marker_found=marker_found,
+            detail=detail,
+        )
+
+
+class PublicationService:
+    """Ejecuta la publicación **solo** con un Human Gate aprobado y evidencia de producción."""
+
+    def __init__(
+        self,
+        *,
+        target_id: str,
+        repository: Path,
+        branch: str,
+        url: str,
+        remote: str = "origin",
+        marker: str = "",
+        publisher: GitPublisher | None = None,
+        probe: ProductionProbe | None = None,
+        allow_remote_push: bool = False,
+        audit: Any | None = None,
+        actor: str = "punto-console",
+    ) -> None:
+        self._target_id = target_id
+        self._repository = Path(repository)
+        self._branch = branch
+        self._url = url
+        self._remote_name = remote or "origin"
+        self._marker = marker
+        self._publisher = publisher or GitPublisher(self._repository)
+        self._probe = probe or ProductionProbe(url=url, marker=marker)
+        self._allow_remote_push = allow_remote_push
+        self._audit = audit
+        self._actor = actor
+
+    @property
+    def publishable(self) -> bool:
+        """True si el destino declara rama y URL de producción."""
+        return bool(self._branch and self._url)
+
+    def publish(
+        self,
+        *,
+        task_id: UUID | str,
+        request_id: str,
+        commit_sha: str,
+        approval_id: UUID | None,
+        gate: Any,
+        record: PublicationRecord | None = None,
+    ) -> PublicationRecord:
+        """Publica el commit aprobado y comprueba producción.
+
+        Args:
+            task_id: Tarea humana cuyo resultado se publica.
+            request_id: Solicitud de desarrollo que produjo el commit.
+            commit_sha: Commit local ya validado que se integra en la rama de producción.
+            approval_id: Human Gate de publicación.
+            gate: ``HumanGate`` real (el único emisor de autorizaciones).
+            record: Expediente ya abierto para la tarea (conserva su historial de etapas).
+
+        Raises:
+            HumanGateNotApprovedError: si no hay aprobación válida para **esa** operación. Es el
+                mismo error del motor, para que no exista una segunda noción de autorización.
+            PublicationRefused: si el destino no es publicable o el plan de push no es válido.
+        """
+        record = record or PublicationRecord(
+            task_id=str(task_id),
+            request_id=request_id,
+            target_id=self._target_id,
+            commit_sha=commit_sha,
+            approval_id="" if approval_id is None else str(approval_id),
+        )
+        # La autorización se comprueba con el punto único de parada del motor: sin gate aprobado,
+        # esta función no sigue. No hay ninguna vía alternativa.
+        gate.assert_executable(approval_id)
+        if not self.publishable:
+            record.error_kind = "TARGET_NOT_PUBLISHABLE"
+            record.error = (
+                "el destino no declara rama y URL de producción: PUNTO no adivina dónde vive "
+                "producción"
+            )
+            record.advance(
+                PublicationStage.BLOCKED_NOT_PUBLISHABLE, record.error
+            )
+            return record
+
+        plan = PushPlan(remote=self._remote_name, branch=self._branch, sha=commit_sha)
+        record.advance(PublicationStage.PUBLISHING, f"push a {plan.ref}")
+        self._log("publication_started", record, {"ref": plan.ref, "sha": commit_sha[:12]})
+        try:
+            evidence = self._publisher.push(plan, allow_remote=self._allow_remote_push)
+        except PublicationRefused as refused:
+            record.error_kind = refused.kind
+            record.error = refused.detail
+            record.advance(PublicationStage.PUBLICATION_FAILED, refused.detail)
+            self._log("publication_failed", record, {"kind": refused.kind}, failed=True)
+            return record
+        record.push = evidence
+        if not evidence.pushed:
+            record.error_kind = "PUSH_FAILED"
+            record.error = "el push no terminó bien: la rama de producción no cambió"
+            record.advance(PublicationStage.PUBLICATION_FAILED, evidence.output[:300])
+            self._log("publication_failed", record, {"kind": "PUSH_FAILED"}, failed=True)
+            return record
+        self._log("publication_pushed", record, {"ref": plan.ref, "sha": commit_sha[:12]})
+
+        record.advance(PublicationStage.DEPLOYMENT_VERIFICATION, f"comprobando {self._url}")
+        production = self._probe.check()
+        record.production = production
+        if not production.validated:
+            record.error_kind = "DEPLOYMENT_NOT_VERIFIED"
+            record.error = (
+                f"producción respondió {production.status_code} y el marcador esperado "
+                f"{'no apareció' if self._marker else 'no se comprobó'}"
+            )
+            record.advance(PublicationStage.DEPLOYMENT_NOT_VERIFIED, record.error)
+            self._log(
+                "production_not_verified", record, production.as_dict(), failed=True
+            )
+            return record
+        record.advance(PublicationStage.PRODUCTION_VALIDATED, "producción comprobada")
+        self._log("production_verified", record, production.as_dict())
+        return record
+
+    def _log(
+        self,
+        action: str,
+        record: PublicationRecord,
+        metadata: dict[str, Any],
+        *,
+        failed: bool = False,
+    ) -> None:
+        """Registra la transición en la auditoría del motor, si hay una."""
+        if self._audit is None:
+            return
+        from punto.schemas.audit import AuditEventType
+        from punto.schemas.enums import AuditResult
+
+        event = {
+            "publication_started": AuditEventType.PUBLICATION_REQUESTED,
+            "publication_pushed": AuditEventType.PUBLICATION_PUSHED,
+            "publication_failed": AuditEventType.PUBLICATION_FAILED,
+            "production_verified": AuditEventType.PRODUCTION_VERIFIED,
+            "production_not_verified": AuditEventType.PRODUCTION_NOT_VERIFIED,
+        }[action]
+        self._audit.log_dev_event(
+            event,
+            action,
+            request_id=record.request_id,
+            metadata={
+                "task_id": record.task_id,
+                "target_id": record.target_id,
+                "approval_id": record.approval_id,
+                "stage": record.stage.value,
+                "payload": json.dumps(metadata, ensure_ascii=False)[:600],
+            },
+            result=AuditResult.FAILURE if failed else AuditResult.SUCCESS,
+            actor=self._actor,
+        )

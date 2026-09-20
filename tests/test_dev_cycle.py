@@ -62,6 +62,12 @@ SOURCE = "export const TIPOS = ['Casa', 'Apartamento'];\n"
 #: un objeto sin política. Sin esto, el techo de archivos por nivel de autoridad no se ejercía.
 _POLICY_ENGINE = PolicyEngine.from_config()
 
+#: Canario de prueba — **no** es un secreto real. Tiene forma de credencial para que las
+#: inyecciones de secreto (leer, escribir y comprobar que no se filtra) sean realistas, y se
+#: declara canary en su propio nombre para que el escáner del motor lo reconozca, como manda su
+#: documentación de placeholders, en vez de bloquear el release por material didáctico de pruebas.
+CANARY_API_KEY = "sk-0123456789abcdef0123456789ab"  # canary
+
 
 def _git(root: Path, *args: str) -> str:
     """Ejecuta Git en el repositorio fixture (solo para prepararlo)."""
@@ -97,8 +103,7 @@ def _repo(tmp_path: Path) -> Path:
     (root / ".env.local").write_text("DATABASE_URL=postgresql://canary:canary@host/db\n",
                                      encoding="utf-8")
     # Un almacén de credenciales **dentro** del alcance: la denegación tiene que ser por secreto.
-    (root / "src" / ".env.local").write_text("API_KEY=sk-0123456789abcdef0123456789ab\n",
-                                             encoding="utf-8")
+    (root / "src" / ".env.local").write_text(f"API_KEY={CANARY_API_KEY}\n", encoding="utf-8")
     _git(root, "init", "-b", "main")
     _git(root, "add", "-A")
     _git(
@@ -644,7 +649,7 @@ def test_un_cambio_con_secreto_no_se_aplica(tmp_path: Path) -> None:
                     {
                         "path": "src/lib/opciones.ts",
                         "operation": "MODIFY",
-                        "content": "export const K = 'sk-0123456789abcdef0123456789ab';\n",
+                        "content": f"export const K = '{CANARY_API_KEY}';\n",
                     }
                 ]
             ),
@@ -655,7 +660,7 @@ def test_un_cambio_con_secreto_no_se_aplica(tmp_path: Path) -> None:
 
     assert result.status is DevelopmentStatus.CHANGE_REJECTED
     assert "CHANGE_SECRET" in [issue.code for issue in result.change_issues]
-    assert "sk-0123456789abcdef" not in (root / "src" / "lib" / "opciones.ts").read_text(
+    assert CANARY_API_KEY[:16] not in (root / "src" / "lib" / "opciones.ts").read_text(
         encoding="utf-8"
     )
 

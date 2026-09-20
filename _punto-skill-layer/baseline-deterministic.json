@@ -1,0 +1,566 @@
+[
+  {
+    "case": "CASE-A",
+    "kind": "A",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/lib/tipos.ts",
+      "src/lib/tipos.ts",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.053,
+    "record": {
+      "run_id": "4893958f-0820-45f3-8d9c-b0c336203c87",
+      "task_id": "CASE-A",
+      "case_id": "CASE-A",
+      "case_kind": "A",
+      "mode": "DETERMINISTIC",
+      "primary_role": "BUILDER",
+      "primary_provider": "guionizado",
+      "primary_model": "guionizado-1",
+      "primary_transport": "scripted",
+      "started_at": "2026-09-20T06:39:11.071111Z",
+      "finished_at": "2026-09-20T06:39:11.780082Z",
+      "elapsed_ms": 708,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 108,
+      "provider_calls": 3,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 2
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 1
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 1,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 4,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 9230,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['guionizado']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-B",
+    "kind": "B",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/lib/tipos.ts",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.044,
+    "record": {
+      "run_id": "7f645f34-76c2-4321-826d-a7a700ec0d55",
+      "task_id": "CASE-B",
+      "case_id": "CASE-B",
+      "case_kind": "B",
+      "mode": "DETERMINISTIC",
+      "primary_role": "ARCHITECT",
+      "primary_provider": "guionizado",
+      "primary_model": "guionizado-1",
+      "primary_transport": "scripted",
+      "started_at": "2026-09-20T06:39:12.045706Z",
+      "finished_at": "2026-09-20T06:39:12.608210Z",
+      "elapsed_ms": 564,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 102,
+      "provider_calls": 2,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 1
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1
+      },
+      "tool_calls": 2,
+      "transport_retries": 0,
+      "repair_rounds": 0,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 3,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 5269,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['guionizado']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-C",
+    "kind": "C",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/lib/tipos.ts",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.042,
+    "record": {
+      "run_id": "71f57aff-d781-4609-992d-7ca10536e638",
+      "task_id": "CASE-C",
+      "case_id": "CASE-C",
+      "case_kind": "C",
+      "mode": "DETERMINISTIC",
+      "primary_role": "BUILDER",
+      "primary_provider": "guionizado",
+      "primary_model": "guionizado-1",
+      "primary_transport": "scripted",
+      "started_at": "2026-09-20T06:39:12.826959Z",
+      "finished_at": "2026-09-20T06:39:13.374176Z",
+      "elapsed_ms": 532,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 107,
+      "provider_calls": 2,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 1
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1
+      },
+      "tool_calls": 2,
+      "transport_retries": 0,
+      "repair_rounds": 0,
+      "plan_revisions": 1,
+      "scope_expansions": 1,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 3,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 5245,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['guionizado']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-D",
+    "kind": "D",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/lib/tipos.ts",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.045,
+    "record": {
+      "run_id": "d7874ffd-7b5f-42e5-9e4c-794ada847c06",
+      "task_id": "CASE-D",
+      "case_id": "CASE-D",
+      "case_kind": "D",
+      "mode": "DETERMINISTIC",
+      "primary_role": "BUILDER",
+      "primary_provider": "guionizado",
+      "primary_model": "guionizado-1",
+      "primary_transport": "scripted",
+      "started_at": "2026-09-20T06:39:13.649488Z",
+      "finished_at": "2026-09-20T06:39:14.159308Z",
+      "elapsed_ms": 518,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 98,
+      "provider_calls": 2,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 1
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1
+      },
+      "tool_calls": 2,
+      "transport_retries": 0,
+      "repair_rounds": 0,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 3,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 5291,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['guionizado']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-E",
+    "kind": "E",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/lib/tipos.ts",
+      "src/lib/tipos.ts",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.041,
+    "record": {
+      "run_id": "53a3c11b-e1d5-490c-ab02-3f13cc7a9570",
+      "task_id": "CASE-E",
+      "case_id": "CASE-E",
+      "case_kind": "E",
+      "mode": "DETERMINISTIC",
+      "primary_role": "BUILDER",
+      "primary_provider": "guionizado",
+      "primary_model": "guionizado-1",
+      "primary_transport": "scripted",
+      "started_at": "2026-09-20T06:39:14.386268Z",
+      "finished_at": "2026-09-20T06:39:15.048452Z",
+      "elapsed_ms": 649,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 108,
+      "provider_calls": 3,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 2
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 1
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 1,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 4,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 8796,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['guionizado']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-F",
+    "kind": "F",
+    "status": "PASS",
+    "plan_status": "N/A",
+    "error": "la aplicación se abrió, respondió y cumplió lo esperado",
+    "change_issues": [],
+    "applied": [],
+    "verification": [
+      [
+        "consumer_qa",
+        0
+      ]
+    ],
+    "gates": [],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.0,
+    "record": {
+      "run_id": "CASE-F-qa",
+      "task_id": "CASE-F",
+      "case_id": "CASE-F",
+      "case_kind": "F",
+      "mode": "DETERMINISTIC",
+      "primary_role": "",
+      "primary_provider": "",
+      "primary_model": "",
+      "primary_transport": "",
+      "started_at": "2026-09-20T06:39:15.171503Z",
+      "finished_at": "2026-09-20T06:39:26.346718Z",
+      "elapsed_ms": 11182,
+      "provider_elapsed_ms": 0,
+      "verification_elapsed_ms": 11182,
+      "provider_calls": 0,
+      "provider_calls_by_role": {},
+      "provider_calls_by_phase": {},
+      "tool_calls": 0,
+      "transport_retries": 0,
+      "repair_rounds": 0,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 0,
+      "files_read": 0,
+      "files_changed": 0,
+      "context_requests": 0,
+      "verification_count": 1,
+      "verification_failures": 0,
+      "functional_chain_verifications": 0,
+      "functional_chain_pass": false,
+      "pell_retrievals": 0,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "total_tokens": null,
+        "source": "UNAVAILABLE"
+      },
+      "prompt_chars": 0,
+      "context_chars": 0,
+      "success": true,
+      "final_status": "PASS",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "verificación de consumidor: 0 llamadas a proveedor"
+      ]
+    }
+  }
+]

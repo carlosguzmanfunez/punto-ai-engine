@@ -1,0 +1,314 @@
+[
+  {
+    "case": "CASE-B",
+    "kind": "B",
+    "status": "DEVELOPMENT_VERIFICATION_FAILED",
+    "plan_status": "PLAN_VALID",
+    "error": "la verificación no pasó tras las rondas de reparación",
+    "change_issues": [],
+    "applied": [],
+    "verification": [
+      [
+        "focused",
+        1
+      ],
+      [
+        "chain",
+        1
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.061,
+    "record": {
+      "run_id": "75efa979-25f5-4a06-9687-636981103acb",
+      "task_id": "CASE-B",
+      "case_id": "CASE-B",
+      "case_kind": "B",
+      "mode": "REAL",
+      "primary_role": "ARCHITECT",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "started_at": "2026-09-20T06:39:36.671963Z",
+      "finished_at": "2026-09-20T06:42:30.218612Z",
+      "elapsed_ms": 173536,
+      "provider_elapsed_ms": 172951,
+      "verification_elapsed_ms": 122,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 4,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 0,
+      "scope_expansions": 0,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 0,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 2,
+      "functional_chain_verifications": 0,
+      "functional_chain_pass": false,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 5440,
+        "output_tokens": 10960,
+        "total_tokens": 16400,
+        "source": "REAL"
+      },
+      "prompt_chars": 13144,
+      "context_chars": 182,
+      "success": false,
+      "final_status": "DEVELOPMENT_VERIFICATION_FAILED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": true,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-D",
+    "kind": "D",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx",
+      "src/lib/tipos.ts",
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.053,
+    "record": {
+      "run_id": "32862222-5551-4cff-a1be-321f453a572b",
+      "task_id": "CASE-D",
+      "case_id": "CASE-D",
+      "case_kind": "D",
+      "mode": "REAL",
+      "primary_role": "BUILDER",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "started_at": "2026-09-20T06:42:30.474697Z",
+      "finished_at": "2026-09-20T06:45:17.735717Z",
+      "elapsed_ms": 167261,
+      "provider_elapsed_ms": 166448,
+      "verification_elapsed_ms": 117,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 6,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 1,
+      "scope_expansions": 1,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 7,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 5725,
+        "output_tokens": 9807,
+        "total_tokens": 15532,
+        "source": "REAL"
+      },
+      "prompt_chars": 13982,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    }
+  },
+  {
+    "case": "CASE-E",
+    "kind": "E",
+    "status": "DEVELOPMENT_COMPLETED",
+    "plan_status": "PLAN_VALID",
+    "error": "",
+    "change_issues": [],
+    "applied": [
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx",
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx",
+      "src/lib/tipos.ts",
+      "src/components/Buscador.tsx",
+      "src/components/Rejilla.tsx"
+    ],
+    "verification": [
+      [
+        "focused",
+        0
+      ],
+      [
+        "chain",
+        0
+      ]
+    ],
+    "gates": [
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW",
+      "ALLOW"
+    ],
+    "repeated_blocks": {
+      "worker_instructions": 522,
+      "plan_contract": 1101,
+      "build_contract": 1301
+    },
+    "dirty_preserved": true,
+    "overhead_ms": 0.046,
+    "record": {
+      "run_id": "2c02f7d0-feae-46e0-a4fc-af84c061e17b",
+      "task_id": "CASE-E",
+      "case_id": "CASE-E",
+      "case_kind": "E",
+      "mode": "REAL",
+      "primary_role": "BUILDER",
+      "primary_provider": "openai",
+      "primary_model": "gpt-5.6-sol",
+      "primary_transport": "configured",
+      "started_at": "2026-09-20T06:45:18.015783Z",
+      "finished_at": "2026-09-20T06:48:35.682225Z",
+      "elapsed_ms": 197666,
+      "provider_elapsed_ms": 196710,
+      "verification_elapsed_ms": 122,
+      "provider_calls": 4,
+      "provider_calls_by_role": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "provider_calls_by_phase": {
+        "implementation": 1,
+        "planning": 1,
+        "repair": 2
+      },
+      "tool_calls": 6,
+      "transport_retries": 0,
+      "repair_rounds": 2,
+      "plan_revisions": 1,
+      "scope_expansions": 1,
+      "stagnation_events": 0,
+      "repeated_failure_signatures": 0,
+      "files_discovered": 3,
+      "files_read": 3,
+      "files_changed": 7,
+      "context_requests": 0,
+      "verification_count": 2,
+      "verification_failures": 0,
+      "functional_chain_verifications": 1,
+      "functional_chain_pass": true,
+      "pell_retrievals": 1,
+      "pell_hits": 0,
+      "human_gates": 0,
+      "tokens": {
+        "input_tokens": 5710,
+        "output_tokens": 11404,
+        "total_tokens": 17114,
+        "source": "REAL"
+      },
+      "prompt_chars": 13883,
+      "context_chars": 182,
+      "success": true,
+      "final_status": "DEVELOPMENT_COMPLETED",
+      "regression_detected": false,
+      "correctable_defects_created": 0,
+      "human_gate_required": false,
+      "rollback_required": false,
+      "notes": [
+        "proveedores: ['deepseek', 'openai']"
+      ]
+    }
+  }
+]

@@ -40,6 +40,7 @@ from punto.orchestrator.dev_cycle import DevelopmentCycle
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.contract import ProviderRole
+from punto.providers.secrets import redact_secret_text
 from punto.publish.production import (
     GitPublisher,
     ProductionProbe,
@@ -80,6 +81,12 @@ PUSH_AUTHORIZATION_ENV: Final[str] = "PUNTO_PRODUCTION_PUSH"
 
 #: Tope de filas de verificación que se muestran a una persona.
 MAX_VERIFICATION_ROWS: Final[int] = 20
+
+#: Tope de piezas de evidencia (problemas, condiciones y recursos) que se muestran en un gate.
+MAX_EVIDENCE_ROWS: Final[int] = 12
+
+#: Tope del motivo del gate: el detalle real, acotado y ya redactado.
+MAX_REASON_CHARS: Final[int] = 400
 
 #: Motivos de parada del ciclo que son, de verdad, una petición de autoridad humana.
 HUMAN_REQUIRED_KINDS: Final[frozenset[str]] = frozenset(
@@ -191,14 +198,20 @@ class ConsoleTask:
                 self.notes = [*self.notes[-4:], detail[:300]]
 
     def summary(self) -> dict[str, Any]:
-        """Resumen del resultado de desarrollo, sin contenido de ficheros."""
+        """Resumen del resultado de desarrollo, sin contenido de ficheros.
+
+        Incluye la evidencia **real** de la decisión gobernada (problemas con su código y detalle,
+        decisiones de autoridad con sus reglas y razones, y el alcance del plan). Es lo que permite
+        que un Human Gate diga *qué* se autoriza y *por qué* PUNTO pide una persona: antes de esto
+        el resultado llegaba sin nada de esa evidencia y el gate solo podía ser genérico.
+        """
         result = self.result
         if result is None:
             return {}
         return {
             "status": result.status.value,
-            "error_kind": result.error_kind,
-            "error": result.error[:300],
+            "error_kind": _redacted(result.error_kind, 60),
+            "error": _redacted(result.error, 300),
             "commit_sha": result.commit_sha,
             "branch": result.branch,
             "applied": [item.path for item in result.applied],
@@ -215,6 +228,19 @@ class ConsoleTask:
             "published": result.published,
             "duration_ms": result.duration_ms,
             "pell_status": result.pell_status,
+            "plan_summary": _redacted(result.plan.summary if result.plan is not None else ""),
+            "plan_issues": [
+                {"code": item.code, "detail": _redacted(item.detail)}
+                for item in result.plan_issues[:MAX_EVIDENCE_ROWS]
+            ],
+            "change_issues": [
+                {"code": item.code, "detail": _redacted(item.detail)}
+                for item in result.change_issues[:MAX_EVIDENCE_ROWS]
+            ],
+            "authority_evidence": [
+                _decision_view(item) for item in _gate_decisions(result)[:MAX_EVIDENCE_ROWS]
+            ],
+            "scope_paths": list(_result_scope(result))[:MAX_VERIFICATION_ROWS],
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -635,10 +661,7 @@ def register_human_console(
                 task_id=task.task_id,
                 action=human_kind,
                 risk=decision.effective_risk,
-                reason=(
-                    f"el ciclo se detuvo en {human_kind}: hace falta una persona antes de seguir "
-                    f"con {task.target_id}"
-                ),
+                reason=_gate_reason(human_kind, result, task.target_id),
                 resume_status=TaskStatus.IN_PROGRESS,
                 policy_outcome=decision.outcome.value,
                 policy_decision_id=decision.id,
@@ -701,7 +724,13 @@ def register_human_console(
     def _gate_view(
         deps: ConsoleDependencies, approval_id: UUID, registry: Mapping[str, ConsoleTask]
     ) -> dict[str, Any]:
-        """Vista mínima de un gate: lo necesario para decidir, sin dumps ni prompts."""
+        """Vista de un gate: lo necesario para decidir **con la causa real delante**.
+
+        Además del estado y el destino, se expone la evidencia gobernada del ciclo —qué operación
+        quiere hacer PUNTO, qué recursos toca y qué condición concreta disparó el REQUIRE_HUMAN— y
+        el alcance de la autorización: qué se autoriza al aprobar y qué no. Nada de eso se inventa
+        aquí: sale del resultado real y de la decisión de autoridad que ya produjo el ciclo.
+        """
         approval = deps.gates.get(approval_id)
         if approval is None:
             return {"approval_id": str(approval_id), "status": "NOT_FOUND"}
@@ -734,6 +763,7 @@ def register_human_console(
                 ),
             },
             "verification": task.summary().get("verification", []) if task is not None else [],
+            "evidence": _gate_evidence(approval, task, target, publication=publication),
             "requested_at": approval.requested_at.isoformat(),
             "resolved_at": approval.resolved_at.isoformat() if approval.resolved_at else "",
             "resolved_by": approval.resolved_by or "",
@@ -833,6 +863,154 @@ def _publication_gate_status(
         return ""
     approval = dependencies.gates.get(UUID(publication.approval_id))
     return approval.status.value if approval is not None else ""
+
+
+# ----------------------------------------------------- evidencia del Human Gate
+def _redacted(text: object, limit: int = 300) -> str:
+    """Texto acotado y **redactado** con el mecanismo del motor, listo para la interfaz.
+
+    Es la única puerta por la que un texto que viene del ciclo (o del proveedor) llega a la
+    persona: no se muestra ninguna credencial ni contenido de ficheros.
+    """
+    return redact_secret_text(str(text))[:limit]
+
+
+def _result_scope(result: DevelopmentResult) -> tuple[str, ...]:
+    """Recursos (rutas relativas) del alcance real del resultado: el final, o el inicial."""
+    return tuple(result.final_scope or result.initial_scope)
+
+
+def _gate_decisions(result: DevelopmentResult) -> tuple[Any, ...]:
+    """Decisiones de autoridad que explican la parada: las que no fueron autónomas, o la última."""
+    blocking = tuple(
+        item
+        for item in result.authority_decisions
+        if item.outcome not in {"ALLOW", "ALLOW_WITH_REVIEW"}
+    )
+    if blocking:
+        return blocking
+    return tuple(result.authority_decisions[-1:]) if result.authority_decisions else ()
+
+
+def _decision_view(decision: Any) -> dict[str, Any]:
+    """Vista de una decisión de autoridad: sus reglas, sus razones y la evidencia que exige."""
+    return {
+        "operation": _redacted(decision.operation, 60),
+        "outcome": _redacted(decision.outcome, 40),
+        "authority_class": _redacted(decision.authority_class, 40),
+        "risk": _redacted(decision.risk, 20),
+        "rules": [_redacted(item, 120) for item in decision.rules[:MAX_EVIDENCE_ROWS]],
+        "reasons": [_redacted(item, 200) for item in decision.reasons[:MAX_EVIDENCE_ROWS]],
+        "resources": [_redacted(item, 200) for item in decision.resources[:MAX_EVIDENCE_ROWS]],
+        "required_evidence": [
+            _redacted(item, 200) for item in decision.required_evidence[:MAX_EVIDENCE_ROWS]
+        ],
+    }
+
+
+def _gate_reason(kind: str, result: DevelopmentResult, target_id: str) -> str:
+    """Motivo del Human Gate con la **causa real** que PUNTO ya calculó.
+
+    Un gate que solo dice «hace falta una persona» no es accionable: el motivo lleva el código del
+    problema y el detalle que produjo el ciclo (reglas, clase de autoridad y riesgo incluidos), ya
+    acotado y redactado. Si el ciclo no dejó detalle, se cae al texto genérico en vez de inventarlo.
+    """
+    cause = _human_cause(result)
+    if cause["code"] and cause["detail"]:
+        return f"{kind}: {cause['detail']}"[:MAX_REASON_CHARS]
+    if cause["code"]:
+        return f"{kind}: el ciclo se detuvo con {cause['code']} en {target_id}"[:MAX_REASON_CHARS]
+    return (
+        f"el ciclo se detuvo en {kind}: hace falta una persona antes de seguir con {target_id}"
+    )[:MAX_REASON_CHARS]
+
+
+def _human_cause(result: DevelopmentResult | None) -> dict[str, str]:
+    """Causa real de la parada: el primer problema que PUNTO encontró, con su código y su detalle.
+
+    El detalle lo compone el ciclo (``el plan toca N recurso(s) y el sobre de autoridad devuelve
+    REQUIRE_HUMAN (HUMAN_GATE_REQUIRED, riesgo HIGH): recurso de clase desconocida: se falla
+    cerrado``), no la interfaz: aquí solo se propaga.
+    """
+    if result is None:
+        return {"code": "", "detail": ""}
+    for issue in (*result.plan_issues, *result.change_issues):
+        return {"code": _redacted(issue.code, 60), "detail": _redacted(issue.detail, 300)}
+    return {"code": _redacted(result.error_kind, 60), "detail": _redacted(result.error, 300)}
+
+
+def _planned_changes(result: DevelopmentResult | None) -> dict[str, list[str]]:
+    """Lo que el plan declaraba hacer, recurso a recurso (nada se ha aplicado todavía)."""
+    plan = result.plan if result is not None else None
+    if plan is None:
+        return {"modify": [], "create": [], "delete": []}
+    return {
+        "modify": [_redacted(item, 200) for item in plan.files_to_modify[:MAX_EVIDENCE_ROWS]],
+        "create": [_redacted(item, 200) for item in plan.files_to_create[:MAX_EVIDENCE_ROWS]],
+        "delete": [_redacted(item, 200) for item in plan.files_to_delete[:MAX_EVIDENCE_ROWS]],
+    }
+
+
+def _gate_evidence(
+    approval: Any,
+    task: ConsoleTask | None,
+    target: DevelopmentTarget | None,
+    *,
+    publication: bool,
+) -> dict[str, Any]:
+    """Evidencia mínima y gobernada para que una persona sepa qué autoriza y por qué.
+
+    Responde, con datos reales del ciclo: qué operación quiere hacer PUNTO, qué recursos afecta, qué
+    condición concreta disparó el REQUIRE_HUMAN/HIGH, qué autoriza aprobar y qué no autoriza.
+    """
+    result = task.result if task is not None else None
+    destination = target.human_name if target is not None else ""
+    decisions = _gate_decisions(result)[:3] if result is not None else ()
+    scope = list(_result_scope(result)) if result is not None else []
+    return {
+        "risk": approval.risk.name,
+        "policy_outcome": approval.policy_outcome or "",
+        "action": approval.action,
+        "operation": {
+            "name": _redacted(decisions[0].operation, 40) if decisions else "",
+            "summary": (
+                _redacted(result.plan.summary, 300)
+                if result is not None and result.plan is not None
+                else ""
+            ),
+            "planned": _planned_changes(result),
+        },
+        "resources": {
+            "paths": [_redacted(item, 200) for item in scope[:MAX_EVIDENCE_ROWS]],
+            "total": len(scope),
+        },
+        "cause": _human_cause(result),
+        "conditions": [_decision_view(item) for item in decisions],
+        "authorizes": (
+            f"Publicar en producción el commit aprobado de {destination or 'este destino'} y "
+            "comprobar que sirve lo esperado."
+            if publication
+            else (
+                f"Que PUNTO continúe **esta** operación en "
+                f"{destination or 'el destino autorizado'}: el plan declarado se aplicará en el "
+                "alcance permitido y se verificará con el catálogo del destino. Nada más."
+            )
+        ),
+        "does_not_authorize": (
+            [
+                "Nada más que ese commit en la rama de producción declarada.",
+                "Autoridad nueva: la aprobación no amplía permisos, alcance ni reglas.",
+                "Publicar en otro destino ni por otra vía.",
+            ]
+            if publication
+            else [
+                "Publicar en producción: eso exige su propio Human Gate de publicación.",
+                "Autoridad nueva: la aprobación no amplía permisos, alcance ni reglas de PUNTO.",
+                "Operar sobre otro destino: el gate está ligado a esta tarea y a este destino.",
+                "Saltar la verificación: el ciclo sigue verificando y puede fallar igualmente.",
+            ]
+        ),
+    }
 
 
 def _issue_human_kind(result: DevelopmentResult) -> str:

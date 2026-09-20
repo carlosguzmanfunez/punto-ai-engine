@@ -446,6 +446,19 @@ class DevelopmentCycle:
                 plan_issues=plan_issues,
                 retrieval=retrieval,
                 started=started,
+                provider=self._last_provider,
+                model=self._last_model,
+                # La causa **real** del rechazo viaja con el resultado: el código y el detalle del
+                # primer problema son lo que una persona necesita para decidir en el Human Gate.
+                # Antes se perdían aquí (el resultado salía sin ``error_kind``, sin decisiones de
+                # autoridad y sin alcance), así que el gate solo podía decir que hacía falta
+                # una persona. Esa evidencia existía: ahora viaja.
+                error_kind=plan_issues[0].code if plan_issues else "PLAN_REJECTED",
+                error=plan_issues[0].detail if plan_issues else "",
+                initial_scope=_bounded(plan.touched_paths()) if plan is not None else (),
+                final_scope=_bounded(plan.touched_paths()) if plan is not None else (),
+                risk_envelopes=tuple(self._risk_envelopes),
+                authority_decisions=tuple(self._authority_decisions),
             )
         self._final_plan = self._final_plan or plan
 

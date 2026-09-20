@@ -1,4 +1,4 @@
-"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
+﻿"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
 
 Cubre lo que el encargo pide demostrar (A a N) **sin tocar producción real**: el push va
 a un remoto Git local (bare) y la comprobación de producción se inyecta. Lo que no se
@@ -16,7 +16,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import yaml
@@ -37,12 +37,20 @@ from punto.policy.policy_engine import PolicyEngine
 from punto.providers.base import ModelCompletion
 from punto.providers.contract import ModelUsage, ProviderRole
 from punto.providers.router import ProviderRouter
+from punto.providers.transport import REDACTED
 from punto.publish.production import (
     GitPublisher,
     ProductionProbe,
     PublicationService,
 )
-from punto.schemas.dev import RepositoryOperation
+from punto.schemas.build import BuildValidationIssue
+from punto.schemas.dev import (
+    AuthorityDecisionRecord,
+    DevelopmentResult,
+    DevelopmentStatus,
+    RepositoryOperation,
+)
+from punto.schemas.enums import RiskLevel, TaskStatus
 from punto.workspace.target import (
     DevelopmentTarget,
     DevelopmentTargetRegistry,
@@ -1112,6 +1120,296 @@ def test_un_destino_no_registrado_no_concede_acceso_a_otro_directorio(tmp_path: 
     assert client.get("/console/tasks").json()["total"] == 0
     assert client.get("/console/targets").json()["targets"][0]["target_id"] == TARGET_ID
     assert _git(ajeno, "rev-parse", "--abbrev-ref", "HEAD") == "ai/console-fixture"
+
+
+# ------------------------------------------- evidencia del Human Gate · A a G
+def _repo_con_css(tmp_path: Path) -> tuple[Path, Path]:
+    """Repositorio del montaje con un recurso de clase **desconocida** para el sobre de autoridad.
+
+    Una hoja de estilos (``.css``) no cae en ninguna clase conocida del clasificador de recursos,
+    así que el sobre aplica su regla de fallo cerrado y exige persona. Es el mismo camino que
+    produjo el gate real: no se fuerza nada desde fuera.
+    """
+    repo, remoto = _repos(tmp_path)
+    (repo / "src" / "app").mkdir(parents=True, exist_ok=True)
+    (repo / "src" / "app" / "globals.css").write_text("body { margin: 0 }\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(
+        repo,
+        "-c",
+        "user.name=console",
+        "-c",
+        "user.email=console@punto.local",
+        "commit",
+        "-m",
+        "estilos base",
+    )
+    return repo, remoto
+
+
+def _plan_con_recurso_desconocido() -> dict[str, Any]:
+    """Plan válido que toca un recurso de clase desconocida: el sobre responde REQUIRE_HUMAN."""
+    payload = _plan()
+    payload["files_to_modify"] = ["src/lib/tipos.ts", "src/app/globals.css"]
+    payload["summary"] = "reemplazar el mapa de cobertura por uno real"
+    return payload
+
+
+def _cambio_con_css() -> dict[str, Any]:
+    """Cambio que acompaña al plan (no llega a aplicarse: el plan exige persona)."""
+    payload = _cambio()
+    payload["changes"].append(
+        {
+            "path": "src/app/globals.css",
+            "operation": "MODIFY",
+            "content": "body { margin: 0; }\n",
+            "reason": "el mapa necesita su hoja de estilos",
+            "acceptance_criterion": "una sola fuente de tipos",
+        }
+    )
+    return payload
+
+
+def _tarea_con_plan_que_exige_persona(
+    tmp_path: Path,
+) -> tuple[TestClient, Path, Path, Any, dict[str, Any]]:
+    """Tarea real detenida en ``PLAN_REQUIRES_HUMAN`` con su gate pendiente."""
+    repo, remoto = _repo_con_css(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, deps = _app(
+        target=target,
+        respuestas=[
+            _plan_con_recurso_desconocido(),
+            _plan_con_recurso_desconocido(),
+            _cambio_con_css(),
+        ],
+    )
+    tarea = client.post(
+        "/console/tasks",
+        json={
+            "objective": "poner el mapa real de Honduras",
+            "target_id": TARGET_ID,
+            "scope_paths": ["src"],
+        },
+    ).json()
+    return client, repo, remoto, deps, tarea
+
+
+def test_a_el_gate_muestra_la_causa_gobernada_real(tmp_path: Path) -> None:
+    """A: el gate HIGH dice qué condición concreta disparó el REQUIRE_HUMAN, no una frase vacía."""
+    client, _repo, _remoto, _deps, tarea = _tarea_con_plan_que_exige_persona(tmp_path)
+
+    assert tarea["stage"] == "WAITING_HUMAN", tarea
+    gate = client.get("/console/human-gates").json()["items"][0]
+    evidencia = gate["evidence"]
+
+    assert gate["action"] == "PLAN_REQUIRES_HUMAN"
+    assert gate["risk"] == "HIGH"
+    assert gate["policy_outcome"] == "REQUIRE_HUMAN"
+    # La causa: el problema real que PUNTO encontró, con su código y su detalle.
+    assert evidencia["cause"]["code"] == "PLAN_REQUIRES_HUMAN"
+    assert "recurso de clase desconocida" in evidencia["cause"]["detail"]
+    # La condición gobernada: la regla que se disparó y la clase de autoridad resultante.
+    condicion = evidencia["conditions"][0]
+    assert "unknown-resource" in condicion["rules"]
+    assert condicion["risk"] == "HIGH"
+    assert condicion["outcome"] == "REQUIRE_HUMAN"
+    assert condicion["authority_class"] == "HUMAN_GATE_REQUIRED"
+    assert condicion["required_evidence"], "el sobre declara qué evidencia exige"
+    # El motivo del gate ya no es la frase genérica.
+    assert "recurso de clase desconocida" in gate["reason"]
+    assert gate["reason"] != (
+        "el ciclo se detuvo en PLAN_REQUIRES_HUMAN: hace falta una persona antes de seguir "
+        f"con {TARGET_ID}"
+    )
+    # Y el resultado real del ciclo trae la causa (antes salía sin código ni detalle).
+    assert tarea["development"]["error_kind"] == "PLAN_REQUIRES_HUMAN"
+    assert tarea["development"]["plan_issues"][0]["code"] == "PLAN_REQUIRES_HUMAN"
+
+
+def test_b_el_gate_muestra_la_operacion_y_los_recursos_afectados(tmp_path: Path) -> None:
+    """B: se ve qué quiere hacer PUNTO, sobre qué recursos y qué autoriza aprobar."""
+    client, _repo, _remoto, _deps, _tarea = _tarea_con_plan_que_exige_persona(tmp_path)
+    gate = client.get("/console/human-gates").json()["items"][0]
+    evidencia = gate["evidence"]
+
+    assert evidencia["operation"]["summary"]
+    assert evidencia["operation"]["planned"]["modify"] == [
+        "src/lib/tipos.ts",
+        "src/app/globals.css",
+    ]
+    assert "src/app/globals.css" in evidencia["resources"]["paths"]
+    assert evidencia["resources"]["total"] >= 2
+    # El alcance de la autorización, explícito en las dos direcciones.
+    assert "esta" in evidencia["authorizes"] or "este" in evidencia["authorizes"]
+    assert any("producción" in texto.lower() for texto in evidencia["does_not_authorize"])
+    assert all(texto.strip() for texto in evidencia["does_not_authorize"])
+    # Y el gate sigue sin resolver: nada se aprobó ni se rechazó solo.
+    assert gate["is_pending"] is True
+    assert gate["resolved_by"] == ""
+
+
+def test_c_aprobar_y_rechazar_siguen_ligados_al_mismo_gate(tmp_path: Path) -> None:
+    """C: los botones resuelven **ese** gate real; la evidencia no cambia el vínculo."""
+    client, _repo, _remoto, _deps, tarea = _tarea_con_plan_que_exige_persona(tmp_path)
+    approval_id = tarea["gates"][0]
+
+    aprobacion = client.post(
+        f"/console/human-gates/{approval_id}/approve",
+        json={"resolved_by": "humano-local", "note": "el mapa entra en el alcance"},
+    )
+
+    assert aprobacion.status_code == 200, aprobacion.text
+    assert aprobacion.json()["approval_id"] == approval_id
+    assert aprobacion.json()["status"] == "APPROVED"
+    assert aprobacion.json()["task"]["stage"] == "HUMAN_APPROVED"
+    assert client.get("/console/human-gates").json()["pending"] == 0
+    # Resolver dos veces sigue siendo imposible.
+    doble = client.post(
+        f"/console/human-gates/{approval_id}/approve", json={"resolved_by": "humano-local"}
+    )
+    assert doble.status_code == 409
+
+    # Y en otra tarea, REJECT deja la tarea rechazada y el gate sin autorización.
+    client2, _repo2, _remoto2, _deps2, tarea2 = _tarea_con_plan_que_exige_persona(tmp_path / "dos")
+    rechazo = client2.post(
+        f"/console/human-gates/{tarea2['gates'][0]}/reject",
+        json={"resolved_by": "humano-local", "note": "todavía no"},
+    ).json()
+
+    assert rechazo["status"] == "REJECTED"
+    assert rechazo["task"]["stage"] == "REJECTED"
+    assert rechazo["task"]["progress"]["rejected"] is True
+
+
+def test_d_la_evidencia_es_la_decision_real_y_no_reescribe_policy_ni_risk(tmp_path: Path) -> None:
+    """D: lo que muestra el gate es la decisión que PUNTO ya tomó, sin recalcular nada."""
+    client, _repo, _remoto, deps, tarea = _tarea_con_plan_que_exige_persona(tmp_path)
+    eventos = [
+        dict(evento.metadata)
+        for evento in deps.audit.by_resource(tarea["task_id"])
+        if evento.event_type.value == "DEV_RISK_EVALUATED"
+    ]
+    gate = client.get("/console/human-gates").json()["items"][0]
+    condicion = gate["evidence"]["conditions"][0]
+
+    assert eventos, "el ciclo dejó registrada su evaluación de riesgo"
+    ultimo = eventos[-1]
+    assert condicion["risk"] == ultimo["risk"]
+    assert condicion["outcome"] == ultimo["outcome"]
+    assert condicion["authority_class"] == ultimo["authority_class"]
+    assert list(condicion["rules"]) == list(ultimo["rules"])
+    assert ultimo["risk"] == "HIGH" and ultimo["outcome"] == "REQUIRE_HUMAN"
+    # La decisión del PolicyEngine que liga el gate sigue siendo la suya, intacta.
+    assert gate["policy_decision_id"]
+    assert gate["policy_outcome"] == "REQUIRE_HUMAN"
+
+
+def test_e_el_gate_no_filtra_secretos(tmp_path: Path) -> None:
+    """E: ni el detalle del ciclo ni el texto del proveedor publican una credencial."""
+    secreto = "sk-live-0123456789abcdef"
+    dsn = "postgres://usuario:clave@host/base"
+
+    class _CicloConSecreto:
+        """Ciclo falso: lo único que la consola le pide es ``run``."""
+
+        def run(self, request: Any) -> DevelopmentResult:
+            return DevelopmentResult(
+                request_id=request.request_id,
+                status=DevelopmentStatus.PLAN_REJECTED,
+                error_kind="PLAN_REQUIRES_HUMAN",
+                error=f"el sobre devuelve REQUIRE_HUMAN con la clave {secreto}",
+                plan_issues=(
+                    BuildValidationIssue(
+                        code="PLAN_REQUIRES_HUMAN",
+                        detail=f"recurso fuera del alcance autónomo: token {secreto}",
+                    ),
+                ),
+                authority_decisions=(
+                    AuthorityDecisionRecord(
+                        operation="write",
+                        outcome="REQUIRE_HUMAN",
+                        authority_class="HUMAN_GATE_REQUIRED",
+                        risk="HIGH",
+                        rules=("unknown-resource",),
+                        reasons=(f"la conexión {dsn} no es una comprobación", f"clave {secreto}"),
+                        resources=("src/app/globals.css",),
+                        required_evidence=("autorización humana explícita",),
+                    ),
+                ),
+                final_scope=("src/app/globals.css",),
+            )
+
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, deps = _app(target=target, respuestas=[_plan()])
+    deps.dev_cycle = _CicloConSecreto()  # type: ignore[assignment]
+
+    tarea = client.post(
+        "/console/tasks",
+        json={
+            "objective": "una tarea cualquiera",
+            "target_id": TARGET_ID,
+            "scope_paths": ["src"],
+        },
+    ).json()
+    gate = client.get("/console/human-gates").json()["items"][0]
+
+    serializado = json.dumps(tarea, ensure_ascii=False) + json.dumps(gate, ensure_ascii=False)
+    assert secreto not in serializado
+    assert "clave@host" not in serializado
+    assert REDACTED in gate["reason"]
+    assert REDACTED in gate["evidence"]["cause"]["detail"]
+    assert all(REDACTED in item for item in gate["evidence"]["conditions"][0]["reasons"])
+    # Y el gate sigue siendo real y resoluble pese a la redacción.
+    assert gate["is_pending"] is True
+    assert deps.gates.get(UUID(gate["approval_id"])) is not None
+
+
+def test_f_un_gate_de_riesgo_menor_o_sin_resultado_no_se_rompe(tmp_path: Path) -> None:
+    """F: sin evidencia que mostrar el gate se degrada, no falla."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, deps = _app(target=target, respuestas=[_plan(), _cambio()])
+    deps.gates.request(
+        task_id=uuid4(),
+        action="modify_docs",
+        risk=RiskLevel.LOW,
+        reason="actualizar la documentación del módulo",
+        resume_status=TaskStatus.IN_PROGRESS,
+        policy_outcome="ALLOW_WITH_REVIEW",
+    )
+
+    vista = client.get("/console/human-gates").json()["items"][0]
+
+    assert vista["risk"] == "LOW"
+    assert vista["evidence"]["cause"] == {"code": "", "detail": ""}
+    assert vista["evidence"]["conditions"] == []
+    assert vista["evidence"]["resources"] == {"paths": [], "total": 0}
+    assert vista["evidence"]["authorizes"]
+    assert vista["evidence"]["does_not_authorize"]
+    assert vista["is_pending"] is True
+    assert client.get("/console").status_code == 200, "la página sigue sirviéndose"
+
+
+def test_g_la_tarea_en_espera_no_se_autoriza_sola(tmp_path: Path) -> None:
+    """G: la tarea se queda esperando decisión humana; no se aprueba, rechaza ni continúa sola."""
+    client, repo, remoto, _deps, tarea = _tarea_con_plan_que_exige_persona(tmp_path)
+    antes = _git(repo, "log", "-1", "--format=%H")
+
+    for _ in range(3):
+        detalle = client.get(f"/console/tasks/{tarea['task_id']}").json()
+        assert detalle["stage"] == "WAITING_HUMAN"
+        assert detalle["publication"] is None
+        assert detalle["gates_detail"][0]["is_pending"] is True
+
+    assert client.get("/console/human-gates").json()["pending"] == 1
+    # Nada se aplicó ni se confirmó: el repositorio sigue en el mismo commit, sin push.
+    assert _git(repo, "log", "-1", "--format=%H") == antes
+    assert _git(repo, "status", "--porcelain") == ""
+    assert _refs(remoto)["main"] == _git(repo, "rev-parse", "main")
+    # Publicar sigue siendo imposible: no hay gate de publicación ni commit aprobado.
+    assert client.post(f"/console/tasks/{tarea['task_id']}/publish").status_code == 409
 
 
 def _refs(remoto: Path) -> dict[str, str]:

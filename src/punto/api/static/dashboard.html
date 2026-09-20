@@ -622,10 +622,16 @@
           : (progress.waiting_human ? "WAITING_HUMAN" : (progress.failed ? "FAILED" : ""));
         const pendingGate = (consoleState.gates || []).find(
           (gate) => gate.task_id === task.task_id && gate.is_pending);
+        const dev = task.development || {};
+        // Causa real de la parada: el código y el detalle que produjo el ciclo, no una frase genérica.
+        const cause = dev.error_kind
+          ? `<div class="note" data-cause>${dev.error_kind}${dev.error ? ": " + dev.error : ""}</div>`
+          : "";
         const waiting = progress.waiting_human
           ? `<div class="human-wait" data-testid="human-wait-${task.task_id}">! Esperando tu aprobación${
               progress.waiting_kind === "publication" ? " para publicar en producción" : ""
             } — PUNTO no está bloqueado por un error: está esperando a una persona.
+            ${cause}
             ${pendingGate ? `
             <div class="actions">
               <button data-approve="${pendingGate.approval_id}" data-testid="approve-${pendingGate.approval_id}">APPROVE</button>
@@ -690,6 +696,48 @@
           </article>`;
       }
 
+      function evidenceBlock(gate) {
+        const evidence = gate.evidence;
+        if (!evidence) return "";
+        const planned = (evidence.operation && evidence.operation.planned) || {};
+        const labels = { modify: "MODIFY", create: "CREATE", delete: "DELETE" };
+        const plannedRows = Object.keys(labels)
+          .filter((kind) => (planned[kind] || []).length)
+          .map((kind) => `<div class="item"><span>${labels[kind]}</span><code>${planned[kind].join(", ")}</code></div>`)
+          .join("");
+        const scope = (evidence.resources && evidence.resources.paths) || [];
+        const scopeRows = scope.length
+          ? `<div class="list">${scope
+              .map((path) => `<div class="item"><span>recurso</span><code>${path}</code></div>`)
+              .join("")}</div>`
+          : "";
+        const conditions = (evidence.conditions || [])
+          .map((item) => `
+            <div class="note" data-condition>
+              <div><strong>${item.outcome}</strong> · clase ${item.authority_class} · riesgo ${item.risk}${
+                item.operation ? ` · operación <code>${item.operation}</code>` : ""
+              }</div>
+              ${(item.rules || []).length ? `<div>reglas: <code>${item.rules.join(", ")}</code></div>` : ""}
+              ${(item.reasons || []).map((reason) => `<div>· ${reason}</div>`).join("")}
+              ${(item.required_evidence || []).length
+                ? `<div>exige: ${item.required_evidence.join("; ")}</div>`
+                : ""}
+            </div>`)
+          .join("");
+        const notAuthorized = (evidence.does_not_authorize || [])
+          .map((text) => `<div>· ${text}</div>`)
+          .join("");
+        return `
+          <div class="row"><span class="label">Causa</span><span class="value"><code>${evidence.cause.code || "—"}</code></span></div>
+          ${evidence.cause.detail ? `<div class="note">${evidence.cause.detail}</div>` : ""}
+          ${conditions ? `<div class="row"><span class="label">Condición que exige persona</span><span class="value"></span></div>${conditions}` : ""}
+          ${evidence.operation && evidence.operation.summary ? `<div class="row"><span class="label">Operación</span><span class="value">${evidence.operation.summary}</span></div>` : ""}
+          ${plannedRows ? `<div class="row"><span class="label">Cambios declarados por el plan</span><span class="value"></span></div><div class="list">${plannedRows}</div>` : ""}
+          ${scope.length ? `<div class="row"><span class="label">Recursos afectados (${evidence.resources.total})</span><span class="value"></span></div>${scopeRows}` : ""}
+          <div class="note ok">Al aprobar autorizas: ${evidence.authorizes}</div>
+          ${notAuthorized ? `<div class="note warn">No autorizas:<br>${notAuthorized}</div>` : ""}`;
+      }
+
       function gateCard(gate) {
         const pending = gate.is_pending;
         const destination = gate.destination || {};
@@ -706,6 +754,7 @@
               : destination.target_id}</span></div>
             ${destination.commit_sha ? `<div class="row"><span class="label">Commit</span><code>${destination.commit_sha.slice(0, 10)}</code></div>` : ""}
             <div class="row"><span class="label">Decisión de política</span><span class="value"><code>${gate.policy_outcome || "—"}</code></span></div>
+            ${evidenceBlock(gate)}
             ${(gate.verification || []).length ? `<div class="list">${gate.verification
               .map((item) => `<div class="item"><span>${item.name}</span><code>${item.passed ? "PASS" : "FAIL"}</code></div>`)
               .join("")}</div>` : ""}

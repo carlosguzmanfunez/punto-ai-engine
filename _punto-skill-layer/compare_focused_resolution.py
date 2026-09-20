@@ -1,11 +1,13 @@
-"""EXPERIMENTO 03 — comparación de CASE-B contra el control congelado y los brazos anteriores.
+"""EXPERIMENTO 03 (y su ronda de refinación) — CASE-B contra el control congelado y todos los brazos.
 
 Lee la evidencia del arnés (un JSON por brazo) y produce:
 
-- la tabla de las métricas que el encargo pide (§28);
+- la tabla de las métricas que el encargo pide (§18);
+- las métricas de la **primera reparación** recalculadas con el instrumento corregido y **ancladas en
+  la ronda 1** (§14), a partir de los eventos de auditoría guardados: no se repite ninguna corrida;
 - qué métricas **no** se pueden comparar porque el control no las medía (se dice, no se rellena con
   ceros: un cero inventado sería una conclusión falsa);
-- ``experiment-03-delta.json`` con los números crudos por brazo.
+- ``experiment-03-0.2-delta.json`` con los números crudos por brazo.
 
 Uso:
     python _punto-skill-layer/compare_focused_resolution.py
@@ -13,8 +15,9 @@ Uso:
 
 from __future__ import annotations
 
+import importlib.util
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,7 @@ BRAZOS: tuple[tuple[str, str], ...] = (
     ("architect-0.2.0+handoff", "baseline-real-round2.json"),
     ("builder-0.1.0", "baseline-real-builder-0.1.0.json"),
     ("resolution-0.1.0", "baseline-real-skill-resolution-0.1.0.json"),
+    ("resolution-0.2.0", "baseline-real-skill-resolution-0.2.0.json"),
 )
 
 #: (título, ruta dentro del registro) de las métricas comparables.
@@ -59,12 +63,68 @@ CAMPOS: tuple[tuple[str, str], ...] = (
 CAMPOS_RESOLUCION: tuple[tuple[str, str], ...] = (
     ("first_attempt_pass", "first_attempt"),
     ("first_repair_attempted", "first_repair"),
+    ("first_repair_reached_verification", "first_repair"),
     ("first_repair_strategy_changed", "first_repair"),
     ("first_repair_addressed_failure_resource", "first_repair"),
     ("first_repair_pass", "first_repair"),
+    ("first_repair_scope_expansion_requested", "first_repair"),
+    ("first_repair_scope_expansion_approved", "first_repair"),
+    ("first_repair_change_same_resource", "first_repair"),
+    ("first_repair_change_same_proposal", "first_repair"),
+    ("first_repair_change_applied", "first_repair"),
+    ("first_repair_focused_pass", "first_repair"),
+    ("first_repair_chain_pass", "first_repair"),
     ("causal_stagnation_events", "first_repair"),
     ("repair_2_prompt_chars", "calculado"),
 )
+
+
+class _Evento:
+    """Evento de auditoría mínimo, con la forma que lee el arnés."""
+
+    def __init__(self, tipo: str, metadata: Mapping[str, Any]) -> None:
+        self.event_type = type("Tipo", (), {"value": tipo})()
+        self.metadata = dict(metadata)
+
+
+class _Resultado:
+    """Resultado de ciclo mínimo, para recalcular métricas de evidencia guardada."""
+
+    def __init__(self, applied: Sequence[str], repair_rounds: int) -> None:
+        self.applied = tuple(type("Cambio", (), {"path": item})() for item in applied)
+        self.repair_rounds = repair_rounds
+
+
+def _arnes() -> Any:
+    """Carga el arnés para reutilizar **su** lógica de métricas, sin duplicarla aquí."""
+    ruta = EVIDENCE / "run_baseline.py"
+    especificacion = importlib.util.spec_from_file_location("punto_arnes", ruta)
+    assert especificacion is not None and especificacion.loader is not None
+    modulo = importlib.util.module_from_spec(especificacion)
+    especificacion.loader.exec_module(modulo)
+    return modulo
+
+
+def _recalcular(caso: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recalcula las métricas de la primera reparación desde los eventos guardados.
+
+    El instrumento de la corrida de 0.2.0 anclaba la «primera reparación» en el primer registro de
+    progreso, que puede ser el de la ronda 2 si la ronda 1 terminó con cambios rechazados (D-6). Aquí
+    se recalcula con el instrumento corregido, sobre la misma evidencia: no se repite ninguna corrida.
+    """
+    eventos = [
+        _Evento(str(item["event_type"]), item.get("metadata", {}))
+        for item in caso.get("audit_events", [])
+    ]
+    if not any(evento.event_type.value == "DEV_RESOLUTION_INPUT" for evento in eventos):
+        return None
+    record = caso.get("record", {})
+    return _arnes()._resolution_evidence(
+        eventos,
+        caso.get("calls_detail", []),
+        caso.get("calls_detail", []),
+        _Resultado(caso.get("applied", ()), int(record.get("repair_rounds", 0) or 0)),
+    )
 
 
 def _valor(item: Mapping[str, Any], ruta: str) -> Any:
@@ -149,10 +209,11 @@ def cargar() -> dict[str, dict[str, Any]]:
 def main() -> int:
     """Imprime la comparación y guarda el delta crudo."""
     brazos = cargar()
-    if "resolution-0.1.0" not in brazos:
-        print("no hay evidencia del brazo de resolución: nada que comparar todavía")
+    if "resolution-0.2.0" not in brazos:
+        print("no hay evidencia del brazo de resolución 0.2.0: nada que comparar todavía")
         return 1
-    nombres = list(brazos)
+    # Se comparan los tres brazos del encargo; los demás se listan como contexto histórico.
+    nombres = [nombre for nombre, _ in BRAZOS if nombre in brazos]
     ancho = 16
     print(f"{'métrica':40}" + "".join(f"{nombre[:ancho]:>{ancho}}" for nombre in nombres))
     for titulo, ruta in CAMPOS:
@@ -161,10 +222,13 @@ def main() -> int:
     print()
     print(f"{'métrica de resolución':40}" + "".join(f"{n[:ancho]:>{ancho}}" for n in nombres))
     extras = {nombre: _extra(brazos[nombre]) for nombre in nombres}
+    recalculo = {nombre: _recalcular(brazos[nombre]) for nombre in nombres}
     for titulo, _ in CAMPOS_RESOLUCION:
         fila = ""
         for nombre in nombres:
             valor = extras[nombre].get(titulo)
+            if valor is None and recalculo[nombre] is not None:
+                valor = recalculo[nombre].get(titulo)
             fila += f"{('—' if valor is None else str(valor)):>{ancho}}"
         print(f"{titulo:40}{fila}")
 
@@ -184,12 +248,20 @@ def main() -> int:
             for titulo, ruta in CAMPOS
         },
         "metricas_resolucion": {
-            titulo: {nombre: extras[nombre].get(titulo) for nombre in nombres}
+            titulo: {
+                nombre: (
+                    extras[nombre].get(titulo)
+                    if extras[nombre].get(titulo) is not None
+                    else (recalculo[nombre] or {}).get(titulo)
+                )
+                for nombre in nombres
+            }
             for titulo, _ in CAMPOS_RESOLUCION
         },
+        "metricas_resolucion_recalculadas": recalculo,
         "propuestas": {nombre: extras[nombre]["proposals"] for nombre in nombres},
     }
-    salida = EVIDENCE / "experiment-03-delta.json"
+    salida = EVIDENCE / "experiment-03-0.2-delta.json"
     salida.write_text(json.dumps(delta, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nevidencia: {salida}")
     return 0

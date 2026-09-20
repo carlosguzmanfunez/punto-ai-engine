@@ -1,0 +1,1056 @@
+{
+  "brazos": [
+    "control",
+    "architect-0.1.0",
+    "architect-0.2.0+handoff",
+    "builder-0.1.0",
+    "resolution-0.1.0",
+    "resolution-0.2.0"
+  ],
+  "metricas": {
+    "status": {
+      "control": "DEVELOPMENT_VERIFICATION_FAILED",
+      "architect-0.1.0": "DEVELOPMENT_VERIFICATION_FAILED",
+      "architect-0.2.0+handoff": "DEVELOPMENT_VERIFICATION_FAILED",
+      "builder-0.1.0": "DEVELOPMENT_VERIFICATION_FAILED",
+      "resolution-0.1.0": "DEVELOPMENT_COMPLETED",
+      "resolution-0.2.0": "DEVELOPMENT_VERIFICATION_FAILED"
+    },
+    "success": {
+      "control": false,
+      "architect-0.1.0": false,
+      "architect-0.2.0+handoff": false,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": false
+    },
+    "functional_chain_pass": {
+      "control": false,
+      "architect-0.1.0": false,
+      "architect-0.2.0+handoff": false,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": false
+    },
+    "provider_calls": {
+      "control": 4,
+      "architect-0.1.0": 4,
+      "architect-0.2.0+handoff": 4,
+      "builder-0.1.0": 4,
+      "resolution-0.1.0": 4,
+      "resolution-0.2.0": 4
+    },
+    "architect_calls": {
+      "control": 1,
+      "architect-0.1.0": 1,
+      "architect-0.2.0+handoff": 1,
+      "builder-0.1.0": 1,
+      "resolution-0.1.0": 1,
+      "resolution-0.2.0": 1
+    },
+    "builder_calls": {
+      "control": 3,
+      "architect-0.1.0": 3,
+      "architect-0.2.0+handoff": 3,
+      "builder-0.1.0": 3,
+      "resolution-0.1.0": 3,
+      "resolution-0.2.0": 3
+    },
+    "repair_rounds": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 2,
+      "resolution-0.2.0": 2
+    },
+    "scope_expansions": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 1,
+      "builder-0.1.0": 1,
+      "resolution-0.1.0": 1,
+      "resolution-0.2.0": 1
+    },
+    "tool_calls": {
+      "control": 4,
+      "architect-0.1.0": 4,
+      "architect-0.2.0+handoff": 4,
+      "builder-0.1.0": 4,
+      "resolution-0.1.0": 6,
+      "resolution-0.2.0": 4
+    },
+    "files_read": {
+      "control": 3,
+      "architect-0.1.0": 3,
+      "architect-0.2.0+handoff": 3,
+      "builder-0.1.0": 3,
+      "resolution-0.1.0": 3,
+      "resolution-0.2.0": 3
+    },
+    "files_changed": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 0,
+      "builder-0.1.0": 0,
+      "resolution-0.1.0": 6,
+      "resolution-0.2.0": 0
+    },
+    "verification_count": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 2,
+      "resolution-0.2.0": 2
+    },
+    "verification_failures": {
+      "control": 2,
+      "architect-0.1.0": 2,
+      "architect-0.2.0+handoff": 2,
+      "builder-0.1.0": 2,
+      "resolution-0.1.0": 0,
+      "resolution-0.2.0": 2
+    },
+    "human_gates": {
+      "control": 0,
+      "architect-0.1.0": 0,
+      "architect-0.2.0+handoff": 0,
+      "builder-0.1.0": 0,
+      "resolution-0.1.0": 0,
+      "resolution-0.2.0": 0
+    },
+    "prompt_chars": {
+      "control": 13144,
+      "architect-0.1.0": 15906,
+      "architect-0.2.0+handoff": 16924,
+      "builder-0.1.0": 18691,
+      "resolution-0.1.0": 21581,
+      "resolution-0.2.0": 20892
+    },
+    "initial_builder_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 3992,
+      "resolution-0.2.0": 3938
+    },
+    "resolution_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 15329,
+      "resolution-0.2.0": 14694
+    },
+    "input_tokens": {
+      "control": 5440,
+      "architect-0.1.0": 5391,
+      "architect-0.2.0+handoff": 6187,
+      "builder-0.1.0": 8965,
+      "resolution-0.1.0": 9543,
+      "resolution-0.2.0": 9604
+    },
+    "output_tokens": {
+      "control": 10960,
+      "architect-0.1.0": 10128,
+      "architect-0.2.0+handoff": 23111,
+      "builder-0.1.0": 13018,
+      "resolution-0.1.0": 10849,
+      "resolution-0.2.0": 13828
+    },
+    "total_tokens": {
+      "control": 16400,
+      "architect-0.1.0": 15519,
+      "architect-0.2.0+handoff": 29298,
+      "builder-0.1.0": 21983,
+      "resolution-0.1.0": 20392,
+      "resolution-0.2.0": 23432
+    },
+    "provider_elapsed_ms": {
+      "control": 172951,
+      "architect-0.1.0": 201751,
+      "architect-0.2.0+handoff": 364336,
+      "builder-0.1.0": 217280,
+      "resolution-0.1.0": 219520,
+      "resolution-0.2.0": 288949
+    },
+    "elapsed_ms": {
+      "control": 173536,
+      "architect-0.1.0": 203032,
+      "architect-0.2.0+handoff": 365021,
+      "builder-0.1.0": 218566,
+      "resolution-0.1.0": 220502,
+      "resolution-0.2.0": 289646
+    }
+  },
+  "metricas_resolucion": {
+    "first_attempt_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": false,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "first_repair_attempted": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": true
+    },
+    "first_repair_reached_verification": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": false
+    },
+    "first_repair_strategy_changed": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": true
+    },
+    "first_repair_addressed_failure_resource": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "first_repair_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "first_repair_scope_expansion_requested": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": true
+    },
+    "first_repair_scope_expansion_approved": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": true,
+      "resolution-0.2.0": true
+    },
+    "first_repair_change_same_resource": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": true
+    },
+    "first_repair_change_same_proposal": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": true
+    },
+    "first_repair_change_applied": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "first_repair_focused_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "first_repair_chain_pass": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": false,
+      "resolution-0.2.0": false
+    },
+    "causal_stagnation_events": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": null,
+      "resolution-0.1.0": 0,
+      "resolution-0.2.0": 0
+    },
+    "repair_2_prompt_chars": {
+      "control": null,
+      "architect-0.1.0": null,
+      "architect-0.2.0+handoff": null,
+      "builder-0.1.0": 5258,
+      "resolution-0.1.0": 7727,
+      "resolution-0.2.0": 6874
+    }
+  },
+  "metricas_resolucion_recalculadas": {
+    "control": null,
+    "architect-0.1.0": null,
+    "architect-0.2.0+handoff": null,
+    "builder-0.1.0": null,
+    "resolution-0.1.0": {
+      "resolution_inputs": [
+        {
+          "block_chars": 1086,
+          "causal_gap": [
+            "src/lib/tipos.ts"
+          ],
+          "causal_stagnation": false,
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "previous_patch": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "resource_paths": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "resource_relations": [
+            "src/lib/tipos.ts=VERIFICATION_ARGV",
+            "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+            "src/components/Buscador.tsx=VERIFICATION_ARGV"
+          ],
+          "round": 1,
+          "unmapped": []
+        },
+        {
+          "block_chars": 1174,
+          "causal_gap": [
+            "src/lib/tipos.ts"
+          ],
+          "causal_stagnation": false,
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "previous_patch": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "resource_paths": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "resource_relations": [
+            "src/lib/tipos.ts=VERIFICATION_ARGV",
+            "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+            "src/components/Buscador.tsx=VERIFICATION_ARGV"
+          ],
+          "round": 2,
+          "unmapped": []
+        }
+      ],
+      "progress_records": [
+        {
+          "causal_gap": [
+            "src/lib/tipos.ts"
+          ],
+          "causal_stagnation": false,
+          "failure_resources": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: True",
+          "new_causal_evidence": false,
+          "newly_addressed_failure_resources": [],
+          "newly_explained_failure_resources": [],
+          "repeated_failure_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "resources_status": [
+            "src/lib/tipos.ts=UNEXPLAINED",
+            "src/components/Rejilla.tsx=CHANGED",
+            "src/components/Buscador.tsx=CHANGED"
+          ],
+          "round": 1,
+          "same_failure_after_patch": false,
+          "strategy_signature": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY",
+          "touched_failure_intersection": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "touched_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "verification_result": "FAILED",
+          "verifications_still_failing": [
+            "focused",
+            "chain"
+          ]
+        },
+        {
+          "causal_gap": [],
+          "causal_stagnation": false,
+          "failure_resources": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "failure_signature": "no-failure",
+          "new_causal_evidence": true,
+          "newly_addressed_failure_resources": [
+            "src/lib/tipos.ts"
+          ],
+          "newly_explained_failure_resources": [
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "repeated_failure_resources": [],
+          "resources_status": [
+            "src/lib/tipos.ts=CHANGED",
+            "src/components/Rejilla.tsx=UNCHANGED_BY_EVIDENCE",
+            "src/components/Buscador.tsx=UNCHANGED_BY_EVIDENCE"
+          ],
+          "round": 2,
+          "same_failure_after_patch": false,
+          "strategy_signature": "src/lib/tipos.ts:MODIFY",
+          "touched_failure_intersection": [
+            "src/lib/tipos.ts"
+          ],
+          "touched_resources": [
+            "src/lib/tipos.ts"
+          ],
+          "verification_result": "PASSED",
+          "verifications_still_failing": []
+        }
+      ],
+      "round_info": {
+        "0": {
+          "validated_paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "repair_strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY",
+            "tests/tipos-chain.test.ts:CREATE"
+          ],
+          "rejected_issue_codes": []
+        },
+        "1": {
+          "resolution_input": {
+            "block_chars": 1086,
+            "causal_gap": [
+              "src/lib/tipos.ts"
+            ],
+            "causal_stagnation": false,
+            "failed": [
+              "focused",
+              "chain"
+            ],
+            "previous_patch": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx",
+              "tests/tipos-chain.test.ts"
+            ],
+            "resource_paths": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "resource_relations": [
+              "src/lib/tipos.ts=VERIFICATION_ARGV",
+              "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+              "src/components/Buscador.tsx=VERIFICATION_ARGV"
+            ],
+            "round": 1,
+            "unmapped": []
+          },
+          "validated_paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "progress": {
+            "causal_gap": [
+              "src/lib/tipos.ts"
+            ],
+            "causal_stagnation": false,
+            "failure_resources": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: True",
+            "new_causal_evidence": false,
+            "newly_addressed_failure_resources": [],
+            "newly_explained_failure_resources": [],
+            "repeated_failure_resources": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx"
+            ],
+            "resources_status": [
+              "src/lib/tipos.ts=UNEXPLAINED",
+              "src/components/Rejilla.tsx=CHANGED",
+              "src/components/Buscador.tsx=CHANGED"
+            ],
+            "round": 1,
+            "same_failure_after_patch": false,
+            "strategy_signature": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY",
+            "touched_failure_intersection": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx"
+            ],
+            "touched_resources": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx"
+            ],
+            "verification_result": "FAILED",
+            "verifications_still_failing": [
+              "focused",
+              "chain"
+            ]
+          },
+          "repair_strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY"
+          ],
+          "rejected_issue_codes": []
+        },
+        "2": {
+          "resolution_input": {
+            "block_chars": 1174,
+            "causal_gap": [
+              "src/lib/tipos.ts"
+            ],
+            "causal_stagnation": false,
+            "failed": [
+              "focused",
+              "chain"
+            ],
+            "previous_patch": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx",
+              "tests/tipos-chain.test.ts"
+            ],
+            "resource_paths": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "resource_relations": [
+              "src/lib/tipos.ts=VERIFICATION_ARGV",
+              "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+              "src/components/Buscador.tsx=VERIFICATION_ARGV"
+            ],
+            "round": 2,
+            "unmapped": []
+          },
+          "validated_paths": [
+            "src/lib/tipos.ts"
+          ],
+          "progress": {
+            "causal_gap": [],
+            "causal_stagnation": false,
+            "failure_resources": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "failure_signature": "no-failure",
+            "new_causal_evidence": true,
+            "newly_addressed_failure_resources": [
+              "src/lib/tipos.ts"
+            ],
+            "newly_explained_failure_resources": [
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "repeated_failure_resources": [],
+            "resources_status": [
+              "src/lib/tipos.ts=CHANGED",
+              "src/components/Rejilla.tsx=UNCHANGED_BY_EVIDENCE",
+              "src/components/Buscador.tsx=UNCHANGED_BY_EVIDENCE"
+            ],
+            "round": 2,
+            "same_failure_after_patch": false,
+            "strategy_signature": "src/lib/tipos.ts:MODIFY",
+            "touched_failure_intersection": [
+              "src/lib/tipos.ts"
+            ],
+            "touched_resources": [
+              "src/lib/tipos.ts"
+            ],
+            "verification_result": "PASSED",
+            "verifications_still_failing": []
+          },
+          "rejected_issue_codes": [],
+          "repair_strategy": []
+        }
+      },
+      "causal_stagnation_events": 0,
+      "scope_expansions": [
+        {
+          "round": 1,
+          "resources": [
+            "src/lib/tipos.ts"
+          ],
+          "decision": "APPROVED",
+          "plan_version": 2
+        }
+      ],
+      "first_repair_attempted": true,
+      "first_repair_reached_verification": true,
+      "first_repair_strategy_changed": true,
+      "first_repair_addressed_failure_resource": false,
+      "first_repair_pass": false,
+      "first_repair_causal_gap": [
+        "src/lib/tipos.ts"
+      ],
+      "first_repair_scope_expansion_requested": true,
+      "first_repair_scope_expansion_approved": true,
+      "first_repair_change_same_resource": false,
+      "first_repair_change_same_proposal": false,
+      "first_repair_change_applied": false,
+      "first_repair_validated_paths": [
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx"
+      ],
+      "first_repair_rejected_issue_codes": [],
+      "first_repair_touched_resources": [
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx"
+      ],
+      "first_repair_applied_paths": [
+        "src/lib/tipos.ts"
+      ],
+      "first_repair_focused_pass": false,
+      "first_repair_chain_pass": false,
+      "previous_strategy": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY|tests/tipos-chain.test.ts:CREATE",
+      "resolution_prompt_chars": 15329,
+      "initial_builder_prompt_chars": 3992,
+      "resolution_block_chars": [
+        1086,
+        1174
+      ],
+      "builder_calls": 3,
+      "repair_rounds": 2
+    },
+    "resolution-0.2.0": {
+      "resolution_inputs": [
+        {
+          "block_chars": 1086,
+          "causal_gap": [
+            "src/lib/tipos.ts"
+          ],
+          "causal_stagnation": false,
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "previous_patch": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "resource_paths": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "resource_relations": [
+            "src/lib/tipos.ts=VERIFICATION_ARGV",
+            "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+            "src/components/Buscador.tsx=VERIFICATION_ARGV"
+          ],
+          "round": 1,
+          "unmapped": []
+        },
+        {
+          "block_chars": 1086,
+          "causal_gap": [
+            "src/lib/tipos.ts"
+          ],
+          "causal_stagnation": false,
+          "failed": [
+            "focused",
+            "chain"
+          ],
+          "previous_patch": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "resource_paths": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "resource_relations": [
+            "src/lib/tipos.ts=VERIFICATION_ARGV",
+            "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+            "src/components/Buscador.tsx=VERIFICATION_ARGV"
+          ],
+          "round": 2,
+          "unmapped": []
+        }
+      ],
+      "progress_records": [
+        {
+          "causal_gap": [],
+          "causal_stagnation": false,
+          "escalated_failure_resources": [],
+          "failure_resources": [
+            "src/lib/tipos.ts",
+            "src/components/Rejilla.tsx",
+            "src/components/Buscador.tsx"
+          ],
+          "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: False",
+          "new_causal_evidence": true,
+          "newly_addressed_failure_resources": [],
+          "newly_explained_failure_resources": [
+            "src/lib/tipos.ts"
+          ],
+          "repeated_failure_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "resources_status": [
+            "src/lib/tipos.ts=UNCHANGED_BY_EVIDENCE",
+            "src/components/Rejilla.tsx=CHANGED",
+            "src/components/Buscador.tsx=CHANGED"
+          ],
+          "round": 2,
+          "same_failure_after_patch": true,
+          "strategy_signature": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY|tests/tipos-chain.test.ts:MODIFY",
+          "touched_failure_intersection": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx"
+          ],
+          "touched_resources": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "verification_result": "FAILED",
+          "verifications_still_failing": [
+            "focused",
+            "chain"
+          ]
+        }
+      ],
+      "round_info": {
+        "0": {
+          "validated_paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "repair_strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY",
+            "tests/tipos-chain.test.ts:CREATE"
+          ],
+          "rejected_issue_codes": []
+        },
+        "1": {
+          "resolution_input": {
+            "block_chars": 1086,
+            "causal_gap": [
+              "src/lib/tipos.ts"
+            ],
+            "causal_stagnation": false,
+            "failed": [
+              "focused",
+              "chain"
+            ],
+            "previous_patch": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx",
+              "tests/tipos-chain.test.ts"
+            ],
+            "resource_paths": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "resource_relations": [
+              "src/lib/tipos.ts=VERIFICATION_ARGV",
+              "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+              "src/components/Buscador.tsx=VERIFICATION_ARGV"
+            ],
+            "round": 1,
+            "unmapped": []
+          },
+          "rejected_issue_codes": [
+            "CHANGE_ALREADY_EXISTS"
+          ],
+          "validated_paths": [],
+          "repair_strategy": []
+        },
+        "2": {
+          "resolution_input": {
+            "block_chars": 1086,
+            "causal_gap": [
+              "src/lib/tipos.ts"
+            ],
+            "causal_stagnation": false,
+            "failed": [
+              "focused",
+              "chain"
+            ],
+            "previous_patch": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx",
+              "tests/tipos-chain.test.ts"
+            ],
+            "resource_paths": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "resource_relations": [
+              "src/lib/tipos.ts=VERIFICATION_ARGV",
+              "src/components/Rejilla.tsx=VERIFICATION_ARGV",
+              "src/components/Buscador.tsx=VERIFICATION_ARGV"
+            ],
+            "round": 2,
+            "unmapped": []
+          },
+          "validated_paths": [
+            "src/components/Buscador.tsx",
+            "src/components/Rejilla.tsx",
+            "tests/tipos-chain.test.ts"
+          ],
+          "progress": {
+            "causal_gap": [],
+            "causal_stagnation": false,
+            "escalated_failure_resources": [],
+            "failure_resources": [
+              "src/lib/tipos.ts",
+              "src/components/Rejilla.tsx",
+              "src/components/Buscador.tsx"
+            ],
+            "failure_signature": "focused:1:TIPOS: export const TIPOS = ['Casa'];|chain:1:CADENA: False",
+            "new_causal_evidence": true,
+            "newly_addressed_failure_resources": [],
+            "newly_explained_failure_resources": [
+              "src/lib/tipos.ts"
+            ],
+            "repeated_failure_resources": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx"
+            ],
+            "resources_status": [
+              "src/lib/tipos.ts=UNCHANGED_BY_EVIDENCE",
+              "src/components/Rejilla.tsx=CHANGED",
+              "src/components/Buscador.tsx=CHANGED"
+            ],
+            "round": 2,
+            "same_failure_after_patch": true,
+            "strategy_signature": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY|tests/tipos-chain.test.ts:MODIFY",
+            "touched_failure_intersection": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx"
+            ],
+            "touched_resources": [
+              "src/components/Buscador.tsx",
+              "src/components/Rejilla.tsx",
+              "tests/tipos-chain.test.ts"
+            ],
+            "verification_result": "FAILED",
+            "verifications_still_failing": [
+              "focused",
+              "chain"
+            ]
+          },
+          "repair_strategy": [
+            "src/components/Buscador.tsx:MODIFY",
+            "src/components/Rejilla.tsx:MODIFY",
+            "tests/tipos-chain.test.ts:MODIFY"
+          ],
+          "rejected_issue_codes": []
+        }
+      },
+      "causal_stagnation_events": 0,
+      "scope_expansions": [
+        {
+          "round": 0,
+          "resources": [],
+          "decision": "DENIED",
+          "plan_version": 0
+        },
+        {
+          "round": 1,
+          "resources": [
+            "src/lib/tipos.ts"
+          ],
+          "decision": "APPROVED",
+          "plan_version": 2
+        }
+      ],
+      "first_repair_attempted": true,
+      "first_repair_reached_verification": false,
+      "first_repair_strategy_changed": true,
+      "first_repair_addressed_failure_resource": false,
+      "first_repair_pass": false,
+      "first_repair_causal_gap": [
+        "src/lib/tipos.ts"
+      ],
+      "first_repair_scope_expansion_requested": true,
+      "first_repair_scope_expansion_approved": true,
+      "first_repair_change_same_resource": true,
+      "first_repair_change_same_proposal": true,
+      "first_repair_change_applied": false,
+      "first_repair_validated_paths": [],
+      "first_repair_rejected_issue_codes": [
+        "CHANGE_ALREADY_EXISTS"
+      ],
+      "first_repair_touched_resources": [],
+      "first_repair_applied_paths": [],
+      "first_repair_focused_pass": false,
+      "first_repair_chain_pass": false,
+      "previous_strategy": "src/components/Buscador.tsx:MODIFY|src/components/Rejilla.tsx:MODIFY|tests/tipos-chain.test.ts:CREATE",
+      "resolution_prompt_chars": 14694,
+      "initial_builder_prompt_chars": 3938,
+      "resolution_block_chars": [
+        1086,
+        1086
+      ],
+      "builder_calls": 3,
+      "repair_rounds": 2
+    }
+  },
+  "propuestas": {
+    "control": [],
+    "architect-0.1.0": [],
+    "architect-0.2.0+handoff": [],
+    "builder-0.1.0": [
+      {
+        "phase": "implementation",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [],
+        "root_cause": ""
+      },
+      {
+        "phase": "repair",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "La fuente canónica src/lib/tipos.ts no incluye 'Apartamento' y los consumidores todavía declaran `tipos` localmente; el archivo de prueba no existe. La verificación exige 'Apartamento' en la fuente e "
+      },
+      {
+        "phase": "repair",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "El cambio anterior propuso CREATE para tests/tipos-chain.test.ts, pero el archivo ya existía en el entorno; la operación correcta es MODIFY y se necesita el contenido previo para no perder información"
+      }
+    ],
+    "resolution-0.1.0": [
+      {
+        "phase": "implementation",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [
+          "src/lib/tipos.ts"
+        ],
+        "root_cause": ""
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "El recurso canónico src/lib/tipos.ts no contiene 'Apartamento' y los consumidores aún definen arreglos locales, por lo que la verificación centrada en el eslabón 'canonical source' falla y la cadena f"
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/lib/tipos.ts"
+        ],
+        "unchanged_resources": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "root_cause": "src/lib/tipos.ts no incluye el literal 'Apartamento' que la verificación focused comprueba, por lo que la cadena funcional completa falla incluso aunque los consumidores ya importan '@/lib/tipos'."
+      }
+    ],
+    "resolution-0.2.0": [
+      {
+        "phase": "implementation",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [
+          "src/lib/tipos.ts"
+        ],
+        "root_cause": ""
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/lib/tipos.ts",
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [],
+        "root_cause": "src/lib/tipos.ts no contiene 'Apartamento' y los componentes Buscador/Rejilla mantienen listas locales en lugar de importar desde '@/lib/tipos', por lo que la verificación focused y la cadena no se cu"
+      },
+      {
+        "phase": "resolution",
+        "changes": [
+          "src/components/Buscador.tsx",
+          "src/components/Rejilla.tsx",
+          "tests/tipos-chain.test.ts"
+        ],
+        "unchanged_resources": [
+          "src/lib/tipos.ts"
+        ],
+        "root_cause": "Buscador y Rejilla mantienen listas locales duplicadas en lugar de importar TIPOS desde src/lib/tipos.ts, y el intento anterior usó CREATE sobre tests/tipos-chain.test.ts que ya existía, por lo que la"
+      }
+    ]
+  }
+}

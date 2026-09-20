@@ -823,7 +823,7 @@ class _RecordingClient:
         """No hay recursos que liberar."""
 
 
-def _e2e_plan(modify: Sequence[str] | None = None) -> dict[str, Any]:
+def _e2e_plan(modify: Sequence[str] | None = None, create: Sequence[str] = ()) -> dict[str, Any]:
     """Plan del montaje, equivalente al de CASE-B."""
     return {
         "summary": "unificar la lista de tipos en una sola fuente",
@@ -836,7 +836,7 @@ def _e2e_plan(modify: Sequence[str] | None = None) -> dict[str, Any]:
                 "src/components/Buscador.tsx",
             )
         ),
-        "files_to_create": [],
+        "files_to_create": list(create),
         "files_to_delete": [],
         "verification_commands": ["focused", "chain"],
         "risks": ["cambiar la interfaz sin querer"],
@@ -1388,6 +1388,209 @@ class _RepositorioFalso:
         """Ninguna ruta existe."""
         del path
         return False
+
+
+# ------------------------------------------------- D-6: métricas ancladas en la ronda 1
+class _Evento:
+    """Evento de auditoría mínimo, con la forma que lee el arnés."""
+
+    def __init__(self, tipo: str, metadata: dict[str, Any]) -> None:
+        self.event_type = type("Tipo", (), {"value": tipo})()
+        self.metadata = metadata
+
+
+class _ResultadoFalso:
+    """Resultado de ciclo mínimo para las métricas."""
+
+    applied: tuple[Any, ...] = ()
+    repair_rounds = 2
+
+
+def _arnes() -> Any:
+    """Carga el arnés como módulo: sus métricas son parte del experimento y se prueban."""
+    import importlib.util
+
+    ruta = Path(__file__).resolve().parents[1] / "_punto-skill-layer" / "run_baseline.py"
+    especificacion = importlib.util.spec_from_file_location("punto_arnes", ruta)
+    assert especificacion is not None and especificacion.loader is not None
+    modulo = importlib.util.module_from_spec(especificacion)
+    especificacion.loader.exec_module(modulo)
+    return modulo
+
+
+def test_d6_1_las_metricas_se_anclan_en_la_ronda_1_no_en_el_primer_registro() -> None:
+    """Defecto D-6: una ronda rechazada no deja registro de progreso, y la métrica se leía de la 2ª.
+
+    Se reproduce la forma de la corrida de 0.2.0: ronda 1 con ampliación aprobada y cambio del
+    recurso causal, descartada por un cambio hermano inválido (``CHANGE_ALREADY_EXISTS``); ronda 2
+    aplicada y fallida. Las métricas de la **primera** reparación deben leerse de la ronda 1.
+    """
+    eventos = [
+        _Evento(
+            "DEV_RESOLUTION_INPUT",
+            {"round": 1, "failed": ["focused", "chain"], "causal_gap": ["src/lib/tipos.ts"]},
+        ),
+        _Evento(
+            "DEV_SCOPE_EXPANSION_REQUESTED",
+            {"round": 1, "resources": ["src/lib/tipos.ts"], "evidence": ["focused exit 1"]},
+        ),
+        _Evento(
+            "DEV_SCOPE_EXPANSION_APPROVED",
+            {"plan_version": 2, "resources": ["src/lib/tipos.ts"]},
+        ),
+        _Evento("DEV_PLAN_REVISED", {"plan_version": 2, "added_resources": ["src/lib/tipos.ts"]}),
+        _Evento(
+            "DEV_CHANGE_REJECTED",
+            {"round": 1, "issue_codes": ["CHANGE_ALREADY_EXISTS"]},
+        ),
+        _Evento(
+            "DEV_RESOLUTION_INPUT",
+            {"round": 2, "failed": ["focused", "chain"], "causal_gap": []},
+        ),
+        _Evento(
+            "DEV_CHANGE_VALIDATED",
+            {"changes": 2, "paths": ["src/components/Buscador.tsx", "src/components/Rejilla.tsx"]},
+        ),
+        _Evento(
+            "DEV_CAUSAL_PROGRESS",
+            {
+                "round": 2,
+                "causal_gap": [],
+                "verification_result": "FAILED",
+                "touched_resources": ["src/components/Buscador.tsx", "src/components/Rejilla.tsx"],
+                "verifications_still_failing": ["focused", "chain"],
+                "resources_status": ["src/lib/tipos.ts=UNCHANGED_BY_EVIDENCE"],
+            },
+        ),
+    ]
+    detalle = [
+        {
+            "role": "BUILDER",
+            "phase": "resolution",
+            "proposal": {
+                "scope_expansion": True,
+                "changes": [
+                    {"path": "src/lib/tipos.ts", "operation": "MODIFY"},
+                    {"path": "tests/tipos-chain.test.ts", "operation": "CREATE"},
+                ],
+            },
+        }
+    ]
+
+    evidencia = _arnes()._resolution_evidence(eventos, [], detalle, _ResultadoFalso())
+
+    assert evidencia["first_repair_reached_verification"] is False
+    assert evidencia["first_repair_pass"] is False
+    # La brecha es la de la ronda 1 (donde el cambio se descartó), no la de la ronda 2.
+    assert evidencia["first_repair_causal_gap"] == ["src/lib/tipos.ts"]
+    assert evidencia["first_repair_rejected_issue_codes"] == ["CHANGE_ALREADY_EXISTS"]
+    assert evidencia["first_repair_scope_expansion_approved"] is True
+    assert evidencia["first_repair_change_same_resource"] is True
+    assert evidencia["first_repair_change_same_proposal"] is True
+    assert evidencia["first_repair_change_applied"] is False, "el cambio se descartó con la ronda"
+    assert evidencia["first_repair_focused_pass"] is False
+    assert evidencia["first_repair_chain_pass"] is False
+    assert evidencia["progress_records"][0]["round"] == 2, "solo la ronda 2 llegó a verificar"
+    assert evidencia["round_info"]["1"]["validated_paths"] == []
+    assert evidencia["round_info"]["2"]["validated_paths"] == [
+        "src/components/Buscador.tsx",
+        "src/components/Rejilla.tsx",
+    ]
+
+
+def test_d6_2_ciclo_real_un_cambio_hermano_invalido_descarta_el_cambio_discriminante(
+    tmp_path: Path,
+) -> None:
+    """La forma exacta del fallo de 0.2.0 en CASE-B, en determinista.
+
+    El cambio del recurso causal viaja en la misma propuesta que la ampliación (la regla D-5
+    funciona) y la ampliación se aprueba; pero otro cambio de la misma propuesta reintroduce como
+    ``CREATE`` un fichero que la ronda anterior ya creó, así que PUNTO descarta **toda** la
+    propuesta y el cambio discriminante nunca se aplica.
+    """
+    responses = [
+        _e2e_plan(
+            modify=("src/components/Rejilla.tsx", "src/components/Buscador.tsx"),
+            create=("tests/tipos-chain.test.ts",),
+        ),
+        {
+            "summary": "consumidores y prueba",
+            "changes": [
+                *_consumidores(),
+                {
+                    "path": "tests/tipos-chain.test.ts",
+                    "operation": "CREATE",
+                    "content": "// cadena de tipos\n",
+                    "reason": "dejar la cadena cubierta",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+            ],
+        },
+        {
+            "summary": "ampliación y cambio de la fuente, con el hermano inválido",
+            "changes": [
+                {
+                    "path": "src/lib/tipos.ts",
+                    "operation": "MODIFY",
+                    "content": "export const TIPOS = ['Casa', 'Apartamento'];\n",
+                    "reason": "la verificación focalizada mide este fichero",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+                *_consumidores(),
+                {
+                    "path": "tests/tipos-chain.test.ts",
+                    "operation": "CREATE",
+                    "content": "// cadena de tipos\n",
+                    "reason": "reintroducir la prueba",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+            ],
+            "root_cause": "la fuente canónica no declara el tipo que la verificación lee",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "la verificación focalizada encuentra el tipo exigido",
+            "scope_expansion": {
+                "trigger": "evidencia de la verificación focalizada",
+                "evidence": ["focused mide src/lib/tipos.ts y el plan no lo autoriza"],
+                "root_cause": "es la fuente canónica del dato que la verificación exige",
+                "resources": ["src/lib/tipos.ts"],
+                "operations": ["MODIFY"],
+                "relationship": "fuente canónica de la misma cadena funcional",
+            },
+        },
+        {
+            "summary": "consumidores otra vez, sin la fuente",
+            "changes": [
+                *_consumidores(),
+                {
+                    "path": "tests/tipos-chain.test.ts",
+                    "operation": "MODIFY",
+                    "content": "// cadena de tipos revisada\n",
+                    "reason": "corregir la operación de la prueba",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+            ],
+            "root_cause": "Buscador y Rejilla mantienen listas locales duplicadas",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "los consumidores consumen la fuente",
+            "unchanged_resources": [
+                {"path": "src/lib/tipos.ts", "evidence": "la fuente ya es la canónica"},
+            ],
+        },
+    ]
+    result, detalle, _client = _run_e2e(tmp_path, responses)
+    progreso = _meta(detalle, "DEV_CAUSAL_PROGRESS")
+
+    # La ampliación se aprobó y la regla funcionó: el cambio del recurso causal viajó con ella.
+    assert len(_meta(detalle, "DEV_SCOPE_EXPANSION_APPROVED")) == 1
+    rechazos = _meta(detalle, "DEV_CHANGE_REJECTED")
+    assert [item["round"] for item in rechazos] == [1]
+    assert rechazos[0]["issue_codes"] == ("CHANGE_ALREADY_EXISTS",)
+    # Pero la ronda 1 entera se descartó: nunca verificó y el recurso causal no se aplicó.
+    assert [item["round"] for item in progreso] == [2]
+    assert "src/lib/tipos.ts" not in {item.path for item in result.applied}
+    assert result.status is DevelopmentStatus.VERIFICATION_FAILED
+    assert result.rolled_back is True
+    assert result.repair_rounds == 2
 
 
 def test_d5_5_el_registro_identifica_la_version_0_2_0() -> None:

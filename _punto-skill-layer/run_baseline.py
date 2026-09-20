@@ -324,6 +324,43 @@ def _expansion_rounds(events: list[Any]) -> list[dict[str, Any]]:
     return salida
 
 
+def _round_info(events: list[Any]) -> dict[int, dict[str, Any]]:
+    """Información por **ronda de reparación**, anclada en los eventos del ciclo.
+
+    Hace falta porque una ronda puede terminar sin aplicar nada (cambios rechazados) y entonces no
+    deja registro de progreso: leer ``progress_records[0]`` como «primera reparación» atribuía a la
+    ronda 1 lo que en realidad hizo la 2 (defecto detectado en la corrida de 0.2.0).
+    """
+    ronda = 0
+    info: dict[int, dict[str, Any]] = {}
+    for event in events:
+        tipo = event.event_type.value
+        meta = dict(event.metadata)
+        if tipo == "DEV_RESOLUTION_INPUT":
+            ronda = int(meta.get("round", ronda) or ronda)
+            registro = info.setdefault(ronda, {})
+            registro["resolution_input"] = meta
+        elif tipo == "DEV_CHANGE_VALIDATED":
+            info.setdefault(ronda, {})["validated_paths"] = [
+                str(item) for item in (meta.get("paths") or ())
+            ]
+        elif tipo == "DEV_CHANGE_REJECTED" and "round" in meta:
+            info.setdefault(int(meta["round"]), {})["rejected_issue_codes"] = [
+                str(item) for item in (meta.get("issue_codes") or ())
+            ]
+        elif tipo == "DEV_REPAIR_PROGRESS":
+            info.setdefault(int(meta.get("round", ronda) or ronda), {})["repair_strategy"] = [
+                str(item) for item in (meta.get("strategy") or ())
+            ]
+        elif tipo == "DEV_CAUSAL_PROGRESS":
+            info.setdefault(int(meta.get("round", ronda) or ronda), {})["progress"] = meta
+    for registro in info.values():
+        registro.setdefault("validated_paths", [])
+        registro.setdefault("rejected_issue_codes", [])
+        registro.setdefault("repair_strategy", [])
+    return info
+
+
 def _resolution_evidence(
     events: list[Any],
     calls: list[dict[str, Any]],
@@ -357,7 +394,14 @@ def _resolution_evidence(
     expansiones = _expansion_rounds(events)
     ampliacion_1 = next((item for item in expansiones if item["round"] == 1), None)
     pedidos = {str(item) for item in (ampliacion_1 or {}).get("resources", [])}
-    tocados_1 = {str(item) for item in (primera.get("touched_resources") or ())}
+    # La **primera reparación** es la ronda 1, no el primer registro de progreso: una ronda cuyos
+    # cambios se rechazan no llega a aplicar ni a verificar, y no deja registro.
+    rondas = _round_info(events)
+    ronda_1 = rondas.get(1, {})
+    verificado_1 = ronda_1.get("progress") or {}
+    alcanzo_1 = bool(verificado_1)
+    tocados_1 = {str(item) for item in (verificado_1.get("touched_resources") or ())}
+    validados_1 = {str(item) for item in (ronda_1.get("validated_paths") or ())}
     aplicados = {str(item.path) for item in getattr(result, "applied", ())}
     # La respuesta de la primera resolución, tal como viajó: permite saber si el cambio del recurso
     # ampliado fue **en la misma respuesta** que la petición de ampliación.
@@ -369,34 +413,43 @@ def _resolution_evidence(
     return {
         "resolution_inputs": entradas,
         "progress_records": progreso,
+        "round_info": {str(llave): valor for llave, valor in sorted(rondas.items())},
         "causal_stagnation_events": len(estancamiento),
         "scope_expansions": expansiones,
-        "first_repair_attempted": bool(progreso),
+        "first_repair_attempted": bool(pedidos or cambios_1 or ronda_1),
+        "first_repair_reached_verification": alcanzo_1,
         "first_repair_strategy_changed": (
             bool(progreso)
             and str(primera.get("strategy_signature", "")) != estrategia_previa
         ),
         "first_repair_addressed_failure_resource": bool(
-            primera.get("newly_addressed_failure_resources")
+            verificado_1.get("newly_addressed_failure_resources")
         ),
-        "first_repair_pass": bool(primera)
-        and primera.get("verification_result") == "PASSED",
-        "first_repair_causal_gap": list(primera.get("causal_gap", ())),
+        "first_repair_pass": alcanzo_1
+        and verificado_1.get("verification_result") == "PASSED",
+        "first_repair_causal_gap": list(verificado_1.get("causal_gap", ()))
+        or list((ronda_1.get("resolution_input") or {}).get("causal_gap") or ()),
         "first_repair_scope_expansion_requested": ampliacion_1 is not None,
         "first_repair_scope_expansion_approved": bool(
             ampliacion_1 and ampliacion_1["decision"] == "APPROVED"
         ),
-        "first_repair_change_same_resource": bool(pedidos & tocados_1),
+        "first_repair_change_same_resource": bool(pedidos & cambios_1),
         "first_repair_change_same_proposal": bool(
             propuesta_1.get("scope_expansion") and (pedidos & cambios_1)
         ),
-        "first_repair_change_applied": bool(pedidos & aplicados),
-        "first_repair_focused_pass": bool(primera)
+        "first_repair_change_applied": bool(alcanzo_1 and (pedidos & validados_1)),
+        "first_repair_validated_paths": sorted(validados_1),
+        "first_repair_rejected_issue_codes": [
+            str(item) for item in (ronda_1.get("rejected_issue_codes") or ())
+        ],
+        "first_repair_touched_resources": sorted(tocados_1),
+        "first_repair_applied_paths": sorted(pedidos & aplicados),
+        "first_repair_focused_pass": alcanzo_1
         and "focused"
-        not in {str(item) for item in (primera.get("verifications_still_failing") or ())},
-        "first_repair_chain_pass": bool(primera)
+        not in {str(item) for item in (verificado_1.get("verifications_still_failing") or ())},
+        "first_repair_chain_pass": alcanzo_1
         and "chain"
-        not in {str(item) for item in (primera.get("verifications_still_failing") or ())},
+        not in {str(item) for item in (verificado_1.get("verifications_still_failing") or ())},
         "previous_strategy": estrategia_previa,
         "resolution_prompt_chars": sum(
             item["prompt_chars"] for item in calls if item["phase"] == "resolution"

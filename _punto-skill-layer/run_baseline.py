@@ -292,10 +292,45 @@ def _first_attempt(result: Any, calls_detail: list[dict[str, Any]], handoff: str
     }
 
 
+def _expansion_rounds(events: list[Any]) -> list[dict[str, Any]]:
+    """Rondas de ampliación de alcance, emparejando cada petición con su decisión por orden.
+
+    Los eventos llevan la ronda de la petición y el desenlace, pero no en el mismo evento: se empareja
+    cada ``REQUESTED`` con el ``APPROVED``/``DENIED`` que le sigue, sin tocar el ciclo.
+    """
+    ronda = 0
+    pendiente: dict[str, Any] | None = None
+    salida: list[dict[str, Any]] = []
+    for event in events:
+        tipo = event.event_type.value
+        meta = dict(event.metadata)
+        if tipo == "DEV_RESOLUTION_INPUT":
+            ronda = int(meta.get("round", ronda) or ronda)
+        elif tipo == "DEV_SCOPE_EXPANSION_REQUESTED":
+            pendiente = {
+                "round": int(meta.get("round", ronda) or ronda),
+                "resources": [str(item) for item in (meta.get("resources") or ())],
+                "decision": "PENDING",
+                "plan_version": 0,
+            }
+            salida.append(pendiente)
+        elif tipo == "DEV_SCOPE_EXPANSION_APPROVED" and pendiente is not None:
+            pendiente["decision"] = "APPROVED"
+            pendiente["plan_version"] = int(meta.get("plan_version", 0) or 0)
+            pendiente = None
+        elif tipo == "DEV_SCOPE_EXPANSION_DENIED" and pendiente is not None:
+            pendiente["decision"] = "DENIED"
+            pendiente = None
+    return salida
+
+
 def _resolution_evidence(
-    events: list[Any], calls: list[dict[str, Any]], result: Any
+    events: list[Any],
+    calls: list[dict[str, Any]],
+    detalle: list[dict[str, Any]],
+    result: Any,
 ) -> dict[str, Any]:
-    """Evidencia de la fase de resolución y **métrica principal** del experimento 03.
+    """Evidencia de la fase de resolución y **métricas de la primera reparación**.
 
     La pregunta del encargo no es si el primer intento acierta (no es el trabajo de esta skill),
     sino si **la primera reparación posterior a un fallo real** aborda el recurso que la
@@ -319,10 +354,23 @@ def _resolution_evidence(
         "|".join(str(item) for item in previas[-1].get("strategy", ())) if previas else ""
     )
     primera = progreso[0] if progreso else {}
+    expansiones = _expansion_rounds(events)
+    ampliacion_1 = next((item for item in expansiones if item["round"] == 1), None)
+    pedidos = {str(item) for item in (ampliacion_1 or {}).get("resources", [])}
+    tocados_1 = {str(item) for item in (primera.get("touched_resources") or ())}
+    aplicados = {str(item.path) for item in getattr(result, "applied", ())}
+    # La respuesta de la primera resolución, tal como viajó: permite saber si el cambio del recurso
+    # ampliado fue **en la misma respuesta** que la petición de ampliación.
+    respuestas = [
+        item for item in detalle if item["role"] == "BUILDER" and item["phase"] == "resolution"
+    ]
+    propuesta_1 = respuestas[0]["proposal"] if respuestas else {}
+    cambios_1 = {str(item.get("path", "")) for item in propuesta_1.get("changes", [])}
     return {
         "resolution_inputs": entradas,
         "progress_records": progreso,
         "causal_stagnation_events": len(estancamiento),
+        "scope_expansions": expansiones,
         "first_repair_attempted": bool(progreso),
         "first_repair_strategy_changed": (
             bool(progreso)
@@ -334,6 +382,21 @@ def _resolution_evidence(
         "first_repair_pass": bool(primera)
         and primera.get("verification_result") == "PASSED",
         "first_repair_causal_gap": list(primera.get("causal_gap", ())),
+        "first_repair_scope_expansion_requested": ampliacion_1 is not None,
+        "first_repair_scope_expansion_approved": bool(
+            ampliacion_1 and ampliacion_1["decision"] == "APPROVED"
+        ),
+        "first_repair_change_same_resource": bool(pedidos & tocados_1),
+        "first_repair_change_same_proposal": bool(
+            propuesta_1.get("scope_expansion") and (pedidos & cambios_1)
+        ),
+        "first_repair_change_applied": bool(pedidos & aplicados),
+        "first_repair_focused_pass": bool(primera)
+        and "focused"
+        not in {str(item) for item in (primera.get("verifications_still_failing") or ())},
+        "first_repair_chain_pass": bool(primera)
+        and "chain"
+        not in {str(item) for item in (primera.get("verifications_still_failing") or ())},
         "previous_strategy": estrategia_previa,
         "resolution_prompt_chars": sum(
             item["prompt_chars"] for item in calls if item["phase"] == "resolution"
@@ -532,7 +595,7 @@ def _run_case(case: dict[str, Any], *, mode: str, root: Path) -> dict[str, Any]:
         notes=(f"proveedores: {sorted({item['provider'] for item in observed.calls})}",),
     )
     recorded_ms = time.perf_counter()
-    resolution = _resolution_evidence(events, observed.calls, result)
+    resolution = _resolution_evidence(events, observed.calls, calls_detail, result)
     record = build_record(
         evidence,
         task_id=case["case_id"],
@@ -758,6 +821,9 @@ def main() -> int:
             f"ctx={record.context_chars}c tokens={record.tokens.source} "
             f"chain={record.functional_chain_pass} "
             f"first_repair_pass={reparacion.get('first_repair_pass', 'N/A')} "
+            f"misma_propuesta={reparacion.get('first_repair_change_same_proposal', 'N/A')} "
+            f"aplicado={reparacion.get('first_repair_change_applied', 'N/A')} "
+            f"exp_aprobada={reparacion.get('first_repair_scope_expansion_approved', 'N/A')} "
             f"gap={reparacion.get('first_repair_causal_gap', [])}"
         )
     EVIDENCE.mkdir(exist_ok=True)

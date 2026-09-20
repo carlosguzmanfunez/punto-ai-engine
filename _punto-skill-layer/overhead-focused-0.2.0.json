@@ -1,0 +1,58 @@
+{
+  "versiones": {
+    "punto-focused-resolution@0.1.0": {
+      "skill_reference": "punto-focused-resolution@0.1.0",
+      "skill_id": "punto-focused-resolution",
+      "skill_version": "0.1.0",
+      "skill_sha256": "a0486da6454f4a8ea6b62020e229a6ec7023769ef3ccffc7cf34dee0a9a64f2e",
+      "skill_chars": 1286,
+      "resolution_context_chars": 1146,
+      "causal_handoff_chars": 322,
+      "expected_resolution_context_prompt_chars": 4210,
+      "skill_instructions_chars": 1810,
+      "expected_effective_prompt_chars": 6020,
+      "duplicated_procedural_chars": 0,
+      "duplicated_context_chars": 0,
+      "labels_present_once": {
+        "resolution_input": true,
+        "causal_handoff": true
+      }
+    },
+    "punto-focused-resolution@0.2.0": {
+      "skill_reference": "punto-focused-resolution@0.2.0",
+      "skill_id": "punto-focused-resolution",
+      "skill_version": "0.2.0",
+      "skill_sha256": "b016d28ad7db841a15d12dd3d19342c570c864dc83c1b2bf27c0bf160eabbf73",
+      "skill_chars": 1558,
+      "resolution_context_chars": 1146,
+      "causal_handoff_chars": 322,
+      "expected_resolution_context_prompt_chars": 4210,
+      "skill_instructions_chars": 2082,
+      "expected_effective_prompt_chars": 6292,
+      "duplicated_procedural_chars": 0,
+      "duplicated_context_chars": 0,
+      "labels_present_once": {
+        "resolution_input": true,
+        "causal_handoff": true
+      }
+    }
+  },
+  "delta": {
+    "skill_chars": 272,
+    "resolution_context_chars": 0,
+    "expected_effective_prompt_chars": 272,
+    "hunks": 1,
+    "regla": "si el recurso causal está fuera de alcance y el cambio mínimo ya se conoce, pedir la ampliación e incluir el cambio en la misma respuesta"
+  },
+  "comun": {
+    "duplicated_procedural_chars": [
+      0,
+      0
+    ],
+    "duplicated_context_chars": [
+      0,
+      0
+    ],
+    "causal_handoff_chars": 322
+  }
+}

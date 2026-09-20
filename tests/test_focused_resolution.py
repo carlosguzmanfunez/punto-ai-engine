@@ -74,6 +74,8 @@ from punto.workspace.target import (
 )
 
 SKILL = "punto-focused-resolution@0.1.0"
+#: Versión de la ronda final de refinación (EXPERIMENTO 03 · D-5). La 0.1.0 se conserva intacta.
+SKILL_V2 = "punto-focused-resolution@0.2.0"
 SKILL_ID = "punto-focused-resolution"
 TARGET_ID = "preflight-fixture"
 WORK_BRANCH = "ai/skill-layer-baseline"
@@ -1224,6 +1226,206 @@ def test_16e_el_arnes_persiste_el_handoff_que_se_envio() -> None:
         "DEV_CAUSAL_HANDOFF",
     ):
         assert clave in texto, f"el arnés no persiste {clave}"
+
+
+# ---------------------------------------------------------------- D-5: refinación 0.2.0
+def test_d5_1_la_regla_de_la_misma_respuesta_esta_en_0_2_0_y_no_en_0_1_0() -> None:
+    """Punto 1 de la refinación: el delta es la regla, y solo la regla (+272 caracteres)."""
+    vieja = load_skill(SKILL)
+    nueva = load_skill(SKILL_V2)
+
+    assert nueva.version == "0.2.0"
+    assert nueva.role == vieja.role == "BUILDER"
+    assert nueva.chars - vieja.chars == 272, "el delta debe ser mínimo y medido"
+    # La regla nueva: ampliar y cambiar en la misma respuesta, con PUNTO decidiendo.
+    assert "scope_expansion" in nueva.body and "misma respuesta" in nueva.body
+    assert "decide si la autoriza" in nueva.body
+    assert "si no la autoriza, no se aplica nada" in nueva.body
+    # Y no estaba antes: el delta no es cosmético.
+    assert "misma respuesta" not in vieja.body
+
+    def normalizar(texto: str) -> str:
+        return " ".join(texto.split())
+
+    regla = (
+        "Si ya conoces el cambio mínimo del recurso que está fuera de alcance, pide la "
+        "`scope_expansion` **e incluye ese cambio en la misma respuesta**: PUNTO evalúa la "
+        "ampliación antes de validar los cambios y decide si la autoriza; si no la autoriza, "
+        "no se aplica nada."
+    )
+    esperado = normalizar(vieja.body).replace(
+        "está fuera del alcance. Que una verificación",
+        f"está fuera del alcance. {regla} Que una verificación",
+    )
+
+    assert normalizar(nueva.body) == esperado, "0.2.0 no cambia nada más que esa regla"
+
+
+def test_d5_2_la_version_0_1_0_sigue_disponible_como_historica() -> None:
+    """Punto 12: la versión anterior no se toca; queda como evidencia."""
+    vieja = load_skill(SKILL)
+    ruta = Path(vieja.path)
+
+    assert ruta.is_file()
+    assert "0.1.0" in str(ruta)
+    assert vieja.version == "0.1.0"
+    assert vieja.sha256 == "a0486da6454f4a8ea6b62020e229a6ec7023769ef3ccffc7cf34dee0a9a64f2e"
+    # Y las dos versiones conviven: pedir cada una devuelve la suya.
+    assert load_skill(SKILL).chars != load_skill(SKILL_V2).chars
+
+
+def test_d5_3_la_resolucion_recibe_0_2_0_una_sola_vez() -> None:
+    """Puntos 6, 11 y 14: una sola inyección, sin autoridad añadida y sin secretos."""
+    from punto.security.deterministic import SECRET_PATTERNS
+
+    cycle = _cycle(resolution=SKILL_V2)
+    request = _request()
+    marcador = "# Resolución focalizada de un fallo"
+
+    primera = cycle._instructions_for(ProviderRole.BUILDER, request, phase=RESOLUTION_PHASE)
+    segunda = cycle._instructions_for(ProviderRole.BUILDER, request, phase=RESOLUTION_PHASE)
+
+    assert primera.count(marcador) == 1
+    assert segunda == primera
+    assert len(primera) == len(WORKER_INSTRUCTIONS) + 2 + load_skill(SKILL_V2).chars
+    cuerpo = load_skill(SKILL_V2).body.lower()
+    for prohibido in ("grant", "bypass", "human gate", "policyengine", "budget", "push", "deploy"):
+        assert prohibido not in cuerpo, f"la skill menciona {prohibido!r}"
+    assert not any(pattern.search(load_skill(SKILL_V2).body) for _n, pattern, _s in SECRET_PATTERNS)
+    # Y la autoridad no cambia por declarar la skill nueva.
+    assert cycle.config.max_repair_rounds == 3
+    assert cycle.config.require_functional_chain is True
+
+
+def test_d5_4_una_ampliacion_denegada_no_aplica_el_cambio(tmp_path: Path) -> None:
+    """Puntos 2, 3 y 5: mismo payload con ampliación y cambio; sin aprobación, no se aplica nada.
+
+    La ampliación **sin evidencia causal** se deniega por regla del sobre, y el cambio del recurso
+    no autorizado no llega a aplicarse: la frontera es de PUNTO, no de la skill.
+    """
+    responses = [
+        _e2e_plan(modify=("src/components/Rejilla.tsx", "src/components/Buscador.tsx")),
+        {"summary": "consumidores", "changes": _consumidores()},
+        {
+            "summary": "ampliación sin evidencia y cambio del recurso",
+            "changes": [
+                *_consumidores(),
+                {
+                    "path": "src/lib/tipos.ts",
+                    "operation": "MODIFY",
+                    "content": "export const TIPOS = ['Casa', 'Apartamento'];\n",
+                    "reason": "la verificación focalizada mide este fichero",
+                    "acceptance_criterion": "una sola fuente de tipos",
+                },
+            ],
+            "root_cause": "la fuente canónica no declara el tipo que la verificación lee",
+            "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+            "expected_effect": "la verificación focalizada encuentra el tipo exigido",
+            "scope_expansion": {
+                "trigger": "evidencia de la verificación focalizada",
+                "evidence": [],
+                "root_cause": "es la fuente canónica del dato que la verificación exige",
+                "resources": ["src/lib/tipos.ts"],
+                "operations": ["MODIFY"],
+                "relationship": "fuente canónica de la misma cadena funcional",
+            },
+        },
+    ]
+    result, detalle, _client = _run_e2e(tmp_path, responses, max_repair_rounds=1)
+
+    assert _meta(detalle, "DEV_SCOPE_EXPANSION_DENIED") != []
+    assert _meta(detalle, "DEV_SCOPE_EXPANSION_APPROVED") == []
+    assert _meta(detalle, "DEV_PLAN_REVISED") == []
+    # El cambio del recurso no autorizado no se aplicó, y PUNTO lo dijo con su código.
+    assert "src/lib/tipos.ts" not in {item.path for item in result.applied}
+    assert "CHANGE_NOT_IN_PLAN" in {issue.code for issue in result.change_issues}
+    assert result.error_kind == "CHANGE_REJECTED"
+    assert result.status is not DevelopmentStatus.COMPLETED
+
+
+def test_d5_4b_una_ampliacion_que_exige_persona_tampoco_revisa_el_plan() -> None:
+    """Punto 5 (vía Human Gate): sin autorización el plan no se revisa, así que no se aplica nada.
+
+    Pedir una ampliación que cruza el presupuesto de la sesión devuelve Human Gate: la frontera la
+    decide PUNTO, y el cambio del recurso no autorizado no puede ni validarse.
+    """
+    cycle = _cycle(resolution=SKILL_V2)
+    plan = _plan()
+    request = _request()
+    pedido = {
+        "trigger": "evidencia de la verificación focalizada",
+        "evidence": ["focused exit 1: TIPOS: export const TIPOS = ['Casa'];"],
+        "root_cause": "la fuente canónica no declara el tipo que la verificación mide",
+        "resources": [f"src/lib/nuevo-{indice:02d}.ts" for indice in range(19)],
+        "operations": ["MODIFY"],
+        "relationship": "misma cadena funcional del objetivo",
+    }
+
+    devuelto, estado = cycle._handle_scope_expansion(
+        request=request,
+        plan=plan,
+        repository=_RepositorioFalso(),  # type: ignore[arg-type]
+        payload=pedido,
+        round_index=1,
+    )
+
+    assert estado == "HUMAN_GATE"
+    assert devuelto is plan, "sin autorización no hay plan nuevo: el cambio no puede validarse"
+    detalle = [
+        {"event": event.event_type.value, **dict(event.metadata)}
+        for event in cycle.audit.by_resource(str(request.request_id))
+    ]
+    assert _meta(detalle, "DEV_SCOPE_EXPANSION_REQUESTED") != []
+    negadas = _meta(detalle, "DEV_SCOPE_EXPANSION_DENIED")
+    assert negadas and negadas[0]["outcome"] == "REQUIRE_HUMAN"
+    assert _meta(detalle, "DEV_SCOPE_EXPANSION_APPROVED") == []
+
+
+class _RepositorioFalso:
+    """Repositorio mínimo: todo lo pedido es nuevo, así que la ampliación crea recursos."""
+
+    def exists(self, path: str) -> bool:
+        """Ninguna ruta existe."""
+        del path
+        return False
+
+
+def test_d5_5_el_registro_identifica_la_version_0_2_0() -> None:
+    """Punto 13: la evidencia nombra la versión exacta, y el arnés no la confunde con 0.1.0."""
+    ahora = utc_now()
+    evidence = RunEvidence(
+        run_id="r2",
+        case_id="CASE-B",
+        case_kind="B",
+        mode="REAL",
+        started_at=ahora,
+        finished_at=ahora,
+        elapsed_ms=1_000,
+        provider_calls=(
+            ProviderCall(role="BUILDER", provider="deepseek", phase="resolution", prompt_chars=10),
+        ),
+    )
+    record = build_record(
+        evidence,
+        resolution_skill_id=SKILL_ID,
+        resolution_skill_version="0.2.0",
+        resolution_skill_activated=True,
+        resolution_skill_chars=load_skill(SKILL_V2).chars,
+    )
+
+    assert record.resolution_skill_version == "0.2.0"
+    assert record.resolution_skill_chars == load_skill(SKILL_V2).chars
+
+    harness = Path(__file__).resolve().parents[1] / "_punto-skill-layer" / "run_baseline.py"
+    texto = harness.read_text(encoding="utf-8")
+    assert "resolution-{resolution_ref" in texto, "la evidencia va versionada por skill"
+    for clave in (
+        '"first_repair_change_same_proposal"',
+        '"first_repair_scope_expansion_approved"',
+        '"first_repair_focused_pass"',
+        '"first_repair_chain_pass"',
+    ):
+        assert clave in texto, f"el arnés no registra {clave}"
 
 
 def test_16c_el_recurso_relevante_que_el_plan_no_autoriza_queda_bloqueado(tmp_path: Path) -> None:

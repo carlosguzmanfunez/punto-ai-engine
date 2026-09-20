@@ -396,6 +396,28 @@ def test_e_un_efecto_externo_sigue_exigiendo_persona(
 
 
 # ------------------------------------------- el caso real, recurso a recurso
+def test_el_plan_real_de_un_solo_css_deja_de_pedir_persona(
+    envelope: AdaptiveAuthorityEnvelope,
+) -> None:
+    """La decisión que bloqueó la Task real: un plan que solo modifica `src/app/globals.css`.
+
+    Es la evidencia gobernada del caso (`operation=plan_apply`, `rules=[unknown-resource,
+    local-technical-reversible]`, `risk=HIGH`, `resources=[src/app/globals.css]`): con la taxonomía
+    corregida, ese mismo perfil es autónomo y no dispara ninguna regla de persona.
+    """
+    decision = envelope.assess(_write(("src/app/globals.css",)))
+
+    assert envelope.classify("src/app/globals.css") is ResourceClass.APPLICATION_CODE
+    assert "unknown-resource" not in decision.rule_names
+    assert decision.outcome.value == "ALLOW"
+    assert decision.authority_class.value == "AUTONOMOUS_LOCAL"
+    assert decision.resource_classes == (ResourceClass.APPLICATION_CODE,)
+    # Sigue habiendo una regla local técnica reversible, pero ya no exige persona.
+    assert "local-technical-reversible" in decision.rule_names
+    assert not decision.requires_human
+    assert not decision.prohibited
+
+
 def test_el_plan_real_ya_no_tiene_ningun_recurso_desconocido(
     envelope: AdaptiveAuthorityEnvelope,
 ) -> None:

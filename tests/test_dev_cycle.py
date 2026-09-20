@@ -293,7 +293,13 @@ def _cycle(
         router.assign_role(role, "guionizado")
     target = _target(root, verification=verification, allow_delete=allow_delete)
     logger = audit if audit is not None else AuditLogger()
-    options: dict[str, Any] = {"max_repair_rounds": max_repair_rounds}
+    options: dict[str, Any] = {
+        "max_repair_rounds": max_repair_rounds,
+        # Esta suite comprueba el **validador** (alcance, autoridad, operación, huella, secretos)
+        # con su contabilidad de siempre: el preflight estructural tiene su propio módulo
+        # (``tests/test_proposal_preflight.py``) y aquí se desactiva para aislar lo que se mide.
+        "max_structural_corrections": 0,
+    }
     if max_context_files is not None:
         options["max_context_files"] = max_context_files
     cycle = DevelopmentCycle(

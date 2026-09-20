@@ -927,7 +927,14 @@ def _run_e2e(
     cycle = DevelopmentCycle(
         router=router,
         targets=DevelopmentTargetRegistry({TARGET_ID: target}),
-        config=DevelopmentConfig(max_repair_rounds=max_repair_rounds, resolution_skill=SKILL),
+        config=DevelopmentConfig(
+            max_repair_rounds=max_repair_rounds,
+            resolution_skill=SKILL,
+            # Estas pruebas reproducen la frontera de **resolución** (y su historia medida en los
+            # experimentos 03/03b): el preflight estructural tiene su propio módulo y aquí se
+            # desactiva para no mezclar dos mecanismos con contabilidad distinta.
+            max_structural_corrections=0,
+        ),
         audit=audit,
         policy_engine=_POLICY_ENGINE,
     )

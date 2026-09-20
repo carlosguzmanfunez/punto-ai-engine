@@ -68,6 +68,12 @@ from punto.orchestrator.focused_resolution import (
     resolution_block,
     resource_statuses,
 )
+from punto.orchestrator.proposal_preflight import (
+    ProposalPreflightResult,
+    correction_feedback,
+    issue_codes,
+    proposal_preflight,
+)
 from punto.policy.config_loader import ConfigLoader
 from punto.policy.envelope import (
     AUTONOMOUS_MAX_FILES,
@@ -90,6 +96,7 @@ from punto.providers.router import ProviderRouter
 from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest, BuildValidationIssue
 from punto.schemas.dev import (
+    MAX_PLAN_ITEMS,
     AppliedChange,
     AuthorityDecisionRecord,
     ChangeOperation,
@@ -214,6 +221,12 @@ class DevelopmentConfig:
     max_context_rounds: int = 2
     #: Rondas seguidas con el mismo fallo y la misma estrategia antes de declarar estancamiento.
     stagnation_limit: int = 2
+    #: Correcciones **estructurales** admitidas por ciclo: una propuesta que PUNTO puede rechazar
+    #: por un hecho medible (CREATE sobre algo que existe, MODIFY sobre algo que no está, cambios
+    #: contradictorios o sin efecto) se corrige sin gastar una ronda funcional de reparación. El
+    #: límite es pequeño y explícito: no hay reintentos ilimitados, y ``max_repair_rounds`` no se
+    #: toca.
+    max_structural_corrections: int = 2
     #: Techo acumulado de recursos distintos para toda la sesión (anti-fragmentación).
     session_ceiling: int = AUTONOMOUS_MAX_FILES * 3
     #: Permitir que el BUILDER pida ampliar alcance con evidencia causal.
@@ -289,6 +302,9 @@ class DevelopmentCycle:
     _skill_activations: dict[str, SkillActivation] = field(
         default_factory=dict, init=False, repr=False
     )
+    #: Correcciones estructurales consumidas en esta ejecución (contabilidad separada de las rondas
+    #: funcionales de reparación): es evidencia de por qué una propuesta no llegó a aplicarse.
+    _structural_corrections: int = field(default=0, init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -303,6 +319,7 @@ class DevelopmentCycle:
         self._last_root_cause = ""
         self._last_risk = ""
         self._skill_activations.clear()
+        self._structural_corrections = 0
         self._snapshots = None
         self._checkpoint = None
 
@@ -454,6 +471,7 @@ class DevelopmentCycle:
             applied=outcome["applied"],
             verification=outcome["verification"],
             repair_rounds=outcome["repair_rounds"],
+            structural_corrections=outcome["structural_corrections"],
             granted=outcome["granted"],
             denied=outcome["denied"],
             checkpoint_id=outcome["checkpoint_id"],
@@ -464,8 +482,8 @@ class DevelopmentCycle:
             error=outcome["error"],
             provider=outcome["provider"],
             model=outcome["model"],
-            initial_scope=plan.touched_paths(),
-            final_scope=(outcome["plan"] or plan).touched_paths(),
+            initial_scope=_bounded(plan.touched_paths()),
+            final_scope=_bounded((outcome["plan"] or plan).touched_paths()),
             plan_versions=tuple(outcome["plan_versions"]),
             risk_envelopes=tuple(outcome["risk_envelopes"]),
             scope_expansions=tuple(outcome["scope_expansions"]),
@@ -936,15 +954,19 @@ class DevelopmentCycle:
     ) -> None:
         """Registra una decisión de autoridad en el resultado y en la auditoría."""
         profile: OperationRisk | None = decision.profile
+        # Regla de esta frontera: **todo campo de evidencia acotado por esquema recibe una secuencia
+        # acotada**. Una decisión sobre muchos recursos no puede reventar el registro con un
+        # ``ValidationError``: la decisión y sus totales viajan en la auditoría, y aquí se acota lo
+        # que el esquema admite (mismo defecto que en ``ScopeExpansionRecord``).
         record = AuthorityDecisionRecord(
             operation=profile.operation.value if profile is not None else "",
             outcome=decision.outcome.value,
             authority_class=decision.authority_class.value,
             risk=decision.risk.name,
-            rules=decision.rule_names,
-            reasons=decision.reasons,
-            resources=profile.resources if profile is not None else (),
-            required_evidence=decision.required_evidence,
+            rules=_bounded(decision.rule_names),
+            reasons=_bounded(decision.reasons),
+            resources=_bounded(profile.resources if profile is not None else ()),
+            required_evidence=_bounded(decision.required_evidence),
         )
         self._authority_decisions.append(record)
         if len(self._risk_envelopes) < 40:
@@ -960,6 +982,7 @@ class DevelopmentCycle:
                 "risk": decision.risk.name,
                 "rules": list(decision.rule_names),
                 "blast_radius": profile.blast_radius if profile is not None else 0,
+                "resources_total": len(profile.resources) if profile is not None else 0,
                 "required_evidence": list(decision.required_evidence),
             },
         )
@@ -1082,22 +1105,31 @@ class DevelopmentCycle:
             if decision.outcome.value == "REQUIRE_HUMAN"
             else ExpansionStatus.DENIED
         )
+        # Los campos de evidencia del registro están acotados por esquema (``MAX_PLAN_ITEMS``). Una
+        # petición grande no puede reventar la construcción del registro: se acota lo que se guarda
+        # y **los totales reales viajan en el evento de auditoría**, que es donde vive la decisión.
+        # El desenlace sigue siendo el que decidió el sobre (DENIED / HUMAN_GATE), no una excepción.
+        acumulados = tuple(
+            str(item) for item in decision.record.get("cumulative_resources", ())
+        )
+        declarados = payload.get("resources")
+        total_declarados = len(declarados) if isinstance(declarados, list) else len(requested)
+        total_pedidos = len(requested)
+        total_acumulados = len(acumulados)
         record = ScopeExpansionRecord(
             trigger=trigger,
-            evidence=evidence,
+            evidence=evidence[:MAX_PLAN_ITEMS],
             root_cause=root_cause,
-            new_resources=requested,
-            operations=operations,
+            new_resources=requested[:MAX_PLAN_ITEMS],
+            operations=operations[:MAX_PLAN_ITEMS],
             relationship_to_original_objective=relationship,
             risk_before=decision.delta.previous_risk.name,
             risk_after=decision.delta.new_risk.name,
             authority_decision=decision.outcome.value,
             verification_required=tuple(
                 str(item) for item in decision.record.get("verification_required", ())
-            ),
-            cumulative_resources=tuple(
-                str(item) for item in decision.record.get("cumulative_resources", ())
-            ),
+            )[:MAX_PLAN_ITEMS],
+            cumulative_resources=acumulados[:MAX_PLAN_ITEMS],
             status=status,
         )
         self._scope_expansions.append(record)
@@ -1109,6 +1141,9 @@ class DevelopmentCycle:
                 request,
                 {
                     "resources": list(requested),
+                    "requested_declared": total_declarados,
+                    "requested_total": total_pedidos,
+                    "cumulative_total": total_acumulados,
                     "outcome": decision.outcome.value,
                     "reasons": list(decision.reasons),
                 },
@@ -1146,6 +1181,9 @@ class DevelopmentCycle:
             {
                 "plan_version": version,
                 "resources": list(requested),
+                "requested_declared": total_declarados,
+                "requested_total": total_pedidos,
+                "cumulative_total": total_acumulados,
                 "risk_before": decision.delta.previous_risk.name,
                 "risk_after": decision.delta.new_risk.name,
                 "relationship": relationship,
@@ -1202,6 +1240,23 @@ class DevelopmentCycle:
         return True, ()
 
     # ------------------------------------------------------------ build + apply
+    def _preflight_proposal(
+        self,
+        proposals: Sequence[FileChangeProposal],
+        repository: GovernedRepository,
+    ) -> ProposalPreflightResult | None:
+        """Preflight estructural de la propuesta contra el estado real del workspace.
+
+        Devuelve ``None`` si el estado no se puede leer: entonces sigue el camino de siempre, que ya
+        reporta el motivo con su propio código. No aplica, no escribe y no concede nada.
+        """
+        try:
+            return proposal_preflight(
+                proposals, exists=repository.exists, read_text=repository.read_text
+            )
+        except (RepositoryDenied, SecretBoundaryViolation):
+            return None
+
     def _record_resolution_progress(
         self,
         *,
@@ -1349,7 +1404,17 @@ class DevelopmentCycle:
         # fallo dejó de avanzar). Es local a la ejecución: un ciclo nuevo empieza sin memoria.
         resolution = ResolutionState()
 
-        for _ in range(self.config.max_repair_rounds + 1):
+        # El techo de iteraciones es explícito: rondas funcionales de reparación + correcciones
+        # estructurales + la implementación inicial. Ni bucle abierto ni rondas escondidas.
+        max_iterations = (
+            self.config.max_repair_rounds
+            + 1
+            + self.config.max_structural_corrections
+        )
+        # La corrección estructural se construye al final de una iteración y se entrega en la
+        # siguiente invocación: se consume una sola vez (si no, se perdería antes de viajar).
+        pending_feedback = ""
+        for _ in range(max_iterations):
             # La skill de resolución solo actúa sobre un **fallo real ya medido**: sin verificación
             # fallida no hay nada que resolver, y la implementación inicial no la recibe.
             failed_now = tuple(item for item in verification if not item.passed)
@@ -1358,6 +1423,8 @@ class DevelopmentCycle:
                 failure_map(verification, target, plan) if resolution_phase else None
             )
             block = ""
+            proposal_feedback = pending_feedback
+            pending_feedback = ""
             if current_failure is not None:
                 causal_gap = resolution.observe_failure(current_failure)
                 block = resolution_block(
@@ -1400,6 +1467,7 @@ class DevelopmentCycle:
                 pell_block,
                 failure_evidence,
                 resolution=block,
+                proposal_feedback=proposal_feedback,
             )
             result = self._invoke(
                 ProviderRole.BUILDER,
@@ -1536,6 +1604,35 @@ class DevelopmentCycle:
                 change_issues = (proposal_issue,)
                 failure_evidence = proposal_issue.detail
                 continue
+
+            # Preflight determinista de la propuesta: los hechos del workspace que PUNTO puede
+            # medir se comprueban **antes** de validar y aplicar. Una inconsistencia estructural
+            # se corrige sin consumir una ronda funcional de reparación; la atomicidad no cambia
+            # (nada se aplica a medias) y la autoridad no se roza: si el preflight pasa, manda
+            # ``_validate_changes``.
+            if proposals and self._structural_corrections < self.config.max_structural_corrections:
+                preflight = self._preflight_proposal(proposals, repository)
+                if preflight is not None and not preflight.valid and preflight.correctable:
+                    self._structural_corrections += 1
+                    pending_feedback = correction_feedback(preflight)
+                    self._log(
+                        AuditEventType.DEV_PROPOSAL_PREFLIGHT_FAILED,
+                        "dev_proposal_preflight_failed",
+                        request,
+                        {
+                            "round": rounds,
+                            "structural_correction": self._structural_corrections,
+                            "max_structural_corrections": self.config.max_structural_corrections,
+                            "issue_codes": list(issue_codes(preflight)),
+                            "issues": [item.as_dict() for item in preflight.blocking[:5]],
+                            "advisory_codes": [
+                                item.code for item in preflight.advisory[:5]
+                            ],
+                            "repair_round_consumed": False,
+                        },
+                        AuditResult.FAILURE,
+                    )
+                    continue
 
             validated, issues = self._validate_changes(
                 proposals=proposals,
@@ -2346,6 +2443,7 @@ class DevelopmentCycle:
         failure_evidence: str,
         *,
         resolution: str = "",
+        proposal_feedback: str = "",
     ) -> str:
         """Contexto gobernado del BUILDER: plan validado, ficheros y evidencia del fallo.
 
@@ -2353,6 +2451,10 @@ class DevelopmentCycle:
         discriminante (qué recurso mide cada verificación fallida, qué tocó ya el parche anterior y
         qué brecha causal queda abierta). Va vacío en la implementación inicial: sin fallo real no
         hay resolución, y la skill asociada no se activa.
+
+        ``proposal_feedback`` es la corrección estructural de una propuesta que PUNTO rechazó por un
+        hecho medible (CREATE sobre algo que existe, MODIFY sobre algo que no está, cambios
+        contradictorios o sin efecto). Es corto a propósito: la corrección tiene que ser barata.
         """
         lines = [
             f"TARGET: {target.target_id}",
@@ -2373,6 +2475,8 @@ class DevelopmentCycle:
             lines.append("VERIFICATION FAILED AND MUST BE FIXED:\n" + failure_evidence)
         if resolution:
             lines.append(resolution)
+        if proposal_feedback:
+            lines.append(proposal_feedback)
         lines.append(
             "DELIVERABLE: the exact file changes as JSON. You write nothing yourself: PUNTO "
             "validates and applies them. Keep each change MINIMAL: modify only what the task "
@@ -2518,6 +2622,10 @@ class DevelopmentCycle:
             "applied": kwargs.get("applied", ()),
             "verification": kwargs.get("verification", ()),
             "repair_rounds": kwargs.get("repair_rounds", 0),
+            # Contabilidad separada: correcciones estructurales de propuesta (no consumen ronda).
+            "structural_corrections": kwargs.get(
+                "structural_corrections", self._structural_corrections
+            ),
             "granted": kwargs.get("granted", []),
             "denied": kwargs.get("denied", []),
             "checkpoint": checkpoint,
@@ -2554,6 +2662,7 @@ class DevelopmentCycle:
         applied: Sequence[AppliedChange] = (),
         verification: Sequence[CommandEvidence] = (),
         repair_rounds: int = 0,
+        structural_corrections: int = 0,
         granted: Sequence[str] = (),
         denied: Sequence[str] = (),
         checkpoint_id: str = "",
@@ -2619,6 +2728,7 @@ class DevelopmentCycle:
             applied=final_applied,
             verification=tuple(verification),
             repair_rounds=repair_rounds,
+            structural_corrections=structural_corrections,
             context_requests_granted=tuple(granted),
             context_requests_denied=tuple(denied),
             checkpoint_id=checkpoint_id,
@@ -2649,6 +2759,7 @@ class DevelopmentCycle:
                 "commit_sha": result.commit_sha,
                 "rolled_back": result.rolled_back,
                 "repair_rounds": result.repair_rounds,
+                "structural_corrections": result.structural_corrections,
                 "verification_passed": [item.name for item in result.verification if item.passed],
                 "authority": result.authority,
                 "published": result.published,
@@ -3077,6 +3188,16 @@ def _scope_expansion(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
     return raw
+
+
+def _bounded(items: Any, *, limit: int = MAX_PLAN_ITEMS) -> tuple[str, ...]:
+    """Secuencia acotada al tope del esquema, para campos de evidencia con ``max_length``.
+
+    Existe porque un límite superado debe producir una **decisión gobernada** (DENIED, HUMAN_GATE,
+    ChangeRejected), nunca un ``ValidationError``: el motor no usa excepciones como política. Los
+    totales reales viajan en la auditoría, que no está acotada.
+    """
+    return tuple(str(item) for item in (items or ()))[:limit]
 
 
 def _failure_signature(verification: Sequence[CommandEvidence]) -> str:

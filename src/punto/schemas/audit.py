@@ -344,6 +344,9 @@ class AuditEventType(StrEnum):
     DEV_CAUSAL_PROGRESS = "DEV_CAUSAL_PROGRESS"
     #: EXPERIMENTO 03: el mismo fallo siguió sin abordar ni explicar el recurso relevante.
     DEV_CAUSAL_STAGNATION = "DEV_CAUSAL_STAGNATION"
+    #: RESOLUTION PIPELINE HARDENING: la propuesta traía una inconsistencia estructural medible y se
+    #: devolvió al proveedor para corregirla **sin** consumir una ronda funcional de reparación.
+    DEV_PROPOSAL_PREFLIGHT_FAILED = "DEV_PROPOSAL_PREFLIGHT_FAILED"
 
 
 class AuditEvent(BaseModel):

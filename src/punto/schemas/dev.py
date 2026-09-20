@@ -405,6 +405,11 @@ class DevelopmentResult(BaseModel):
     applied: tuple[AppliedChange, ...] = ()
     verification: tuple[CommandEvidence, ...] = ()
     repair_rounds: int = Field(default=0, ge=0)
+    #: Correcciones estructurales de propuesta: inconsistencias medibles (CREATE sobre lo que
+    #: existe, MODIFY sobre lo que no está, cambios contradictorios o sin efecto) que PUNTO
+    #: detecta antes de aplicar y que **no** consumen una ronda funcional de reparación.
+    #: Contabilidad separada de ``repair_rounds``, con su propio techo explícito.
+    structural_corrections: int = Field(default=0, ge=0)
     context_requests_granted: tuple[str, ...] = ()
     context_requests_denied: tuple[str, ...] = ()
     checkpoint_id: str = Field(default="", max_length=64)

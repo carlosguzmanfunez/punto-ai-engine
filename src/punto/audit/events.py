@@ -182,6 +182,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_RESOLUTION_INPUT: "dev_resolution",
     AuditEventType.DEV_CAUSAL_PROGRESS: "dev_resolution",
     AuditEventType.DEV_CAUSAL_STAGNATION: "dev_resolution",
+    AuditEventType.DEV_PROPOSAL_PREFLIGHT_FAILED: "dev_repair",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
     AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",

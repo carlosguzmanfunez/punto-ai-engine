@@ -124,6 +124,18 @@
       .list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
       .item { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }
       .item code { color: var(--text); }
+      /* Detalle de una tarea: la evidencia gobernada que PUNTO ya registró (AP000-OBS-04). */
+      .detail {
+        margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line);
+        border-radius: 10px; background: var(--panel-2);
+      }
+      .detail .row { align-items: flex-start; }
+      .detail .row .value { text-align: left; max-width: 70%; }
+      .detail .cause { color: var(--bad); }
+      .detail pre {
+        margin: 0; white-space: pre-wrap; word-break: break-word;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      }
       .progress { margin: 12px 0 4px; }
       .progress-head {
         display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
@@ -301,6 +313,17 @@
           throw error;
         }
         return payload;
+      }
+
+      // Escapa cualquier texto que venga del motor antes de insertarlo en el DOM: el detalle de un
+      // bloqueo incluye causas y reglas que pueden arrastrar texto del proveedor.
+      function esc(value) {
+        return String(value === undefined || value === null ? "" : value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
       }
 
       function statusRow(provider) {
@@ -707,13 +730,93 @@
             <div class="list">${verification}${push}${production}${gates}</div>
             ${notes}
             <div class="actions">
-              <button class="secondary" data-refresh="${task.task_id}">Ver</button>
+              <button class="secondary" data-ver="${task.task_id}" data-testid="ver-${task.task_id}">Ver</button>
               ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}">Release autónomo</button>` : ""}
               ${canPublish ? `<button data-production="${task.task_id}">Pedir gate de publicación</button>` : ""}
               ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
               ${publication && publication.approval_id && publication.stage !== "PRODUCTION_VALIDATED" && publication.stage !== "WAITING_PRODUCTION_APPROVAL" ? `<button data-publish="${task.task_id}">Publicar</button>` : ""}
             </div>
+            <div class="detail" data-detail="${task.task_id}" hidden></div>
           </article>`;
+      }
+
+      // Evidencia gobernada de una tarea, tal como la devuelve la API: nada se explica aquí por
+      // cuenta propia. Si un campo no está declarado en el resultado, se dice que no lo está.
+      function detailRow(label, value) {
+        return `<div class="row"><span class="label">${esc(label)}</span><span class="value">${value}</span></div>`;
+      }
+
+      function textOr(value, missing) {
+        return value ? esc(value) : `<span class="sub">${esc(missing)}</span>`;
+      }
+
+      function issuesBlock(title, issues) {
+        if (!issues || !issues.length) return "";
+        const rows = issues
+          .map((item) => `<div class="item"><span>${esc(item.code)}</span><code>${esc(item.detail)}</code></div>`)
+          .join("");
+        return `<div class="row"><span class="label">${esc(title)}</span><span class="value"></span></div>
+                <div class="list">${rows}</div>`;
+      }
+
+      function destinationRows(blocked) {
+        const destination = blocked.destination || {};
+        if (!destination.target_id) return "";
+        return [
+          detailRow("Destino", esc(destination.name || destination.target_id)),
+          detailRow("Rama de trabajo", esc(destination.work_branch || "no declarada")),
+          detailRow("Alcance declarado", esc((destination.scope_roots || []).join(", ") || "no declarado")),
+        ].join("");
+      }
+
+      function detailPanel(task) {
+        const dev = task.development || {};
+        const blocked = task.blocked || {};
+        const parts = [];
+        if (blocked.code) {
+          parts.push(`
+            <div class="detail-block" data-blocked="${esc(blocked.code)}">
+              <div class="row"><span class="label">Bloqueo</span><span class="value"><code>${esc(blocked.code)}</code></span></div>
+              <div class="row"><span class="label">Causa real</span><span class="value cause">${textOr(blocked.detail, "el resultado no trae detalle")}</span></div>
+              <div class="row"><span class="label">Regla que lo produjo</span><span class="value">${textOr(blocked.rule, "no declarada en el resultado")}</span></div>
+              <div class="row"><span class="label">Recurso</span><span class="value">${textOr(blocked.resource, "no declarado en el resultado")}</span></div>
+              <div class="row"><span class="label">Qué corresponde</span><span class="value">${textOr(blocked.remedy, "no declarado en el resultado")}</span></div>
+              ${destinationRows(blocked)}
+            </div>`);
+        } else if (dev.error_kind || dev.error) {
+          parts.push(`
+            <div class="detail-block" data-blocked="${esc(dev.error_kind || "FAILED")}">
+              <div class="row"><span class="label">Código</span><span class="value"><code>${esc(dev.error_kind || "sin código")}</code></span></div>
+              <div class="row"><span class="label">Causa real</span><span class="value cause">${textOr(dev.error, "el resultado no trae detalle")}</span></div>
+            </div>`);
+        }
+        parts.push(detailRow("Etapa del ciclo", `${esc(dev.status || task.stage)}
+          · plan ${esc(dev.plan_status || "sin plan")}${blocked.code && blocked.planned === false ? " (no llegó a emitirse)" : ""}`));
+        parts.push(issuesBlock("Incidencias del plan", dev.plan_issues));
+        parts.push(issuesBlock("Incidencias del cambio", dev.change_issues));
+        const authority = (dev.authority_evidence || [])
+          .map((item) => `<div class="item"><span>${esc(item.operation || "")}</span><code>${esc(item.outcome || "")} · ${esc(item.authority_class || "")}</code></div>`)
+          .join("");
+        if (authority) parts.push(`<div class="row"><span class="label">Decisiones de autoridad</span><span class="value"></span></div><div class="list">${authority}</div>`);
+        return parts.filter(Boolean).join("");
+      }
+
+      async function openTaskDetail(taskId, button) {
+        const container = document.querySelector(`[data-detail="${taskId}"]`);
+        if (!container) return;
+        if (!container.hidden) {
+          container.hidden = true;
+          if (button) button.textContent = "Ver";
+          return;
+        }
+        try {
+          const detail = await api(`/console/tasks/${taskId}`);
+          container.innerHTML = detailPanel(detail);
+          container.hidden = false;
+          if (button) button.textContent = "Ocultar";
+        } catch (error) {
+          consoleNote(`no se pudo cargar el detalle: ${String(error.message || error)}`, "bad");
+        }
       }
 
       function evidenceBlock(gate) {
@@ -833,8 +936,8 @@
           button.addEventListener("click", () => releaseTask(button.dataset.release)));
         document.querySelectorAll("[data-publish]").forEach((button) =>
           button.addEventListener("click", () => publishTask(button.dataset.publish)));
-        document.querySelectorAll("[data-refresh]").forEach((button) =>
-          button.addEventListener("click", () => refreshConsole()));
+        document.querySelectorAll("[data-ver]").forEach((button) =>
+          button.addEventListener("click", () => openTaskDetail(button.dataset.ver, button)));
       }
 
       async function loadGates() {

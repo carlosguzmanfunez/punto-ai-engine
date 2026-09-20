@@ -99,13 +99,29 @@ POLICY_ACTION: Final[Mapping[RepositoryOperation, str]] = {
 
 
 class RepositoryDenied(RuntimeError):
-    """La frontera de recursos denegó una operación."""
+    """La frontera de recursos denegó una operación.
+
+    Además del ``detail`` legible, la denegación puede declarar **la regla** que la produjo, el
+    **recurso** sobre el que se decidió y **qué corresponde hacer** para levantar el bloqueo. Lo
+    declara el punto de decisión que conoce la regla (no la interfaz, que solo lo muestra): así el
+    operador puede ver la causa real desde el dashboard sin que nadie la explique por su cuenta.
+    """
 
     code: str = "REPOSITORY_DENIED"
 
-    def __init__(self, detail: str) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        rule: str = "",
+        resource: str = "",
+        remedy: str = "",
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
+        self.rule = rule
+        self.resource = resource
+        self.remedy = remedy
 
 
 class OperationNotAuthorizedError(RepositoryDenied):
@@ -286,7 +302,13 @@ class GovernedRepository:
         if real != self.context.branch_name:
             raise RepositoryDenied(
                 f"la rama real {real!r} no es la rama de trabajo declarada "
-                f"{self.context.branch_name!r}"
+                f"{self.context.branch_name!r}",
+                rule="el ciclo solo trabaja en la rama de trabajo declarada del destino",
+                resource=f"rama {real!r} del destino (declarada {self.context.branch_name!r})",
+                remedy=(
+                    "pon el repositorio del destino en su rama de trabajo declarada y vuelve a "
+                    "lanzar la tarea"
+                ),
             )
         return real
 
@@ -332,7 +354,13 @@ class GovernedRepository:
         declared = name.strip()
         if not declared.startswith("ai/"):
             raise RepositoryDenied(
-                f"la rama de trabajo {declared!r} no es una rama de tarea (debe empezar por 'ai/')"
+                f"la rama de trabajo {declared!r} no es una rama de tarea (debe empezar por 'ai/')",
+                rule="la rama de trabajo de un destino debe ser una rama de tarea (prefijo 'ai/')",
+                resource=f"rama declarada {declared!r}",
+                remedy=(
+                    "corrige work_branch en la configuración del destino para que sea una rama "
+                    "'ai/…' y vuelve a lanzar la tarea"
+                ),
             )
         if self._git.branch_exists(declared):
             return self._git.checkout(declared)

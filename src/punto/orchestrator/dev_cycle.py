@@ -112,6 +112,7 @@ from punto.schemas.dev import (
     AcceptanceEvidence,
     AppliedChange,
     AuthorityDecisionRecord,
+    BlockedEvidence,
     ChangeOperation,
     ClaimEvidence,
     CommandEvidence,
@@ -400,7 +401,19 @@ class DevelopmentCycle:
         target = self._target_or_none(request)
         if target is None:
             return self._blocked(
-                request, "TARGET_NOT_REGISTERED", "el destino no está registrado", started
+                request,
+                "TARGET_NOT_REGISTERED",
+                "el destino no está registrado",
+                started,
+                rule=(
+                    "el destino de una solicitud debe estar registrado en la configuración del "
+                    "motor"
+                ),
+                resource=request.target_repository,
+                remedy=(
+                    "registra el destino en PUNTO_DEV_TARGETS o en la configuración local de "
+                    "destinos y vuelve a lanzar la tarea"
+                ),
             )
         self._log(
             AuditEventType.BUILD_REQUEST_ACCEPTED,
@@ -412,7 +425,14 @@ class DevelopmentCycle:
             repository = self._open_repository(target, request)
         except (RepositoryDenied, DevelopmentTargetError) as exc:
             return self._blocked(
-                request, getattr(exc, "code", "BLOCKED"), str(exc), started, target
+                request,
+                getattr(exc, "code", "BLOCKED"),
+                str(exc),
+                started,
+                target,
+                rule=str(getattr(exc, "rule", "")),
+                resource=str(getattr(exc, "resource", "")),
+                remedy=str(getattr(exc, "remedy", "")),
             )
         self._log(
             AuditEventType.BUILD_REQUEST_NORMALIZED,
@@ -607,7 +627,18 @@ class DevelopmentCycle:
             raise RepositoryDenied(
                 f"el destino está en {repository.baseline_sha[:12]}… y el baseline declarado es "
                 f"{target.baseline_sha[:12]}…: el ciclo no empieza sobre un árbol que no es el "
-                "acordado"
+                "acordado",
+                rule=(
+                    "el ciclo solo empieza sobre el commit acordado del destino "
+                    "(baseline_sha de su configuración confiable)"
+                ),
+                resource=(
+                    f"rama {branch} de {target.target_id} en {repository.baseline_sha[:12]}…"
+                ),
+                remedy=(
+                    "actualiza baseline_sha del destino al commit real de su rama de trabajo "
+                    "(git rev-parse HEAD) y vuelve a lanzar la tarea"
+                ),
             )
         return repository
 
@@ -3325,13 +3356,27 @@ class DevelopmentCycle:
         detail: str,
         started: float,
         target: DevelopmentTarget | None = None,
+        *,
+        rule: str = "",
+        resource: str = "",
+        remedy: str = "",
     ) -> DevelopmentResult:
-        """Cierra el ciclo cuando la frontera impide empezar."""
+        """Cierra el ciclo cuando la frontera impide empezar.
+
+        La evidencia del bloqueo se escribe aquí, en el punto de decisión, con lo que la frontera
+        declaró: es la que el dashboard muestra cuando una persona pulsa «Ver». Si la frontera no
+        declara regla, recurso o acción, quedan vacíos: no se rellenan por suposición.
+        """
         self._log(
             AuditEventType.DEV_CYCLE_BLOCKED,
             "dev_cycle_blocked",
             request,
-            {"code": code, "detail": detail[:300]},
+            {
+                "code": code,
+                "detail": detail[:300],
+                "rule": rule[:300],
+                "resource": resource[:300],
+            },
             AuditResult.FAILURE,
         )
         return DevelopmentResult(
@@ -3341,6 +3386,13 @@ class DevelopmentCycle:
             duration_ms=int((time.perf_counter() - started) * 1000),
             error_kind=code,
             error=detail[:1_000],
+            blocked=BlockedEvidence(
+                code=code[:60],
+                detail=detail[:1_000],
+                rule=rule[:300],
+                resource=resource[:300],
+                remedy=remedy[:300],
+            ),
         )
 
     # ------------------------------------------------------------- auditoría

@@ -1194,7 +1194,7 @@ def _is_publication_gate(action: str) -> bool:
 
 
 def _task_view(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
-    """Vista de la tarea con su recorrido humano y su decisión de release."""
+    """Vista de la tarea con su recorrido humano, su decisión de release y su bloqueo si lo hay."""
     target = dependencies.targets.get(task.target_id)
     return {
         **task.as_dict(),
@@ -1204,6 +1204,53 @@ def _task_view(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str
             if task.release is not None
             else (_release_preview(task, target, dependencies))
         ),
+        "blocked": _blocked_view(task, target),
+    }
+
+
+def _blocked_view(
+    task: ConsoleTask, target: DevelopmentTarget | None
+) -> dict[str, Any]:
+    """Evidencia gobernada del bloqueo de una tarea: código, causa, regla, recurso y acción.
+
+    Sale **entera** del resultado real del ciclo (la escribió la frontera que denegó) más los datos
+    declarados del destino; es lo que la persona ve al pulsar «Ver». Nada se completa por
+    suposición: lo que la frontera no declaró viaja vacío y la interfaz lo dice así.
+    """
+    result = task.result
+    if result is None or result.blocked is None:
+        return {}
+    blocked = result.blocked
+    return {
+        "code": _redacted(blocked.code, 60),
+        "detail": _redacted(blocked.detail, 600),
+        "rule": _redacted(blocked.rule, 300),
+        "resource": _redacted(blocked.resource, 300),
+        "remedy": _redacted(blocked.remedy, 300),
+        # Etapa real del ciclo cuando se detuvo, sin interpretarla.
+        "development_status": result.status.value,
+        "plan_status": result.plan_status.value,
+        "planned": result.plan is not None,
+        "target_id": task.target_id,
+        "destination": _destination_view(target),
+    }
+
+
+def _destination_view(target: DevelopmentTarget | None) -> dict[str, Any]:
+    """Datos **declarados** del destino: dónde trabajaría PUNTO, sin la ruta del repositorio.
+
+    Es la misma información que ya se muestra en el selector de tareas y en la evidencia de un gate:
+    nombre humano, rama de trabajo y raíces de alcance. La ruta absoluta del repositorio no sale de
+    la configuración confiable.
+    """
+    if target is None:
+        return {}
+    return {
+        "target_id": target.target_id,
+        "name": target.human_name,
+        "repository": target.repository.name,
+        "work_branch": target.work_branch,
+        "scope_roots": list(target.scope_roots),
     }
 
 

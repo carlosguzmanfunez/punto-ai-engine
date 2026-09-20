@@ -428,6 +428,26 @@ class PellInfluence(BaseModel):
     observable_effect: str = Field(min_length=1, max_length=MAX_ITEM_CHARS)
 
 
+class BlockedEvidence(BaseModel):
+    """Evidencia gobernada de un bloqueo: qué lo decidió, sobre qué y qué corresponde hacer.
+
+    La escribe **el punto de decisión** —la frontera que denegó la operación—, no la interfaz: el
+    dashboard solo la muestra. ``rule``, ``resource`` y ``remedy`` quedan vacíos cuando esa frontera
+    no los declara, y entonces la interfaz dice que no están registrados en vez de inventarlos.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str = Field(min_length=1, max_length=60)
+    detail: str = Field(default="", max_length=1_000)
+    #: Regla concreta que produjo el bloqueo (quién lo decidió y con qué criterio).
+    rule: str = Field(default="", max_length=300)
+    #: Recurso sobre el que se decidió: destino, rama, ruta o comando según el caso.
+    resource: str = Field(default="", max_length=300)
+    #: Qué corresponde hacer para levantar el bloqueo, según la regla que lo produjo.
+    remedy: str = Field(default="", max_length=300)
+
+
 class DevelopmentResult(BaseModel):
     """Desenlace del ciclo de desarrollo, con la autoridad explícita y acotada."""
 
@@ -480,6 +500,9 @@ class DevelopmentResult(BaseModel):
     duration_ms: int | None = Field(default=None, ge=0)
     error_kind: str = Field(default="", max_length=40)
     error: str = Field(default="", max_length=1_000)
+    #: AP000-OBS-04: evidencia estructurada del bloqueo (código, causa, regla, recurso y acción).
+    #: La frontera que deniega la escribe aquí para que la persona pueda verla desde el dashboard.
+    blocked: BlockedEvidence | None = None
     authority: Literal["LOCAL_APPLY_ONLY"] = "LOCAL_APPLY_ONLY"
     published: bool = Field(
         default=False,
@@ -568,6 +591,7 @@ __all__ = [
     "MAX_PLAN_ITEMS",
     "AppliedChange",
     "AuthorityDecisionRecord",
+    "BlockedEvidence",
     "ChangeOperation",
     "CommandEvidence",
     "ContextRequest",

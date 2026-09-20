@@ -32,6 +32,7 @@ from typing import Final
 
 import yaml
 
+from punto.schemas.authority import KNOWN_DEPLOY_MECHANISMS, TargetAuthority
 from punto.schemas.dev import RepositoryOperation
 
 #: Variable de entorno que declara los destinos de desarrollo, en JSON.
@@ -129,6 +130,9 @@ class DevelopmentTarget:
     production_url: str = ""
     production_marker: str = ""
     publish_remote: str = "origin"
+    #: Autoridad persistente del destino (AP000-R01): qué operaciones están previamente
+    #: autorizadas. Sin sobre explícito no hay autonomía (todo ``False``): fail closed.
+    authority: TargetAuthority = field(default_factory=TargetAuthority)
 
     @property
     def publishable(self) -> bool:
@@ -249,6 +253,89 @@ def _as_float(value: object, default: float, name: str) -> float:
     return parsed
 
 
+def _parse_authority(
+    raw: object, *, target_id: str, production_branch: str
+) -> TargetAuthority:
+    """Valida el sobre de autoridad persistente de un destino (AP000-R01).
+
+    Raises:
+        DevelopmentTargetError: si el sobre no es un objeto, una bandera no es booleana, autoriza
+            despliegue o publicación sin declarar un mecanismo que PUNTO sepa ejecutar, o autoriza
+            una rama de destino distinta de la rama de producción declarada.
+    """
+    if raw is None:
+        return TargetAuthority()
+    if not isinstance(raw, Mapping):
+        raise DevelopmentTargetError(f"authority de {target_id!r} debe ser un objeto")
+
+    flags = {
+        "local_changes": False,
+        "commit": False,
+        "push": False,
+        "deploy": False,
+        "production_release": False,
+        "allow_destructive": False,
+        "require_qa": True,
+    }
+    declared: list[str] = []
+    for name in flags:
+        if name not in raw:
+            continue
+        value = raw[name]
+        if not isinstance(value, bool):
+            raise DevelopmentTargetError(f"authority.{name} de {target_id!r} debe ser booleano")
+        flags[name] = value
+        declared.append(name)
+
+    mechanism = str(raw.get("deploy_mechanism", "")).strip()
+    if "deploy_mechanism" in raw:
+        declared.append("deploy_mechanism")
+    if flags["deploy"] or flags["production_release"]:
+        if not mechanism:
+            raise DevelopmentTargetError(
+                f"authority de {target_id!r} autoriza despliegue o publicación y no declara "
+                "deploy_mechanism: PUNTO no ejecuta un mecanismo que no esté autorizado"
+            )
+        if mechanism not in KNOWN_DEPLOY_MECHANISMS:
+            known = ", ".join(sorted(KNOWN_DEPLOY_MECHANISMS))
+            raise DevelopmentTargetError(
+                f"authority de {target_id!r} declara el mecanismo {mechanism!r}, que PUNTO no "
+                f"ejecuta (conocidos: {known})"
+            )
+
+    branches_raw = raw.get("allowed_branches", ())
+    if isinstance(branches_raw, str) or not isinstance(branches_raw, (list, tuple)):
+        raise DevelopmentTargetError(f"authority.allowed_branches de {target_id!r} debe ser lista")
+    branches: list[str] = []
+    for item in branches_raw:
+        candidate = str(item).strip()
+        if not candidate or (".." in candidate.split("/")):
+            raise DevelopmentTargetError(
+                f"authority.allowed_branches de {target_id!r} contiene una rama inválida"
+            )
+        branches.append(candidate)
+    if "allowed_branches" in raw:
+        declared.append("allowed_branches")
+    if branches and production_branch and production_branch not in branches:
+        raise DevelopmentTargetError(
+            f"authority.allowed_branches de {target_id!r} no incluye su rama de producción "
+            f"{production_branch!r}"
+        )
+
+    return TargetAuthority(
+        local_changes=flags["local_changes"],
+        commit=flags["commit"],
+        push=flags["push"],
+        deploy=flags["deploy"],
+        production_release=flags["production_release"],
+        deploy_mechanism=mechanism,
+        allowed_branches=tuple(branches) or ((production_branch,) if production_branch else ()),
+        allow_destructive=flags["allow_destructive"],
+        require_qa=flags["require_qa"],
+        declared_fields=tuple(dict.fromkeys(declared)),
+    )
+
+
 def target_from_mapping(target_id: str, value: Mapping[str, object]) -> DevelopmentTarget:
     """Construye un destino desde su configuración, validándola entera.
 
@@ -334,6 +421,11 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         production_url=str(value.get("production_url", "")).strip(),
         production_marker=str(value.get("production_marker", "")).strip()[:200],
         publish_remote=str(value.get("publish_remote", "origin")).strip() or "origin",
+        authority=_parse_authority(
+            value.get("authority"),
+            target_id=target_id,
+            production_branch=str(value.get("production_branch", "")).strip(),
+        ),
     )
 
 

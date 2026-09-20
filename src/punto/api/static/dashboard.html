@@ -114,6 +114,9 @@
         letter-spacing: 0.05em;
       }
       .stage.DEVELOPMENT_COMPLETED, .stage.PRODUCTION_VALIDATED { color: var(--ok); border-color: var(--ok); }
+      .stage.AUTO { color: var(--ok); border-color: var(--ok); }
+      .stage.HUMAN_GATE { color: var(--warn); border-color: var(--warn); }
+      .stage.DENIED { color: var(--bad); border-color: var(--bad); }
       .stage.WAITING_HUMAN, .stage.WAITING_PRODUCTION_APPROVAL, .stage.PUBLISHING,
       .stage.DEPLOYMENT_VERIFICATION { color: var(--warn); border-color: var(--warn); }
       .stage.DEVELOPMENT_FAILED, .stage.REJECTED, .stage.PUBLICATION_FAILED,
@@ -293,7 +296,9 @@
         try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = { detail: text }; }
         if (!response.ok) {
           const detail = payload && payload.detail ? payload.detail : response.statusText;
-          throw new Error(detail);
+          const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          error.payload = payload;
+          throw error;
         }
         return payload;
       }
@@ -660,6 +665,7 @@
       function taskCard(task) {
         const dev = task.development || {};
         const publication = task.publication;
+        const release = task.release || {};
         const verification = (dev.verification || [])
           .map((item) => `<div class="item"><span>${item.name}</span><code>${item.passed ? "PASS" : "FAIL"} (${item.exit_code})</code></div>`)
           .join("");
@@ -673,6 +679,15 @@
           ? `<div class="item"><span>gates</span><code>${task.gates.length}</code></div>`
           : "";
         const canPublish = dev.status === "DEVELOPMENT_COMPLETED" && dev.commit_sha;
+        const releaseBadge = release.disposition
+          ? `<span class="stage ${release.disposition}">${release.disposition}</span>
+             <span class="sub" style="margin: 0 0 0 6px">${release.autonomous ? "dentro de la autoridad del destino" : "requiere persona"}</span>`
+          : "";
+        const releaseReasons = (release.reasons || [])
+          .slice(0, 3)
+          .map((reason) => `<div class="note">${reason}</div>`)
+          .join("");
+        const canRelease = release.autonomous && dev.status === "DEVELOPMENT_COMPLETED";
         const notes = (task.notes || []).map((text) => `<div class="note">${text}</div>`).join("");
         return `
           <article class="card" data-task="${task.task_id}" data-testid="tarea-${task.task_id}">
@@ -681,6 +696,8 @@
             ${progressBlock(task)}
             <div class="row"><span class="label">Etapa</span><span class="value">${stageBadge(task.stage)}
               ${task.publication_stage && task.publication_stage !== task.stage ? stageBadge(task.publication_stage) : ""}</span></div>
+            ${release.disposition ? `<div class="row"><span class="label">Release autónomo</span><span class="value">${releaseBadge}</span></div>` : ""}
+            ${releaseReasons}
             ${dev.status ? `<div class="row"><span class="label">Desarrollo</span><span class="value">${dev.status}</span></div>` : ""}
             ${dev.commit_sha ? `<div class="row"><span class="label">Commit local</span><code>${dev.commit_sha.slice(0, 10)}</code></div>` : ""}
             ${dev.functional_chain_result ? `<div class="row"><span class="label">Cadena</span><span class="value">${dev.functional_chain_result}</span></div>` : ""}
@@ -689,6 +706,7 @@
             ${notes}
             <div class="actions">
               <button class="secondary" data-refresh="${task.task_id}">Ver</button>
+              ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}">Release autónomo</button>` : ""}
               ${canPublish ? `<button data-production="${task.task_id}">Pedir gate de publicación</button>` : ""}
               ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
               ${publication && publication.approval_id && publication.stage !== "PRODUCTION_VALIDATED" && publication.stage !== "WAITING_PRODUCTION_APPROVAL" ? `<button data-publish="${task.task_id}">Publicar</button>` : ""}
@@ -776,9 +794,22 @@
         consoleState.targets = payload.targets;
         document.getElementById("tarea-target").innerHTML = payload.targets.length
           ? payload.targets
-              .map((target) => `<option value="${target.target_id}">${target.name || target.target_id}${target.publishable ? " · publicable" : ""}</option>`)
+              .map((target) => `<option value="${target.target_id}">${target.name || target.target_id}${target.publishable ? " · publicable" : ""} · ${authorityLabel(target)}</option>`)
               .join("")
           : `<option value="">(sin destinos registrados)</option>`;
+      }
+
+      // Autoridad persistente del destino (AP000-R01): lo que la configuración confiable concede.
+      function authorityLabel(target) {
+        const authority = target.authority || {};
+        if (!authority.declared) return "sin autoridad persistente";
+        if (authority.push && authority.deploy && authority.production_release) {
+          return "autonomía completa (commit · push · deploy · producción)";
+        }
+        const partes = ["local_changes", "commit", "push", "deploy", "production_release"]
+          .filter((clave) => authority[clave])
+          .join(" · ");
+        return partes ? `autorizado: ${partes}` : "sin autoridad persistente";
       }
 
       // La consola carga sus datos **al usarla**: el dashboard de proveedores funciona aunque esta
@@ -796,6 +827,8 @@
           : `<div class="note">todavía no hay tareas</div>`;
         document.querySelectorAll("[data-production]").forEach((button) =>
           button.addEventListener("click", () => requestProductionGate(button.dataset.production)));
+        document.querySelectorAll("[data-release]").forEach((button) =>
+          button.addEventListener("click", () => releaseTask(button.dataset.release)));
         document.querySelectorAll("[data-publish]").forEach((button) =>
           button.addEventListener("click", () => publishTask(button.dataset.publish)));
         document.querySelectorAll("[data-refresh]").forEach((button) =>
@@ -881,6 +914,22 @@
           pollWhileRunning();
         } catch (error) {
           consoleNote(String(error.message || error), "bad");
+        }
+      }
+
+      // Release autónomo (AP000-R01): la autoridad la concede la configuración del destino, no este
+      // botón. Si el motor decide HUMAN_GATE o DENIED, no se publica nada y se explica por qué.
+      async function releaseTask(taskId) {
+        try {
+          const task = await api(`/console/tasks/${taskId}/release`, { method: "POST" });
+          consoleNote(`release autónomo · etapa ${task.stage}`, task.stage === "PRODUCTION_VALIDATED" ? "ok" : "warn");
+          await Promise.all([loadTasks(), loadGates()]);
+          pollWhileRunning();
+        } catch (error) {
+          const detalle = (error.payload && error.payload.detail) || {};
+          const motivos = detalle.reasons ? detalle.reasons.join(" · ") : String(error.message || error);
+          consoleNote(`sin release autónomo (${detalle.disposition || "HUMAN_GATE"}): ${motivos}`, "warn");
+          await Promise.all([loadTasks(), loadGates()]);
         }
       }
 

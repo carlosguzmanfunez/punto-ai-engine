@@ -174,6 +174,8 @@ class PublicationRecord:
     push: PushEvidence | None = None
     production: ProductionEvidence | None = None
     history: list[dict[str, str]] = field(default_factory=list)
+    #: Decisión de autoridad que amparó la publicación (AP000-R01), si no fue un Human Gate.
+    authority: dict[str, Any] | None = None
 
     def advance(self, stage: PublicationStage, detail: str = "") -> PublicationStage:
         """Cambia de etapa dejando constancia del momento y del motivo."""
@@ -197,6 +199,7 @@ class PublicationRecord:
             "push": self.push.as_dict() if self.push is not None else None,
             "production": self.production.as_dict() if self.production is not None else None,
             "history": list(self.history),
+            "authority": self.authority,
         }
 
 
@@ -453,7 +456,16 @@ class ProductionProbe:
 
 
 class PublicationService:
-    """Ejecuta la publicación **solo** con un Human Gate aprobado y evidencia de producción."""
+    """Ejecuta la publicación con autoridad demostrada: Human Gate o sobre persistente del destino.
+
+    AP000-R01: hay **dos** formas legítimas de autorizar la publicación y ambas son explícitas:
+
+    - un ``HumanGate`` aprobado para **esa** operación (la vía de siempre, ``assert_executable``);
+    - una decisión ``AUTO`` de :mod:`punto.policy.target_authority`, que exige autoridad persistente
+      declarada por el destino y todas las condiciones verificables demostradas.
+
+    Sin una de las dos, ``publish`` no sigue. No hay tercera vía.
+    """
 
     def __init__(
         self,
@@ -493,23 +505,27 @@ class PublicationService:
         task_id: UUID | str,
         request_id: str,
         commit_sha: str,
-        approval_id: UUID | None,
-        gate: Any,
+        approval_id: UUID | None = None,
+        gate: Any = None,
         record: PublicationRecord | None = None,
+        authority: Any = None,
     ) -> PublicationRecord:
-        """Publica el commit aprobado y comprueba producción.
+        """Publica el commit autorizado y comprueba producción.
 
         Args:
             task_id: Tarea humana cuyo resultado se publica.
             request_id: Solicitud de desarrollo que produjo el commit.
             commit_sha: Commit local ya validado que se integra en la rama de producción.
-            approval_id: Human Gate de publicación.
-            gate: ``HumanGate`` real (el único emisor de autorizaciones).
+            approval_id: Human Gate de publicación (vía humana).
+            gate: ``HumanGate`` real (el único emisor de aprobaciones humanas).
             record: Expediente ya abierto para la tarea (conserva su historial de etapas).
+            authority: Decisión ``AUTO`` del sobre persistente del destino (AP000-R01). Si no hay
+                aprobación humana, esta es la **única** otra autorización admitida.
 
         Raises:
-            HumanGateNotApprovedError: si no hay aprobación válida para **esa** operación. Es el
-                mismo error del motor, para que no exista una segunda noción de autorización.
+            HumanGateNotApprovedError: si no hay aprobación humana válida para **esa** operación y
+                tampoco una decisión de autoridad persistente en estado ``AUTO``. Es el mismo error
+                del motor, para que no exista una segunda noción de autorización humana.
             PublicationRefused: si el destino no es publicable o el plan de push no es válido.
         """
         record = record or PublicationRecord(
@@ -519,9 +535,19 @@ class PublicationService:
             commit_sha=commit_sha,
             approval_id="" if approval_id is None else str(approval_id),
         )
-        # La autorización se comprueba con el punto único de parada del motor: sin gate aprobado,
-        # esta función no sigue. No hay ninguna vía alternativa.
-        gate.assert_executable(approval_id)
+        autonomous = authority is not None and bool(getattr(authority, "autonomous", False))
+        if not autonomous:
+            # La autorización humana se comprueba con el punto único de parada del motor: sin gate
+            # aprobado y sin sobre persistente que lo sustituya, esta función no sigue.
+            if gate is None:
+                record.error_kind = "HUMAN_GATE_REQUIRED"
+                record.error = (
+                    "sin Human Gate aprobado y sin autoridad persistente del destino: no se publica"
+                )
+                record.advance(PublicationStage.PUBLICATION_FAILED, record.error)
+                return record
+            gate.assert_executable(approval_id)
+        record.authority = authority.as_dict() if authority is not None else None
         if not self.publishable:
             record.error_kind = "TARGET_NOT_PUBLISHABLE"
             record.error = (
@@ -535,7 +561,32 @@ class PublicationService:
 
         plan = PushPlan(remote=self._remote_name, branch=self._branch, sha=commit_sha)
         record.advance(PublicationStage.PUBLISHING, f"push a {plan.ref}")
-        self._log("publication_started", record, {"ref": plan.ref, "sha": commit_sha[:12]})
+        if autonomous:
+            # Evidencia de la decisión que ampara la publicación: quién la autorizó (el sobre
+            # persistente del destino) y con qué condiciones demostradas.
+            self._log(
+                "release_authorized",
+                record,
+                {
+                    "target_id": self._target_id,
+                    "disposition": authority.disposition,
+                    "conditions": [
+                        item["name"]
+                        for item in authority.as_dict().get("conditions", [])
+                        if item.get("state") == "SATISFIED"
+                    ],
+                    "policy_decision_id": authority.policy_decision_id,
+                },
+            )
+        self._log(
+            "publication_started",
+            record,
+            {
+                "ref": plan.ref,
+                "sha": commit_sha[:12],
+                "authorized_by": "target-authority-envelope" if autonomous else "human-gate",
+            },
+        )
         try:
             evidence = self._publisher.push(plan, allow_remote=self._allow_remote_push)
         except PublicationRefused as refused:
@@ -591,6 +642,7 @@ class PublicationService:
             "publication_failed": AuditEventType.PUBLICATION_FAILED,
             "production_verified": AuditEventType.PRODUCTION_VERIFIED,
             "production_not_verified": AuditEventType.PRODUCTION_NOT_VERIFIED,
+            "release_authorized": AuditEventType.AUTONOMOUS_RELEASE_AUTHORIZED,
         }[action]
         self._audit.log_dev_event(
             event,

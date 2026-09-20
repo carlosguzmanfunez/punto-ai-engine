@@ -361,6 +361,11 @@ class AuditEventType(StrEnum):
     PRODUCTION_VERIFIED = "PRODUCTION_VERIFIED"
     #: PUBLICACIÓN: el push ocurrió pero producción no confirma el despliegue.
     PRODUCTION_NOT_VERIFIED = "PRODUCTION_NOT_VERIFIED"
+    #: AP000-R01: se evaluó si una operación de release cabe en la autoridad persistente del
+    #: destino. Lleva el desenlace (AUTO/HUMAN_GATE/DENIED) y **todas** las condiciones evaluadas.
+    RELEASE_AUTHORITY_EVALUATED = "RELEASE_AUTHORITY_EVALUATED"
+    #: AP000-R01: el release se ejecutó sin Human Gate, al amparo del sobre persistente del destino.
+    AUTONOMOUS_RELEASE_AUTHORIZED = "AUTONOMOUS_RELEASE_AUTHORIZED"
 
 
 class AuditEvent(BaseModel):

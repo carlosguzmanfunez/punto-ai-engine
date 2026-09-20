@@ -39,6 +39,12 @@ from punto.common import utc_now
 from punto.orchestrator.dev_cycle import DevelopmentCycle
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
+from punto.policy.target_authority import (
+    GIT_PUSH_MECHANISM,
+    ReleaseContext,
+    ReleaseDecision,
+    evaluate_release,
+)
 from punto.providers.contract import ProviderRole
 from punto.providers.secrets import redact_secret_text
 from punto.publish.production import (
@@ -174,6 +180,10 @@ class ConsoleTask:
         self.finished_at: datetime | None = None
         self.result: DevelopmentResult | None = None
         self.publication: PublicationRecord | None = None
+        #: Decisión de autoridad de release evaluada (AP000-R01): AUTO, HUMAN_GATE o DENIED.
+        self.release: ReleaseDecision | None = None
+        #: Caché de la comprobación real de que el commit del ciclo existe en el repositorio.
+        self.commit_presence: dict[str, bool] = {}
         self.gates: list[UUID] = []
         self.runs = 0
         self.notes: list[str] = []
@@ -349,6 +359,7 @@ def register_human_console(
                     "publishable": target.publishable,
                     "production_branch": target.production_branch,
                     "production_url": target.production_url,
+                    "authority": target.authority.as_dict(),
                 }
                 for target in (dependencies.targets[key] for key in sorted(dependencies.targets))
             ]
@@ -611,6 +622,44 @@ def register_human_console(
         _run_publication(task, target, dependencies, executor, UUID(publication.approval_id))
         return _task_view(task, dependencies)
 
+    @application.post(
+        "/console/tasks/{task_id}/release",
+        tags=["console"],
+        summary="Ejecutar el release con la autoridad persistente del destino",
+    )
+    def release_console_task(task_id: UUID) -> dict[str, Any]:
+        """Ejecuta la cadena de publicación si el sobre persistente del destino la autoriza.
+
+        Es la ruta **autónoma** de AP000-R01: no concede autoridad —la lee de la configuración
+        confiable del destino— y fracasa cerrado si la decisión no es ``AUTO``. Una desviación
+        material (rama, destino, commit, verificación, QA, borrados, secretos, mecanismo o falta de
+        dato) devuelve 409 con las condiciones que la bloquean, y la persona decide por el gate.
+        """
+        task = _task_or_404(tasks, task_id)
+        target = _target_or_400(dependencies, task.target_id)
+        decision = _evaluate_and_log(task, target, dependencies)
+        if decision is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="la tarea no tiene resultado de desarrollo que liberar",
+            )
+        task.release = decision
+        if not decision.autonomous:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": (
+                        "la operación no está dentro de la autoridad persistente del destino o no "
+                        "cumple sus condiciones: decide una persona en el Human Gate"
+                    ),
+                    "disposition": decision.disposition,
+                    "reasons": list(decision.reasons),
+                    "blockers": [item.name for item in decision.blockers],
+                },
+            )
+        _run_publication(task, target, dependencies, executor, None, decision)
+        return _task_view(task, dependencies)
+
     # ------------------------------------------------------------- ejecución
     def _run_development(
         task: ConsoleTask,
@@ -637,9 +686,20 @@ def register_human_console(
             pool.submit(work)
 
     def _reflect(task: ConsoleTask, result: DevelopmentResult, deps: ConsoleDependencies) -> None:
-        """Traduce el resultado del ciclo a la etapa visible y crea el gate si hace falta."""
+        """Traduce el resultado del ciclo a la etapa visible y crea el gate si hace falta.
+
+        AP000-R01: cuando el desarrollo termina bien se **evalúa** la autoridad persistente del
+        destino. Si la operación está dentro de esa autoridad y todas las condiciones están
+        demostradas, la publicación continúa sola (``AUTO``); si hay una desviación material o falta
+        un dato, se queda con la decisión a la vista y el humano decide.
+        """
         if result.status.value == "DEVELOPMENT_COMPLETED":
             task.set_stage(ConsoleStage.DEVELOPMENT_COMPLETED)
+            target = deps.targets.get(task.target_id)
+            release = _evaluate_and_log(task, target, deps)
+            task.release = release
+            if release is not None and release.autonomous and target is not None:
+                _run_publication(task, target, deps, executor, None, release)
             return
         if result.error_kind in HUMAN_REQUIRED_KINDS or _issue_human_kind(result):
             human_kind = (
@@ -684,13 +744,22 @@ def register_human_console(
         target: DevelopmentTarget,
         deps: ConsoleDependencies,
         pool: ThreadPoolExecutor | None,
-        approval_id: UUID,
+        approval_id: UUID | None,
+        decision: ReleaseDecision | None = None,
     ) -> None:
-        """Ejecuta la publicación gobernada del commit aprobado."""
+        """Ejecuta la publicación gobernada del commit, por gate humano o por sobre del destino."""
         result = task.result
         if result is None or not result.commit_sha:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, detail="la tarea no tiene commit que publicar"
+            )
+        if task.publication is None:
+            task.publication = PublicationRecord(
+                task_id=str(task.task_id),
+                request_id=str(task.request_id),
+                target_id=target.target_id,
+                commit_sha=result.commit_sha,
+                approval_id="" if approval_id is None else str(approval_id),
             )
         service = (
             deps.publisher_factory(target)
@@ -708,6 +777,7 @@ def register_human_console(
                     approval_id=approval_id,
                     gate=deps.gates,
                     record=task.publication,
+                    authority=decision,
                 )
             except Exception as exc:  # la publicación nunca tumba la consola
                 task.set_stage(PublicationStage.PUBLICATION_FAILED, f"publicación rechazada: {exc}")
@@ -820,8 +890,32 @@ def _is_publication_gate(action: str) -> bool:
 
 
 def _task_view(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
-    """Vista de la tarea con su recorrido humano proyectado desde los estados reales."""
-    return {**task.as_dict(), "progress": _progress(task, dependencies)}
+    """Vista de la tarea con su recorrido humano y su decisión de release."""
+    target = dependencies.targets.get(task.target_id)
+    return {
+        **task.as_dict(),
+        "progress": _progress(task, dependencies),
+        "release": (
+            task.release.as_dict()
+            if task.release is not None
+            else (_release_preview(task, target, dependencies))
+        ),
+    }
+
+
+def _release_preview(
+    task: ConsoleTask,
+    target: DevelopmentTarget | None,
+    dependencies: ConsoleDependencies,
+) -> dict[str, Any] | None:
+    """Decisión de release vigente para que la interfaz refleje lo que decidiría el motor.
+
+    Es la **misma** función de evaluación del motor sobre las mismas señales reales; no ejecuta
+    nada ni deja auditoría (la auditoría la escribe la evaluación que sí decide).
+    """
+    if task.result is None:
+        return None
+    return _release_decision(task, target, dependencies).as_dict()
 
 
 def _progress(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
@@ -863,6 +957,25 @@ def _publication_gate_status(
         return ""
     approval = dependencies.gates.get(UUID(publication.approval_id))
     return approval.status.value if approval is not None else ""
+
+
+def _commit_present(task: ConsoleTask, target: DevelopmentTarget | None, sha: str) -> bool | None:
+    """True si el commit está en el repositorio del destino, con el runner saneado de publicación.
+
+    ``None`` significa «no se pudo comprobar»: la condición quedará ``UNKNOWN`` y la decisión
+    fallará cerrado en vez de suponer que el commit existe.
+    """
+    if not sha or target is None:
+        return None
+    cached = task.commit_presence.get(sha)
+    if cached is not None:
+        return cached
+    try:
+        present = GitPublisher(target.repository).has_commit(sha)
+    except Exception:  # git ausente o repositorio ilegible: no se puede demostrar
+        return None
+    task.commit_presence[sha] = present
+    return present
 
 
 # ----------------------------------------------------- evidencia del Human Gate
@@ -949,6 +1062,79 @@ def _planned_changes(result: DevelopmentResult | None) -> dict[str, list[str]]:
         "create": [_redacted(item, 200) for item in plan.files_to_create[:MAX_EVIDENCE_ROWS]],
         "delete": [_redacted(item, 200) for item in plan.files_to_delete[:MAX_EVIDENCE_ROWS]],
     }
+
+
+def _release_decision(
+    task: ConsoleTask,
+    target: DevelopmentTarget | None,
+    deps: ConsoleDependencies,
+    *,
+    audit_policy: bool = False,
+) -> ReleaseDecision:
+    """Decisión de release con las señales reales de la tarea y del destino (AP000-R01).
+
+    La política se evalúa con el ``PolicyEngine`` real sobre ``deploy_production``; la autoridad
+    persistente del destino y las condiciones verificables deciden si esa operación continúa sola.
+    """
+    result = task.result
+    commit_sha = result.commit_sha if result is not None else ""
+    policy_decision = deps.policy.evaluate(
+        ActionRequest(
+            action=PRODUCTION_ACTION,
+            technical=True,
+            reversible=False,
+            risk_level=RiskLevel.HIGH,
+            production_impact=True,
+            files_changed=[item.path for item in result.applied] if result is not None else [],
+        )
+    )
+    if audit_policy:
+        deps.audit.log_policy_decision(policy_decision)
+    return evaluate_release(
+        ReleaseContext(
+            task_id=str(task.task_id),
+            target=target,
+            policy_decision=policy_decision,
+            result=result,
+            commit_sha=commit_sha,
+            branch=result.branch if result is not None else "",
+            repository=target.repository if target is not None else None,
+            destination_branch=target.production_branch if target is not None else "",
+            destination_url=target.production_url if target is not None else "",
+            destination_remote=target.publish_remote if target is not None else "",
+            mechanism=GIT_PUSH_MECHANISM,
+            commit_present=_commit_present(task, target, commit_sha),
+        )
+    )
+
+
+def _evaluate_and_log(
+    task: ConsoleTask,
+    target: DevelopmentTarget | None,
+    deps: ConsoleDependencies,
+) -> ReleaseDecision | None:
+    """Evalúa la autoridad de release y deja la decisión auditada con todas sus condiciones."""
+    if task.result is None:
+        return None
+    decision = _release_decision(task, target, deps, audit_policy=True)
+    deps.audit.log_dev_event(
+        AuditEventType.RELEASE_AUTHORITY_EVALUATED,
+        "release_authority_evaluated",
+        request_id=str(task.task_id),
+        metadata={
+            "target_id": task.target_id,
+            "disposition": decision.disposition,
+            "operation": decision.operation,
+            "policy_outcome": decision.policy_outcome,
+            "risk": decision.risk,
+            "authorized_operations": list(decision.authorized_operations),
+            "conditions": [
+                {"name": item.name, "state": item.state} for item in decision.conditions
+            ],
+            "reasons": list(decision.reasons)[:6],
+        },
+    )
+    return decision
 
 
 def _gate_evidence(

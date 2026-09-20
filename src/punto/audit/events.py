@@ -191,6 +191,10 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.PUBLICATION_FAILED: "publication",
     AuditEventType.PRODUCTION_VERIFIED: "publication",
     AuditEventType.PRODUCTION_NOT_VERIFIED: "publication",
+    #: AP000-R01: la decisión de autoridad de release se registra sobre la tarea, de modo que
+    #: ``AuditLogger.by_resource(task_id)`` reconstruye la decisión con sus condiciones.
+    AuditEventType.RELEASE_AUTHORITY_EVALUATED: "release_authority",
+    AuditEventType.AUTONOMOUS_RELEASE_AUTHORIZED: "publication",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
     AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",

@@ -1,4 +1,4 @@
-"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
+﻿"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
 
 Cubre lo que el encargo pide demostrar (A a N) **sin tocar producción real**: el push va
 a un remoto Git local (bare) y la comprobación de producción se inyecta. Lo que no se
@@ -43,6 +43,7 @@ from punto.publish.production import (
     ProductionProbe,
     PublicationService,
 )
+from punto.schemas.authority import TargetAuthority
 from punto.schemas.build import BuildValidationIssue
 from punto.schemas.dev import (
     AuthorityDecisionRecord,
@@ -1536,6 +1537,107 @@ def test_d_e_f_el_gate_de_publicacion_usa_la_produccion_declarada_y_no_publica_n
     despues = {evento.event_type.value for evento in audit.by_resource(tarea["task_id"])}
     assert "PUBLICATION_PUSHED" not in despues
     assert "PRODUCTION_VERIFIED" not in despues
+
+
+# ------------------------------------------- AP000-R01 · release autónomo condicional
+def _autoridad_completa() -> TargetAuthority:
+    """Sobre persistente que autoriza la cadena completa (push + despliegue + publicación)."""
+    return TargetAuthority(
+        local_changes=True,
+        commit=True,
+        push=True,
+        deploy=True,
+        production_release=True,
+        deploy_mechanism="git-push",
+        allowed_branches=("main",),
+        declared_fields=(
+            "local_changes",
+            "commit",
+            "push",
+            "deploy",
+            "production_release",
+            "deploy_mechanism",
+        ),
+    )
+
+
+def _autoridad_solo_commit() -> TargetAuthority:
+    """Sobre que autoriza commit local pero **no** la publicación."""
+    return TargetAuthority(
+        local_changes=True,
+        commit=True,
+        declared_fields=("local_changes", "commit"),
+    )
+
+
+def test_ap000_release_autonomo_publica_sin_human_gate(tmp_path: Path) -> None:
+    """A/L: autoridad persistente + condiciones verdes ⇒ commit, push, despliegue y verificación."""
+    repo, remoto = _repos(tmp_path)
+    target = replace(_target(repo, remoto=remoto), authority=_autoridad_completa())
+    client, audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    assert tarea["stage"] == "PRODUCTION_VALIDATED", tarea
+    assert tarea["release"]["disposition"] == "AUTO"
+    assert tarea["release"]["autonomous"] is True
+    assert tarea["release"]["blockers"] == []
+    assert tarea["gates"] == [], "la cadena autorizada no pide aprobación humana"
+    assert client.get("/console/human-gates").json()["pending"] == 0
+    publicacion = tarea["publication"]
+    assert publicacion["push"]["pushed"] is True
+    assert publicacion["production"]["validated"] is True
+    assert publicacion["authority"]["disposition"] == "AUTO"
+    assert _refs(remoto)["main"] == tarea["development"]["commit_sha"]
+    tipos = {evento.event_type.value for evento in audit.by_resource(tarea["task_id"])}
+    assert "RELEASE_AUTHORITY_EVALUATED" in tipos
+    assert "AUTONOMOUS_RELEASE_AUTHORIZED" in tipos
+    assert "PUBLICATION_PUSHED" in tipos and "PRODUCTION_VERIFIED" in tipos
+    assert "HUMAN_GATE_CREATED" not in tipos
+
+
+def test_ap000_commit_automatico_y_publicacion_con_persona(tmp_path: Path) -> None:
+    """K: si el destino autoriza commit pero no producción, el commit sale y publica una persona."""
+    repo, remoto = _repos(tmp_path)
+    target = replace(_target(repo, remoto=remoto), authority=_autoridad_solo_commit())
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    assert tarea["stage"] == "DEVELOPMENT_COMPLETED"
+    assert tarea["development"]["commit_sha"], "el commit del ciclo es automático"
+    assert tarea["release"]["disposition"] == "HUMAN_GATE"
+    assert tarea["release"]["autonomous"] is False
+    assert "production_release" not in tarea["release"]["authorized_operations"]
+    assert _refs(remoto)["main"] == _git(repo, "rev-parse", "main"), "no se empujó nada"
+    # Y la vía humana sigue disponible para desviaciones materiales.
+    assert client.post(f"/console/tasks/{tarea['task_id']}/production-gate").status_code == 200
+
+
+def test_ap000_el_release_autonomo_falla_cerrado_sin_autoridad(tmp_path: Path) -> None:
+    """Fail closed: sin sobre persistente, la ruta autónoma devuelve 409 con las condiciones."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)  # sin bloque authority
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    respuesta = client.post(f"/console/tasks/{tarea['task_id']}/release")
+
+    assert respuesta.status_code == 409
+    detalle = respuesta.json()["detail"]
+    assert detalle["disposition"] == "HUMAN_GATE"
+    assert any("sin autorización persistente" in motivo for motivo in detalle["reasons"])
+    assert _refs(remoto)["main"] == _git(repo, "rev-parse", "main")
+    assert client.get("/console/human-gates").json()["pending"] == 0
 
 
 def _refs(remoto: Path) -> dict[str, str]:

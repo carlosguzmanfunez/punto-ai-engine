@@ -478,6 +478,61 @@ _MANIFESTS: Final[tuple[str, ...]] = (
     "go.mod",
     "cargo.toml",
 )
+#: Sufijos de **fuente y activos del producto**: código, hojas de estilo, plantillas y activos
+#: estáticos que forman parte normal del producto local.
+#:
+#: Reconocerlos evita que un recurso corriente —una hoja de estilos de la aplicación— caiga en la
+#: clase desconocida y exija una persona **por su extensión** (AP000-OBS-05). Reconoce el **tipo**,
+#: nunca el permiso: la procedencia (destino registrado), la ruta (workspace y scope concedido), los
+#: marcadores de secreto/infraestructura/autenticación/pago, la operación destructiva y el tamaño
+#: del cambio se comprueban aparte y siguen decidiendo por sí mismos. Lo que no esté aquí ni en
+#: ninguna otra clase conocida sigue siendo ``UNKNOWN`` y sigue fallando cerrado.
+_PRODUCT_SOURCE_SUFFIXES: Final[tuple[str, ...]] = (
+    # Código de la aplicación.
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".go",
+    ".rs",
+    # Hojas de estilo (presentación del producto).
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".pcss",
+    # Plantillas y markup.
+    ".html",
+    ".htm",
+    ".vue",
+    ".svelte",
+    ".astro",
+    ".hbs",
+    ".handlebars",
+    ".ejs",
+    ".jinja",
+    ".jinja2",
+    ".twig",
+    # Activos estáticos del producto (imágenes, tipografías, iconos).
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".avif",
+    ".ico",
+    ".bmp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+)
 _DOC_SUFFIXES: Final[tuple[str, ...]] = (".md", ".rst", ".txt", ".adoc")
 
 
@@ -602,7 +657,7 @@ class AdaptiveAuthorityEnvelope:
             return ResourceClass.PROJECT_CONFIGURATION
         if lowered.startswith((".next/", "dist/", "build/", "node_modules/", "__pycache__/")):
             return ResourceClass.BUILD_ARTIFACT
-        if lowered.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs")):
+        if lowered.endswith(_PRODUCT_SOURCE_SUFFIXES):
             return ResourceClass.APPLICATION_CODE
         return ResourceClass.UNKNOWN
 

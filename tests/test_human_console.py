@@ -1,4 +1,4 @@
-﻿"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
+"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
 
 Cubre lo que el encargo pide demostrar (A a N) **sin tocar producción real**: el push va
 a un remoto Git local (bare) y la comprobación de producción se inyecta. Lo que no se
@@ -1124,16 +1124,21 @@ def test_un_destino_no_registrado_no_concede_acceso_a_otro_directorio(tmp_path: 
 
 
 # ------------------------------------------- evidencia del Human Gate · A a G
-def _repo_con_css(tmp_path: Path) -> tuple[Path, Path]:
+def _repo_con_recurso_desconocido(tmp_path: Path) -> tuple[Path, Path]:
     """Repositorio del montaje con un recurso de clase **desconocida** para el sobre de autoridad.
 
-    Una hoja de estilos (``.css``) no cae en ninguna clase conocida del clasificador de recursos,
-    así que el sobre aplica su regla de fallo cerrado y exige persona. Es el mismo camino que
-    produjo el gate real: no se fuerza nada desde fuera.
+    Un fichero de datos binario ordinario (``src/app/recursos.bin``) no cae en ninguna clase
+    conocida del clasificador de recursos, así que el sobre aplica su regla de fallo cerrado y exige
+    persona. Es el mismo camino que produjo el gate real: no se fuerza nada desde fuera.
+
+    Las hojas de estilo **sí** son una clase conocida desde AP000-OBS-05 (``application_code``), así
+    que el montaje las incluye como recurso normal —el del caso real— junto al que de verdad es
+    desconocido.
     """
     repo, remoto = _repos(tmp_path)
     (repo / "src" / "app").mkdir(parents=True, exist_ok=True)
     (repo / "src" / "app" / "globals.css").write_text("body { margin: 0 }\n", encoding="utf-8")
+    (repo / "src" / "app" / "recursos.bin").write_bytes(b"\x00\x01datos\x02")
     _git(repo, "add", "-A")
     _git(
         repo,
@@ -1151,7 +1156,11 @@ def _repo_con_css(tmp_path: Path) -> tuple[Path, Path]:
 def _plan_con_recurso_desconocido() -> dict[str, Any]:
     """Plan válido que toca un recurso de clase desconocida: el sobre responde REQUIRE_HUMAN."""
     payload = _plan()
-    payload["files_to_modify"] = ["src/lib/tipos.ts", "src/app/globals.css"]
+    payload["files_to_modify"] = [
+        "src/lib/tipos.ts",
+        "src/app/globals.css",
+        "src/app/recursos.bin",
+    ]
     payload["summary"] = "reemplazar el mapa de cobertura por uno real"
     return payload
 
@@ -1175,7 +1184,7 @@ def _tarea_con_plan_que_exige_persona(
     tmp_path: Path,
 ) -> tuple[TestClient, Path, Path, Any, dict[str, Any]]:
     """Tarea real detenida en ``PLAN_REQUIRES_HUMAN`` con su gate pendiente."""
-    repo, remoto = _repo_con_css(tmp_path)
+    repo, remoto = _repo_con_recurso_desconocido(tmp_path)
     target = _target(repo, remoto=remoto)
     client, _audit, _target_obj, deps = _app(
         target=target,
@@ -1238,8 +1247,11 @@ def test_b_el_gate_muestra_la_operacion_y_los_recursos_afectados(tmp_path: Path)
     assert evidencia["operation"]["planned"]["modify"] == [
         "src/lib/tipos.ts",
         "src/app/globals.css",
+        "src/app/recursos.bin",
     ]
+    # La hoja de estilos entra como recurso normal del plan; el que exige persona es el .bin.
     assert "src/app/globals.css" in evidencia["resources"]["paths"]
+    assert "src/app/recursos.bin" in evidencia["resources"]["paths"]
     assert evidencia["resources"]["total"] >= 2
     # El alcance de la autorización, explícito en las dos direcciones.
     assert "esta" in evidencia["authorizes"] or "este" in evidencia["authorizes"]

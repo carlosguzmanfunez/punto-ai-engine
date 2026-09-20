@@ -50,7 +50,7 @@ from test_human_console import (
     _git,
     _plan,
     _plan_con_recurso_desconocido,
-    _repo_con_css,
+    _repo_con_recurso_desconocido,
     _repos,
     _target,
 )
@@ -94,7 +94,7 @@ def _tarea_con_gate_pendiente(
     tmp_path: Path,
 ) -> tuple[DevelopmentTarget, TestClient, dict[str, Any]]:
     """Tarea real detenida esperando persona (``PLAN_REQUIRES_HUMAN``) con su gate pendiente."""
-    repo, remoto = _repo_con_css(tmp_path)
+    repo, remoto = _repo_con_recurso_desconocido(tmp_path)
     target = _target(repo, remoto=remoto)
     client, _audit, _target_obj, _deps = _app(
         target=target,

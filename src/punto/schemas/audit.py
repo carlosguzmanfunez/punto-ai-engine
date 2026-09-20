@@ -351,6 +351,14 @@ class AuditEventType(StrEnum):
     CONSOLE_TASK_CREATED = "CONSOLE_TASK_CREATED"
     #: CONSOLA HUMANA: la tarea cambió de etapa (desarrollo o publicación).
     CONSOLE_TASK_STAGE_CHANGED = "CONSOLE_TASK_STAGE_CHANGED"
+    #: AP000-OBS-01: la consola recuperó el estado gobernado persistido al arrancar de nuevo.
+    CONSOLE_STATE_RECOVERED = "CONSOLE_STATE_RECOVERED"
+    #: AP000-OBS-01: había estado persistido y no era utilizable: la consola falla cerrado y
+    #: arranca con el registro vacío, sin inventar ninguna tarea ni ningún gate.
+    CONSOLE_STATE_REJECTED = "CONSOLE_STATE_REJECTED"
+    #: AP000-OBS-01: el estado no se pudo persistir (contenido con forma de credencial o error de
+    #: escritura). La consola sigue funcionando en memoria: lo que no ocurre es escribir el estado.
+    CONSOLE_STATE_WRITE_REFUSED = "CONSOLE_STATE_WRITE_REFUSED"
     #: PUBLICACIÓN: se solicitó publicar un commit aprobado en producción.
     PUBLICATION_REQUESTED = "PUBLICATION_REQUESTED"
     #: PUBLICACIÓN: el commit aprobado llegó a la rama de producción.

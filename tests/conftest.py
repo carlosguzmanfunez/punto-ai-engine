@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from punto.api.app import Engine, create_app
+from punto.api.console_state import CONSOLE_STATE_ENV
 from punto.audit.logger import AuditLogger
 from punto.developer.context import ExecutionContext
 from punto.developer.local import LocalDeveloperRunner
@@ -87,6 +88,19 @@ def init_git_workspace(workspace: Path, *, branch: str = "main") -> None:
 def fixture_project() -> Path:
     """Directorio del proyecto fixture, intacto."""
     return FIXTURE_PROJECT_DIR
+
+
+@pytest.fixture(autouse=True)
+def isolated_console_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aísla el estado durable de la consola (AP000-OBS-01) del estado real de la máquina.
+
+    La consola persiste sus tareas y Human Gates en ``.punto-memory/`` del directorio de trabajo.
+    Sin esta barrera, cada prueba que monte la consola escribiría en el estado real del usuario y
+    las pruebas se recuperarían tareas unas a otras. La variable es la misma que usa el motor
+    (``PUNTO_CONSOLE_STATE_PATH``); una prueba que necesite simular un reinicio sobre el **mismo**
+    fichero solo tiene que montar dos veces la consola dentro de la misma prueba.
+    """
+    monkeypatch.setenv(CONSOLE_STATE_ENV, str(tmp_path / "console-state.json"))
 
 
 @pytest.fixture

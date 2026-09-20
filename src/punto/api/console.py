@@ -1,4 +1,4 @@
-﻿"""Consola humana local: crea tareas, sigue su etapa, atiende Human Gates y publica a producción.
+"""Consola humana local: crea tareas, sigue su etapa, atiende Human Gates y publica a producción.
 
 Se registra **sobre la aplicación FastAPI que ya existe** (`punto.api.app`) y **reutiliza** la
 maquinaria del motor, sin construir un sistema paralelo:
@@ -19,7 +19,7 @@ estados del motor, no publica sin aprobación humana y no devuelve secretos ni p
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,8 +31,18 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from punto.api.console_state import (
+    ConsoleStateError,
+    ConsoleStateSnapshot,
+    ConsoleStateStatus,
+    ConsoleStateStore,
+    GateRecord,
+    StageRules,
+    TaskRecord,
+    publication_of,
+)
 from punto.api.task_progress import TaskSignals, build_progress
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
@@ -56,7 +66,7 @@ from punto.publish.production import (
 )
 from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest
-from punto.schemas.decision import ActionRequest
+from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
 from punto.workspace.target import DevelopmentTarget, DevelopmentTargetError
@@ -130,6 +140,48 @@ class ConsoleStage(StrEnum):
     REJECTED = "REJECTED"
 
 
+#: Recurso lógico con el que se auditan los eventos del estado durable de la consola.
+CONSOLE_STATE_RESOURCE: Final[str] = "console-state"
+
+#: Etapas que implican trabajo vivo del proceso. Al recuperarlas tras un reinicio no hay nada
+#: corriendo: se conserva la etapa real (no se inventa un fallo ni un cierre) y se anota el hecho.
+IN_FLIGHT_STAGES: Final[frozenset[str]] = frozenset(
+    {ConsoleStage.QUEUED.value, ConsoleStage.DEVELOPING.value, PublicationStage.PUBLISHING.value}
+)
+
+#: Nota con la que se marca una tarea recuperada que quedó a mitad de camino.
+INTERRUPTED_NOTE: Final[str] = (
+    "recuperada del estado durable: esta etapa no sigue corriendo en este proceso; "
+    "reanúdala para continuarla"
+)
+
+#: Etapas de publicación: todo este vocabulario implica un expediente de publicación abierto.
+_PUBLICATION_STAGES: Final[frozenset[str]] = frozenset(stage.value for stage in PublicationStage)
+
+#: Coherencia que debe cumplir el estado persistido para poder recuperarse (AP000-OBS-01).
+#:
+#: Sin estas reglas el almacén solo validaría forma y referencias; con ellas, una etapa que la
+#: consola no puede haber alcanzado —por ejemplo ``DEVELOPMENT_COMPLETED`` sin un resultado real
+#: del ciclo detrás— se rechaza entera en vez de convertirse en estado inventado.
+RESTORE_RULES: Final[StageRules] = StageRules(
+    known=frozenset(stage.value for stage in ConsoleStage) | _PUBLICATION_STAGES,
+    terminal=TERMINAL_STAGES,
+    requires_result=frozenset(
+        {
+            ConsoleStage.DEVELOPMENT_COMPLETED.value,
+            ConsoleStage.WAITING_HUMAN.value,
+            ConsoleStage.HUMAN_APPROVED.value,
+        }
+        | _PUBLICATION_STAGES
+    ),
+    requires_completed_result=frozenset(
+        {ConsoleStage.DEVELOPMENT_COMPLETED.value} | _PUBLICATION_STAGES
+    ),
+    requires_publication=_PUBLICATION_STAGES,
+    requires_validated_production=frozenset({PublicationStage.PRODUCTION_VALIDATED.value}),
+)
+
+
 class TaskCreateBody(BaseModel):
     """Cuerpo de ``POST /console/tasks``: la solicitud escrita por una persona."""
 
@@ -187,6 +239,9 @@ class ConsoleTask:
         self.gates: list[UUID] = []
         self.runs = 0
         self.notes: list[str] = []
+        #: Momento en que la tarea se recuperó del estado durable (``None`` si nació en este
+        #: proceso). No es una etapa: es la procedencia real de lo que se está viendo.
+        self.recovered_at: datetime | None = None
         self._lock = Lock()
 
     @property
@@ -274,6 +329,12 @@ class ConsoleTask:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at is not None else "",
+            # AP000-OBS-01: de dónde viene lo que se está viendo. Una tarea nacida en este proceso
+            # no lleva marca; una recuperada del estado durable dice cuándo se recuperó.
+            "recovered": self.recovered_at is not None,
+            "recovered_at": (
+                self.recovered_at.isoformat() if self.recovered_at is not None else ""
+            ),
             "development": self.summary(),
             "publication": self.publication.as_dict() if self.publication else None,
             "notes": list(self.notes),
@@ -337,6 +398,42 @@ def register_human_console(
 
     tasks: dict[str, ConsoleTask] = {}
     executor = None if dependencies.run_inline else ThreadPoolExecutor(max_workers=2)
+    #: Almacén durable del estado gobernado (tareas y Human Gates) y cerrojo de escritura.
+    store = ConsoleStateStore()
+    state_lock = Lock()
+    _restore_console_state(store, dependencies, tasks)
+
+    def persist() -> None:
+        """Persiste el estado gobernado de la consola para que sobreviva al proceso.
+
+        Escribe una **instantánea completa** (tareas y los gates que les pertenecen), así que
+        repetirla no duplica nada. Nunca lanza: si el estado no se puede escribir —contenido con
+        forma de credencial, error de disco o un registro que no serializa— la consola sigue
+        funcionando y el hecho queda auditado, porque perder durabilidad no puede tumbar la
+        operación que la persona está haciendo.
+        """
+        try:
+            with state_lock:
+                snapshot = tuple(tasks.values())
+                records = [_task_record(task) for task in snapshot]
+                approvals = [_gate_record(item) for item in _console_gates(snapshot, dependencies)]
+            store.save(tasks=records, gates=approvals)
+        except ConsoleStateError as exc:
+            _log_state_event(
+                dependencies,
+                AuditEventType.CONSOLE_STATE_WRITE_REFUSED,
+                "console_state_write_refused",
+                exc.detail,
+                metadata={"kind": exc.kind},
+            )
+        except (ValidationError, ValueError) as exc:
+            _log_state_event(
+                dependencies,
+                AuditEventType.CONSOLE_STATE_WRITE_REFUSED,
+                "console_state_write_refused",
+                f"el estado en memoria no se puede serializar: {type(exc).__name__}",
+                metadata={"kind": "STATE_UNSERIALIZABLE"},
+            )
 
     # ------------------------------------------------------------------ página
     @application.get(CONSOLE_PATH, response_class=HTMLResponse, tags=["console"])
@@ -408,6 +505,7 @@ def register_human_console(
         )
         if body.run:
             _run_development(task, request, dependencies, executor)
+        persist()
         return _task_view(task, dependencies)
 
     @application.get("/console/tasks", tags=["console"], summary="Listar tareas")
@@ -433,7 +531,12 @@ def register_human_console(
         summary="Reanudar el desarrollo de una tarea",
     )
     def run_console_task(task_id: UUID) -> dict[str, Any]:
-        """Vuelve a ejecutar el ciclo sobre la misma solicitud (nunca si fue rechazada)."""
+        """Vuelve a ejecutar el ciclo sobre la misma solicitud (nunca si fue rechazada).
+
+        La identidad gobernada **no** cambia: es la misma solicitud, ejecutada otra vez. Cambiarla
+        dejaría huérfanos los gates ya pedidos y el expediente de publicación —y duplicaría la
+        entrada del registro—, que es justo lo que el estado durable no puede tolerar.
+        """
         task = _task_or_404(tasks, task_id)
         if task.stage == ConsoleStage.REJECTED.value:
             raise HTTPException(
@@ -442,6 +545,7 @@ def register_human_console(
             )
         target = _target_or_400(dependencies, task.target_id)
         request = BuildRequest(
+            request_id=task.task_id,
             objective=task.objective,
             target_repository=target.target_id,
             requested_role=ProviderRole.BUILDER,
@@ -449,9 +553,9 @@ def register_human_console(
             scope_paths=task.scope_paths,
             context=task.context,
         )
-        task.task_id = request.request_id
         tasks[str(task.task_id)] = task
         _run_development(task, request, dependencies, executor)
+        persist()
         return _task_view(task, dependencies)
 
     # -------------------------------------------------------------- human gates
@@ -476,6 +580,9 @@ def register_human_console(
         """Aprueba el gate. Solo la aprobación de **publicación** desencadena la publicación."""
         approval = _gate_or_404(dependencies, approval_id)
         _resolve_gate(dependencies, approval_id, approved=True, body=body)
+        # La decisión humana se persiste antes de ejecutar nada: si la publicación falla, lo que la
+        # persona decidió sigue siendo durable.
+        persist()
         task = tasks.get(str(approval.task_id))
         if _is_publication_gate(approval.action):
             if task is None:
@@ -485,9 +592,11 @@ def register_human_console(
                 )
             target = _target_or_400(dependencies, task.target_id)
             _run_publication(task, target, dependencies, executor, approval_id)
+            persist()
             return _task_view(task, dependencies)
         if task is not None:
             task.set_stage(ConsoleStage.HUMAN_APPROVED, f"aprobado por {body.resolved_by}")
+        persist()
         return {
             "approval_id": str(approval_id),
             "status": ApprovalStatus.APPROVED.value,
@@ -512,6 +621,7 @@ def register_human_console(
             if _is_publication_gate(approval.action):
                 task.publication = None
             task.set_stage(ConsoleStage.REJECTED, f"rechazado por {body.resolved_by}")
+        persist()
         return {
             "approval_id": str(approval_id),
             "status": ApprovalStatus.REJECTED.value,
@@ -605,6 +715,7 @@ def register_human_console(
             "gate de publicación pendiente de decisión humana",
         )
         task.set_stage(PublicationStage.WAITING_PRODUCTION_APPROVAL)
+        persist()
         return _task_view(task, dependencies)
 
     @application.post(
@@ -675,13 +786,18 @@ def register_human_console(
         task.runs += 1
 
         def work() -> None:
+            # El estado gobernado se persiste en cuanto el ciclo termina —bien o mal—, para que un
+            # reinicio justo después no pierda el desenlace ni la petición de persona.
             try:
-                result = deps.dev_cycle.run(request)
-            except Exception as exc:  # el ciclo no debe tumbar la consola
-                task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, f"el ciclo falló: {exc}")
-                return
-            task.result = result
-            _reflect(task, result, deps)
+                try:
+                    result = deps.dev_cycle.run(request)
+                except Exception as exc:  # el ciclo no debe tumbar la consola
+                    task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, f"el ciclo falló: {exc}")
+                    return
+                task.result = result
+                _reflect(task, result, deps)
+            finally:
+                persist()
 
         if pool is None:
             work()
@@ -772,21 +888,28 @@ def register_human_console(
         task.set_stage(PublicationStage.PUBLISHING)
 
         def work() -> None:
+            # El expediente de publicación se persiste con su etapa real, incluso si la cadena se
+            # rechaza: la etapa es la prueba de dónde quedó la operación.
             try:
-                record = service.publish(
-                    task_id=task.task_id,
-                    request_id=str(task.request_id),
-                    commit_sha=result.commit_sha,
-                    approval_id=approval_id,
-                    gate=deps.gates,
-                    record=task.publication,
-                    authority=decision,
-                )
-            except Exception as exc:  # la publicación nunca tumba la consola
-                task.set_stage(PublicationStage.PUBLICATION_FAILED, f"publicación rechazada: {exc}")
-                return
-            task.publication = record
-            task.set_stage(record.stage, record.error)
+                try:
+                    record = service.publish(
+                        task_id=task.task_id,
+                        request_id=str(task.request_id),
+                        commit_sha=result.commit_sha,
+                        approval_id=approval_id,
+                        gate=deps.gates,
+                        record=task.publication,
+                        authority=decision,
+                    )
+                except Exception as exc:  # la publicación nunca tumba la consola
+                    task.set_stage(
+                        PublicationStage.PUBLICATION_FAILED, f"publicación rechazada: {exc}"
+                    )
+                    return
+                task.publication = record
+                task.set_stage(record.stage, record.error)
+            finally:
+                persist()
 
         if pool is None:
             work()
@@ -869,6 +992,184 @@ def register_human_console(
 
 
 # --------------------------------------------------------------------- auxiliares
+# ------------------------------------------------- estado durable (AP000-OBS-01)
+def _restore_console_state(
+    store: ConsoleStateStore, dependencies: ConsoleDependencies, tasks: dict[str, ConsoleTask]
+) -> ConsoleStateSnapshot:
+    """Recupera el estado gobernado persistido, o falla cerrado y arranca con el registro vacío.
+
+    Lo que se recupera es lo que estaba escrito: la misma identidad de tarea, la misma etapa, el
+    mismo resultado del ciclo y la misma decisión humana. Nada se deduce de la etapa ni del nombre:
+    si el documento no es coherente, no se recupera **ninguna** parte y el hecho queda auditado.
+    """
+    snapshot = store.load(rules=RESTORE_RULES)
+    if snapshot.status is ConsoleStateStatus.RECOVERED:
+        recovered_at = utc_now()
+        for record in snapshot.tasks:
+            task = _task_from_record(record, recovered_at)
+            if task.stage in IN_FLIGHT_STAGES:
+                # La etapa se conserva tal cual —no se convierte en fallo ni en cierre— y se deja
+                # dicho que ese trabajo ya no está corriendo en este proceso.
+                task.notes = [*task.notes[-4:], INTERRUPTED_NOTE]
+            tasks.setdefault(str(record.task_id), task)
+        approvals = [
+            _gate_request_from_record(gate)
+            for gate in snapshot.gates
+            if dependencies.gates.get(gate.approval_id) is None
+        ]
+        dependencies.gates.extend(approvals)
+        _log_state_event(
+            dependencies,
+            AuditEventType.CONSOLE_STATE_RECOVERED,
+            "console_state_recovered",
+            snapshot.detail,
+            metadata=snapshot.as_metadata(),
+        )
+    elif snapshot.status is ConsoleStateStatus.REJECTED:
+        _log_state_event(
+            dependencies,
+            AuditEventType.CONSOLE_STATE_REJECTED,
+            "console_state_rejected",
+            snapshot.detail,
+            metadata=snapshot.as_metadata(),
+        )
+    return snapshot
+
+
+def _log_state_event(
+    dependencies: ConsoleDependencies,
+    event_type: AuditEventType,
+    action: str,
+    detail: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Deja constancia auditada del estado durable, sin que la auditoría rompa la consola."""
+    payload: dict[str, Any] = {"detail": _redacted(detail, 300)}
+    if metadata:
+        payload.update(metadata)
+    try:
+        dependencies.audit.log_dev_event(
+            event_type, action, request_id=CONSOLE_STATE_RESOURCE, metadata=payload
+        )
+    except Exception:  # la traza no puede tumbar la operación que la persona está haciendo
+        return
+
+
+def _task_record(task: ConsoleTask) -> TaskRecord:
+    """Vista persistible de una tarea: estado gobernado y evidencia, sin contenido de ficheros."""
+    return TaskRecord(
+        task_id=task.task_id,
+        objective=task.objective,
+        target_id=task.target_id,
+        acceptance_criteria=tuple(task.acceptance_criteria),
+        scope_paths=tuple(task.scope_paths),
+        context=task.context,
+        stage=task.stage,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        finished_at=task.finished_at,
+        runs=task.runs,
+        notes=tuple(task.notes),
+        gate_ids=tuple(task.gates),
+        result=task.result,
+        publication=task.publication.as_dict() if task.publication is not None else None,
+    )
+
+
+def _task_from_record(record: TaskRecord, recovered_at: datetime) -> ConsoleTask:
+    """Reconstruye la tarea desde su registro persistido, con la etapa y la evidencia reales.
+
+    ``recovered_at`` deja constancia de la procedencia: lo que se ve viene del estado durable, no
+    de este proceso. No se recalcula ninguna etapa y no se inventa ningún resultado.
+    """
+    task = ConsoleTask(
+        task_id=record.task_id,
+        objective=record.objective,
+        target_id=record.target_id,
+        acceptance_criteria=tuple(record.acceptance_criteria),
+        scope_paths=tuple(record.scope_paths),
+        context=record.context,
+    )
+    task.stage = record.stage
+    task.created_at = record.created_at
+    task.updated_at = record.updated_at
+    task.finished_at = record.finished_at
+    task.runs = record.runs
+    task.notes = list(record.notes)
+    task.gates = list(record.gate_ids)
+    task.result = record.result
+    task.publication = publication_of(record)
+    task.recovered_at = recovered_at
+    return task
+
+
+def _gate_record(approval: HumanApprovalRequest) -> GateRecord:
+    """Vista persistible de un gate: la solicitud, su vínculo y la decisión humana si la hay."""
+    return GateRecord(
+        approval_id=approval.id,
+        task_id=approval.task_id,
+        action=approval.action,
+        risk=approval.risk,
+        reason=approval.reason[:MAX_REASON_CHARS],
+        status=approval.status,
+        requested_at=approval.requested_at,
+        resolved_at=approval.resolved_at,
+        resolved_by=approval.resolved_by,
+        resolution_note=approval.resolution_note,
+        resume_status=approval.resume_status,
+        policy_outcome=approval.policy_outcome,
+        policy_decision_id=approval.policy_decision_id,
+    )
+
+
+def _gate_request_from_record(record: GateRecord) -> HumanApprovalRequest:
+    """Reconstruye la solicitud gobernada con **la misma identidad** y su decisión ya tomada.
+
+    Se reinserta con ``HumanGate.extend`` —el mecanismo que el propio gate declara para restaurar
+    estado— en vez de volver a resolverla: resolverla otra vez inventaría un momento de decisión que
+    no es el real. Una solicitud pendiente vuelve pendiente; una aprobada vuelve aprobada, con su
+    actor, su momento y su nota.
+    """
+    return HumanApprovalRequest(
+        id=record.approval_id,
+        task_id=record.task_id,
+        action=record.action,
+        risk=record.risk,
+        reason=record.reason,
+        requested_at=record.requested_at,
+        status=record.status,
+        resolved_at=record.resolved_at,
+        resolved_by=record.resolved_by,
+        resolution_note=record.resolution_note,
+        resume_status=record.resume_status,
+        policy_outcome=record.policy_outcome,
+        policy_decision_id=record.policy_decision_id,
+    )
+
+
+def _console_gates(
+    tasks: Iterable[ConsoleTask], dependencies: ConsoleDependencies
+) -> tuple[HumanApprovalRequest, ...]:
+    """Gates que pertenecen a las tareas de la consola: los que se persisten y se recuperan.
+
+    El ``HumanGate`` es del motor y puede llevar solicitudes de otros subsistemas (replanificación,
+    presupuesto) cuyos vínculos internos no son estado de la consola. El límite es explícito: se
+    persiste lo que pertenece a una tarea de la consola —sus gates y el de su publicación—, ni más
+    ni menos.
+    """
+    found: dict[UUID, HumanApprovalRequest] = {}
+    for task in tasks:
+        identifiers = list(task.gates)
+        if task.publication is not None and task.publication.approval_id:
+            identifiers.append(UUID(task.publication.approval_id))
+        for approval_id in identifiers:
+            approval = dependencies.gates.get(approval_id)
+            if approval is not None:
+                found.setdefault(approval.id, approval)
+    return tuple(found.values())
+
+
 def _task_or_404(tasks: Mapping[str, ConsoleTask], task_id: UUID) -> ConsoleTask:
     """Tarea de la consola o 404."""
     task = tasks.get(str(task_id))

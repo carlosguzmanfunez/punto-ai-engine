@@ -186,6 +186,11 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     # --- Consola humana local + publicación a producción ----------------------
     AuditEventType.CONSOLE_TASK_CREATED: "console_task",
     AuditEventType.CONSOLE_TASK_STAGE_CHANGED: "console_task",
+    #: AP000-OBS-01: el estado durable de la consola (recuperación, rechazo y escritura denegada)
+    #: se registra sobre el propio estado, no sobre una tarea: no es evidencia de una operación.
+    AuditEventType.CONSOLE_STATE_RECOVERED: "console_state",
+    AuditEventType.CONSOLE_STATE_REJECTED: "console_state",
+    AuditEventType.CONSOLE_STATE_WRITE_REFUSED: "console_state",
     AuditEventType.PUBLICATION_REQUESTED: "publication",
     AuditEventType.PUBLICATION_PUSHED: "publication",
     AuditEventType.PUBLICATION_FAILED: "publication",

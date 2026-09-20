@@ -28,8 +28,9 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
@@ -93,6 +94,56 @@ class PublicationRefused(RuntimeError):
         super().__init__(f"{kind}: {detail}")
 
 
+#: Motivo con el que se rechaza un expediente persistido que no cumple su contrato.
+STATE_INVALID: Final[str] = "PUBLICATION_STATE_INVALID"
+
+
+def _state_field(
+    data: Mapping[str, Any], key: str, kind: type | tuple[type, ...], where: str
+) -> Any:
+    """Campo obligatorio de un expediente persistido, con su tipo.
+
+    Raises:
+        PublicationRefused: si falta o no tiene el tipo esperado. Nunca se rellena un hueco con un
+            valor por defecto: un expediente incompleto no se restaura.
+    """
+    if key not in data:
+        raise PublicationRefused(STATE_INVALID, f"{where}: falta el campo {key!r}")
+    value = data[key]
+    kinds = kind if isinstance(kind, tuple) else (kind,)
+    if isinstance(value, bool) and bool not in kinds and int in kinds:
+        raise PublicationRefused(STATE_INVALID, f"{where}: {key!r} no puede ser booleano")
+    if not isinstance(value, kinds):
+        raise PublicationRefused(
+            STATE_INVALID, f"{where}: {key!r} no tiene el tipo esperado ({type(value).__name__})"
+        )
+    return value
+
+
+def _history_entries(raw: Any, where: str) -> list[dict[str, str]]:
+    """Historial persistido de la publicación, validado entrada por entrada."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise PublicationRefused(STATE_INVALID, f"{where}: el historial no es una lista")
+    entries: list[dict[str, str]] = []
+    for index, item in enumerate(raw):
+        spot = f"{where}.history[{index}]"
+        if not isinstance(item, Mapping):
+            raise PublicationRefused(STATE_INVALID, f"{spot}: se esperaba un objeto")
+        stage = _state_field(item, "stage", str, spot)
+        if stage not in PUBLICATION_STAGES:
+            raise PublicationRefused(STATE_INVALID, f"{spot}: etapa desconocida {stage!r}")
+        moment = _state_field(item, "at", str, spot)
+        try:
+            datetime.fromisoformat(moment)
+        except ValueError as exc:
+            raise PublicationRefused(STATE_INVALID, f"{spot}: momento inválido") from exc
+        detail = _state_field(item, "detail", str, spot)
+        entries.append({"stage": stage, "at": moment, "detail": detail})
+    return entries
+
+
 class PublicationStage(StrEnum):
     """Etapas de la publicación a producción (las que no existían en el motor)."""
 
@@ -103,6 +154,10 @@ class PublicationStage(StrEnum):
     DEPLOYMENT_VERIFICATION = "DEPLOYMENT_VERIFICATION"
     DEPLOYMENT_NOT_VERIFIED = "DEPLOYMENT_NOT_VERIFIED"
     PRODUCTION_VALIDATED = "PRODUCTION_VALIDATED"
+
+
+#: Etapas válidas de publicación: una etapa fuera de aquí delata un expediente manipulado.
+PUBLICATION_STAGES: Final[frozenset[str]] = frozenset(stage.value for stage in PublicationStage)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +183,27 @@ class PushEvidence:
             "output": redact_secret_text(self.output)[:MAX_PUSH_OUTPUT_CHARS],
             "pushed": self.pushed,
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PushEvidence:
+        """Reconstruye la evidencia del push desde su vista serializable.
+
+        Se usa al recuperar un expediente durable tras un reinicio. Falla cerrado: un campo ausente
+        o con otra forma levanta ``PublicationRefused`` en vez de rellenarse con un valor por
+        defecto, porque una evidencia inventada es peor que ninguna evidencia.
+        """
+        if not isinstance(data, Mapping):
+            raise PublicationRefused(STATE_INVALID, "push: se esperaba un objeto")
+        argv = _state_field(data, "argv", list, "push")
+        return cls(
+            remote=_state_field(data, "remote", str, "push"),
+            ref=_state_field(data, "ref", str, "push"),
+            sha=_state_field(data, "sha", str, "push"),
+            argv=tuple(str(item) for item in argv),
+            exit_code=_state_field(data, "exit_code", int, "push"),
+            output=_state_field(data, "output", str, "push"),
+            pushed=_state_field(data, "pushed", bool, "push"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +233,31 @@ class ProductionEvidence:
             "validated": self.validated,
             "detail": self.detail[:300],
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ProductionEvidence:
+        """Reconstruye la evidencia de producción desde su vista serializable.
+
+        La validación declarada tiene que coincidir con la que sale de la propia evidencia: si el
+        documento dice ``validated`` y la respuesta real no lo sostiene, el expediente se rechaza.
+        """
+        if not isinstance(data, Mapping):
+            raise PublicationRefused(STATE_INVALID, "production: se esperaba un objeto")
+        evidence = cls(
+            url=_state_field(data, "url", str, "production"),
+            marker=_state_field(data, "marker", str, "production"),
+            attempts=_state_field(data, "attempts", int, "production"),
+            status_code=_state_field(data, "status_code", int, "production"),
+            marker_found=_state_field(data, "marker_found", bool, "production"),
+            detail=_state_field(data, "detail", str, "production"),
+        )
+        declared = _state_field(data, "validated", bool, "production")
+        if declared is not evidence.validated:
+            raise PublicationRefused(
+                STATE_INVALID,
+                "production: la validación declarada no coincide con la evidencia comprobada",
+            )
+        return evidence
 
 
 @dataclass(slots=True)
@@ -201,6 +302,47 @@ class PublicationRecord:
             "history": list(self.history),
             "authority": self.authority,
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PublicationRecord:
+        """Reconstruye el expediente completo desde su vista serializable (estado durable).
+
+        Es la operación simétrica de :meth:`as_dict`: lo que se guarda se puede volver a leer con el
+        mismo contrato. Falla cerrado (``PublicationRefused`` con ``PUBLICATION_STATE_INVALID``) si
+        falta un campo, la etapa no es una etapa real o la evidencia no sostiene lo que declara, de
+        modo que un expediente manipulado **no** se convierte en una publicación validada.
+        """
+        if not isinstance(data, Mapping):
+            raise PublicationRefused(STATE_INVALID, "publication: se esperaba un objeto")
+        where = "publication"
+        stage_raw = _state_field(data, "stage", str, where)
+        if stage_raw not in PUBLICATION_STAGES:
+            raise PublicationRefused(STATE_INVALID, f"{where}: etapa desconocida {stage_raw!r}")
+        push = data.get("push")
+        production = data.get("production")
+        authority = data.get("authority")
+        if push is not None and not isinstance(push, Mapping):
+            raise PublicationRefused(STATE_INVALID, f"{where}: el push no es un objeto")
+        if production is not None and not isinstance(production, Mapping):
+            raise PublicationRefused(STATE_INVALID, f"{where}: la producción no es un objeto")
+        if authority is not None and not isinstance(authority, Mapping):
+            raise PublicationRefused(STATE_INVALID, f"{where}: la autoridad no es un objeto")
+        return cls(
+            task_id=_state_field(data, "task_id", str, where),
+            request_id=_state_field(data, "request_id", str, where),
+            target_id=_state_field(data, "target_id", str, where),
+            commit_sha=_state_field(data, "commit_sha", str, where),
+            approval_id=_state_field(data, "approval_id", str, where),
+            stage=PublicationStage(stage_raw),
+            error_kind=_state_field(data, "error_kind", str, where),
+            error=_state_field(data, "error", str, where),
+            push=PushEvidence.from_dict(push) if push is not None else None,
+            production=(
+                ProductionEvidence.from_dict(production) if production is not None else None
+            ),
+            history=_history_entries(data.get("history"), where),
+            authority=dict(authority) if authority is not None else None,
+        )
 
 
 @dataclass(frozen=True, slots=True)

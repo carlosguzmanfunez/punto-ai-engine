@@ -692,7 +692,9 @@
         return `
           <article class="card" data-task="${task.task_id}" data-testid="tarea-${task.task_id}">
             <h3>${task.objective.slice(0, 90)}</h3>
-            <div class="sub">${task.target_id} · <code>${task.task_id.slice(0, 8)}</code></div>
+            <div class="sub">${task.target_id} · <code>${task.task_id.slice(0, 8)}</code>${
+              task.recovered ? " · recuperada del estado durable (sobrevivió a un reinicio)" : ""
+            }</div>
             ${progressBlock(task)}
             <div class="row"><span class="label">Etapa</span><span class="value">${stageBadge(task.stage)}
               ${task.publication_stage && task.publication_stage !== task.stage ? stageBadge(task.publication_stage) : ""}</span></div>

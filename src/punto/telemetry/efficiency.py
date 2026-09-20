@@ -133,6 +133,11 @@ class EfficiencyRecord(BaseModel):
     primary_model: str = Field(default="", max_length=120)
     primary_transport: str = Field(default="", max_length=40)
 
+    #: Skill activada en esta ejecución (SKILL-LAYER-0). Vacío y ``False`` significan el control.
+    skill_id: str = Field(default="", max_length=80)
+    skill_version: str = Field(default="", max_length=20)
+    skill_activated: bool = False
+
     started_at: datetime
     finished_at: datetime
     elapsed_ms: int = Field(ge=0)
@@ -224,6 +229,9 @@ def build_record(
     primary_provider: str = "",
     primary_model: str = "",
     primary_transport: str = "",
+    skill_id: str = "",
+    skill_version: str = "",
+    skill_activated: bool = False,
     verification_elapsed_ms: int = 0,
     stagnation_events: int = 0,
     repeated_failure_signatures: int = 0,
@@ -245,6 +253,9 @@ def build_record(
         primary_provider=primary_provider,
         primary_model=primary_model,
         primary_transport=primary_transport,
+        skill_id=skill_id,
+        skill_version=skill_version,
+        skill_activated=skill_activated,
         started_at=evidence.started_at,
         finished_at=evidence.finished_at,
         elapsed_ms=evidence.elapsed_ms,

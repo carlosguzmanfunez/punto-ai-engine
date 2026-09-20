@@ -334,6 +334,8 @@ class AuditEventType(StrEnum):
     DEV_STAGNATION_DETECTED = "DEV_STAGNATION_DETECTED"
     #: PILOT-05: la cadena funcional completa quedó verificada extremo a extremo.
     DEV_FUNCTIONAL_CHAIN_VERIFIED = "DEV_FUNCTIONAL_CHAIN_VERIFIED"
+    #: SKILL-LAYER-0: se activó una skill para un rol, con su identificador, versión y huella.
+    DEV_SKILL_ACTIVATED = "DEV_SKILL_ACTIVATED"
 
 
 class AuditEvent(BaseModel):

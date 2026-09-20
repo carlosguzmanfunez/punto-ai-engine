@@ -203,6 +203,12 @@ class DevelopmentConfig:
     allow_scope_expansion: bool = True
     #: Exigir que el plan declare la cadena funcional que completa.
     require_functional_chain: bool = True
+    #: Skill experimental del ARCHITECT (``id`` o ``id@version``), declarada por el operador.
+    #:
+    #: Vacío significa el comportamiento de siempre: sin skill, las instrucciones del ARCHITECT son
+    #: exactamente las de antes. La activación es **explícita** (SKILL-LAYER-0): no hay selección
+    #: automática todavía.
+    architect_skill: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +259,7 @@ class DevelopmentCycle:
     _functional_chain_result: str = field(default="", init=False, repr=False)
     _last_root_cause: str = field(default="", init=False, repr=False)
     _last_risk: str = field(default="", init=False, repr=False)
+    _skill_activation: Any = field(default=None, init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -266,6 +273,7 @@ class DevelopmentCycle:
         self._final_plan = None
         self._last_root_cause = ""
         self._last_risk = ""
+        self._skill_activation = None
         self._snapshots = None
         self._checkpoint = None
 
@@ -2119,6 +2127,57 @@ class DevelopmentCycle:
         lines.append(BUILD_CONTRACT)
         return "\n".join(lines)
 
+    def _instructions_for(self, role: ProviderRole, request: BuildRequest) -> str:
+        """Instrucciones del rol: las de siempre, más la skill activada si el operador la declaró.
+
+        La activación es explícita y **solo** para el ARCHITECT en este experimento. Una skill
+        declarada que no valide **no se ignora**: se falla cerrado, porque ejecutar sin ella
+daría un
+        resultado que no se podría atribuir al experimento. ``SKILL != AUTHORITY``: la skill es
+        procedimiento, y nada de lo que diga cambia permisos, presupuestos ni verificaciones.
+        """
+        if role is not ProviderRole.ARCHITECT or not self.config.architect_skill.strip():
+            return WORKER_INSTRUCTIONS
+        if self._skill_activation is None:
+            from punto.skills import SkillValidationError, activate_skill
+
+            try:
+                activation = activate_skill(
+                    self.config.architect_skill,
+                    role=role.value,
+                    base_instructions=WORKER_INSTRUCTIONS,
+                )
+            except SkillValidationError as exc:
+                self._log(
+                    AuditEventType.DEV_SKILL_ACTIVATED,
+                    "dev_skill_activated",
+                    request,
+                    {
+                        "skill_reference": self.config.architect_skill,
+                        "activated": False,
+                        "detail": str(exc)[:300],
+                    },
+                    AuditResult.FAILURE,
+                )
+                raise DevelopmentCycleError(
+                    f"la skill declarada no se pudo activar: {exc}"
+                ) from exc
+            self._skill_activation = activation
+            self._log(
+                AuditEventType.DEV_SKILL_ACTIVATED,
+                "dev_skill_activated",
+                request,
+                {
+                    "skill_id": activation.skill_id,
+                    "skill_version": activation.skill_version,
+                    "skill_reference": activation.reference,
+                    "activated": activation.activated,
+                    "chars": activation.chars,
+                    "sha256": activation.sha256,
+                },
+            )
+        return self._skill_activation.instructions or WORKER_INSTRUCTIONS
+
     def _invoke(
         self,
         role: ProviderRole,
@@ -2143,7 +2202,7 @@ class DevelopmentCycle:
         )
         provider_request = ProviderRequest(
             role=role,
-            instructions=WORKER_INSTRUCTIONS,
+            instructions=self._instructions_for(role, request),
             request_id=str(request.request_id),
             context=prompt,
             metadata={"target_id": request.target_repository, "phase": "PILOT-04"},

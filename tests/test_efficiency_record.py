@@ -186,3 +186,21 @@ def test_la_evidencia_declara_calidad_junto_a_eficiencia() -> None:
     assert record.functional_chain_pass is True
     assert record.regression_detected is False
     assert record.repair_rounds == 1
+
+
+def test_el_registro_identifica_la_skill_activada() -> None:
+    """El registro dice qué skill y qué versión produjeron el resultado (o que no hubo ninguna)."""
+    con_skill = build_record(
+        _evidence((_call(),)),
+        task_id="task-1",
+        skill_id="punto-causal-architect",
+        skill_version="0.1.0",
+        skill_activated=True,
+    )
+    assert con_skill.skill_id == "punto-causal-architect"
+    assert con_skill.skill_version == "0.1.0"
+    assert con_skill.skill_activated is True
+
+    sin_skill = build_record(_evidence((_call(),)))
+    assert sin_skill.skill_id == ""
+    assert sin_skill.skill_activated is False

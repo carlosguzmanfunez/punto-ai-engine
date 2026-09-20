@@ -132,12 +132,19 @@ Memoria al cierre: **18 VERIFIED · 1 SUPERSEDED · 0 CANDIDATE · 0 FAILED**.
 
 ## 8. Git y publicación
 
-- **PUNTO**: commits de PILOT-05 y del cierre enfocado, **sin force** y **sin reescritura**, publicados
-  a `origin/main`; `HEAD == origin/main` y ahead/behind **0/0** verificados con `git fetch` y
-  `git ls-remote`.
-- **Target**: se publica **únicamente** la rama `ai/pilot-05-adaptive-authority` (commit `b63f0f1`);
-  `main` permanece en `6ba5230` **intacto** y el ` M .gitignore` del usuario sigue sin publicar.
+- **PUNTO**: commits de PILOT-05 (`ac2c145`, `e4ac47d`, `a1d00ad`) y del cierre enfocado (`aa048a2`
+  arreglo, `688b4ff` pruebas), **sin force** y **sin reescritura**, publicados a `origin/main`
+  (`f1edf32..b941f4d`). Verificado con `git fetch`, `git rev-parse` y `git ls-remote`:
+  **HEAD == `origin/main` == `b941f4daab44a8e97ab0f98a2500d24c50610dfc`**, ahead/behind **0/0**.
+- **Target**: se publica **únicamente** la rama de trabajo
+  `ai/pilot-05-adaptive-authority` → `b63f0f159e8238c60a70f4e0eec8154db14d0670` (rama nueva);
+  `main` remoto permanece en `6ba523049d4340c3d8ef860110b89691fc24f4e3` **intacto** y el
+  ` M .gitignore` del usuario sigue sin confirmar y sin publicar.
 - **No** hay merge a `main`, ni despliegue, ni producción.
+
+Evidencia de esta corrida en `_punto-pilot-05/`: `focused-chain.log` (la firma del fallo),
+`focused-chain-after-fix.log` (79/79), `full-suite-after-fix.log` (3 863 PASS · 0 FAIL),
+`repro-browser-sessions-*.json` (40 sesiones + comparación de contención), `pell-learning.json`.
 
 ## 9. Veredicto
 

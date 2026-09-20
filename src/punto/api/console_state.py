@@ -52,6 +52,7 @@ __all__ = [
     "ConsoleStateStore",
     "GateRecord",
     "StageRules",
+    "TaskAttempt",
     "TaskRecord",
     "default_console_state_path",
     "publication_of",
@@ -83,6 +84,7 @@ MAX_CONSOLE_GATES: Final[int] = 500
 #: Topes por campo: lo que la consola admite como máximo y un poco de holgura.
 MAX_ITEMS: Final[int] = 200
 MAX_NOTES: Final[int] = 20
+MAX_ATTEMPTS: Final[int] = 20
 MAX_TEXT_CHARS: Final[int] = 2_000
 MAX_REASON_CHARS: Final[int] = 400
 
@@ -167,6 +169,24 @@ class GateRecord(BaseModel):
     policy_decision_id: UUID | None = None
 
 
+class TaskAttempt(BaseModel):
+    """Intento real de ejecución del ciclo sobre una tarea (uno por llamada al ciclo).
+
+    Lo escribe la consola al terminar cada intento, con el desenlace **real** del ciclo. Existe para
+    que un reintento sea visible: sin él, dos intentos con el mismo desenlace son indistinguibles y
+    una persona no puede saber si la tarea se volvió a ejecutar o no.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run: int = Field(ge=1, le=1_000)
+    started_at: datetime
+    status: str = Field(min_length=1, max_length=40)
+    error_kind: str = Field(default="", max_length=40)
+    commit_sha: str = Field(default="", max_length=64)
+    duration_ms: int | None = Field(default=None, ge=0)
+
+
 class TaskRecord(BaseModel):
     """Tarea gobernada tal como se persiste: lo necesario para continuar y rendir cuentas."""
 
@@ -184,6 +204,8 @@ class TaskRecord(BaseModel):
     finished_at: datetime | None = None
     runs: int = Field(default=0, ge=0, le=1_000)
     notes: tuple[str, ...] = Field(default=(), max_length=MAX_NOTES)
+    #: Historial de intentos reales del ciclo, acotado: es la auditoría de lo que ya se intentó.
+    attempts: tuple[TaskAttempt, ...] = Field(default=(), max_length=MAX_ATTEMPTS)
     gate_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_ITEMS)
     #: Resultado real del ciclo. Es la evidencia que permite continuar sin repetir etapas; se
     #: valida con el propio contrato del motor al leerlo, así que un documento manipulado no pasa.

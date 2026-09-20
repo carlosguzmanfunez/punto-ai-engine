@@ -769,6 +769,30 @@
         ].join("");
       }
 
+      // Momento legible de un intento; si el motor no lo declaró, se dice en vez de inventarlo.
+      function moment(value) {
+        if (!value) return "sin momento registrado";
+        const when = new Date(value);
+        return Number.isNaN(when.getTime()) ? String(value) : when.toLocaleString();
+      }
+
+      // Historial de intentos reales del ciclo: es lo que distingue un reintento de una tarea que
+      // no se volvió a ejecutar cuando el desenlace es el mismo (AP000-OBS-04-R1).
+      function attemptsBlock(task) {
+        const attempts = task.attempts || [];
+        if (!attempts.length) return "";
+        const rows = attempts
+          .map((item) => {
+            const resultado = [item.status, item.error_kind].filter(Boolean).join(" · ");
+            const duracion = item.duration_ms === null || item.duration_ms === undefined ? "" : ` · ${item.duration_ms} ms`;
+            const commit = item.commit_sha ? ` · commit ${item.commit_sha.slice(0, 10)}` : "";
+            return `<div class="item"><span>intento ${esc(item.run)} · ${esc(moment(item.started_at))}</span><code>${esc(resultado)}${esc(duracion)}${esc(commit)}</code></div>`;
+          })
+          .join("");
+        return `<div class="row"><span class="label">Intentos del ciclo</span><span class="value"></span></div>
+                <div class="list" data-attempts>${rows}</div>`;
+      }
+
       function detailPanel(task) {
         const dev = task.development || {};
         const blocked = task.blocked || {};
@@ -792,6 +816,7 @@
         }
         parts.push(detailRow("Etapa del ciclo", `${esc(dev.status || task.stage)}
           · plan ${esc(dev.plan_status || "sin plan")}${blocked.code && blocked.planned === false ? " (no llegó a emitirse)" : ""}`));
+        parts.push(attemptsBlock(task));
         parts.push(issuesBlock("Incidencias del plan", dev.plan_issues));
         parts.push(issuesBlock("Incidencias del cambio", dev.change_issues));
         const authority = (dev.authority_evidence || [])

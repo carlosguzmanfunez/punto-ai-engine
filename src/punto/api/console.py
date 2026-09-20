@@ -34,12 +34,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from punto.api.console_state import (
+    MAX_ATTEMPTS,
     ConsoleStateError,
     ConsoleStateSnapshot,
     ConsoleStateStatus,
     ConsoleStateStore,
     GateRecord,
     StageRules,
+    TaskAttempt,
     TaskRecord,
     publication_of,
 )
@@ -69,7 +71,12 @@ from punto.schemas.build import BuildRequest
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
-from punto.workspace.target import DevelopmentTarget, DevelopmentTargetError
+from punto.workspace.target import (
+    DevelopmentTarget,
+    DevelopmentTargetError,
+    DevelopmentTargetRegistry,
+    load_development_targets,
+)
 
 __all__ = [
     "CONSOLE_HTML",
@@ -238,6 +245,9 @@ class ConsoleTask:
         self.commit_presence: dict[str, bool] = {}
         self.gates: list[UUID] = []
         self.runs = 0
+        #: Intento en curso: se abre al lanzar el ciclo y se cierra con su desenlace real.
+        self.attempt_started_at: datetime | None = None
+        self.attempts: list[TaskAttempt] = []
         self.notes: list[str] = []
         #: Momento en que la tarea se recuperó del estado durable (``None`` si nació en este
         #: proceso). No es una etapa: es la procedencia real de lo que se está viendo.
@@ -337,6 +347,9 @@ class ConsoleTask:
             ),
             "development": self.summary(),
             "publication": self.publication.as_dict() if self.publication else None,
+            # AP000-OBS-04-R1: un reintento tiene que ser visible; si no, dos intentos con el mismo
+            # desenlace son indistinguibles y parece que la tarea no se volvió a ejecutar.
+            "attempts": [item.model_dump(mode="json") for item in self.attempts],
             "notes": list(self.notes),
         }
 
@@ -352,6 +365,13 @@ class ConsoleDependencies:
     targets: Mapping[str, DevelopmentTarget]
     publisher_factory: Callable[[DevelopmentTarget], PublicationService] | None = None
     run_inline: bool = False
+    #: Relectura de la configuración de destinos **vigente** (AP000-OBS-04-R1).
+    #:
+    #: La consola compone sus destinos una vez, al arrancar; una corrección legítima de la
+    #: configuración confiable (baseline, alcance, verificación…) tiene que gobernar el intento
+    #: siguiente y no el proceso anterior. Es inyectable y por defecto ``None``: una composición
+    #: explícita (pruebas, integraciones) manda sobre lo que diga la máquina.
+    targets_reload: Callable[[], Mapping[str, DevelopmentTarget]] | None = None
     #: Entorno del que se lee el interlock de publicación (``PUNTO_PRODUCTION_PUSH``). Es una
     #: **lectura** de configuración del proceso, no el entorno de un comando hijo: la frontera de
     #: ejecución la construye ``build_sanitized_environment`` cuando de verdad se lanza un proceso.
@@ -474,7 +494,7 @@ def register_human_console(
     )
     def create_console_task(body: TaskCreateBody) -> dict[str, Any]:
         """Crea la tarea y lanza el ciclo de desarrollo: una persona escribe, PUNTO ejecuta."""
-        target = _target_or_400(dependencies, body.target_id)
+        target = _refresh_target(dependencies, body.target_id)
         request = BuildRequest(
             objective=body.objective,
             target_repository=target.target_id,
@@ -536,6 +556,10 @@ def register_human_console(
         La identidad gobernada **no** cambia: es la misma solicitud, ejecutada otra vez. Cambiarla
         dejaría huérfanos los gates ya pedidos y el expediente de publicación —y duplicaría la
         entrada del registro—, que es justo lo que el estado durable no puede tolerar.
+
+        El intento se ejecuta con la **configuración vigente** del destino: si la causa del bloqueo
+        anterior ya se corrigió (por ejemplo el ``baseline_sha``), el reintento lo evalúa y puede
+        avanzar. No se salta ningún guard, ni la política, ni el QA: se vuelve a pasar por todos.
         """
         task = _task_or_404(tasks, task_id)
         if task.stage == ConsoleStage.REJECTED.value:
@@ -543,7 +567,7 @@ def register_human_console(
                 status.HTTP_409_CONFLICT,
                 detail="la tarea fue rechazada por una persona: no se reanuda",
             )
-        target = _target_or_400(dependencies, task.target_id)
+        target = _refresh_target(dependencies, task.target_id)
         request = BuildRequest(
             request_id=task.task_id,
             objective=task.objective,
@@ -784,6 +808,7 @@ def register_human_console(
         """Ejecuta el ciclo de desarrollo y refleja su resultado en la tarea."""
         task.set_stage(ConsoleStage.DEVELOPING)
         task.runs += 1
+        _open_attempt(task)
 
         def work() -> None:
             # El estado gobernado se persiste en cuanto el ciclo termina —bien o mal—, para que un
@@ -793,9 +818,11 @@ def register_human_console(
                     result = deps.dev_cycle.run(request)
                 except Exception as exc:  # el ciclo no debe tumbar la consola
                     task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, f"el ciclo falló: {exc}")
+                    _close_attempt(task, result=None, error=f"el ciclo falló: {exc}")
                     return
                 task.result = result
                 _reflect(task, result, deps)
+                _close_attempt(task, result=result)
             finally:
                 persist()
 
@@ -993,6 +1020,43 @@ def register_human_console(
 
 # --------------------------------------------------------------------- auxiliares
 # ------------------------------------------------- estado durable (AP000-OBS-01)
+def _refresh_target(dependencies: ConsoleDependencies, target_id: str) -> DevelopmentTarget:
+    """Relee la configuración vigente del destino antes de ejecutar el ciclo (AP000-OBS-04-R1).
+
+    La consola y el ciclo reciben sus destinos **una vez**, al componerse; si una persona corrige
+    legítimamente la configuración confiable (por ejemplo el ``baseline_sha`` de un destino cuyo
+    árbol avanzó), el intento siguiente tiene que evaluar esa configuración, no la copia que quedó
+    en memoria al arrancar. Aquí se relee y se actualizan los dos registros —el de la consola y el
+    del ciclo— para que el intento use el mismo destino en todas sus fases.
+
+    Falla cerrado: si la configuración no se puede leer o el destino ya no está registrado, se
+    rechaza la ejecución con la causa real en vez de seguir con la configuración vieja.
+
+    Returns:
+        El destino vigente.
+
+    Raises:
+        HTTPException: 409 si la configuración no se puede releer o el destino desapareció.
+    """
+    if dependencies.targets_reload is None:
+        return _target_or_400(dependencies, target_id)
+    try:
+        fresh = dict(dependencies.targets_reload())
+    except DevelopmentTargetError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "no se pudo releer la configuración de destinos: "
+                f"{redact_secret_text(str(exc))[:300]}"
+            ),
+        ) from exc
+    dependencies.targets = fresh
+    cycle_targets = getattr(dependencies.dev_cycle, "targets", None)
+    if isinstance(cycle_targets, DevelopmentTargetRegistry):
+        cycle_targets.targets = fresh
+    return _target_or_400(dependencies, target_id)
+
+
 def _restore_console_state(
     store: ConsoleStateStore, dependencies: ConsoleDependencies, tasks: dict[str, ConsoleTask]
 ) -> ConsoleStateSnapshot:
@@ -1056,6 +1120,40 @@ def _log_state_event(
         return
 
 
+def _open_attempt(task: ConsoleTask) -> None:
+    """Abre el intento en curso: desde aquí hasta su desenlace, la tarea ejecuta el ciclo."""
+    task.attempt_started_at = utc_now()
+
+
+def _close_attempt(
+    task: ConsoleTask, *, result: DevelopmentResult | None, error: str = ""
+) -> None:
+    """Cierra el intento con el desenlace **real** del ciclo y lo añade al historial.
+
+    El historial es lo que permite distinguir un reintento de una tarea que no se volvió a ejecutar
+    cuando el desenlace es el mismo. Se acota a los últimos intentos: es auditoría operativa, no un
+    registro sin fin.
+    """
+    started = task.attempt_started_at or utc_now()
+    duracion = result.duration_ms if result is not None and result.duration_ms is not None else None
+    task.attempts = [
+        *task.attempts[-(MAX_ATTEMPTS - 1) :],
+        TaskAttempt(
+            run=max(task.runs, 1),
+            started_at=started,
+            status=result.status.value if result is not None else "CYCLE_ERROR",
+            error_kind=(
+                result.error_kind
+                if result is not None
+                else _redacted(error or "el ciclo falló", 40)
+            ),
+            commit_sha=result.commit_sha if result is not None else "",
+            duration_ms=duracion,
+        ),
+    ]
+    task.attempt_started_at = None
+
+
 def _task_record(task: ConsoleTask) -> TaskRecord:
     """Vista persistible de una tarea: estado gobernado y evidencia, sin contenido de ficheros."""
     return TaskRecord(
@@ -1071,6 +1169,7 @@ def _task_record(task: ConsoleTask) -> TaskRecord:
         finished_at=task.finished_at,
         runs=task.runs,
         notes=tuple(task.notes),
+        attempts=tuple(task.attempts),
         gate_ids=tuple(task.gates),
         result=task.result,
         publication=task.publication.as_dict() if task.publication is not None else None,
@@ -1097,6 +1196,7 @@ def _task_from_record(record: TaskRecord, recovered_at: datetime) -> ConsoleTask
     task.finished_at = record.finished_at
     task.runs = record.runs
     task.notes = list(record.notes)
+    task.attempts = list(record.attempts)
     task.gates = list(record.gate_ids)
     task.result = record.result
     task.publication = publication_of(record)
@@ -1597,4 +1697,7 @@ def _composition_from_engine(application: FastAPI) -> ConsoleDependencies:
         audit=engine.audit,
         policy=engine.policy_engine,
         targets=dict(registry.targets),
+        # AP000-OBS-04-R1: la configuración confiable se relee antes de cada intento, de modo que
+        # una corrección legítima del destino gobierne el intento siguiente y no el arranque.
+        targets_reload=lambda: load_development_targets(),
     )

@@ -1,0 +1,82 @@
+{
+  "CASE-B": {
+    "status_baseline": "DEVELOPMENT_VERIFICATION_FAILED",
+    "status_skill": "DEVELOPMENT_VERIFICATION_FAILED",
+    "skill_reference": "punto-causal-architect@0.1.0",
+    "success": {
+      "baseline": false,
+      "skill": false,
+      "delta": 0
+    },
+    "functional_chain_pass": {
+      "baseline": false,
+      "skill": false,
+      "delta": 0
+    },
+    "elapsed_ms": {
+      "baseline": 173536,
+      "skill": 203032,
+      "delta": 29496
+    },
+    "provider_calls": {
+      "baseline": 4,
+      "skill": 4,
+      "delta": 0
+    },
+    "repair_rounds": {
+      "baseline": 2,
+      "skill": 2,
+      "delta": 0
+    },
+    "scope_expansions": {
+      "baseline": 0,
+      "skill": 0,
+      "delta": 0
+    },
+    "tool_calls": {
+      "baseline": 4,
+      "skill": 4,
+      "delta": 0
+    },
+    "prompt_chars": {
+      "baseline": 13144,
+      "skill": 15906,
+      "delta": 2762
+    },
+    "context_chars": {
+      "baseline": 182,
+      "skill": 182,
+      "delta": 0
+    },
+    "files_read": {
+      "baseline": 3,
+      "skill": 3,
+      "delta": 0
+    },
+    "verification_count": {
+      "baseline": 2,
+      "skill": 2,
+      "delta": 0
+    },
+    "human_gates": {
+      "baseline": 0,
+      "skill": 0,
+      "delta": 0
+    },
+    "tokens_reales": {
+      "baseline": 16400,
+      "skill": 15519
+    },
+    "provider_calls_by_role": {
+      "baseline": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      },
+      "skill": {
+        "ARCHITECT": 1,
+        "BUILDER": 3
+      }
+    },
+    "skill_chars": 0
+  }
+}

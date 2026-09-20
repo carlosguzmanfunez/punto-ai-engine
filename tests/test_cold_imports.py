@@ -139,6 +139,9 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.workflow.providers",
     "punto.workflow.roles",
     "punto.workflow.state_machine",
+    # --- SKILL-LAYER-0: telemetría pasiva de eficiencia ------------------------
+    "punto.telemetry",
+    "punto.telemetry.efficiency",
 )
 
 

@@ -183,6 +183,11 @@ _ACTION_IMPACTS: Final[MappingProxyType[str, ActionImpact]] = MappingProxyType(
         "fix_bug": _AUTONOMOUS_IMPACT,
         "create_branch": _AUTONOMOUS_IMPACT,
         "create_commit": _AUTONOMOUS_IMPACT,
+        # PILOT-05: borrar o mover un fichero local del proyecto autorizado. Está catalogada
+        # porque el riesgo lo decide el sobre adaptativo: borrar algo preexistente exige
+        # autorización humana y borrar lo que el propio ciclo creó es deshacer
+        # (`irreversible_delete` sigue sin ser autónoma nunca).
+        "delete_file": _AUTONOMOUS_IMPACT,
         "create_documentation": _AUTONOMOUS_IMPACT,
         "simulate_failure": _AUTONOMOUS_IMPACT,
         # ---------------------------------------------------------- LEVEL 1 ----

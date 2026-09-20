@@ -7,6 +7,23 @@
 #
 # IMPORTANTE: estos límites son techos de nivel. Si la ActionRequest declara un
 # presupuesto más estricto, prevalece el más restrictivo de los dos.
+#
+# IMPORTANTE (PILOT-05): `max_files_changed` es un PRESUPUESTO ANTI-RUNAWAY, no
+# la frontera de autoridad. La frontera de autoridad la decide el riesgo
+# efectivo: `config/risk-rules.yaml` (autonomous_max_level: MEDIUM; HIGH y
+# CRITICAL exigen Human Gate) más el sobre adaptativo
+# (`punto.policy.envelope.AdaptiveAuthorityEnvelope`). Un cambio local,
+# reversible, verificable, sin secretos, sin producción y sin efecto externo no
+# deja de ser autónomo porque crezca de 5 a 6, 10 o 15 archivos: deja de serlo
+# cuando sube el riesgo. Los dos números deben decir lo mismo, así que el techo
+# del nivel 0 coincide con el umbral `medium.max_files_changed` de
+# `risk-rules.yaml`: por encima de él el riesgo calculado pasa a HIGH y exige
+# Human Gate. Antes de PILOT-05 el nivel 0 fijaba 5 archivos mientras el modelo
+# de riesgo ya consideraba autónomo hasta 20: dos reglas constitucionales
+# contradictorias, y la más restrictiva bloqueaba trabajo de bajo riesgo.
+# Cambiar esta configuración es una decisión HUMANA (para el ciclo, modificar
+# budgets.yaml es autoelevación de autoridad): el ciclo no puede hacerlo por su
+# cuenta y hay una prueba que lo demuestra.
 # ============================================================================
 
 version: "0.1.0"
@@ -25,7 +42,7 @@ levels:
   0:
     max_cost_usd: 1.0
     max_execution_minutes: 15
-    max_files_changed: 5
+    max_files_changed: 20
     max_attempts: 3
   1:
     max_cost_usd: 5.0

@@ -431,8 +431,14 @@ class GovernedRepository:
         *,
         paths: Sequence[str],
         description: str = "",
+        reversible: bool | None = None,
     ) -> None:
         """Comprueba autorización declarada y del catálogo de política.
+
+        ``reversible`` permite declarar un hecho **comprobable**: un borrado local cuyo contenido
+        está en el checkpoint del ciclo es reversible (se puede restaurar), y por tanto no tiene por
+        qué arrastrar el escalador de irreversibilidad. Por defecto se mantiene lo conservador: un
+        ``DELETE`` se declara irreversible salvo que quien lo pide pueda demostrar lo contrario.
 
         Raises:
             OperationNotAuthorizedError: si el destino no declara la operación.
@@ -446,7 +452,11 @@ class GovernedRepository:
             ActionRequest(
                 action=action,
                 technical=True,
-                reversible=operation is not RepositoryOperation.DELETE,
+                reversible=(
+                    (operation is not RepositoryOperation.DELETE)
+                    if reversible is None
+                    else reversible
+                ),
                 risk_level=RiskLevel.LOW,
                 production_impact=False,
                 legal_impact=False,
@@ -505,7 +515,13 @@ class GovernedRepository:
         self._log_file_changed(change)
         return change
 
-    def delete_file(self, path: str, *, expected_sha256: str | None = None) -> FileChange:
+    def delete_file(
+        self,
+        path: str,
+        *,
+        expected_sha256: str | None = None,
+        reversible: bool | None = None,
+    ) -> FileChange:
         """Elimina un fichero del alcance (solo si el destino autoriza DELETE).
 
         Raises:
@@ -519,7 +535,7 @@ class GovernedRepository:
         current = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else ""
         if expected_sha256 is not None and expected_sha256 != current:
             raise StaleWriteError(f"{relative}: huella distinta de la declarada")
-        self.authorize(RepositoryOperation.DELETE, paths=(relative,))
+        self.authorize(RepositoryOperation.DELETE, paths=(relative,), reversible=reversible)
         change = self._filesystem.delete_file(relative)
         self._log_file_changed(change)
         return change

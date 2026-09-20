@@ -316,6 +316,24 @@ class AuditEventType(StrEnum):
     DEV_PELL_INFLUENCE = "DEV_PELL_INFLUENCE"
     #: PILOT-04: el ciclo quedó bloqueado por la frontera de autoridad o de recursos.
     DEV_CYCLE_BLOCKED = "DEV_CYCLE_BLOCKED"
+    #: PILOT-05: PUNTO evaluó el riesgo efectivo de una operación (con las reglas disparadas).
+    DEV_RISK_EVALUATED = "DEV_RISK_EVALUATED"
+    #: PILOT-05: se pidió ampliar el alcance con evidencia causal.
+    DEV_SCOPE_EXPANSION_REQUESTED = "DEV_SCOPE_EXPANSION_REQUESTED"
+    #: PILOT-05: la expansión de alcance se aprobó de forma autónoma (misma clase de riesgo).
+    DEV_SCOPE_EXPANSION_APPROVED = "DEV_SCOPE_EXPANSION_APPROVED"
+    #: PILOT-05: la expansión se denegó o quedó en Human Gate.
+    DEV_SCOPE_EXPANSION_DENIED = "DEV_SCOPE_EXPANSION_DENIED"
+    #: PILOT-05: el plan se revisó (v1 → v2) con su delta de riesgo y su decisión.
+    DEV_PLAN_REVISED = "DEV_PLAN_REVISED"
+    #: PILOT-05: se identificó la causa raíz de un fallo con su evidencia.
+    DEV_ROOT_CAUSE_IDENTIFIED = "DEV_ROOT_CAUSE_IDENTIFIED"
+    #: PILOT-05: progreso de una ronda de reparación (hipótesis, estrategia y resultado).
+    DEV_REPAIR_PROGRESS = "DEV_REPAIR_PROGRESS"
+    #: PILOT-05: la reparación se estancó (mismo fallo y misma estrategia sin evidencia nueva).
+    DEV_STAGNATION_DETECTED = "DEV_STAGNATION_DETECTED"
+    #: PILOT-05: la cadena funcional completa quedó verificada extremo a extremo.
+    DEV_FUNCTIONAL_CHAIN_VERIFIED = "DEV_FUNCTIONAL_CHAIN_VERIFIED"
 
 
 class AuditEvent(BaseModel):

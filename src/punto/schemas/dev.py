@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Final, Literal
+from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -62,11 +62,26 @@ class RepositoryOperation(StrEnum):
 
 
 class ChangeOperation(StrEnum):
-    """Operación de un cambio propuesto sobre un fichero."""
+    """Operación de un cambio propuesto sobre un fichero.
+
+    ``RENAME`` y ``MOVE`` son la misma primitiva local —cambiar un recurso de sitio dentro del
+    proyecto— y se distinguen porque el proveedor declara su intención: un renombrado conserva el
+    directorio y un movimiento lo cambia. Las dos son reversibles con el checkpoint del ciclo.
+    """
 
     CREATE = "CREATE"
     MODIFY = "MODIFY"
     DELETE = "DELETE"
+    RENAME = "RENAME"
+    MOVE = "MOVE"
+
+
+class ExpansionStatus(StrEnum):
+    """Veredicto del sobre adaptativo sobre una expansión de alcance."""
+
+    AUTO_APPROVED = "AUTO_APPROVED"
+    HUMAN_GATE = "HUMAN_GATE_REQUIRED"
+    DENIED = "DENIED"
 
 
 class PlanStatus(StrEnum):
@@ -142,11 +157,16 @@ class FileChangeProposal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     path: str = Field(description="Ruta relativa del fichero.")
-    operation: ChangeOperation = Field(description="Crear, modificar o borrar.")
+    operation: ChangeOperation = Field(description="Crear, modificar, borrar, renombrar o mover.")
+    source_path: str | None = Field(
+        default=None,
+        max_length=MAX_PATH_CHARS,
+        description="Origen en RENAME/MOVE. Debe estar vacío en el resto de operaciones.",
+    )
     content: str | None = Field(
         default=None,
         max_length=MAX_CONTENT_CHARS,
-        description="Contenido exacto para CREATE/MODIFY. Nunca para DELETE.",
+        description="Contenido exacto para CREATE/MODIFY. Nunca para DELETE/RENAME/MOVE.",
     )
     expected_sha256: str | None = Field(
         default=None,
@@ -161,11 +181,11 @@ class FileChangeProposal(BaseModel):
         default="", max_length=MAX_ITEM_CHARS, description="Criterio del encargo que satisface."
     )
 
-    @field_validator("path")
+    @field_validator("path", "source_path")
     @classmethod
-    def validate_path(cls, value: str) -> str:
+    def validate_path(cls, value: str | None) -> str | None:
         """Acepta solo rutas declarables."""
-        return _clean_path(value)
+        return None if value is None else _clean_path(value)
 
     @model_validator(mode="after")
     def validate_shape(self) -> FileChangeProposal:
@@ -174,10 +194,16 @@ class FileChangeProposal(BaseModel):
         Raises:
             ValueError: si la combinación de operación y contenido no tiene sentido.
         """
-        if self.operation is ChangeOperation.DELETE:
+        if self.operation in (ChangeOperation.DELETE, ChangeOperation.RENAME, ChangeOperation.MOVE):
             if self.content is not None:
-                raise ValueError("un borrado no lleva contenido")
+                raise ValueError(f"la operación {self.operation.value} no lleva contenido")
+            if self.operation is not ChangeOperation.DELETE and not self.source_path:
+                raise ValueError(f"la operación {self.operation.value} exige un origen")
+            if self.operation is ChangeOperation.RENAME and self.source_path == self.path:
+                raise ValueError("un renombrado no puede dejar el fichero donde estaba")
             return self
+        if self.source_path is not None:
+            raise ValueError(f"la operación {self.operation.value} no declara origen")
         if self.content is None:
             raise ValueError(f"la operación {self.operation.value} exige contenido")
         if not self.content.strip():
@@ -194,6 +220,14 @@ class DevelopmentPlan(BaseModel):
     files_to_read: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
     files_to_modify: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
     files_to_create: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    files_to_delete: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_PLAN_ITEMS,
+        description=(
+            "Rutas que el plan declara borrar o mover. Un borrado de algo que ya existía exige "
+            "autorización humana; el de algo que creó este mismo ciclo es revertir."
+        ),
+    )
     verification_commands: tuple[str, ...] = Field(
         default=(),
         max_length=MAX_VERIFICATION_COMMANDS,
@@ -201,8 +235,13 @@ class DevelopmentPlan(BaseModel):
     )
     risks: tuple[str, ...] = Field(default=(), max_length=MAX_RISKS)
     acceptance_mapping: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    functional_chain: tuple[FunctionalChainStep, ...] = Field(
+        default=(),
+        max_length=MAX_PLAN_ITEMS,
+        description="Cadena funcional que el plan completa, eslabón a eslabón.",
+    )
 
-    @field_validator("files_to_read", "files_to_modify", "files_to_create")
+    @field_validator("files_to_read", "files_to_modify", "files_to_create", "files_to_delete")
     @classmethod
     def validate_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         """Normaliza y deduplica rutas declaradas."""
@@ -229,8 +268,84 @@ class DevelopmentPlan(BaseModel):
         return tuple(cleaned)
 
     def touched_paths(self) -> tuple[str, ...]:
-        """Rutas que el plan declara escribir, en orden estable."""
-        return tuple(dict.fromkeys((*self.files_to_modify, *self.files_to_create)))
+        """Rutas que el plan declara escribir o borrar, en orden estable."""
+        return tuple(
+            dict.fromkeys(
+                (*self.files_to_modify, *self.files_to_create, *self.files_to_delete)
+            )
+        )
+
+
+class FunctionalChainStep(BaseModel):
+    """Un eslabón de la cadena funcional que el objetivo exige completar.
+
+    El plan no se valida solo porque «compile»: declara qué cadena funcional resuelve (fuente
+    canónica → consumidores → comportamiento → pruebas → build) y con qué verificación del catálogo
+    se comprueba cada eslabón. PUNTO exige que cada paso cite una verificación real del destino.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    step: str = Field(min_length=1, max_length=MAX_ITEM_CHARS)
+    description: str = Field(default="", max_length=MAX_ITEM_CHARS)
+    verification: str = Field(
+        min_length=1, max_length=MAX_ITEM_CHARS, description="Nombre del catálogo del destino."
+    )
+
+
+class ScopeExpansionRecord(BaseModel):
+    """Registro de una ampliación de alcance, con la causa que la justifica.
+
+    Es la pieza que separa **scope expansion** de **authority escalation**: sin evidencia causal y
+    sin relación declarada con el objetivo original, no hay expansión posible.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    trigger: str = Field(default="evidencia de verificación", max_length=MAX_ITEM_CHARS)
+    evidence: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    root_cause: str = Field(default="", max_length=MAX_ITEM_CHARS)
+    new_resources: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    operations: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    relationship_to_original_objective: str = Field(default="", max_length=MAX_ITEM_CHARS)
+    risk_before: str = Field(default="", max_length=40)
+    risk_after: str = Field(default="", max_length=40)
+    authority_decision: str = Field(default="", max_length=40)
+    verification_required: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    cumulative_resources: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    status: ExpansionStatus = Field(default=ExpansionStatus.DENIED)
+
+
+class PlanRevisionRecord(BaseModel):
+    """Versión del plan con el delta que la produjo."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    plan_version: int = Field(ge=1)
+    parent_version: int = Field(default=0, ge=0)
+    reason: str = Field(default="", max_length=MAX_ITEM_CHARS)
+    evidence: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    added_resources: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    removed_resources: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    changed_operations: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    risk_before: str = Field(default="", max_length=40)
+    risk_after: str = Field(default="", max_length=40)
+    authority_result: str = Field(default="", max_length=40)
+
+
+class AuthorityDecisionRecord(BaseModel):
+    """Decisión de autoridad tomada durante el ciclo, con las reglas que la sostienen."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    operation: str = Field(max_length=60)
+    outcome: str = Field(max_length=40)
+    authority_class: str = Field(max_length=40)
+    risk: str = Field(max_length=20)
+    rules: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    reasons: tuple[str, ...] = Field(default=(), max_length=MAX_RISKS)
+    resources: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    required_evidence: tuple[str, ...] = Field(default=(), max_length=MAX_RISKS)
 
 
 class AppliedChange(BaseModel):
@@ -297,6 +412,15 @@ class DevelopmentResult(BaseModel):
     commit_sha: str = Field(default="", max_length=64)
     pell_status: str = Field(default="DISABLED", max_length=20)
     pell_influence: tuple[PellInfluence, ...] = ()
+    #: PILOT-05: alcance inicial y final, versiones del plan, sobres de riesgo, expansiones y
+    #: decisiones de autoridad. Es la evidencia que hace auditable la autonomía adaptativa.
+    initial_scope: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    final_scope: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    plan_versions: tuple[PlanRevisionRecord, ...] = ()
+    risk_envelopes: tuple[dict[str, Any], ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    scope_expansions: tuple[ScopeExpansionRecord, ...] = ()
+    authority_decisions: tuple[AuthorityDecisionRecord, ...] = ()
+    functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
     duration_ms: int | None = Field(default=None, ge=0)
@@ -368,6 +492,17 @@ class DevelopmentResult(BaseModel):
             "error": self.error,
             "authority": self.authority,
             "published": self.published,
+            "initial_scope": list(self.initial_scope),
+            "final_scope": list(self.final_scope),
+            "plan_versions": [item.model_dump(mode="json") for item in self.plan_versions],
+            "risk_envelopes": [dict(item) for item in self.risk_envelopes],
+            "scope_expansions": [
+                item.model_dump(mode="json") for item in self.scope_expansions
+            ],
+            "authority_decisions": [
+                item.model_dump(mode="json") for item in self.authority_decisions
+            ],
+            "functional_chain_result": self.functional_chain_result,
         }
 
 
@@ -378,14 +513,19 @@ __all__ = [
     "MAX_PATH_CHARS",
     "MAX_PLAN_ITEMS",
     "AppliedChange",
+    "AuthorityDecisionRecord",
     "ChangeOperation",
     "CommandEvidence",
     "ContextRequest",
     "DevelopmentPlan",
     "DevelopmentResult",
     "DevelopmentStatus",
+    "ExpansionStatus",
     "FileChangeProposal",
+    "FunctionalChainStep",
     "PellInfluence",
+    "PlanRevisionRecord",
     "PlanStatus",
     "RepositoryOperation",
+    "ScopeExpansionRecord",
 ]

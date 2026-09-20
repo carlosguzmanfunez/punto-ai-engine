@@ -53,6 +53,16 @@ from punto.memory.retrieval import (
     render_experience_block,
 )
 from punto.memory.store import ExperienceStore
+from punto.policy.config_loader import ConfigLoader
+from punto.policy.envelope import (
+    AUTONOMOUS_MAX_FILES,
+    AdaptiveAuthorityEnvelope,
+    EnvelopeOperation,
+    Environment,
+    OperationRisk,
+    Provenance,
+    VerificationStrength,
+)
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.contract import (
     ProviderRequest,
@@ -66,16 +76,20 @@ from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest, BuildValidationIssue
 from punto.schemas.dev import (
     AppliedChange,
+    AuthorityDecisionRecord,
     ChangeOperation,
     CommandEvidence,
     ContextRequest,
     DevelopmentPlan,
     DevelopmentResult,
     DevelopmentStatus,
+    ExpansionStatus,
     FileChangeProposal,
     PellInfluence,
+    PlanRevisionRecord,
     PlanStatus,
     RepositoryOperation,
+    ScopeExpansionRecord,
 )
 from punto.schemas.enums import AuditResult
 from punto.schemas.execution import CommandResult
@@ -166,15 +180,29 @@ class _ApplyAborted(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class DevelopmentConfig:
-    """Límites del ciclo: los fija PUNTO, no la solicitud."""
+    """Límites del ciclo: los fija PUNTO, no la solicitud.
+
+    ``max_files_changed`` es un **presupuesto anti-runaway**, no la frontera de autoridad: la
+    autoridad la decide el sobre adaptativo por riesgo efectivo. El número sigue existiendo para que
+    ninguna tarea se convierta en un barrido del repositorio y para que el ciclo tenga un techo duro
+    declarado.
+    """
 
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     max_context_files: int = MAX_CONTEXT_FILES
     max_context_file_chars: int = MAX_CONTEXT_FILE_CHARS
     max_context_total_chars: int = MAX_CONTEXT_TOTAL_CHARS
-    max_files_changed: int = 12
+    max_files_changed: int = AUTONOMOUS_MAX_FILES
     max_repair_rounds: int = 3
     max_context_rounds: int = 2
+    #: Rondas seguidas con el mismo fallo y la misma estrategia antes de declarar estancamiento.
+    stagnation_limit: int = 2
+    #: Techo acumulado de recursos distintos para toda la sesión (anti-fragmentación).
+    session_ceiling: int = AUTONOMOUS_MAX_FILES * 3
+    #: Permitir que el BUILDER pida ampliar alcance con evidencia causal.
+    allow_scope_expansion: bool = True
+    #: Exigir que el plan declare la cadena funcional que completa.
+    require_functional_chain: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,11 +235,81 @@ class DevelopmentCycle:
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
     _last_provider: str = field(default="", init=False, repr=False)
     _last_model: str = field(default="", init=False, repr=False)
+    _envelope: AdaptiveAuthorityEnvelope | None = field(default=None, init=False, repr=False)
+    #: Evidencia de PILOT-05: autoridad, riesgo, versiones del plan y expansiones del ciclo.
+    _authority_decisions: list[AuthorityDecisionRecord] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _risk_envelopes: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _plan_versions: list[PlanRevisionRecord] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _scope_expansions: list[ScopeExpansionRecord] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _cumulative_resources: set[str] = field(default_factory=set, init=False, repr=False)
+    _created_paths: set[str] = field(default_factory=set, init=False, repr=False)
+    _final_plan: DevelopmentPlan | None = field(default=None, init=False, repr=False)
+    _functional_chain_result: str = field(default="", init=False, repr=False)
+    _last_root_cause: str = field(default="", init=False, repr=False)
+    _last_risk: str = field(default="", init=False, repr=False)
+
+    def _reset_run_state(self) -> None:
+        """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
+        self._authority_decisions.clear()
+        self._risk_envelopes.clear()
+        self._plan_versions.clear()
+        self._scope_expansions.clear()
+        self._cumulative_resources.clear()
+        self._created_paths.clear()
+        self._functional_chain_result = ""
+        self._final_plan = None
+        self._last_root_cause = ""
+        self._last_risk = ""
+        self._snapshots = None
+        self._checkpoint = None
+
+    @property
+    def envelope(self) -> AdaptiveAuthorityEnvelope:
+        """Sobre de autoridad adaptativo del ciclo, construido desde la constitución.
+
+        Las rutas constitucionales **no** se inventan aquí: se leen de ``config/constitution.yaml``
+        (``protected_files`` + ``additional_protected_paths``) y de ``config/permissions.yaml``
+        (``self_elevation.targets``), que son las que ya declaran qué recursos cambian las reglas
+        con las que PUNTO decide su propia autoridad.
+        """
+        if self._envelope is None:
+            loader = ConfigLoader()
+            declaration = loader.load("constitution")
+            permissions = loader.load("permissions")
+            declared: list[str] = []
+            raw_protected = declaration.get("protected_files", [])
+            if isinstance(raw_protected, list):
+                for entry in raw_protected:
+                    if isinstance(entry, dict) and "path" in entry:
+                        declared.append(str(entry["path"]))
+                    elif isinstance(entry, str):
+                        declared.append(entry)
+            additional = declaration.get("additional_protected_paths", [])
+            if isinstance(additional, list):
+                declared.extend(str(item) for item in additional)
+            elevation = permissions.get("self_elevation", {})
+            if isinstance(elevation, dict):
+                targets = elevation.get("targets", [])
+                if isinstance(targets, list):
+                    declared.extend(str(item) for item in targets)
+            self._envelope = AdaptiveAuthorityEnvelope(
+                constitutional_paths=declared,
+                max_files=self.config.max_files_changed,
+                session_ceiling=self.config.session_ceiling,
+            )
+        return self._envelope
 
     # ------------------------------------------------------------------ público
     def run(self, request: BuildRequest) -> DevelopmentResult:
         """Ejecuta el ciclo completo sobre el destino de la solicitud."""
         started = time.perf_counter()
+        self._reset_run_state()
         target = self._target_or_none(request)
         if target is None:
             return self._blocked(
@@ -295,21 +393,7 @@ class DevelopmentCycle:
                 retrieval=retrieval,
                 started=started,
             )
-        self._log(
-            AuditEventType.DEV_PLAN_CREATED,
-            "dev_plan_created",
-            request,
-            {
-                "touched": list(plan.touched_paths()),
-                "verification": list(plan.verification_commands),
-            },
-        )
-        self._log(
-            AuditEventType.DEV_PLAN_VALIDATED,
-            "dev_plan_validated",
-            request,
-            {"touched": len(plan.touched_paths()), "risks": len(plan.risks)},
-        )
+        self._final_plan = self._final_plan or plan
 
         outcome = self._build_and_apply(
             request=request,
@@ -324,7 +408,7 @@ class DevelopmentCycle:
             target,
             repository,
             status=outcome["status"],
-            plan=plan,
+            plan=outcome["plan"] or plan,
             plan_status=PlanStatus.VALID,
             plan_issues=(),
             change_issues=outcome["change_issues"],
@@ -343,6 +427,13 @@ class DevelopmentCycle:
             error=outcome["error"],
             provider=outcome["provider"],
             model=outcome["model"],
+            initial_scope=plan.touched_paths(),
+            final_scope=(outcome["plan"] or plan).touched_paths(),
+            plan_versions=tuple(outcome["plan_versions"]),
+            risk_envelopes=tuple(outcome["risk_envelopes"]),
+            scope_expansions=tuple(outcome["scope_expansions"]),
+            authority_decisions=tuple(outcome["authority_decisions"]),
+            functional_chain_result=outcome["functional_chain_result"],
         )
 
     # ------------------------------------------------------------------ destinos
@@ -534,6 +625,7 @@ class DevelopmentCycle:
         """
         issues: tuple[BuildValidationIssue, ...] = ()
         plan: DevelopmentPlan | None = None
+        created_logged = False
         for attempt in range(2):
             prompt = self._plan_prompt(
                 request, target, context_files, retrieval, rejection=issues, attempt=attempt
@@ -561,12 +653,54 @@ class DevelopmentCycle:
             except Exception as exc:  # el contrato del plan es la primera validación
                 issues = (BuildValidationIssue(code="PLAN_INVALID", detail=str(exc)[:300]),)
                 continue
+            if not created_logged:
+                self._log(
+                    AuditEventType.DEV_PLAN_CREATED,
+                    "dev_plan_created",
+                    request,
+                    {
+                        "touched": list(plan.touched_paths()),
+                        "verification": list(plan.verification_commands),
+                    },
+                )
+                created_logged = True
             issues = self._validate_plan(plan, target, request)
-            envelope = self._envelope_issue(plan, repository)
-            if envelope is not None:
-                issues = (*issues, envelope)
+            issues = (*issues, *self._authority_review(plan, repository, request, phase="plan"))
             if not issues:
+                self._log(
+                    AuditEventType.DEV_PLAN_VALIDATED,
+                    "dev_plan_validated",
+                    request,
+                    {
+                        "touched": len(plan.touched_paths()),
+                        "risks": len(plan.risks),
+                        "functional_chain": len(plan.functional_chain),
+                    },
+                )
+                self._final_plan = plan
+                self._cumulative_resources.update(plan.touched_paths())
+                self._plan_versions.append(
+                    PlanRevisionRecord(
+                        plan_version=1,
+                        parent_version=0,
+                        reason="plan inicial validado por PUNTO",
+                        evidence=tuple(plan.acceptance_mapping),
+                        added_resources=plan.touched_paths(),
+                        risk_before="LOW",
+                        risk_after=(
+                            self._authority_decisions[-1].risk
+                            if self._authority_decisions
+                            else ""
+                        ),
+                        authority_result=(
+                            self._authority_decisions[-1].outcome
+                            if self._authority_decisions
+                            else ""
+                        ),
+                    )
+                )
                 return plan, ()
+
         return plan, issues
 
     def _validate_plan(
@@ -598,6 +732,17 @@ class DevelopmentCycle:
                         detail=f"la verificación {name!r} no está en el catálogo del destino",
                     )
                 )
+        for step in plan.functional_chain:
+            if step.verification not in known:
+                issues.append(
+                    BuildValidationIssue(
+                        code="PLAN_UNKNOWN_CHAIN_VERIFICATION",
+                        detail=(
+                            f"el eslabón {step.step!r} cita la verificación "
+                            f"{step.verification!r}, que no está en el catálogo del destino"
+                        ),
+                    )
+                )
         if not plan.verification_commands:
             issues.append(
                 BuildValidationIssue(
@@ -610,6 +755,16 @@ class DevelopmentCycle:
                 BuildValidationIssue(
                     code="PLAN_WITHOUT_ACCEPTANCE",
                     detail="el plan no mapea ningún criterio de aceptación de la solicitud",
+                )
+            )
+        if self.config.require_functional_chain and len(touched) >= 2 and not plan.functional_chain:
+            issues.append(
+                BuildValidationIssue(
+                    code="PLAN_WITHOUT_FUNCTIONAL_CHAIN",
+                    detail=(
+                        "un plan que toca varios recursos debe declarar la cadena funcional que "
+                        "completa (fuente canónica → consumidores → comportamiento → verificación)"
+                    ),
                 )
             )
         for path in (*plan.files_to_read, *touched):
@@ -652,11 +807,342 @@ class DevelopmentCycle:
             return BuildValidationIssue(
                 code="PLAN_OUTSIDE_AUTHORITY",
                 detail=(
-                    f"el plan toca {len(touched)} fichero(s) y la autoridad del motor no "
+                    f"el plan toca {len(touched)} fichero(s) y la autoridad constitucional no "
                     f"alcanza para confirmarlos: {reason}"
                 )[:300],
             )
         return None
+
+    # --------------------------------------------------------- autoridad adaptativa
+    def _plan_profile(
+        self,
+        plan: DevelopmentPlan,
+        *,
+        operation: EnvelopeOperation = EnvelopeOperation.PLAN_APPLY,
+        resources: Sequence[str] | None = None,
+    ) -> OperationRisk:
+        """Perfil de riesgo del plan, con atributos que fija PUNTO a partir del plan validado.
+
+        El proveedor no declara ninguno de estos atributos: el riesgo, la procedencia y la fuerza de
+        la verificación los calcula el ciclo. Es lo que impide una escalada dirigida por prompt.
+        """
+        steps = len(plan.verification_commands)
+        strength = (
+            VerificationStrength.STRONG
+            if steps >= 3
+            else VerificationStrength.MODERATE
+            if steps
+            else VerificationStrength.NONE
+        )
+        return OperationRisk(
+            operation=operation,
+            resources=tuple(resources) if resources is not None else plan.touched_paths(),
+            environment=Environment.LOCAL,
+            reversible=True,
+            verification_strength=strength,
+            provenance=Provenance.PUNTO_POLICY,
+            evidence=tuple(plan.acceptance_mapping) or (plan.summary,),
+            description=plan.summary,
+        )
+
+    def _change_profile(
+        self, proposal: FileChangeProposal, *, created_by_cycle: bool
+    ) -> OperationRisk:
+        """Perfil de riesgo de un cambio concreto, deducido de su operación y su ruta."""
+        operation = {
+            ChangeOperation.CREATE: EnvelopeOperation.CREATE,
+            ChangeOperation.MODIFY: EnvelopeOperation.WRITE,
+            ChangeOperation.DELETE: EnvelopeOperation.DELETE,
+            ChangeOperation.RENAME: EnvelopeOperation.RENAME,
+            ChangeOperation.MOVE: EnvelopeOperation.MOVE,
+        }[proposal.operation]
+        evidence = tuple(
+            item for item in (proposal.reason, proposal.acceptance_criterion) if item
+        )
+        return OperationRisk(
+            operation=operation,
+            resources=tuple(
+                item for item in (proposal.source_path, proposal.path) if item
+            ),
+            environment=Environment.LOCAL,
+            reversible=True,
+            verification_strength=VerificationStrength.MODERATE,
+            destructive=proposal.operation is ChangeOperation.DELETE,
+            created_by_cycle=created_by_cycle,
+            provenance=Provenance.EVIDENCE if evidence else Provenance.PUNTO_POLICY,
+            evidence=evidence,
+            description=proposal.reason,
+        )
+
+    def _record_decision(
+        self, decision: Any, request: BuildRequest, *, phase: str
+    ) -> None:
+        """Registra una decisión de autoridad en el resultado y en la auditoría."""
+        profile: OperationRisk | None = decision.profile
+        record = AuthorityDecisionRecord(
+            operation=profile.operation.value if profile is not None else "",
+            outcome=decision.outcome.value,
+            authority_class=decision.authority_class.value,
+            risk=decision.risk.name,
+            rules=decision.rule_names,
+            reasons=decision.reasons,
+            resources=profile.resources if profile is not None else (),
+            required_evidence=decision.required_evidence,
+        )
+        self._authority_decisions.append(record)
+        if len(self._risk_envelopes) < 40:
+            self._risk_envelopes.append({"phase": phase, **decision.as_dict()})
+        self._log(
+            AuditEventType.DEV_RISK_EVALUATED,
+            "dev_risk_evaluated",
+            request,
+            {
+                "phase": phase,
+                "outcome": decision.outcome.value,
+                "authority_class": decision.authority_class.value,
+                "risk": decision.risk.name,
+                "rules": list(decision.rule_names),
+                "blast_radius": profile.blast_radius if profile is not None else 0,
+                "required_evidence": list(decision.required_evidence),
+            },
+        )
+
+    def _authority_review(
+        self,
+        plan: DevelopmentPlan,
+        repository: GovernedRepository,
+        request: BuildRequest,
+        *,
+        phase: str = "plan",
+    ) -> tuple[BuildValidationIssue, ...]:
+        """Revisa el plan completo contra el sobre adaptativo **y** contra la constitución.
+
+        Se toman los dos veredictos y manda el más restrictivo: el sobre adaptativo añade reglas de
+        riesgo, pero **nunca** relaja lo que el PolicyEngine deniega. El techo de archivos sigue
+        existiendo como presupuesto anti-runaway, no como frontera de autoridad.
+        """
+        issues: list[BuildValidationIssue] = []
+        decision = self.envelope.assess(self._plan_profile(plan))
+        self._record_decision(decision, request, phase=phase)
+        self._last_risk = decision.risk.name
+        constitutional = self._envelope_issue(plan, repository)
+        if constitutional is not None:
+            issues.append(constitutional)
+        if not decision.autonomous:
+            code = (
+                "PLAN_OUTSIDE_AUTHORITY"
+                if decision.prohibited
+                else "PLAN_REQUIRES_HUMAN"
+            )
+            issues.append(
+                BuildValidationIssue(
+                    code=code,
+                    detail=(
+                        f"el plan toca {len(plan.touched_paths())} recurso(s) y el sobre de "
+                        f"autoridad devuelve {decision.outcome.value} "
+                        f"({decision.authority_class.value}, riesgo {decision.risk.name}): "
+                        + "; ".join(decision.reasons)[:200]
+                    )[:300],
+                )
+            )
+        return tuple(issues)
+
+    def _handle_scope_expansion(
+        self,
+        *,
+        request: BuildRequest,
+        plan: DevelopmentPlan,
+        repository: GovernedRepository,
+        payload: Mapping[str, Any],
+        round_index: int,
+    ) -> tuple[DevelopmentPlan, str]:
+        """Evalúa una ampliación de alcance pedida por el BUILDER con evidencia causal.
+
+        La evidencia la produce una verificación real, no el proveedor: sin evidencia y sin relación
+        declarada con el objetivo, la expansión se rechaza. Con ellas, el sobre compara el riesgo
+        **acumulado** antes y después y decide: misma clase de riesgo ⇒ autónoma (plan v2);
+        frontera protegida o techo de sesión ⇒ Human Gate; recurso constitucional ⇒ denegada.
+
+        Returns:
+            El plan vigente (v2 si se aprobó) y el desenlace: ``APPROVED``, ``DENIED`` o
+            ``HUMAN_GATE``.
+        """
+        trigger = str(payload.get("trigger") or "evidencia de verificación")[:300]
+        root_cause = str(payload.get("root_cause") or "")[:300]
+        relationship = str(payload.get("relationship") or "")[:300]
+        evidence = _text_tuple(payload.get("evidence"))
+        requested = _text_tuple(payload.get("resources"))
+        operations = _text_tuple(payload.get("operations")) or ("write",)
+        self._log(
+            AuditEventType.DEV_SCOPE_EXPANSION_REQUESTED,
+            "dev_scope_expansion_requested",
+            request,
+            {
+                "round": round_index,
+                "trigger": trigger,
+                "resources": list(requested),
+                "evidence": list(evidence),
+                "root_cause": root_cause,
+            },
+            AuditResult.FAILURE,
+        )
+        if not requested:
+            self._log(
+                AuditEventType.DEV_SCOPE_EXPANSION_DENIED,
+                "dev_scope_expansion_denied",
+                request,
+                {"reason": "la petición no declara recursos nuevos"},
+                AuditResult.FAILURE,
+            )
+            return plan, "DENIED"
+
+        additions: dict[str, list[str]] = {"files_to_modify": [], "files_to_create": []}
+        for item in requested:
+            cleaned = item.replace("\\", "/")
+            if cleaned in additions["files_to_create"] or cleaned in additions["files_to_modify"]:
+                continue
+            bucket = "files_to_create" if not repository.exists(cleaned) else "files_to_modify"
+            additions[bucket].append(cleaned)
+        requested_resources = (*plan.touched_paths(), *requested)
+        profile = self._plan_profile(
+            plan,
+            operation=EnvelopeOperation.SCOPE_EXPANSION,
+            resources=requested_resources,
+        )
+        decision = self.envelope.expansion(
+            self._plan_profile(plan),
+            profile,
+            evidence=evidence,
+            relationship=relationship,
+            trigger=trigger,
+            root_cause=root_cause,
+            cumulative_resources=sorted(self._cumulative_resources),
+        )
+        status = (
+            ExpansionStatus.AUTO_APPROVED
+            if decision.approved
+            else ExpansionStatus.HUMAN_GATE
+            if decision.outcome.value == "REQUIRE_HUMAN"
+            else ExpansionStatus.DENIED
+        )
+        record = ScopeExpansionRecord(
+            trigger=trigger,
+            evidence=evidence,
+            root_cause=root_cause,
+            new_resources=requested,
+            operations=operations,
+            relationship_to_original_objective=relationship,
+            risk_before=decision.delta.previous_risk.name,
+            risk_after=decision.delta.new_risk.name,
+            authority_decision=decision.outcome.value,
+            verification_required=tuple(
+                str(item) for item in decision.record.get("verification_required", ())
+            ),
+            cumulative_resources=tuple(
+                str(item) for item in decision.record.get("cumulative_resources", ())
+            ),
+            status=status,
+        )
+        self._scope_expansions.append(record)
+        self._record_decision(decision.decision, request, phase="scope_expansion")
+        if not decision.approved:
+            self._log(
+                AuditEventType.DEV_SCOPE_EXPANSION_DENIED,
+                "dev_scope_expansion_denied",
+                request,
+                {
+                    "resources": list(requested),
+                    "outcome": decision.outcome.value,
+                    "reasons": list(decision.reasons),
+                },
+                AuditResult.FAILURE,
+            )
+            return plan, "HUMAN_GATE" if status is ExpansionStatus.HUMAN_GATE else "DENIED"
+
+        revised = plan.model_copy(
+            update={
+                "files_to_create": (*plan.files_to_create, *additions["files_to_create"]),
+                "files_to_modify": (*plan.files_to_modify, *additions["files_to_modify"]),
+            }
+        )
+        version = len(self._plan_versions) + 1
+        self._plan_versions.append(
+            PlanRevisionRecord(
+                plan_version=version,
+                parent_version=version - 1,
+                reason=trigger,
+                evidence=evidence,
+                added_resources=tuple(requested),
+                removed_resources=(),
+                changed_operations=operations,
+                risk_before=decision.delta.previous_risk.name,
+                risk_after=decision.delta.new_risk.name,
+                authority_result=decision.outcome.value,
+            )
+        )
+        self._cumulative_resources.update(requested)
+        self._final_plan = revised
+        self._log(
+            AuditEventType.DEV_SCOPE_EXPANSION_APPROVED,
+            "dev_scope_expansion_approved",
+            request,
+            {
+                "plan_version": version,
+                "resources": list(requested),
+                "risk_before": decision.delta.previous_risk.name,
+                "risk_after": decision.delta.new_risk.name,
+                "relationship": relationship,
+            },
+        )
+        self._log(
+            AuditEventType.DEV_PLAN_REVISED,
+            "dev_plan_revised",
+            request,
+            {
+                "plan_version": version,
+                "parent_version": version - 1,
+                "added_resources": list(requested),
+                "touched": len(revised.touched_paths()),
+            },
+        )
+        return revised, "APPROVED"
+
+    def _verify_functional_chain(
+        self,
+        plan: DevelopmentPlan,
+        verification: Sequence[CommandEvidence],
+        request: BuildRequest,
+    ) -> tuple[bool, tuple[BuildValidationIssue, ...]]:
+        """Comprueba que cada eslabón de la cadena funcional quedó verificado de verdad."""
+        if not plan.functional_chain:
+            self._functional_chain_result = "NOT_DECLARED"
+            return True, ()
+        passed = {item.name for item in verification if item.passed}
+        pending = [step for step in plan.functional_chain if step.verification not in passed]
+        if pending:
+            issues = tuple(
+                BuildValidationIssue(
+                    code="FUNCTIONAL_CHAIN_STEP_UNVERIFIED",
+                    detail=(
+                        f"el eslabón {step.step!r} depende de la verificación "
+                        f"{step.verification!r}, que no pasó"
+                    ),
+                )
+                for step in pending
+            )
+            self._functional_chain_result = "FAILED"
+            return False, issues
+        self._functional_chain_result = "VERIFIED"
+        self._log(
+            AuditEventType.DEV_FUNCTIONAL_CHAIN_VERIFIED,
+            "dev_functional_chain_verified",
+            request,
+            {
+                "steps": [step.step for step in plan.functional_chain],
+                "verifications": sorted({step.verification for step in plan.functional_chain}),
+            },
+        )
+        return True, ()
 
     # ------------------------------------------------------------ build + apply
     def _build_and_apply(
@@ -698,6 +1184,10 @@ class DevelopmentCycle:
         provider = ""
         model = ""
         failure_evidence = ""
+        root_cause = ""
+        previous_signature = ""
+        previous_strategy: tuple[str, ...] = ()
+        stagnation_streak = 0
 
         for _ in range(self.config.max_repair_rounds + 1):
             prompt = self._build_prompt(
@@ -733,6 +1223,87 @@ class DevelopmentCycle:
                 )
                 failure_evidence = change_issues[0].detail
                 continue
+
+            # Causa raíz: en una reparación, sin hipótesis no se toca nada. Es la regla que impide
+            # el «patch until green»: cada ronda explica qué falló, por qué y qué espera conseguir.
+            root_cause, root_evidence, expected_effect = _root_cause(payload)
+            if rounds > 0:
+                if not root_cause:
+                    change_issues = (
+                        BuildValidationIssue(
+                            code="CHANGE_WITHOUT_ROOT_CAUSE",
+                            detail=(
+                                "una reparación sin causa raíz es un parche a ciegas: declara "
+                                "root_cause, evidence y expected_effect"
+                            ),
+                        ),
+                    )
+                    failure_evidence = change_issues[0].detail
+                    if rounds >= self.config.max_repair_rounds:
+                        # Nada de trabajo aplicado se queda sin verificar: si se corta aquí, se
+                        # revierte lo que sí se aplicó en rondas anteriores.
+                        rolled_back = self._rollback(
+                            request, checkpoint, repository, tuple(applied)
+                        )
+                        return self._outcome(
+                            status=DevelopmentStatus.CHANGE_REJECTED,
+                            error_kind="CHANGE_WITHOUT_ROOT_CAUSE",
+                            error=change_issues[0].detail,
+                            provider=provider,
+                            model=model,
+                            applied=() if rolled_back else applied,
+                            verification=verification,
+                            repair_rounds=rounds,
+                            granted=granted,
+                            denied=denied,
+                            checkpoint=checkpoint,
+                            influence=influence,
+                            change_issues=change_issues,
+                            rolled_back=rolled_back,
+                        )
+                    rounds += 1
+                    continue
+                self._log(
+                    AuditEventType.DEV_ROOT_CAUSE_IDENTIFIED,
+                    "dev_root_cause_identified",
+                    request,
+                    {
+                        "round": rounds,
+                        "root_cause": root_cause[:200],
+                        "evidence": list(root_evidence)[:5],
+                        "expected_effect": expected_effect[:200],
+                    },
+                )
+                self._last_root_cause = root_cause
+
+            # Expansión de alcance: solo con evidencia causal y dentro de la misma clase de riesgo.
+            expansion = _scope_expansion(payload)
+            if expansion is not None:
+                plan, expansion_status = self._handle_scope_expansion(
+                    request=request,
+                    plan=plan,
+                    repository=repository,
+                    payload=expansion,
+                    round_index=rounds,
+                )
+                if expansion_status == "HUMAN_GATE":
+                    return self._outcome(
+                        status=DevelopmentStatus.BLOCKED,
+                        error_kind="HUMAN_GATE_REQUIRED",
+                        error=(
+                            "la ampliación de alcance cruza una frontera que exige autorización "
+                            "humana: el ciclo se detiene sin tocar el recurso"
+                        ),
+                        provider=provider,
+                        model=model,
+                        applied=applied,
+                        verification=verification,
+                        repair_rounds=rounds,
+                        granted=granted,
+                        denied=denied,
+                        checkpoint=checkpoint,
+                        influence=influence,
+                    )
 
             # Peticiones de contexto: se conceden o se deniegan, y se vuelve a pedir el trabajo.
             requests = _context_requests(payload)
@@ -822,7 +1393,7 @@ class DevelopmentCycle:
                 )
 
             try:
-                applied.extend(self._apply(repository, validated, round_index=rounds))
+                round_applied = self._apply(repository, validated, round_index=rounds)
             except _ApplyAborted as aborted:
                 change_issues = (
                     BuildValidationIssue(
@@ -855,6 +1426,7 @@ class DevelopmentCycle:
                     change_issues=change_issues,
                     rolled_back=rolled_back,
                 )
+            applied.extend(round_applied)
             if rounds > 0:
                 self._log(
                     AuditEventType.DEV_REPAIR_COMPLETED,
@@ -863,7 +1435,8 @@ class DevelopmentCycle:
                     {"round": rounds, "changes": len(validated)},
                 )
             verification = self._verify(repository, target, plan, request)
-            if all(item.passed for item in verification):
+            chain_ok, chain_issues = self._verify_functional_chain(plan, verification, request)
+            if all(item.passed for item in verification) and chain_ok:
                 return self._outcome(
                     status=DevelopmentStatus.COMPLETED,
                     error_kind="",
@@ -879,7 +1452,77 @@ class DevelopmentCycle:
                     influence=influence,
                     change_issues=(),
                 )
+            if chain_issues:
+                change_issues = (*change_issues, *chain_issues)
+            signature = _failure_signature(verification)
+            strategy = tuple(
+                f"{item.path}:{item.operation.value}" for item in round_applied
+            )
+            stagnated = (
+                bool(previous_signature)
+                and signature == previous_signature
+                and strategy == previous_strategy
+            )
+            stagnation_streak = stagnation_streak + 1 if stagnated else 0
+            self._log(
+                AuditEventType.DEV_REPAIR_PROGRESS,
+                "dev_repair_progress",
+                request,
+                {
+                    "round": rounds,
+                    "failure_signature": signature,
+                    "hypothesis": root_cause[:200],
+                    "strategy": list(strategy),
+                    "changed_resources": [item.path for item in round_applied],
+                    "result": "FAILED",
+                    "progress": not stagnated,
+                },
+                AuditResult.FAILURE,
+            )
+            if stagnation_streak >= self.config.stagnation_limit:
+                self._log(
+                    AuditEventType.DEV_STAGNATION_DETECTED,
+                    "dev_stagnation_detected",
+                    request,
+                    {
+                        "round": rounds,
+                        "failure_signature": signature,
+                        "strategy": list(strategy),
+                        "streak": stagnation_streak,
+                    },
+                    AuditResult.FAILURE,
+                )
+                rolled_back = self._rollback(request, checkpoint, repository, tuple(applied))
+                return self._outcome(
+                    status=DevelopmentStatus.BLOCKED,
+                    error_kind="STAGNATION",
+                    error=(
+                        "la reparación repite el mismo fallo con la misma estrategia: se corta "
+                        "antes de gastar rondas en balde"
+                    ),
+                    provider=provider,
+                    model=model,
+                    applied=() if rolled_back else applied,
+                    verification=verification,
+                    repair_rounds=rounds,
+                    granted=granted,
+                    denied=denied,
+                    checkpoint=checkpoint,
+                    influence=influence,
+                    change_issues=change_issues,
+                    rolled_back=rolled_back,
+                )
+            previous_signature, previous_strategy = signature, strategy
             failure_evidence = self._failure_evidence(verification)
+            if chain_issues:
+                failure_evidence += "\nFUNCTIONAL CHAIN INCOMPLETE:\n" + "\n".join(
+                    f"- {issue.code}: {issue.detail}" for issue in chain_issues
+                )
+            if stagnated:
+                failure_evidence += (
+                    "\nSTAGNATION: the same failure with the same strategy. Change your "
+                    "hypothesis and your approach; do not repeat the previous patch."
+                )
             if rounds >= self.config.max_repair_rounds:
                 break
             rounds += 1
@@ -996,7 +1639,7 @@ class DevelopmentCycle:
         target: DevelopmentTarget,
         request: BuildRequest,
     ) -> tuple[tuple[FileChangeProposal, ...], tuple[BuildValidationIssue, ...]]:
-        """Valida cada cambio: alcance, operación, política, huella y secretos."""
+        """Valida cada cambio: alcance, operación, autoridad por riesgo, huella y secretos."""
         issues: list[BuildValidationIssue] = []
         validated: list[FileChangeProposal] = []
         declared = set(plan.touched_paths())
@@ -1012,16 +1655,25 @@ class DevelopmentCycle:
                 )
                 continue
             seen.add(path)
-            if path not in declared:
+            missing = [
+                item
+                for item in (path, proposal.source_path)
+                if item and item.replace("\\", "/") not in declared
+            ]
+            if missing:
                 issues.append(
                     BuildValidationIssue(
                         code="CHANGE_NOT_IN_PLAN",
-                        detail=f"{path!r} no está en el plan validado: no se aplica",
+                        detail=(
+                            f"{missing[0]!r} no está en el plan vigente: se aplica solo lo "
+                            "declarado, o se amplía el alcance con evidencia causal"
+                        ),
                     )
                 )
                 continue
             if (
-                proposal.operation is ChangeOperation.DELETE
+                proposal.operation in (ChangeOperation.DELETE, ChangeOperation.RENAME,
+                                       ChangeOperation.MOVE)
                 and RepositoryOperation.DELETE not in target.allowed_operations
             ):
                 issues.append(
@@ -1053,6 +1705,35 @@ class DevelopmentCycle:
                         )
                     )
                     continue
+                if proposal.operation in (ChangeOperation.RENAME, ChangeOperation.MOVE):
+                    source = (proposal.source_path or "").replace("\\", "/")
+                    if not repository.exists(source):
+                        issues.append(
+                            BuildValidationIssue(
+                                code="CHANGE_MISSING_SOURCE",
+                                detail=f"{source!r} no existe: no hay nada que mover",
+                            )
+                        )
+                        continue
+                    if exists:
+                        issues.append(
+                            BuildValidationIssue(
+                                code="CHANGE_ALREADY_EXISTS",
+                                detail=(
+                                    f"{path!r} ya existe: el destino del movimiento está ocupado"
+                                ),
+                            )
+                        )
+                        continue
+                    source_sha = repository.sha256(source)
+                    if proposal.expected_sha256 and proposal.expected_sha256 != source_sha:
+                        issues.append(
+                            BuildValidationIssue(
+                                code="CHANGE_STALE",
+                                detail=f"{source!r}: el fichero cambió desde que se leyó",
+                            )
+                        )
+                        continue
                 if proposal.expected_sha256 and proposal.expected_sha256 != current:
                     issues.append(
                         BuildValidationIssue(
@@ -1061,7 +1742,11 @@ class DevelopmentCycle:
                         )
                     )
                     continue
-                if proposal.operation is not ChangeOperation.DELETE:
+                if proposal.operation not in (
+                    ChangeOperation.DELETE,
+                    ChangeOperation.RENAME,
+                    ChangeOperation.MOVE,
+                ):
                     repository.assert_no_secrets_in_text(path, proposal.content or "")
             except SecretBoundaryViolation as exc:
                 issues.append(
@@ -1075,7 +1760,34 @@ class DevelopmentCycle:
                     )
                 )
                 continue
+            created = path in self._created_paths
+            decision = self.envelope.assess(
+                self._change_profile(proposal, created_by_cycle=created)
+            )
+            self._record_decision(decision, request, phase="change")
+            if not decision.autonomous:
+                issues.append(
+                    BuildValidationIssue(
+                        code=(
+                            "CHANGE_OUTSIDE_AUTHORITY"
+                            if decision.prohibited
+                            else "CHANGE_REQUIRES_HUMAN"
+                        ),
+                        detail=(
+                            f"{path!r}: el sobre de autoridad devuelve "
+                            f"{decision.outcome.value} ({decision.authority_class.value}, riesgo "
+                            f"{decision.risk.name}): " + "; ".join(decision.reasons)[:160]
+                        )[:300],
+                    )
+                )
+                continue
             validated.append(proposal)
+            self._cumulative_resources.add(path)
+            if proposal.operation is ChangeOperation.CREATE:
+                self._created_paths.add(path)
+            if proposal.operation in (ChangeOperation.DELETE, ChangeOperation.RENAME,
+                                      ChangeOperation.MOVE):
+                self._created_paths.discard((proposal.source_path or path).replace("\\", "/"))
         if not issues:
             self._log(
                 AuditEventType.DEV_CHANGE_VALIDATED,
@@ -1102,7 +1814,15 @@ class DevelopmentCycle:
         """
         if self._snapshots is None:
             self._snapshots = FileRepairSnapshots(target.repository)
-        paths = [item.path.replace("\\", "/") for item in validated]
+        # El checkpoint cubre **todo** lo que el ciclo puede cambiar, incluido el origen de un
+        # RENAME/MOVE: si no, revertir un movimiento dejaría el fichero borrado.
+        paths: list[str] = []
+        for proposal in validated:
+            candidates = (
+                proposal.path.replace("\\", "/"),
+                (proposal.source_path or "").replace("\\", "/"),
+            )
+            paths.extend(item for item in candidates if item)
         try:
             snapshot = self._snapshots.create(
                 repair_id=request.request_id,
@@ -1154,18 +1874,69 @@ class DevelopmentCycle:
             path = proposal.path.replace("\\", "/")
             try:
                 if proposal.operation is ChangeOperation.DELETE:
-                    change = repository.delete_file(path, expected_sha256=proposal.expected_sha256)
-                    digest = ""
-                    written = 0
-                else:
-                    change = repository.write_text(
-                        path,
-                        proposal.content or "",
-                        operation=proposal.operation,
-                        expected_sha256=proposal.expected_sha256,
-                    )
+                    # La huella del cambio es la del contenido **que se quitó**: es la evidencia,
+                    # no un hueco. Un borrado verificado conserva lo que había.
                     digest = repository.sha256(path)
-                    written = change.bytes_written
+                    change = repository.delete_file(
+                        path,
+                        expected_sha256=proposal.expected_sha256,
+                        reversible=self._checkpoint is not None,
+                    )
+                    applied.append(
+                        AppliedChange(
+                            path=path,
+                            operation=ChangeOperation.DELETE,
+                            bytes_written=0,
+                            sha256=digest,
+                            verified=change.verified,
+                            round_index=round_index,
+                        )
+                    )
+                    continue
+                if proposal.operation in (ChangeOperation.RENAME, ChangeOperation.MOVE):
+                    source = (proposal.source_path or "").replace("\\", "/")
+                    source_digest = repository.sha256(source)
+                    content = repository.read_text(source)
+                    created = repository.write_text(
+                        path,
+                        content,
+                        operation=ChangeOperation.CREATE,
+                        expected_sha256=None,
+                    )
+                    removed = repository.delete_file(
+                        source,
+                        expected_sha256=proposal.expected_sha256,
+                        reversible=self._checkpoint is not None,
+                    )
+                    applied.append(
+                        AppliedChange(
+                            path=path,
+                            operation=proposal.operation,
+                            bytes_written=created.bytes_written,
+                            sha256=repository.sha256(path),
+                            verified=created.verified and removed.verified,
+                            round_index=round_index,
+                        )
+                    )
+                    applied.append(
+                        AppliedChange(
+                            path=source,
+                            operation=ChangeOperation.DELETE,
+                            bytes_written=0,
+                            sha256=source_digest,
+                            verified=removed.verified,
+                            round_index=round_index,
+                        )
+                    )
+                    continue
+                change = repository.write_text(
+                    path,
+                    proposal.content or "",
+                    operation=proposal.operation,
+                    expected_sha256=proposal.expected_sha256,
+                )
+                digest = repository.sha256(path)
+                written = change.bytes_written
             except RepositoryDenied as exc:
                 raise _ApplyAborted(
                     code=getattr(exc, "code", "CHANGE_DENIED"),
@@ -1408,6 +2179,12 @@ class DevelopmentCycle:
             "provider": kwargs.get("provider", ""),
             "model": kwargs.get("model", ""),
             "change_issues": kwargs.get("change_issues", ()),
+            "authority_decisions": list(self._authority_decisions),
+            "risk_envelopes": list(self._risk_envelopes),
+            "plan_versions": list(self._plan_versions),
+            "scope_expansions": list(self._scope_expansions),
+            "functional_chain_result": self._functional_chain_result,
+            "plan": self._final_plan,
         }
 
     def _result(
@@ -1436,6 +2213,13 @@ class DevelopmentCycle:
         error: str = "",
         provider: str = "",
         model: str = "",
+        initial_scope: Sequence[str] = (),
+        final_scope: Sequence[str] = (),
+        plan_versions: Sequence[PlanRevisionRecord] = (),
+        risk_envelopes: Sequence[Mapping[str, Any]] = (),
+        scope_expansions: Sequence[ScopeExpansionRecord] = (),
+        authority_decisions: Sequence[AuthorityDecisionRecord] = (),
+        functional_chain_result: str = "",
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -1496,6 +2280,13 @@ class DevelopmentCycle:
             duration_ms=int((time.perf_counter() - started) * 1000),
             error_kind=error_kind,
             error=error,
+            initial_scope=tuple(initial_scope),
+            final_scope=tuple(final_scope),
+            plan_versions=tuple(plan_versions),
+            risk_envelopes=tuple(dict(item) for item in risk_envelopes),
+            scope_expansions=tuple(scope_expansions),
+            authority_decisions=tuple(authority_decisions),
+            functional_chain_result=functional_chain_result,
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,
@@ -1523,33 +2314,68 @@ class DevelopmentCycle:
         applied: Sequence[AppliedChange],
         verification: Sequence[CommandEvidence],
     ) -> PellInfluence | None:
-        """Registra el aprendizaje del ciclo y devuelve su influencia declarada."""
+        """Registra el aprendizaje del ciclo y devuelve su influencia declarada.
+
+        Solo entra a PELL una resolución **verificada** y con causa: la experiencia guarda el
+        problema, las condiciones en las que se resolvió, el patrón de resolución, la evidencia y el
+        resultado funcional. No se guarda «cambié el archivo X», y no se guarda nada de lo que el
+        proveedor afirmó sin evidencia del entorno.
+        """
         if self.store is None or not applied:
             return None
+        rounds = sum(1 for item in applied if item.round_index > 0)
         evidence = [
-            f"PILOT-04: {len(applied)} cambios aplicados y verificados en {target.target_id}",
+            f"PILOT-05: {len(applied)} cambios aplicados y verificados en {target.target_id}",
             "verificación: "
             + ", ".join(f"{item.name}={item.exit_code}" for item in verification),
             "rutas: " + ", ".join(item.path for item in applied),
+            f"causa raíz de la reparación: {self._last_root_cause or '(sin reparación)'}",
+            f"cadena funcional: {self._functional_chain_result or 'NOT_DECLARED'}",
         ]
+        conditions = (
+            "condiciones: entorno local, alcance autorizado, verificación del entorno en verde, "
+            f"reversible con checkpoint, sin secretos ni producción; riesgo {self._last_risk}; "
+            f"plan v{len(self._plan_versions)} con "
+            f"{len(self._final_plan.touched_paths()) if self._final_plan else 0} "
+            "recursos; autoridad LOCAL_APPLY_ONLY sin publicación"
+        )
         try:
             stored = self.store.record(
-                problem=f"aplicar cambios reales de forma gobernada en {target.target_id}",
-                context="PUNTO AI ENGINE, PILOT-04",
-                solution=(
-                    "el proveedor propone un plan y cambios estructurados; PUNTO valida alcance, "
-                    "operación, política, huella y secretos, crea un checkpoint reversible antes "
-                    "de escribir, aplica por una sola puerta, verifica con comandos del catálogo "
-                    "y confirma solo sus propias rutas"
+                problem=(
+                    "completar una cadena funcional de desarrollo de bajo riesgo sin fronteras "
+                    f"artificiales, en {target.target_id}"
                 ),
-                procedure=list(plan.files_to_modify) if plan else [],
+                context=conditions,
+                solution=(
+                    "PUNTO evalúa el riesgo efectivo del plan y de cada cambio (operación, "
+                    "recurso, alcance, reversibilidad, verificación, entorno, sensibilidad y "
+                    "efectos externos) en vez de contar archivos; amplía el alcance solo con "
+                    "evidencia causal y misma clase de riesgo; exige causa raíz en cada "
+                    "reparación; corta el bucle si se estanca; verifica la cadena funcional "
+                    "completa y confirma solo sus rutas"
+                ),
+                procedure=list(plan.touched_paths()) if plan else [],
                 result=ExperienceResult.SUCCESS,
                 verification=evidence,
-                tags=["desarrollo", "aplicacion", "gobernado", "checkpoint", "verificacion"],
+                tags=[
+                    "desarrollo",
+                    "autoridad-adaptativa",
+                    "riesgo",
+                    "cadena-funcional",
+                    "checkpoint",
+                    "verificacion",
+                ],
                 status=ExperienceStatus.VERIFIED,
             )
         except Exception:  # la memoria no puede tumbar un ciclo que ya está verificado
             return None
+        if rounds:
+            self._log(
+                AuditEventType.DEV_REPAIR_PROGRESS,
+                "dev_learning_from_repair",
+                request,
+                {"experience_id": stored.id, "repaired_changes": rounds},
+            )
         self._log(
             AuditEventType.DEV_PELL_INFLUENCE,
             "dev_pell_learned",
@@ -1715,13 +2541,23 @@ def _context_requests(payload: Mapping[str, Any]) -> tuple[ContextRequest, ...]:
 BUILD_CONTRACT: Final[str] = (
     "DELIVERABLE: a JSON object with EXACTLY these keys:\n"
     '{"summary": "one sentence", '
-    '"changes": [{"path": "relative/path", "operation": "CREATE|MODIFY|DELETE", '
+    '"changes": [{"path": "relative/path", "operation": "CREATE|MODIFY|DELETE|RENAME|MOVE", '
+    '"source_path": "origin for RENAME/MOVE", '
     '"content": "the FULL new file content", "reason": "why", '
     '"acceptance_criterion": "which criterion it satisfies"}], '
-    '"context_requests": [{"path": "relative/path", "reason": "why you need it"}]}\n'
-    "Rules: only paths declared in the validated plan; DELETE must not carry content; every change "
-    "needs the full file content and a reason; do not touch files outside the plan; do not include "
-    "credentials. You do not apply anything: PUNTO validates and applies."
+    '"context_requests": [{"path": "relative/path", "reason": "why you need it"}], '
+    '"root_cause": "REQUIRED when fixing a failure: its cause, not the symptom", '
+    '"evidence": ["the verification output that proves the cause"], '
+    '"expected_effect": "what will change once the cause is fixed", '
+    '"scope_expansion": {"trigger": "what revealed the need", '
+    '"evidence": ["environment evidence"], "root_cause": "why it belongs to this objective", '
+    '"resources": ["relative/path"], "operations": ["MODIFY"], '
+    '"relationship": "why this resource is part of the same functional chain"}}\n'
+    "Rules: only paths declared in the validated plan; DELETE/RENAME/MOVE must not carry content; "
+    "every change needs the full file content and a reason; do not touch files outside the plan; "
+    "do not include credentials. Ask for scope_expansion with evidence when the objective "
+    "genuinely requires another resource: PUNTO evaluates it and decides; it is not yours to "
+    "grant. You do not apply anything: PUNTO validates and applies."
 )
 
 #: Contrato del plan, escrito en el prompt además de en el ``json_schema``.
@@ -1732,12 +2568,18 @@ PLAN_CONTRACT: Final[str] = (
     '"files_to_read": ["relative/path"], '
     '"files_to_modify": ["relative/path"], '
     '"files_to_create": ["relative/path"], '
+    '"files_to_delete": ["relative/path"], '
     '"verification_commands": ["<nombre del catálogo>"], '
     '"risks": ["risk as text"], '
-    '"acceptance_mapping": ["which acceptance criterion this satisfies"]}\n'
+    '"acceptance_mapping": ["which acceptance criterion this satisfies"], '
+    '"functional_chain": [{"step": "canonical source|consumers|behaviour|tests|build", '
+    '"description": "what this link does", "verification": "<catalog name>"}]}\n'
     "Rules: every key is mandatory (use [] for none); every path is relative to the repository "
     "root and inside the allowed paths; files_to_modify must be non-empty; verification_commands "
-    "must name catalog entries, never a shell command. You have no authority to apply the plan."
+    "must name catalog entries, never a shell command; functional_chain is MANDATORY when the plan "
+    "touches more than one resource, and every link must cite a catalog verification that proves "
+    "There is no fixed file budget: the number of files is a signal, and the authority comes from "
+    "the risk of the change. You have no authority to apply the plan."
 )
 
 #: Instrucciones del worker: su papel no confiable y el formato de su entrega.
@@ -1759,9 +2601,22 @@ PLAN_SCHEMA: Final[Mapping[str, Any]] = {
         "files_to_read": {"type": "array", "items": {"type": "string"}},
         "files_to_modify": {"type": "array", "items": {"type": "string"}},
         "files_to_create": {"type": "array", "items": {"type": "string"}},
+        "files_to_delete": {"type": "array", "items": {"type": "string"}},
         "verification_commands": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "array", "items": {"type": "string"}},
         "acceptance_mapping": {"type": "array", "items": {"type": "string"}},
+        "functional_chain": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step": {"type": "string"},
+                    "description": {"type": "string"},
+                    "verification": {"type": "string"},
+                },
+                "required": ["step", "verification"],
+            },
+        },
     },
     "required": ["summary", "files_to_modify", "verification_commands", "acceptance_mapping"],
 }
@@ -1777,7 +2632,11 @@ BUILD_SCHEMA: Final[Mapping[str, Any]] = {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "operation": {"type": "string", "enum": ["CREATE", "MODIFY", "DELETE"]},
+                    "operation": {
+                        "type": "string",
+                        "enum": ["CREATE", "MODIFY", "DELETE", "RENAME", "MOVE"],
+                    },
+                    "source_path": {"type": "string"},
                     "content": {"type": "string"},
                     "expected_sha256": {"type": "string"},
                     "reason": {"type": "string"},
@@ -1794,10 +2653,87 @@ BUILD_SCHEMA: Final[Mapping[str, Any]] = {
                 "required": ["path"],
             },
         },
+        "root_cause": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "expected_effect": {"type": "string"},
+        "scope_expansion": {
+            "type": "object",
+            "properties": {
+                "trigger": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+                "root_cause": {"type": "string"},
+                "resources": {"type": "array", "items": {"type": "string"}},
+                "operations": {"type": "array", "items": {"type": "string"}},
+                "relationship": {"type": "string"},
+            },
+            "required": ["resources", "relationship", "evidence"],
+        },
         "notes": {"type": "string"},
     },
     "required": ["changes"],
 }
+
+
+def _text_tuple(value: Any, *, limit: int = 40) -> tuple[str, ...]:
+    """Interpreta una lista de textos (o un texto suelto) sin inventar contenido."""
+    if value is None:
+        return ()
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, (list, tuple)):
+        return ()
+    texts: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            texts.append(item.strip()[:400])
+        if len(texts) >= limit:
+            break
+    return tuple(texts)
+
+
+def _root_cause(payload: Mapping[str, Any]) -> tuple[str, tuple[str, ...], str]:
+    """Extrae la hipótesis de causa raíz de una respuesta del BUILDER.
+
+    Sin hipótesis no hay reparación: es la diferencia entre corregir la causa y cambiar cosas hasta
+    que el test deje de quejarse.
+    """
+    cause = payload.get("root_cause")
+    if isinstance(cause, Mapping):
+        cause = cause.get("cause") or cause.get("detail") or ""
+    root = str(cause or "").strip()[:400]
+    evidence = _text_tuple(payload.get("evidence"), limit=10)
+    expected = payload.get("expected_effect")
+    if isinstance(expected, Mapping):
+        expected = expected.get("effect") or ""
+    return root, evidence, str(expected or "").strip()[:400]
+
+
+def _scope_expansion(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Interpreta una petición de ampliación de alcance, si el BUILDER la declara."""
+    raw = payload.get("scope_expansion")
+    if not isinstance(raw, Mapping):
+        return None
+    return raw
+
+
+def _failure_signature(verification: Sequence[CommandEvidence]) -> str:
+    """Firma estable de un fallo: qué verificaciones fallaron y con qué salida.
+
+    Se normaliza la primera línea significativa de cada salida para que dos intentos con el mismo
+    error produzcan la misma firma, y un error distinto no.
+    """
+    parts: list[str] = []
+    for item in verification:
+        if item.passed:
+            continue
+        excerpt = (item.output_excerpt or "").strip().splitlines()
+        head = ""
+        for line in excerpt:
+            candidate = line.strip()
+            if candidate:
+                head = candidate[:120]
+                break
+        parts.append(f"{item.name}:{item.exit_code}:{head}")
+    return "|".join(parts) or "no-failure"
 
 
 def default_development_cycle(

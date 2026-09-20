@@ -66,6 +66,15 @@ actions:
     level: 0
     description: "Crear un commit local en la rama de trabajo."
     category: "git"
+  delete_file:
+    level: 0
+    description: >-
+      Borrar o mover un fichero local del proyecto autorizado, con checkpoint reversible. PILOT-05:
+      la operación local de borrado existe en el catálogo porque el riesgo lo decide el sobre
+      adaptativo, no el catálogo: borrar algo que ya existía exige autorización humana, borrar lo
+      que este mismo ciclo creó es deshacer, y borrar `irreversible_delete` sigue siendo otra cosa
+      (esa acción no es autónoma nunca).
+    category: "code"
   create_documentation:
     level: 0
     description: "Crear o actualizar documentación."

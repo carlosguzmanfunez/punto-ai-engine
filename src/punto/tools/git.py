@@ -24,6 +24,7 @@ from punto.schemas.execution import CommandRequest, CommandResult
 from punto.tools.errors import (
     BranchPolicyViolationError,
     DeveloperExecutionError,
+    WorkspaceNotResolvedError,
     WorkspaceViolationError,
 )
 from punto.tools.shell import ShellRunner
@@ -274,7 +275,9 @@ class GitWorkspace:
         workspace.
 
         Raises:
-            WorkspaceViolationError: si la raíz del repositorio no coincide.
+            WorkspaceNotResolvedError: si el sondeo de Git falla y el workspace **no se puede
+                resolver** como repositorio (con la orden, su código de salida y su salida).
+            WorkspaceViolationError: si la raíz del repositorio no coincide con el workspace.
         """
         if self._root_checked:
             return
@@ -287,11 +290,14 @@ class GitWorkspace:
         self._root_checked = True
 
         if result.exit_code != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise WorkspaceViolationError(
-                detail or "(sin repositorio Git)",
-                str(self._context.workspace_root),
-                "el workspace no es un repositorio Git",
+            # No se pudo **comprobar** el workspace: se dice tal cual, con la orden, su código de
+            # salida y su salida (o su ausencia). Presentarlo como una ruta huida sería inventar el
+            # diagnóstico: la ruta no huyó, el repositorio no se pudo resolver.
+            raise WorkspaceNotResolvedError(
+                workspace=str(self._context.workspace_root),
+                command="git rev-parse --show-toplevel",
+                exit_code=result.exit_code,
+                output=result.stderr or result.stdout,
             )
 
         top = result.stdout.strip()
@@ -300,6 +306,12 @@ class GitWorkspace:
                 top,
                 str(self._context.workspace_root),
                 "el repositorio Git no es el workspace autorizado",
+                rule="el repositorio Git debe ser exactamente el workspace autorizado",
+                resource="raíz del repositorio frente al workspace autorizado",
+                remedy=(
+                    "apunta el destino al repositorio correcto (no a un subdirectorio de otro "
+                    "repositorio) y vuelve a lanzar la tarea"
+                ),
             )
 
     def _run(self, name: str, args: list[str], label: str) -> str:

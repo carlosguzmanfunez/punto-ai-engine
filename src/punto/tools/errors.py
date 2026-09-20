@@ -23,16 +23,83 @@ class WorkspaceViolationError(DeveloperExecutionError):
     Cubre ``..``, rutas absolutas externas y escapes por enlace (symlink o
     junction). La detección se basa en resolver la ruta real, nunca en comparar
     cadenas.
+
+    La denegación puede declarar además la **regla** que la produjo, el **recurso** sobre el que se
+    decidió y **qué corresponde hacer**: lo escribe la frontera que conoce la regla (no la interfaz,
+    que solo lo muestra) para que la causa real llegue a quien opera.
     """
 
-    def __init__(self, candidate: str, workspace: str, detail: str = "") -> None:
+    #: Código estable de la denegación, para la evidencia y la interfaz.
+    code: str = "WORKSPACE_VIOLATION"
+
+    def __init__(
+        self,
+        candidate: str,
+        workspace: str,
+        detail: str = "",
+        *,
+        rule: str = "",
+        resource: str = "",
+        remedy: str = "",
+    ) -> None:
         self.candidate = candidate
         self.workspace = workspace
         self.detail = detail
+        self.rule = rule
+        self.resource = resource
+        self.remedy = remedy
         suffix = f" ({detail})" if detail else ""
         super().__init__(
             f"Ruta fuera del workspace autorizado: {candidate!r} no está dentro de "
             f"{workspace!r}{suffix}"
+        )
+
+
+class WorkspaceNotResolvedError(DeveloperExecutionError):
+    """El workspace autorizado **no se pudo resolver** como repositorio Git.
+
+    No es un intento de escape: es la propia comprobación de la frontera la que no se pudo
+    completar, porque el sondeo de Git falló. Se falla cerrado igual —no se opera sobre un workspace
+    que no se puede demostrar— pero el mensaje dice lo que de verdad pasó: **qué orden** se ejecutó,
+    con **qué código de salida** y con **qué salida** (o su ausencia).
+
+    Antes, un sondeo que fallaba sin decir nada se presentaba como «ruta fuera del workspace
+    autorizado» con la salida vacía como si fuera una ruta: un diagnóstico inventado que ocultaba la
+    causa real (el repositorio no se pudo resolver). Este error existe para no volver a hacerlo.
+    """
+
+    #: Código estable de la denegación, para la evidencia y la interfaz.
+    code: str = "WORKSPACE_UNRESOLVED"
+
+    def __init__(
+        self,
+        *,
+        workspace: str,
+        command: str,
+        exit_code: int,
+        output: str,
+        rule: str = "el ciclo solo opera sobre el repositorio Git autorizado del destino",
+        resource: str = "workspace autorizado del destino",
+        remedy: str = (
+            "comprueba que el destino sigue siendo un repositorio Git accesible y vuelve a lanzar "
+            "la tarea"
+        ),
+    ) -> None:
+        self.workspace = workspace
+        self.command = command
+        self.exit_code = exit_code
+        self.output = output.strip()
+        self.rule = rule
+        self.resource = resource
+        self.remedy = remedy
+        salida = self.output[:300] if self.output else "sin salida"
+        self.detail = (
+            f"el workspace no es un repositorio Git: {command} falló "
+            f"(exit {exit_code}) y devolvió {salida}"
+        )
+        super().__init__(
+            f"No se pudo resolver el repositorio Git del workspace {workspace!r}: "
+            f"{command} falló (exit {exit_code}), {salida}"
         )
 
 
@@ -412,5 +479,6 @@ __all__ = [
     "WebError",
     "WebSandboxUnavailableError",
     "WebSessionError",
+    "WorkspaceNotResolvedError",
     "WorkspaceViolationError",
 ]

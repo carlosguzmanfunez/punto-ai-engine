@@ -69,7 +69,7 @@ from punto.publish.production import (
 from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
-from punto.schemas.dev import DevelopmentResult
+from punto.schemas.dev import BlockedEvidence, DevelopmentResult, DevelopmentStatus
 from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
 from punto.workspace.target import (
     DevelopmentTarget,
@@ -817,8 +817,15 @@ def register_human_console(
                 try:
                     result = deps.dev_cycle.run(request)
                 except Exception as exc:  # el ciclo no debe tumbar la consola
-                    task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, f"el ciclo falló: {exc}")
-                    _close_attempt(task, result=None, error=f"el ciclo falló: {exc}")
+                    # El desenlace operativo tiene que ser el de **este** intento: si el ciclo lanza
+                    # una excepción en vez de devolver un resultado, la tarea no puede seguir
+                    # mostrando el del intento anterior (AP000-OBS-04-R2).
+                    result = _cycle_failure_result(request, exc, deps.targets.get(task.target_id))
+                    task.result = result
+                    task.set_stage(
+                        ConsoleStage.DEVELOPMENT_FAILED, result.error_kind or "CYCLE_ERROR"
+                    )
+                    _close_attempt(task, result=result)
                     return
                 task.result = result
                 _reflect(task, result, deps)
@@ -1118,6 +1125,46 @@ def _log_state_event(
         )
     except Exception:  # la traza no puede tumbar la operación que la persona está haciendo
         return
+
+
+def _cycle_failure_result(
+    request: BuildRequest, exc: Exception, target: DevelopmentTarget | None
+) -> DevelopmentResult:
+    """Resultado real de un intento en el que el ciclo lanzó una excepción.
+
+    El ciclo devuelve un ``DevelopmentResult`` para cada desenlace gobernado; si aun así lanza, el
+    intento tiene su propio desenlace y **la tarea no puede seguir mostrando el resultado del
+    intento anterior**. Aquí se construye con la causa real de la excepción —su código gobernado si
+    lo trae, su mensaje, y la regla/recurso/acción que la frontera haya declarado— para que el
+    dashboard muestre lo que de verdad pasó y no un estado histórico.
+
+    No se inventa nada: lo que la excepción no declare queda con el texto por defecto, que describe
+    exactamente lo ocurrido (el ciclo lanzó en vez de devolver un resultado).
+    """
+    code = str(getattr(exc, "code", "") or "CYCLE_ERROR")
+    detail = _redacted(f"{type(exc).__name__}: {exc}", 600)
+    returning = "el ciclo debe devolver un resultado; lanzar una excepción no es un desenlace"
+    rule = str(getattr(exc, "rule", "")) or returning
+    resource = str(getattr(exc, "resource", "")) or (
+        target.target_id if target is not None else request.target_repository
+    )
+    remedy = str(getattr(exc, "remedy", "")) or (
+        "revisa la causa del intento; corrígela y reanuda la tarea"
+    )
+    return DevelopmentResult(
+        request_id=request.request_id,
+        status=DevelopmentStatus.BLOCKED,
+        target_id=target.target_id if target is not None else request.target_repository,
+        error_kind=code[:40],
+        error=detail[:1_000],
+        blocked=BlockedEvidence(
+            code=code[:60],
+            detail=detail,
+            rule=rule[:300],
+            resource=resource[:300],
+            remedy=remedy[:300],
+        ),
+    )
 
 
 def _open_attempt(task: ConsoleTask) -> None:

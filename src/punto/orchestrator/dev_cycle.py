@@ -133,6 +133,7 @@ from punto.schemas.execution import CommandResult
 from punto.schemas.repair import RepairSnapshot
 from punto.security.deterministic import SECRET_PATTERNS
 from punto.skills import SkillActivation
+from punto.tools.errors import WorkspaceNotResolvedError, WorkspaceViolationError
 from punto.workflow.snapshots import FileRepairSnapshots
 from punto.workspace.repository import (
     GovernedRepository,
@@ -423,10 +424,19 @@ class DevelopmentCycle:
         )
         try:
             repository = self._open_repository(target, request)
-        except (RepositoryDenied, DevelopmentTargetError) as exc:
+        except (
+            RepositoryDenied,
+            WorkspaceNotResolvedError,
+            WorkspaceViolationError,
+            DevelopmentTargetError,
+        ) as exc:
+            # La frontera denegó el trabajo: el desenlace del intento es un bloqueo gobernado, con
+            # su código, su regla, su recurso y su acción. No se propaga como excepción porque el
+            # ciclo **sí** se ejecutó y su desenlace es información válida (y porque la tarea no
+            # puede quedarse mostrando el resultado de un intento anterior).
             return self._blocked(
                 request,
-                getattr(exc, "code", "BLOCKED"),
+                str(getattr(exc, "code", "") or "BLOCKED"),
                 str(exc),
                 started,
                 target,

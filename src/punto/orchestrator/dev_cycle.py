@@ -35,6 +35,7 @@ confirmar cambios que no sean suyos.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -94,6 +95,7 @@ from punto.schemas.dev import (
 from punto.schemas.enums import AuditResult
 from punto.schemas.execution import CommandResult
 from punto.schemas.repair import RepairSnapshot
+from punto.security.deterministic import SECRET_PATTERNS
 from punto.workflow.snapshots import FileRepairSnapshots
 from punto.workspace.repository import (
     GovernedRepository,
@@ -203,6 +205,10 @@ class DevelopmentConfig:
     allow_scope_expansion: bool = True
     #: Exigir que el plan declare la cadena funcional que completa.
     require_functional_chain: bool = True
+    #: Handoff causal plan → BUILDER: transporta la parte operativa del plan ya validado
+    #: (fuente, consumidores, cadena funcional y qué demuestra cada criterio). Configurable para
+    #: poder reproducir el control sin él.
+    causal_handoff: bool = True
     #: Skill experimental del ARCHITECT (``id`` o ``id@version``), declarada por el operador.
     #:
     #: Vacío significa el comportamiento de siempre: sin skill, las instrucciones del ARCHITECT son
@@ -758,6 +764,26 @@ class DevelopmentCycle:
                     detail="un plan que no declara cómo se verifica no se aplica",
                 )
             )
+        plan_text = (
+            plan.summary,
+            *plan.risks,
+            *plan.acceptance_mapping,
+            *(step.description for step in plan.functional_chain),
+        )
+        if any(
+            pattern.search(value)
+            for value in plan_text
+            for _name, pattern, _severity in SECRET_PATTERNS
+        ):
+            issues.append(
+                BuildValidationIssue(
+                    code="PLAN_SECRET_TEXT",
+                    detail=(
+                        "el texto del plan contiene algo con forma de credencial: el plan viaja al "
+                        "BUILDER en el handoff causal, así que no cruza esta frontera"
+                    ),
+                )
+            )
         if request.acceptance_criteria and not plan.acceptance_mapping:
             issues.append(
                 BuildValidationIssue(
@@ -1179,6 +1205,20 @@ class DevelopmentCycle:
                         + ", ".join(inventory["without_pell"][:3])
                     ),
                 )
+            )
+
+        if self.config.causal_handoff:
+            handoff = causal_handoff(plan)
+            self._log(
+                AuditEventType.DEV_CAUSAL_HANDOFF,
+                "dev_causal_handoff",
+                request,
+                {
+                    "present": True,
+                    "chars": len(handoff),
+                    "sha256": hashlib.sha256(handoff.encode("utf-8")).hexdigest(),
+                    "keys": sorted(json.loads(handoff)),
+                },
             )
 
         context_files: list[ContextFile] = list(inventory["selected"])
@@ -2110,6 +2150,8 @@ class DevelopmentCycle:
             "PLAN FILES TO MODIFY: " + (" | ".join(plan.files_to_modify) or "(ninguno)"),
             "PLAN FILES TO CREATE: " + (" | ".join(plan.files_to_create) or "(ninguno)"),
         ]
+        if self.config.causal_handoff:
+            lines.append(CAUSAL_HANDOFF_LABEL + causal_handoff(plan))
         if request.acceptance_criteria:
             lines.append("ACCEPTANCE CRITERIA: " + " | ".join(request.acceptance_criteria))
         for item in context_files:
@@ -2793,6 +2835,33 @@ def _failure_signature(verification: Sequence[CommandEvidence]) -> str:
                 break
         parts.append(f"{item.name}:{item.exit_code}:{head}")
     return "|".join(parts) or "no-failure"
+
+
+#: Etiqueta del handoff causal en el prompt del BUILDER: dice de dónde sale y qué hacer con él.
+CAUSAL_HANDOFF_LABEL: Final[str] = (
+    "CAUSAL HANDOFF (del plan ya validado por PUNTO; úsalo, no lo rederives): "
+)
+
+
+def causal_handoff(plan: DevelopmentPlan) -> str:
+    """Handoff causal compacto del plan al BUILDER, en una línea JSON determinista.
+
+    Transporta **solo** la parte operativa que hoy se perdía: el objetivo, los recursos del plan, la
+    cadena funcional con su verificación por eslabón, qué observación demuestra cada criterio y las
+    verificaciones del catálogo. No incluye riesgos, razonamiento, autoridad, PELL ni auditoría: es
+    información para implementar, no un plan paralelo ni un ensayo.
+    """
+    payload = {
+        "goal": plan.summary,
+        "resources": list(plan.touched_paths()),
+        "chain": [
+            {"step": step.step, "verification": step.verification}
+            for step in plan.functional_chain
+        ],
+        "done": list(plan.acceptance_mapping),
+        "verify": list(plan.verification_commands),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def default_development_cycle(

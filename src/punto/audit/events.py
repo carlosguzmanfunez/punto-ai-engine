@@ -177,6 +177,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_REPAIR_PROGRESS: "dev_repair",
     AuditEventType.DEV_STAGNATION_DETECTED: "dev_repair",
     AuditEventType.DEV_FUNCTIONAL_CHAIN_VERIFIED: "dev_verification",
+    AuditEventType.DEV_CAUSAL_HANDOFF: "dev_plan",
     AuditEventType.DEV_SKILL_ACTIVATED: "dev_skill",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",

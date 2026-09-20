@@ -205,7 +205,13 @@ def load_skill(reference: str, *, root: Path | None = None) -> Skill:
     if not _NAME_PATTERN.match(skill_id):
         raise SkillValidationError(f"identificador de skill inválido: {skill_id!r}")
     base = (root or skills_root()).resolve()
-    path = (base / skill_id / "SKILL.md").resolve()
+    # Una versión pedida se busca en su carpeta (``<id>/<version>/SKILL.md``) para poder **conservar
+    # intacta** la versión anterior como evidencia histórica; sin versión se usa la vigente.
+    candidates = []
+    if wanted_version:
+        candidates.append(base / skill_id / wanted_version / "SKILL.md")
+    candidates.append(base / skill_id / "SKILL.md")
+    path = next((item.resolve() for item in candidates if item.is_file()), candidates[0].resolve())
     if base not in path.parents:
         raise SkillValidationError(f"la skill sale de la raíz declarada: {path}")
     if not path.is_file():

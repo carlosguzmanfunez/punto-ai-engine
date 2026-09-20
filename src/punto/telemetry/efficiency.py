@@ -133,6 +133,10 @@ class EfficiencyRecord(BaseModel):
     primary_model: str = Field(default="", max_length=120)
     primary_transport: str = Field(default="", max_length=40)
 
+    #: Handoff causal plan → BUILDER: si viajó y cuánto ocupó (SKILL-LAYER-0, ronda 2).
+    causal_handoff_present: bool = False
+    causal_handoff_chars: int = Field(default=0, ge=0)
+
     #: Skill activada en esta ejecución (SKILL-LAYER-0). Vacío y ``False`` significan el control.
     skill_id: str = Field(default="", max_length=80)
     skill_version: str = Field(default="", max_length=20)
@@ -229,6 +233,8 @@ def build_record(
     primary_provider: str = "",
     primary_model: str = "",
     primary_transport: str = "",
+    causal_handoff_present: bool = False,
+    causal_handoff_chars: int = 0,
     skill_id: str = "",
     skill_version: str = "",
     skill_activated: bool = False,
@@ -253,6 +259,8 @@ def build_record(
         primary_provider=primary_provider,
         primary_model=primary_model,
         primary_transport=primary_transport,
+        causal_handoff_present=causal_handoff_present,
+        causal_handoff_chars=causal_handoff_chars,
         skill_id=skill_id,
         skill_version=skill_version,
         skill_activated=skill_activated,

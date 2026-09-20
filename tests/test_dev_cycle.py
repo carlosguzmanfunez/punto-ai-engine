@@ -380,6 +380,8 @@ def test_la_auditoria_reconstruye_el_ciclo_por_request_id(tmp_path: Path) -> Non
         "DEV_PLAN_CREATED",
         "DEV_RISK_EVALUATED",
         "DEV_PLAN_VALIDATED",
+        # El handoff causal viaja al BUILDER: se registra antes de invocarlo (SKILL-LAYER-0).
+        "DEV_CAUSAL_HANDOFF",
         "BUILD_PROVIDER_SELECTED",
         "DEV_RISK_EVALUATED",
         "DEV_CHANGE_VALIDATED",

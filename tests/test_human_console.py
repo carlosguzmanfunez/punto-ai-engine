@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -743,6 +744,254 @@ def test_los_gates_no_se_pueden_resolver_dos_veces(
     # Rechazado ⇒ la publicación no se ejecuta ni por la vía directa.
     directa = client.post(f"/console/tasks/{tarea['task_id']}/publish")
     assert directa.status_code == 409
+
+
+# ------------------------------------------------ progreso visual · A a H de la representación
+def _paso(vista: dict[str, Any], clave: str) -> dict[str, Any]:
+    """Etapa del recorrido por su clave."""
+    return next(paso for paso in vista["progress"]["steps"] if paso["key"] == clave)
+
+
+def _estados(vista: dict[str, Any]) -> dict[str, str]:
+    """Estado de cada etapa del recorrido por su clave."""
+    return {paso["key"]: paso["state"] for paso in vista["progress"]["steps"]}
+
+
+def test_a_b_c_el_recorrido_de_una_tarea_real_sale_de_estados_reales(
+    consola: tuple[TestClient, Path, Path],
+) -> None:
+    """A/B/C: recorrido visible, porcentaje derivado de etapas reales y tiempo real."""
+    client, _repo, _remoto = consola
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    progreso = tarea["progress"]
+    assert progreso["total"] == 10
+    assert progreso["production_required"] is True
+    assert progreso["percent"] == 60
+    assert [paso["state"] for paso in progreso["steps"]][:6] == ["COMPLETED"] * 6
+    assert _paso(tarea, "APROBACION")["state"] == "CURRENT"
+    assert _paso(tarea, "APROBACION")["mark"] == "●"
+    assert _paso(tarea, "VALIDACION")["state"] == "PENDING"
+    # El porcentaje se recalcula desde las etapas: no hay ningún valor estimado.
+    assert progreso["percent"] == progreso["completed"] * 100 // progreso["total"]
+    assert progreso["elapsed_seconds"] >= 0
+    assert progreso["time_label"].startswith("Tiempo:")
+    assert progreso["finished"] is False
+    # El detalle y el listado cuentan el mismo recorrido (el reloj es lo único que avanza).
+    detalle = client.get(f"/console/tasks/{tarea['task_id']}").json()["progress"]
+    listado = client.get("/console/tasks").json()["items"][0]["progress"]
+    for vista in (detalle, listado):
+        assert vista["percent"] == progreso["percent"]
+        assert vista["steps"] == progreso["steps"]
+        assert vista["total"] == progreso["total"]
+
+
+def test_a_cada_etapa_completada_tiene_su_evento_real_en_la_auditoria(tmp_path: Path) -> None:
+    """A: lo que el recorrido da por hecho está en la auditoría real de esa tarea."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, deps = _app(target=target, respuestas=[_plan(), _cambio()])
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+    auditoria = {
+        evento.event_type.value for evento in deps.audit.by_resource(tarea["task_id"])
+    }
+
+    assert {
+        "DEV_PLAN_VALIDATED",
+        "DEV_CHANGE_VALIDATED",
+        "DEV_VERIFICATION_COMPLETED",
+        "DEV_FUNCTIONAL_CHAIN_VERIFIED",
+    } <= auditoria
+    completadas = {
+        paso["key"] for paso in tarea["progress"]["steps"] if paso["state"] == "COMPLETED"
+    }
+    assert completadas == {
+        "SOLICITUD",
+        "PLANIFICACION",
+        "CONSTRUCCION",
+        "VERIFICACION",
+        "QA",
+        "DESARROLLO",
+    }
+
+
+def test_el_tiempo_avanza_sin_mover_el_porcentaje(
+    consola: tuple[TestClient, Path, Path],
+) -> None:
+    """C/B: el reloj corre, el porcentaje no se mueve por tiempo."""
+    client, _repo, _remoto = consola
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    primero = client.get(f"/console/tasks/{tarea['task_id']}").json()["progress"]
+    time.sleep(2.0)
+    segundo = client.get(f"/console/tasks/{tarea['task_id']}").json()["progress"]
+
+    assert segundo["elapsed_seconds"] > primero["elapsed_seconds"]
+    assert segundo["percent"] == primero["percent"]
+    assert segundo["completed"] == primero["completed"]
+
+
+def test_d_el_gate_pendiente_se_ve_como_espera_humana_y_no_como_error(tmp_path: Path) -> None:
+    """D: con un gate pendiente, la etapa se marca «!» y la página lo dice con esas palabras."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, _deps = _app(
+        target=target, respuestas=[_plan(cierre=True), _cambio(borrado=True)]
+    )
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "retirar el fichero obsoleto", "target_id": TARGET_ID},
+    ).json()
+
+    progreso = tarea["progress"]
+    assert progreso["waiting_human"] is True
+    assert progreso["waiting_kind"] == "development"
+    assert progreso["failed"] is False
+    assert "aprobación" in progreso["headline"]
+    esperando = [paso for paso in progreso["steps"] if paso["state"] == "WAITING_HUMAN"]
+    assert len(esperando) == 1
+    assert esperando[0]["key"] == "CONSTRUCCION", "lo que exige persona es el cambio"
+    assert esperando[0]["mark"] == "!"
+    assert _paso(tarea, "PLANIFICACION")["state"] == "COMPLETED"
+    assert _paso(tarea, "DESARROLLO")["state"] == "PENDING", "el ciclo no completó el desarrollo"
+    assert "FAILED" not in set(_estados(tarea).values())
+    # Y la página lo representa como espera humana, con los botones de decisión.
+    pagina = client.get("/console").text
+    assert "Esperando tu aprobación" in pagina
+    assert 'class="human-wait"' in pagina
+    assert "data-approve" in pagina and "data-reject" in pagina
+
+
+def test_e_aprobar_hace_avanzar_el_recorrido_hasta_el_final(
+    consola: tuple[TestClient, Path, Path],
+) -> None:
+    """E/G: APPROVE mueve el recorrido de «esperando» a producción validada al 100 %."""
+    client, _repo, _remoto = consola
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+    assert tarea["progress"]["percent"] == 60
+
+    con_gate = client.post(f"/console/tasks/{tarea['task_id']}/production-gate").json()
+    assert _paso(con_gate, "APROBACION")["state"] == "WAITING_HUMAN"
+    assert _paso(con_gate, "APROBACION")["mark"] == "!"
+    assert con_gate["progress"]["waiting_kind"] == "publication"
+    assert con_gate["progress"]["percent"] == 60, "esperar no avanza el porcentaje"
+
+    aprobado = client.post(
+        f"/console/human-gates/{con_gate['publication']['approval_id']}/approve",
+        json={"resolved_by": "humano-local", "note": "adelante"},
+    ).json()
+
+    progreso = aprobado["progress"]
+    assert aprobado["stage"] == "PRODUCTION_VALIDATED"
+    assert progreso["percent"] == 100
+    assert progreso["completed"] == progreso["total"] == 10
+    assert {paso["state"] for paso in progreso["steps"]} == {"COMPLETED"}
+    assert progreso["finished"] is True
+    assert progreso["time_label"].startswith("Finalizada en:")
+    assert progreso["headline"] == "Producción validada"
+    assert progreso["waiting_human"] is False
+
+
+def test_f_rechazar_deja_el_recorrido_en_fallo_y_nunca_en_100(
+    consola: tuple[TestClient, Path, Path],
+) -> None:
+    """F: REJECTED se ve como fallo del recorrido, con el porcentaje congelado bajo el 100."""
+    client, _repo, _remoto = consola
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+    con_gate = client.post(f"/console/tasks/{tarea['task_id']}/production-gate").json()
+
+    rechazo = client.post(
+        f"/console/human-gates/{con_gate['publication']['approval_id']}/reject",
+        json={"resolved_by": "humano-local", "note": "todavía no"},
+    ).json()
+
+    progreso = rechazo["task"]["progress"]
+    assert rechazo["task"]["stage"] == "REJECTED"
+    assert _paso(rechazo["task"], "APROBACION")["state"] == "FAILED"
+    assert _paso(rechazo["task"], "APROBACION")["mark"] == "×"  # noqa: RUF001
+    assert progreso["rejected"] is True
+    assert progreso["failed"] is True
+    assert progreso["finished"] is True
+    assert progreso["percent"] == 60 < 100
+    # Y publicar sigue siendo imposible: el rechazo no se convierte en autorización.
+    assert client.post(f"/console/tasks/{tarea['task_id']}/publish").status_code == 409
+
+
+def test_f_una_produccion_que_no_verifica_muestra_el_fallo_del_despliegue(
+    tmp_path: Path,
+) -> None:
+    """F: el push va bien y la comprobación falla: la etapa real de deployment sale en fallo."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, _deps = _app(
+        target=target, respuestas=[_plan(), _cambio()], fetch=_fetch_sin_marcador
+    )
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+    con_gate = client.post(f"/console/tasks/{tarea['task_id']}/production-gate").json()
+    aprobado = client.post(
+        f"/console/human-gates/{con_gate['publication']['approval_id']}/approve",
+        json={"resolved_by": "humano-local", "note": "adelante"},
+    ).json()
+
+    progreso = aprobado["progress"]
+    assert aprobado["stage"] == "DEPLOYMENT_NOT_VERIFIED"
+    assert _paso(aprobado, "PUBLICACION")["state"] == "COMPLETED"
+    assert _paso(aprobado, "DEPLOYMENT")["state"] == "FAILED"
+    assert _paso(aprobado, "VALIDACION")["state"] == "PENDING"
+    assert progreso["percent"] == 80 < 100
+    assert progreso["finished"] is True
+    assert "no quedó verificada" in progreso["headline"]
+
+
+def test_una_tarea_sin_produccion_termina_su_recorrido_en_el_desarrollo(tmp_path: Path) -> None:
+    """B/G: sin producción declarada, el objetivo real es el desarrollo y ahí sí llega al 100 %."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto, publicable=False)
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+
+    progreso = tarea["progress"]
+    assert progreso["production_required"] is False
+    assert progreso["total"] == 6
+    assert progreso["percent"] == 100
+    assert progreso["finished"] is True
+    assert progreso["time_label"].startswith("Finalizada en:")
+    assert [paso["key"] for paso in progreso["steps"]][-1] == "DESARROLLO"
+
+
+def test_h_la_pagina_lleva_el_recorrido_y_los_proveedores_siguen_igual() -> None:
+    """H: la página trae el stepper y el tiempo sin tocar la configuración de proveedores."""
+    client = TestClient(create_app())
+
+    pagina = client.get("/console").text
+
+    assert 'class="stepper"' in pagina and 'class="bar' in pagina
+    assert "progressBlock" in pagina and "tickElapsed" in pagina
+    assert "data-elapsed" in pagina
+    assert "sk-" not in pagina, "ni claves ni estados con forma de secreto"
+    assert client.get("/providers").status_code == 200
+    assert client.get("/dashboard").status_code == 200
 
 
 def _refs(remoto: Path) -> dict[str, str]:

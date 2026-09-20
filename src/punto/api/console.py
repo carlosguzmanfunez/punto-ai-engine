@@ -33,6 +33,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from punto.api.task_progress import TaskSignals, build_progress
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.orchestrator.dev_cycle import DevelopmentCycle
@@ -50,7 +51,7 @@ from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest
 from punto.schemas.decision import ActionRequest
 from punto.schemas.dev import DevelopmentResult
-from punto.schemas.enums import ApprovalStatus, RiskLevel, TaskStatus
+from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
 from punto.workspace.target import DevelopmentTarget, DevelopmentTargetError
 
 __all__ = [
@@ -88,6 +89,18 @@ HUMAN_REQUIRED_KINDS: Final[frozenset[str]] = frozenset(
         "CHANGE_REQUIRES_HUMAN",
         "PLAN_OUTSIDE_AUTHORITY",
         "CHANGE_OUTSIDE_AUTHORITY",
+    }
+)
+
+#: Etapas que cierran la tarea: su transición es la marca real de finalización.
+TERMINAL_STAGES: Final[frozenset[str]] = frozenset(
+    {
+        "DEVELOPMENT_COMPLETED",
+        "DEVELOPMENT_FAILED",
+        "REJECTED",
+        "PUBLICATION_FAILED",
+        "DEPLOYMENT_NOT_VERIFIED",
+        "PRODUCTION_VALIDATED",
     }
 )
 
@@ -150,6 +163,8 @@ class ConsoleTask:
         self.stage: str = ConsoleStage.QUEUED.value
         self.created_at: datetime = utc_now()
         self.updated_at: datetime = self.created_at
+        #: Momento real en que la tarea alcanzó una etapa terminal (``None`` mientras sigue viva).
+        self.finished_at: datetime | None = None
         self.result: DevelopmentResult | None = None
         self.publication: PublicationRecord | None = None
         self.gates: list[UUID] = []
@@ -163,10 +178,15 @@ class ConsoleTask:
         return self.task_id
 
     def set_stage(self, stage: ConsoleStage | PublicationStage, detail: str = "") -> None:
-        """Cambia la etapa visible, dejando constancia del motivo si lo hay."""
+        """Cambia la etapa visible, dejando constancia del motivo si lo hay.
+
+        La marca de finalización es la hora real de la transición terminal: si la tarea vuelve a
+        avanzar (por ejemplo, el desarrollo completado pasa a publicarse), deja de estar finalizada.
+        """
         with self._lock:
             self.stage = stage.value
             self.updated_at = utc_now()
+            self.finished_at = self.updated_at if stage.value in TERMINAL_STAGES else None
             if detail:
                 self.notes = [*self.notes[-4:], detail[:300]]
 
@@ -214,6 +234,7 @@ class ConsoleTask:
             "gates": [str(item) for item in self.gates],
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "finished_at": self.finished_at.isoformat() if self.finished_at is not None else "",
             "development": self.summary(),
             "publication": self.publication.as_dict() if self.publication else None,
             "notes": list(self.notes),
@@ -342,20 +363,20 @@ def register_human_console(
         )
         if body.run:
             _run_development(task, request, dependencies, executor)
-        return task.as_dict()
+        return _task_view(task, dependencies)
 
     @application.get("/console/tasks", tags=["console"], summary="Listar tareas")
     def list_console_tasks() -> dict[str, Any]:
         """Tareas de la consola, de la más nueva a la más antigua."""
         items = sorted(tasks.values(), key=lambda item: item.created_at, reverse=True)
-        return {"total": len(items), "items": [item.as_dict() for item in items]}
+        return {"total": len(items), "items": [_task_view(item, dependencies) for item in items]}
 
     @application.get("/console/tasks/{task_id}", tags=["console"], summary="Detalle de una tarea")
     def get_console_task(task_id: UUID) -> dict[str, Any]:
         """Detalle de una tarea: etapa, resultado, gates y publicación."""
         task = _task_or_404(tasks, task_id)
         return {
-            **task.as_dict(),
+            **_task_view(task, dependencies),
             "gates_detail": [
                 _gate_view(dependencies, approval_id, tasks) for approval_id in task.gates
             ],
@@ -386,7 +407,7 @@ def register_human_console(
         task.task_id = request.request_id
         tasks[str(task.task_id)] = task
         _run_development(task, request, dependencies, executor)
-        return task.as_dict()
+        return _task_view(task, dependencies)
 
     # -------------------------------------------------------------- human gates
     @application.get("/console/human-gates", tags=["console"], summary="Human Gates")
@@ -419,13 +440,13 @@ def register_human_console(
                 )
             target = _target_or_400(dependencies, task.target_id)
             _run_publication(task, target, dependencies, executor, approval_id)
-            return task.as_dict()
+            return _task_view(task, dependencies)
         if task is not None:
             task.set_stage(ConsoleStage.HUMAN_APPROVED, f"aprobado por {body.resolved_by}")
         return {
             "approval_id": str(approval_id),
             "status": ApprovalStatus.APPROVED.value,
-            "task": task.as_dict() if task is not None else None,
+            "task": _task_view(task, dependencies) if task is not None else None,
             "note": (
                 "la aprobación autoriza esta operación; el ciclo sigue gobernado por PUNTO y no "
                 "se publica nada en producción desde aquí"
@@ -449,7 +470,7 @@ def register_human_console(
         return {
             "approval_id": str(approval_id),
             "status": ApprovalStatus.REJECTED.value,
-            "task": task.as_dict() if task is not None else None,
+            "task": _task_view(task, dependencies) if task is not None else None,
         }
 
     # --------------------------------------------------------------- producción
@@ -539,7 +560,7 @@ def register_human_console(
             "gate de publicación pendiente de decisión humana",
         )
         task.set_stage(PublicationStage.WAITING_PRODUCTION_APPROVAL)
-        return task.as_dict()
+        return _task_view(task, dependencies)
 
     @application.post(
         "/console/tasks/{task_id}/publish",
@@ -557,7 +578,7 @@ def register_human_console(
                 detail="no hay Human Gate de publicación: sin persona no se publica",
             )
         _run_publication(task, target, dependencies, executor, UUID(publication.approval_id))
-        return task.as_dict()
+        return _task_view(task, dependencies)
 
     # ------------------------------------------------------------- ejecución
     def _run_development(
@@ -761,6 +782,52 @@ def _gate_or_404(dependencies: ConsoleDependencies, approval_id: UUID) -> Any:
 def _is_publication_gate(action: str) -> bool:
     """True si el gate autoriza publicar en producción."""
     return action == PRODUCTION_ACTION
+
+
+def _task_view(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
+    """Vista de la tarea con su recorrido humano proyectado desde los estados reales."""
+    return {**task.as_dict(), "progress": _progress(task, dependencies)}
+
+
+def _progress(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
+    """Proyecta la tarea en el recorrido humano: etapas reales, porcentaje y tiempo real.
+
+    Todas las señales que se pasan ya existen: la etapa de la consola, el resultado real del ciclo,
+    la etapa real de publicación, el estado real del ``HumanGate`` y los eventos de auditoría de la
+    tarea (la misma traza que ``/audit/events?resource_id=<task_id>``).
+    """
+    target = dependencies.targets.get(task.target_id)
+    result = task.result
+    publication = task.publication
+    return build_progress(
+        TaskSignals(
+            created_at=task.created_at,
+            now=utc_now(),
+            task_stage=task.stage,
+            publication_stage=publication.stage.value if publication is not None else "",
+            development_status=result.status.value if result is not None else "",
+            development_error_kind=result.error_kind if result is not None else "",
+            functional_chain_result=result.functional_chain_result if result is not None else "",
+            applied_changes=len(result.applied) if result is not None else 0,
+            events=tuple(
+                (event.event_type.value, event.result is AuditResult.SUCCESS)
+                for event in dependencies.audit.by_resource(task.task_id)
+            ),
+            publishable=target.publishable if target is not None else False,
+            publication_gate_status=_publication_gate_status(publication, dependencies),
+            finished_at=task.finished_at,
+        )
+    )
+
+
+def _publication_gate_status(
+    publication: PublicationRecord | None, dependencies: ConsoleDependencies
+) -> str:
+    """Estado real del Human Gate de publicación de la tarea (vacío si no hay gate)."""
+    if publication is None or not publication.approval_id:
+        return ""
+    approval = dependencies.gates.get(UUID(publication.approval_id))
+    return approval.status.value if approval is not None else ""
 
 
 def _issue_human_kind(result: DevelopmentResult) -> str:

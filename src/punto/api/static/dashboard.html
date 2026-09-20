@@ -121,6 +121,37 @@
       .list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
       .item { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }
       .item code { color: var(--text); }
+      .progress { margin: 12px 0 4px; }
+      .progress-head {
+        display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+        font-size: 12px; color: var(--muted);
+      }
+      .progress-head .pct { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+      .bar {
+        height: 8px; border-radius: 6px; background: var(--panel-2);
+        border: 1px solid var(--line); overflow: hidden; margin: 6px 0 8px;
+      }
+      .bar > span { display: block; height: 100%; background: var(--accent); }
+      .bar.COMPLETED > span { background: var(--ok); }
+      .bar.WAITING_HUMAN > span { background: var(--warn); }
+      .bar.FAILED > span { background: var(--bad); }
+      .stepper { display: flex; flex-direction: column; gap: 3px; }
+      .step { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); }
+      .step .mark { width: 14px; text-align: center; font-weight: 700; }
+      .step .evidence { font-size: 11px; color: var(--off); }
+      .step.COMPLETED { color: var(--text); }
+      .step.COMPLETED .mark { color: var(--ok); }
+      .step.CURRENT { color: var(--text); font-weight: 600; }
+      .step.CURRENT .mark { color: var(--accent); }
+      .step.WAITING_HUMAN { color: var(--warn); font-weight: 600; }
+      .step.WAITING_HUMAN .mark { color: var(--warn); }
+      .step.FAILED { color: var(--bad); font-weight: 600; }
+      .step.FAILED .mark { color: var(--bad); }
+      .human-wait {
+        border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; margin-top: 10px;
+        color: var(--warn); font-size: 12px;
+      }
+      .elapsed { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
       textarea {
         font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
         border-radius: 7px; padding: 7px 9px; width: 100%; min-height: 64px;
@@ -553,6 +584,73 @@
         return `<span class="stage ${stage}">${stage}</span>`;
       }
 
+      // Tiempo real: se calcula en el servidor (UTC) y la página solo lo avanza con el reloj local.
+      function humanElapsed(seconds) {
+        const total = Math.max(0, Math.floor(seconds));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+        if (hours) return `${hours} h ${String(minutes).padStart(2, "0")} min`;
+        if (minutes) return `${minutes} min ${String(secs).padStart(2, "0")} s`;
+        return `${secs} s`;
+      }
+
+      function tickElapsed() {
+        document.querySelectorAll("[data-elapsed]").forEach((node) => {
+          const base = Number(node.dataset.seconds || 0);
+          const running = node.dataset.running === "1";
+          const stamp = Number(node.dataset.stamp || Date.now());
+          const extra = running ? Math.floor((Date.now() - stamp) / 1000) : 0;
+          node.textContent = `${node.dataset.prefix}: ${humanElapsed(base + extra)}`;
+        });
+      }
+      setInterval(tickElapsed, 1000);
+
+      function stepRow(step) {
+        return `<div class="step ${step.state}" data-step="${step.key}" title="${step.evidence}">
+          <span class="mark">${step.mark}</span>
+          <span class="step-label">${step.label}</span>
+          <span class="evidence">${step.evidence}</span>
+        </div>`;
+      }
+
+      function progressBlock(task) {
+        const progress = task.progress;
+        if (!progress) return "";
+        const tone = progress.finished
+          ? "COMPLETED"
+          : (progress.waiting_human ? "WAITING_HUMAN" : (progress.failed ? "FAILED" : ""));
+        const pendingGate = (consoleState.gates || []).find(
+          (gate) => gate.task_id === task.task_id && gate.is_pending);
+        const waiting = progress.waiting_human
+          ? `<div class="human-wait" data-testid="human-wait-${task.task_id}">! Esperando tu aprobación${
+              progress.waiting_kind === "publication" ? " para publicar en producción" : ""
+            } — PUNTO no está bloqueado por un error: está esperando a una persona.
+            ${pendingGate ? `
+            <div class="actions">
+              <button data-approve="${pendingGate.approval_id}" data-testid="approve-${pendingGate.approval_id}">APPROVE</button>
+              <button class="secondary" data-reject="${pendingGate.approval_id}" data-testid="reject-${pendingGate.approval_id}">REJECT</button>
+            </div>` : `<div class="sub" style="margin: 6px 0 0">el gate está abajo, en Human Gates</div>`}
+            </div>`
+          : "";
+        const steps = (progress.steps || []).map(stepRow).join("");
+        return `
+          <div class="progress" data-testid="progress-${task.task_id}">
+            <div class="progress-head">
+              <span data-headline>${progress.headline}</span>
+              <span class="pct">${progress.percent}% · ${progress.completed}/${progress.total}</span>
+            </div>
+            <div class="bar ${tone}"><span style="width: ${progress.percent}%"></span></div>
+            <div class="stepper">${steps}</div>
+            <div class="elapsed" data-elapsed
+                 data-seconds="${progress.elapsed_seconds}"
+                 data-running="${progress.finished ? "0" : "1"}"
+                 data-stamp="${Date.now()}"
+                 data-prefix="${progress.finished ? "Finalizada en" : "Tiempo"}">${progress.time_label}</div>
+          </div>
+          ${waiting}`;
+      }
+
       function taskCard(task) {
         const dev = task.development || {};
         const publication = task.publication;
@@ -574,6 +672,7 @@
           <article class="card" data-task="${task.task_id}" data-testid="tarea-${task.task_id}">
             <h3>${task.objective.slice(0, 90)}</h3>
             <div class="sub">${task.target_id} · <code>${task.task_id.slice(0, 8)}</code></div>
+            ${progressBlock(task)}
             <div class="row"><span class="label">Etapa</span><span class="value">${stageBadge(task.stage)}
               ${task.publication_stage && task.publication_stage !== task.stage ? stageBadge(task.publication_stage) : ""}</span></div>
             ${dev.status ? `<div class="row"><span class="label">Desarrollo</span><span class="value">${dev.status}</span></div>` : ""}
@@ -660,11 +759,22 @@
         document.getElementById("gates-list").innerHTML = payload.items.length
           ? payload.items.map(gateCard).join("")
           : `<div class="note">no hay solicitudes humanas</div>`;
-        document.querySelectorAll("[data-approve]").forEach((button) =>
-          button.addEventListener("click", () => resolveGate(button.dataset.approve, true)));
-        document.querySelectorAll("[data-reject]").forEach((button) =>
-          button.addEventListener("click", () => resolveGate(button.dataset.reject, false)));
       }
+
+      // Delegación: los botones de un gate pueden estar en la tarjeta del gate o dentro del
+      // recorrido de la tarea (donde PUNTO muestra que espera a una persona), así que se atienden
+      // en un único punto y nunca se registran dos veces.
+      document.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        const approve = target.closest("[data-approve]");
+        if (approve) {
+          resolveGate(approve.dataset.approve, true);
+          return;
+        }
+        const reject = target.closest("[data-reject]");
+        if (reject) resolveGate(reject.dataset.reject, false);
+      });
 
       function consoleNote(text, kind) {
         const element = document.getElementById("tarea-note");

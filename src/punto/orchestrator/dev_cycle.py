@@ -43,6 +43,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from punto.acceptance import (
+    RequestReference,
+    ground_request,
+    verify_acceptance,
+)
 from punto.audit.logger import AuditLogger
 from punto.memory.experience import ExperienceResult, ExperienceStatus
 from punto.memory.retrieval import (
@@ -97,6 +102,7 @@ from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest, BuildValidationIssue
 from punto.schemas.dev import (
     MAX_PLAN_ITEMS,
+    AcceptanceEvidence,
     AppliedChange,
     AuthorityDecisionRecord,
     ChangeOperation,
@@ -142,6 +148,14 @@ DEFAULT_MAX_OUTPUT_TOKENS: Final[int] = 32_000
 #: Ficheros que el descubrimiento inspecciona como candidatos, y cuántos entran al contexto.
 MAX_DISCOVERY_FILES: Final[int] = 400
 MAX_CONTEXT_FILES: Final[int] = 8
+
+#: AP000-OBS-02: intenciones cuya superficie tiene que estar cubierta por el plan antes de escribir.
+_ACCEPTANCE_PLAN_INTENTS: Final[frozenset[str]] = frozenset(
+    {"REPLACE", "DELETE", "MODIFY", "CREATE"}
+)
+
+#: Tope de problemas de aceptación que se reportan como incidencias de una ronda.
+_MAX_ACCEPTANCE_ISSUES: Final[int] = 8
 MAX_CONTEXT_FILE_CHARS: Final[int] = 18_000
 MAX_CONTEXT_TOTAL_CHARS: Final[int] = 60_000
 
@@ -305,6 +319,8 @@ class DevelopmentCycle:
     #: Correcciones estructurales consumidas en esta ejecución (contabilidad separada de las rondas
     #: funcionales de reparación): es evidencia de por qué una propuesta no llegó a aplicarse.
     _structural_corrections: int = field(default=0, init=False, repr=False)
+    #: AP000-OBS-02: superficies localizadas antes del build (precondición de aceptación).
+    _grounding: tuple[RequestReference, ...] = field(default=(), init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -322,6 +338,8 @@ class DevelopmentCycle:
         self._structural_corrections = 0
         self._snapshots = None
         self._checkpoint = None
+        #: AP000-OBS-02: superficies localizadas antes del build (precondición de aceptación).
+        self._grounding = ()
 
     @property
     def envelope(self) -> AdaptiveAuthorityEnvelope:
@@ -420,6 +438,12 @@ class DevelopmentCycle:
             },
         )
 
+        # AP000-OBS-02: grounding determinista ANTES de construir. Si la solicitud se refiere a un
+        # elemento existente, se localiza su superficie y esa precondición es la evidencia contra la
+        # que se medirá después. Sin esto, una implementación relacionada en otra superficie podía
+        # pasar por satisfacer la solicitud.
+        self._grounding = self._ground(request, target, repository, inventory)
+
         plan, plan_issues = self._plan(
             request, target, inventory["selected"], retrieval, repository
         )
@@ -502,6 +526,8 @@ class DevelopmentCycle:
             scope_expansions=tuple(outcome["scope_expansions"]),
             authority_decisions=tuple(outcome["authority_decisions"]),
             functional_chain_result=outcome["functional_chain_result"],
+            acceptance=tuple(outcome["acceptance"]),
+            acceptance_result=outcome["acceptance_result"],
         )
 
     # ------------------------------------------------------------------ destinos
@@ -563,6 +589,166 @@ class DevelopmentCycle:
                 "acordado"
             )
         return repository
+
+    def _ground(
+        self,
+        request: BuildRequest,
+        target: DevelopmentTarget,
+        repository: GovernedRepository,
+        inventory: Mapping[str, Any],
+    ) -> tuple[RequestReference, ...]:
+        """Localiza las superficies a las que se refiere la solicitud (grounding determinista).
+
+        Se registra la precondición completa —qué superficie, qué línea y qué fragmento— para poder
+        medir después si el elemento cambió donde debía. Los ficheros con secretos o fuera de
+        alcance los descarta la propia lectura gobernada del repositorio.
+        """
+
+        def read_text(path: str) -> str:
+            return repository.read_text(path)
+
+        try:
+            references = ground_request(
+                objective=request.objective,
+                criteria=request.acceptance_criteria,
+                files=tuple(inventory["paths"]),
+                read_text=read_text,
+            )
+        except Exception:
+            # El grounding nunca tumba el ciclo: si no se puede localizar nada, la aceptación queda
+            # «no medida» (sin obligaciones inventadas) y la tarea sigue su camino normal.
+            return ()
+        localizadas = [item for item in references if item.measurable]
+        if localizadas:
+            self._log(
+                AuditEventType.DEV_ACCEPTANCE_GROUNDED,
+                "dev_acceptance_grounded",
+                request,
+                {
+                    "target_id": target.target_id,
+                    "references": len(references),
+                    "measurable": len(localizadas),
+                    "surfaces": [
+                        {
+                            "surface": f"{item.path}:{item.line}",
+                            "intent": reference.intent,
+                            "kind": reference.kind,
+                            "score": item.score,
+                        }
+                        for reference in localizadas
+                        for item in reference.surfaces
+                    ][:12],
+                },
+            )
+        return references
+
+    def _acceptance_preflight(
+        self, plan: DevelopmentPlan, request: BuildRequest
+    ) -> tuple[BuildValidationIssue, ...]:
+        """Comprueba que el plan trabaja sobre la superficie que la solicitud menciona.
+
+        Si la solicitud pide reemplazar, eliminar, modificar o crear algo que PUNTO localizó en una
+        superficie concreta y el plan no toca esa superficie, el plan se rechaza **antes de
+        escribir**: es la diferencia entre «implementé algo relacionado» y «resolví lo pedido».
+        """
+        touched = set(plan.touched_paths())
+        issues: list[BuildValidationIssue] = []
+        for reference in self._grounding:
+            if not reference.measurable or reference.literal:
+                continue
+            if reference.intent not in _ACCEPTANCE_PLAN_INTENTS:
+                continue
+            for surface in reference.surfaces:
+                if surface.path in touched:
+                    continue
+                issues.append(
+                    BuildValidationIssue(
+                        code="PLAN_MISSES_REQUESTED_SURFACE",
+                        detail=(
+                            f"la solicitud se refiere a un elemento existente en "
+                            f"{surface.path}:{surface.line} ({reference.kind}) y el plan no lo "
+                            f"toca: {reference.sentence[:120]}"
+                        )[:300],
+                    )
+                )
+                break
+        if len(issues) > _MAX_ACCEPTANCE_ISSUES:
+            return tuple(issues[:_MAX_ACCEPTANCE_ISSUES])
+        return tuple(issues)
+
+    def _verify_acceptance(
+        self, request: BuildRequest, repository: GovernedRepository
+    ) -> tuple[bool, tuple[BuildValidationIssue, ...], tuple[AcceptanceEvidence, ...]]:
+        """Mide las postcondiciones contra las superficies reales, después del build.
+
+        Devuelve si la aceptación está superada, los problemas accionables (que entran en la cadena
+        de reparación igual que un fallo de verificación) y la evidencia completa.
+        """
+        if not any(item.measurable for item in self._grounding):
+            return True, (), ()
+        records = verify_acceptance(
+            self._grounding,
+            read_text=repository.read_text,
+            changed_paths=repository.changed_paths(),
+            exists=repository.exists,
+        )
+        evidence = tuple(
+            AcceptanceEvidence(
+                sentence=item.sentence,
+                intent=item.intent,
+                kind=item.kind,
+                surface=item.surface,
+                precondition=item.precondition,
+                postcondition=item.postcondition,
+                result=item.result,
+            )
+            for item in records
+        )
+        failed = tuple(item for item in records if item.failed)
+        issues = tuple(
+            BuildValidationIssue(
+                code="ACCEPTANCE_NOT_SATISFIED",
+                detail=(
+                    f"{item.intent} {item.kind} en {item.surface or 'superficie no localizada'}: "
+                    f"{item.postcondition} ({item.precondition})"
+                )[:300],
+            )
+            for item in failed
+        )
+        if failed:
+            self._log(
+                AuditEventType.DEV_ACCEPTANCE_FAILED,
+                "dev_acceptance_failed",
+                request,
+                {
+                    "failed": len(failed),
+                    "measured": len(records),
+                    "surfaces": [item.surface for item in failed][:8],
+                    "details": [item.postcondition[:160] for item in failed][:8],
+                },
+                AuditResult.FAILURE,
+            )
+            return False, issues, evidence
+        self._log(
+            AuditEventType.DEV_ACCEPTANCE_VERIFIED,
+            "dev_acceptance_verified",
+            request,
+            {
+                "measured": len(records),
+                "satisfied": sum(1 for item in records if item.satisfied),
+                "not_measurable": sum(1 for item in records if item.result == "NOT_MEASURABLE"),
+            },
+        )
+        return True, (), evidence
+
+    @staticmethod
+    def _acceptance_result(evidence: Sequence[AcceptanceEvidence]) -> str:
+        """Resultado global de aceptación a partir de la evidencia medida."""
+        if not evidence or all(item.result == "NOT_MEASURABLE" for item in evidence):
+            return "NOT_MEASURED"
+        if any(item.result == "UNSATISFIED" for item in evidence):
+            return "FAILED"
+        return "SATISFIED"
 
     # -------------------------------------------------------------------- PELL
     def _retrieve(self, request: BuildRequest) -> RetrievalOutcome:
@@ -645,6 +831,7 @@ class DevelopmentCycle:
             )
         return {
             "candidates": len(candidates),
+            "paths": tuple(candidates),
             "selected": tuple(selected),
             "pell_ranked": tuple(ranked_pell[: self.config.max_context_files]),
             "without_pell": tuple(ranked_plain[: self.config.max_context_files]),
@@ -734,6 +921,9 @@ class DevelopmentCycle:
                 created_logged = True
             issues = self._validate_plan(plan, target, request)
             issues = (*issues, *self._authority_review(plan, repository, request, phase="plan"))
+            # AP000-OBS-02: el plan tiene que trabajar sobre la superficie que la solicitud
+            # menciona, no solo sobre una relacionada. Se comprueba antes de escribir nada.
+            issues = (*issues, *self._acceptance_preflight(plan, request))
             if not issues:
                 self._log(
                     AuditEventType.DEV_PLAN_VALIDATED,
@@ -1405,6 +1595,9 @@ class DevelopmentCycle:
         applied: list[AppliedChange] = []
         verification: list[CommandEvidence] = []
         checkpoint: RepairSnapshot | None = None
+        #: AP000-OBS-02: evidencia de aceptación de la última ronda evaluada.
+        acceptance_issues: tuple[BuildValidationIssue, ...] = ()
+        acceptance_evidence: tuple[AcceptanceEvidence, ...] = ()
         rounds = 0
         provider = ""
         model = ""
@@ -1555,6 +1748,8 @@ class DevelopmentCycle:
                             influence=influence,
                             change_issues=change_issues,
                             rolled_back=rolled_back,
+                            acceptance=acceptance_evidence,
+                            acceptance_result=self._acceptance_result(acceptance_evidence),
                         )
                     rounds += 1
                     continue
@@ -1692,6 +1887,8 @@ class DevelopmentCycle:
                         checkpoint=checkpoint,
                         influence=influence,
                         change_issues=issues,
+                        acceptance=acceptance_evidence,
+                        acceptance_result=self._acceptance_result(acceptance_evidence),
                     )
                 # Un cambio rechazado es una corrección pendiente, no el final del ciclo: se le
                 # devuelve al proveedor el motivo exacto y se le da otra ronda acotada.
@@ -1761,6 +1958,8 @@ class DevelopmentCycle:
                     influence=influence,
                     change_issues=change_issues,
                     rolled_back=rolled_back,
+                    acceptance=acceptance_evidence,
+                    acceptance_result=self._acceptance_result(acceptance_evidence),
                 )
             applied.extend(round_applied)
             if rounds > 0:
@@ -1772,6 +1971,11 @@ class DevelopmentCycle:
                 )
             verification = self._verify(repository, target, plan, request)
             chain_ok, chain_issues = self._verify_functional_chain(plan, verification, request)
+            # AP000-OBS-02: la aceptación se mide contra la superficie solicitada, después del
+            # build y antes de dar la ronda por buena. Un fallo aquí no es VERIFIED: repara.
+            acceptance_ok, acceptance_issues, acceptance_evidence = self._verify_acceptance(
+                request, repository
+            )
             # El progreso causal se registra **antes** de decidir: la ronda que resuelve el fallo
             # también es evidencia (qué recurso lo resolvió), no solo la que vuelve a fallar.
             signature = _failure_signature(verification)
@@ -1788,7 +1992,7 @@ class DevelopmentCycle:
                     if item
                 )
             )
-            passed = all(item.passed for item in verification) and chain_ok
+            passed = all(item.passed for item in verification) and chain_ok and acceptance_ok
             self._record_resolution_progress(
                 request=request,
                 rounds=rounds,
@@ -1827,9 +2031,13 @@ class DevelopmentCycle:
                     checkpoint=checkpoint,
                     influence=influence,
                     change_issues=(),
+                    acceptance=acceptance_evidence,
+                    acceptance_result=self._acceptance_result(acceptance_evidence),
                 )
             if chain_issues:
                 change_issues = (*change_issues, *chain_issues)
+            if acceptance_issues:
+                change_issues = (*change_issues, *acceptance_issues)
             stagnated = (
                 bool(previous_signature)
                 and signature == previous_signature
@@ -1890,6 +2098,14 @@ class DevelopmentCycle:
                 failure_evidence += "\nFUNCTIONAL CHAIN INCOMPLETE:\n" + "\n".join(
                     f"- {issue.code}: {issue.detail}" for issue in chain_issues
                 )
+            if acceptance_issues:
+                failure_evidence += (
+                    "\nACCEPTANCE NOT SATISFIED (the requested element is still where it was, or "
+                    "the surface the request names was not touched):\n"
+                    + "\n".join(f"- {issue.detail}" for issue in acceptance_issues)
+                    + "\nFix the surface that the request names; do not implement a related "
+                    "feature somewhere else."
+                )
             if stagnated:
                 failure_evidence += (
                     "\nSTAGNATION: the same failure with the same strategy. Change your "
@@ -1917,10 +2133,18 @@ class DevelopmentCycle:
             AuditResult.FAILURE,
         )
         rolled_back = self._rollback(request, checkpoint, repository, tuple(applied))
+        # AP000-OBS-02: si lo que sigue fallando es la aceptación (no las verificaciones), el código
+        # lo dice: la implementación puede estar verde y no ser lo que la solicitud pedía.
+        solo_aceptacion = bool(acceptance_issues) and all(item.passed for item in verification)
         return self._outcome(
             status=DevelopmentStatus.VERIFICATION_FAILED,
-            error_kind="VERIFICATION_FAILED",
-            error="la verificación no pasó tras las rondas de reparación",
+            error_kind="ACCEPTANCE_NOT_SATISFIED" if solo_aceptacion else "VERIFICATION_FAILED",
+            error=(
+                "el criterio de aceptación no quedó satisfecho en la superficie solicitada "
+                "tras las rondas de reparación"
+                if solo_aceptacion
+                else "la verificación no pasó tras las rondas de reparación"
+            ),
             provider=provider,
             model=model,
             applied=() if rolled_back else applied,
@@ -1931,6 +2155,9 @@ class DevelopmentCycle:
             checkpoint=checkpoint,
             influence=influence,
             rolled_back=rolled_back,
+            change_issues=change_issues,
+            acceptance=acceptance_evidence,
+            acceptance_result=self._acceptance_result(acceptance_evidence),
         )
 
     def _handle_context_requests(
@@ -2441,6 +2668,21 @@ class DevelopmentCycle:
             "MAX FILES YOU MAY TOUCH: "
             f"{min(self.config.max_files_changed, target.max_files_changed)}"
         )
+        # AP000-OBS-02: las superficies que PUNTO localizó para lo que la solicitud menciona. El
+        # plan tiene que trabajar sobre ellas; si no, se rechaza antes de escribir nada.
+        if self._grounding:
+            lines.append(
+                "GROUNDED SURFACES (existing elements the request refers to; your plan MUST touch "
+                "them where the intent is REPLACE/DELETE/MODIFY/CREATE):"
+            )
+            for reference in self._grounding:
+                if not reference.measurable:
+                    continue
+                for surface in reference.surfaces:
+                    lines.append(
+                        f"- {surface.path}:{surface.line} [{reference.intent} {reference.kind}] "
+                        f"{surface.snippet[:120]}"
+                    )
         for item in context_files:
             lines.append(f"\n===== {item.path} (sha256={item.sha256[:12]}) =====\n{item.content}")
         block = render_experience_block(retrieval.context)
@@ -2667,6 +2909,8 @@ class DevelopmentCycle:
             "plan_versions": list(self._plan_versions),
             "scope_expansions": list(self._scope_expansions),
             "functional_chain_result": self._functional_chain_result,
+            "acceptance": kwargs.get("acceptance", ()),
+            "acceptance_result": kwargs.get("acceptance_result", "NOT_MEASURED"),
             "plan": self._final_plan,
         }
 
@@ -2704,6 +2948,8 @@ class DevelopmentCycle:
         scope_expansions: Sequence[ScopeExpansionRecord] = (),
         authority_decisions: Sequence[AuthorityDecisionRecord] = (),
         functional_chain_result: str = "",
+        acceptance: Sequence[AcceptanceEvidence] = (),
+        acceptance_result: str = "NOT_MEASURED",
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -2772,6 +3018,8 @@ class DevelopmentCycle:
             scope_expansions=tuple(scope_expansions),
             authority_decisions=tuple(authority_decisions),
             functional_chain_result=functional_chain_result,
+            acceptance=tuple(acceptance),
+            acceptance_result=acceptance_result,
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,

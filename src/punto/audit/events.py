@@ -195,6 +195,11 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     #: ``AuditLogger.by_resource(task_id)`` reconstruye la decisión con sus condiciones.
     AuditEventType.RELEASE_AUTHORITY_EVALUATED: "release_authority",
     AuditEventType.AUTONOMOUS_RELEASE_AUTHORIZED: "publication",
+    #: AP000-OBS-02: la evidencia de aceptación se registra sobre la tarea, de modo que
+    #: ``AuditLogger.by_resource(task_id)`` reconstruye qué superficie se midió y con qué resultado.
+    AuditEventType.DEV_ACCEPTANCE_GROUNDED: "dev_acceptance",
+    AuditEventType.DEV_ACCEPTANCE_VERIFIED: "dev_acceptance",
+    AuditEventType.DEV_ACCEPTANCE_FAILED: "dev_acceptance",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
     AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",

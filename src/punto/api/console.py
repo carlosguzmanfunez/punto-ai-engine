@@ -251,6 +251,9 @@ class ConsoleTask:
                 _decision_view(item) for item in _gate_decisions(result)[:MAX_EVIDENCE_ROWS]
             ],
             "scope_paths": list(_result_scope(result))[:MAX_VERIFICATION_ROWS],
+            # AP000-OBS-02: evidencia de aceptación medida contra la superficie solicitada.
+            "acceptance_result": result.acceptance_result,
+            "acceptance": [item.model_dump() for item in result.acceptance[:MAX_EVIDENCE_ROWS]],
         }
 
     def as_dict(self) -> dict[str, Any]:

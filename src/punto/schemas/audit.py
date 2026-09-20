@@ -366,6 +366,12 @@ class AuditEventType(StrEnum):
     RELEASE_AUTHORITY_EVALUATED = "RELEASE_AUTHORITY_EVALUATED"
     #: AP000-R01: el release se ejecutó sin Human Gate, al amparo del sobre persistente del destino.
     AUTONOMOUS_RELEASE_AUTHORIZED = "AUTONOMOUS_RELEASE_AUTHORIZED"
+    #: AP000-OBS-02: se localizaron las superficies a las que se refiere la solicitud (grounding).
+    DEV_ACCEPTANCE_GROUNDED = "DEV_ACCEPTANCE_GROUNDED"
+    #: AP000-OBS-02: los criterios deterministas quedaron medidos y satisfechos en su superficie.
+    DEV_ACCEPTANCE_VERIFIED = "DEV_ACCEPTANCE_VERIFIED"
+    #: AP000-OBS-02: algún criterio determinista no se cumplió en la superficie solicitada.
+    DEV_ACCEPTANCE_FAILED = "DEV_ACCEPTANCE_FAILED"
 
 
 class AuditEvent(BaseModel):

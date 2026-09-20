@@ -378,6 +378,27 @@ class CommandEvidence(BaseModel):
     passed: bool = False
 
 
+class AcceptanceEvidence(BaseModel):
+    """Evidencia de aceptación de una referencia de la solicitud (AP000-OBS-02).
+
+    Registra la precondición (dónde estaba el elemento que la solicitud mencionaba), la
+    postcondición medida sobre esa misma superficie y el resultado. Es la prueba de que un criterio
+    determinista se midió **contra la superficie solicitada**, no contra una implementación
+    relacionada en otra parte.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sentence: str = Field(default="", max_length=300)
+    intent: str = Field(default="", max_length=20)
+    kind: str = Field(default="", max_length=20)
+    surface: str = Field(default="", max_length=300)
+    precondition: str = Field(default="", max_length=600)
+    postcondition: str = Field(default="", max_length=600)
+    #: ``SATISFIED`` | ``UNSATISFIED`` | ``NOT_MEASURABLE``.
+    result: str = Field(default="", max_length=20)
+
+
 class PellInfluence(BaseModel):
     """Cómo una experiencia recuperada cambió una decisión del ciclo, con efecto observable."""
 
@@ -425,6 +446,11 @@ class DevelopmentResult(BaseModel):
     risk_envelopes: tuple[dict[str, Any], ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
     scope_expansions: tuple[ScopeExpansionRecord, ...] = ()
     authority_decisions: tuple[AuthorityDecisionRecord, ...] = ()
+    #: AP000-OBS-02: evidencia de aceptación medida contra las superficies solicitadas. Si alguna
+    #: referencia medible queda ``UNSATISFIED``, el ciclo **no** puede declarar VERIFIED.
+    acceptance: tuple[AcceptanceEvidence, ...] = ()
+    #: ``SATISFIED`` | ``FAILED`` | ``NOT_MEASURED`` (sin referencias medibles).
+    acceptance_result: str = Field(default="NOT_MEASURED", max_length=20)
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)

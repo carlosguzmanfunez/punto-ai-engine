@@ -460,10 +460,16 @@ def _qa_green(result: DevelopmentResult | None, require_qa: bool) -> ReleaseCond
             ConditionState.UNSATISFIED,
             "el destino exige QA y la cadena funcional no está VERIFIED",
         )
+    if result.acceptance_result == "FAILED":
+        return _condition(
+            "qa_required_green",
+            ConditionState.UNSATISFIED,
+            "la aceptación contra la superficie solicitada no quedó satisfecha",
+        )
     return _condition(
         "qa_required_green",
         ConditionState.SATISFIED,
-        "QA del ciclo verde (cadena funcional VERIFIED)",
+        "QA del ciclo verde (cadena funcional VERIFIED y aceptación medida)",
     )
 
 

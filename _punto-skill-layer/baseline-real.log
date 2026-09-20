@@ -1,0 +1,5 @@
+﻿modo=REAL casos=3 workspace=C:\Users\CARLOS~1\AppData\Local\Temp\punto-baseline-real-cxbignoq
+[CASE-B] DEVELOPMENT_VERIFICATION_FAILED elapsed=173536ms calls=4 repairs=2 prompt=13144c ctx=182c tokens=REAL chain=False
+[CASE-D] DEVELOPMENT_COMPLETED    elapsed=167261ms calls=4 repairs=2 prompt=13982c ctx=182c tokens=REAL chain=True
+[CASE-E] DEVELOPMENT_COMPLETED    elapsed=197666ms calls=4 repairs=2 prompt=13883c ctx=182c tokens=REAL chain=True
+evidencia: C:\Users\Carlos Funez\Desktop\punto-ai-engine\_punto-skill-layer\baseline-real.json

@@ -1,0 +1,3 @@
+﻿modo=REAL casos=['CASE-B'] skill=(ninguna)
+[CASE-B] DEVELOPMENT_VERIFICATION_FAILED elapsed=218566ms calls=4 repairs=2 prompt=18691c ctx=182c tokens=REAL chain=False
+evidencia: C:\Users\Carlos Funez\Desktop\punto-ai-engine\_punto-skill-layer\baseline-real.json

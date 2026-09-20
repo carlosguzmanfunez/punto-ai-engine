@@ -1,4 +1,4 @@
-﻿"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
+"""Consola humana local → tarea → Human Gate → publicación gobernada: la cadena, demostrada.
 
 Cubre lo que el encargo pide demostrar (A a N) **sin tocar producción real**: el push va
 a un remoto Git local (bare) y la comprobación de producción se inyecta. Lo que no se
@@ -1410,6 +1410,132 @@ def test_g_la_tarea_en_espera_no_se_autoriza_sola(tmp_path: Path) -> None:
     assert _refs(remoto)["main"] == _git(repo, "rev-parse", "main")
     # Publicar sigue siendo imposible: no hay gate de publicación ni commit aprobado.
     assert client.post(f"/console/tasks/{tarea['task_id']}/publish").status_code == 409
+
+
+# ------------------------------------------- producción del destino · C, D, E y F
+def test_c_un_destino_no_registrado_no_puede_declarar_produccion(tmp_path: Path) -> None:
+    """C: la producción solo puede venir de la configuración; el navegador no la reescribe."""
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    client, _audit, _target_obj, _deps = _app(target=target, respuestas=[_plan(), _cambio()])
+
+    for campo in ("production_branch", "production_url", "production_marker", "publish_remote"):
+        intento = client.post(
+            "/console/tasks",
+            json={
+                "objective": "x y z",
+                "target_id": TARGET_ID,
+                campo: "https://otro.example/",
+            },
+        )
+        assert intento.status_code == 422, f"el cuerpo no admite {campo}"
+
+    # Un destino no registrado no se puede elegir, ni con la producción "a mano".
+    ajeno = client.post(
+        "/console/tasks", json={"objective": "x y z", "target_id": "otro-destino"}
+    )
+    assert ajeno.status_code == 400
+    # El listado de destinos es de solo lectura: no hay forma de declarar producción desde la API.
+    assert client.post("/console/targets", json={}).status_code == 405
+    assert client.put("/console/targets", json={}).status_code == 405
+    # Y la producción del destino sigue siendo la de su configuración.
+    assert (
+        client.get("/console/targets").json()["targets"][0]["production_url"]
+        == "https://produccion.local/"
+    )
+
+
+def test_d_e_f_el_gate_de_publicacion_usa_la_produccion_declarada_y_no_publica_nada(
+    tmp_path: Path,
+) -> None:
+    """D/E/F: el gate sale con la producción de la configuración, no publica y exige persona."""
+    repo, remoto = _repos(tmp_path)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "targets.local.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "targets": {
+                    TARGET_ID: {
+                        "display_name": "Punto Inmobiliario HN",
+                        "repository": str(repo),
+                        "baseline_sha": _git(repo, "rev-parse", "HEAD"),
+                        "scope_roots": ["src"],
+                        "allowed_operations": [
+                            "READ",
+                            "WRITE",
+                            "CREATE",
+                            "DELETE",
+                            "EXECUTE",
+                            "COMMIT",
+                        ],
+                        "work_branch": WORK_BRANCH,
+                        # Producción declarada **solo** aquí: es la configuración confiable del
+                        # destino. La URL es a propósito distinta de la del destino de la prueba,
+                        # para poder demostrar de dónde sale el dato.
+                        "production_branch": "main",
+                        "production_url": "https://punto-inmobiliario-hn.example/",
+                        "publish_remote": str(remoto),
+                        "verification": {
+                            "focused": {
+                                "argv": ["python", "-c", FOCUSED],
+                                "timeout_seconds": 60.0,
+                            }
+                        },
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    registrados = load_development_targets({"PUNTO_CONFIG_DIR": str(config_dir)})
+    client, audit, _target_obj, deps = _app(
+        target=_target(repo, remoto=remoto), respuestas=[_plan(), _cambio()], targets=registrados
+    )
+    assert deps.targets[TARGET_ID].production_url == "https://punto-inmobiliario-hn.example/"
+
+    tarea = client.post(
+        "/console/tasks",
+        json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
+    ).json()
+    assert tarea["stage"] == "DEVELOPMENT_COMPLETED"
+    antes = _refs(remoto)
+
+    # D: pedir el gate ya no falla por falta de producción declarada.
+    respuesta = client.post(f"/console/tasks/{tarea['task_id']}/production-gate")
+
+    assert respuesta.status_code == 200, respuesta.text
+    cuerpo = respuesta.json()
+    assert cuerpo["stage"] == "WAITING_PRODUCTION_APPROVAL"
+    assert cuerpo["publication"]["approval_id"]
+    vista = client.get("/console/human-gates").json()["items"][0]
+    assert vista["kind"] == "publication"
+    assert vista["destination"]["production_branch"] == "main"
+    assert vista["destination"]["production_url"] == "https://punto-inmobiliario-hn.example/"
+    assert vista["is_pending"] is True
+
+    # E: crear el gate no publica ni empuja nada.
+    assert _refs(remoto) == antes
+    tipos = {evento.event_type.value for evento in audit.by_resource(tarea["task_id"])}
+    assert "PUBLICATION_REQUESTED" not in tipos, "crear el gate no arranca la publicación"
+    assert "PUBLICATION_PUSHED" not in tipos
+    assert "PRODUCTION_VERIFIED" not in tipos
+    # El gate real quedó solicitado y auditado **a nombre de la aprobación** (su propio recurso).
+    del_gate = {
+        evento.event_type.value
+        for evento in audit.by_resource(cuerpo["publication"]["approval_id"])
+    }
+    assert "HUMAN_GATE_CREATED" in del_gate
+
+    # F: sin aprobación humana no hay publicación.
+    publicar = client.post(f"/console/tasks/{tarea['task_id']}/publish").json()
+    assert publicar["stage"] == "PUBLICATION_FAILED"
+    assert _refs(remoto) == antes, "sin persona, la rama de producción no cambia"
+    assert client.get("/console/human-gates").json()["pending"] == 1
+    despues = {evento.event_type.value for evento in audit.by_resource(tarea["task_id"])}
+    assert "PUBLICATION_PUSHED" not in despues
+    assert "PRODUCTION_VERIFIED" not in despues
 
 
 def _refs(remoto: Path) -> dict[str, str]:

@@ -92,6 +92,57 @@ def _escribir(config_dir: Path, contenido: dict[str, Any] | str) -> Path:
     return path
 
 
+# ------------------------------------------------- producción del destino (A y B)
+def test_la_produccion_del_destino_se_declara_en_la_configuracion_local(tmp_path: Path) -> None:
+    """A/B: la rama y la URL de producción salen de la configuración del destino, no de la UI."""
+    repo = _repo(tmp_path)
+    config_dir = tmp_path / "config"
+    _escribir(
+        config_dir,
+        _declaracion(
+            repo,
+            production_branch="main",
+            production_url="https://punto-inmobiliario-hn.vercel.app",
+        ),
+    )
+
+    destino = load_local_development_targets(config_dir)["punto-inmobiliario-hn"]
+
+    assert destino.production_branch == "main"
+    assert destino.production_url == "https://punto-inmobiliario-hn.vercel.app"
+    assert destino.publishable is True
+    assert destino.production_marker == "", "sin marcador declarado no se inventa uno"
+    assert destino.publish_remote == "origin", "el remoto por defecto es el declarado en Git"
+
+
+def test_sin_los_dos_campos_el_destino_no_es_publicable(tmp_path: Path) -> None:
+    """Declarar solo la rama (o solo la URL) no basta: PUNTO exige las dos y no adivina."""
+    repo = _repo(tmp_path)
+    solo_rama = tmp_path / "config-rama"
+    _escribir(solo_rama, _declaracion(repo, production_branch="main"))
+    solo_url = tmp_path / "config-url"
+    _escribir(solo_url, _declaracion(repo, production_url="https://ejemplo.local/"))
+
+    assert load_local_development_targets(solo_rama)["punto-inmobiliario-hn"].publishable is False
+    assert load_local_development_targets(solo_url)["punto-inmobiliario-hn"].publishable is False
+
+
+def test_la_declaracion_local_de_esta_maquina_declara_la_produccion_del_destino_real() -> None:
+    """A/B sobre la declaración real de este puesto (se omite donde no exista)."""
+    config_dir = Path("config")
+    archivo = config_dir / LOCAL_TARGETS_FILE
+    if not archivo.is_file():
+        pytest.skip("no hay declaración local de destinos en esta máquina")
+    destinos = load_local_development_targets(config_dir)
+    destino = destinos.get("punto-inmobiliario-hn")
+    if destino is None:
+        pytest.skip("la declaración local no registra punto-inmobiliario-hn")
+
+    assert destino.production_branch == "main"
+    assert destino.production_url == "https://punto-inmobiliario-hn.vercel.app"
+    assert destino.publishable is True
+
+
 # ------------------------------------------------------------- lectura del archivo local
 def test_el_archivo_local_declara_el_destino_y_resuelve_la_ruta(tmp_path: Path) -> None:
     """La clave del destino resuelve al repositorio declarado, con su nombre humano."""

@@ -1643,15 +1643,19 @@ def _capability_evidence(result: DevelopmentResult | None) -> dict[str, Any]:
     )
     if claim is None and requisito is None:
         return {}
+    requerida = _redacted(
+        (claim.capability if claim is not None else "")
+        or (requisito.capability if requisito else ""),
+        40,
+    )
     return {
         "criterion": _redacted(claim.sentence if claim is not None else "", 300),
         "kind": _redacted(claim.kind if claim is not None else "", 40),
-        "required": _redacted(
-            (claim.capability if claim is not None else "")
-            or (requisito.capability if requisito else ""),
-            40,
-        ),
-        "available": bool(
+        "required": requerida,
+        # Sin capacidad nombrada no hay nada que dar por disponible: se falla cerrado y no se
+        # presenta como usable lo que no se puede comprobar.
+        "available": bool(requerida)
+        and bool(
             claim.capability_available
             if claim is not None
             else (requisito.available if requisito else False)

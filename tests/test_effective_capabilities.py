@@ -34,7 +34,11 @@ from punto.acceptance import (
     extract_claims,
     verify_claims,
 )
-from punto.api.console import ConsoleDependencies, register_human_console
+from punto.api.console import (
+    ConsoleDependencies,
+    _capability_evidence,
+    register_human_console,
+)
 from punto.api.console_state import default_console_state_path
 from punto.api.dashboard import register_dashboard
 from punto.audit.logger import AuditLogger
@@ -621,3 +625,51 @@ def test_el_resultado_con_capacidades_sobrevive_al_estado_durable() -> None:
     assert recuperada["development"]["claims"][0]["evidence_required"]
     assert recuperada["development"]["capabilities"][0]["capability"] == "VISION"
     assert recuperada["development"]["capabilities"][0]["available"] is False
+
+
+def test_una_capacidad_sin_nombre_no_se_presenta_como_disponible() -> None:
+    """Un resultado sin capacidad nombrada no puede leerse como «capacidad disponible»."""
+    sin_capacidad = _resultado_pendiente(ClaimEvidence(
+        sentence="el mapa se integra visualmente",
+        kind="VISUAL_APPEARANCE",
+        required=True,
+        result="NOT_VERIFIED",
+        evidence="criterio visual sin evidencia",
+    ))
+
+    evidencia = _capability_evidence(sin_capacidad)
+
+    assert evidencia["required"] == ""
+    assert evidencia["available"] is False
+
+    con_capacidad = _capability_evidence(
+        _resultado_pendiente(
+            ClaimEvidence(
+                sentence="el mapa se integra visualmente",
+                kind="VISUAL_APPEARANCE",
+                required=True,
+                result="NOT_VERIFIED",
+                evidence="el transporte puede recibir imágenes pero no se aportó ninguna",
+                capability=CAPABILITY_VISION,
+                capability_available=True,
+                remedy="aporta una imagen renderizada",
+            )
+        )
+    )
+
+    assert con_capacidad["required"] == CAPABILITY_VISION
+    assert con_capacidad["available"] is True
+
+
+def _resultado_pendiente(claim: ClaimEvidence) -> DevelopmentResult:
+    """Resultado bloqueado por evidencia con la afirmación dada, sin pasar por el ciclo."""
+    return DevelopmentResult(
+        request_id=uuid4(),
+        status=DevelopmentStatus.BLOCKED,
+        target_id="punto-inmobiliario-hn",
+        plan_status=PlanStatus.REJECTED,
+        error_kind="EVIDENCE_REQUIRED",
+        error="hay un criterio factual/semántico requerido que no se puede demostrar",
+        claims=(claim,),
+        claims_result="EVIDENCE_REQUIRED",
+    )

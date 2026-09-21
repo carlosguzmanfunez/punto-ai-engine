@@ -30,6 +30,7 @@ from typing import Any, Final
 
 __all__ = [
     "CAPABILITY_VISION",
+    "INTERACTION_MARKERS",
     "AcceptanceRecord",
     "CapabilityRequirement",
     "ClaimKind",
@@ -45,6 +46,7 @@ __all__ = [
     "extract_claims",
     "extract_references",
     "ground_request",
+    "is_interaction_claim",
     "measurable",
     "tokens",
     "verify_acceptance",
@@ -953,6 +955,26 @@ class VisualCapability:
         }
 
 
+#: Marcas de un criterio de **interacción** (transición): una captura estática no lo demuestra.
+INTERACTION_MARKERS: Final[tuple[str, ...]] = (
+    "cursor",
+    "hover",
+    "al pasar",
+    "pasar el",
+    "pasa el",
+    "clic",
+    "click",
+    "tooltip",
+    "resalt",
+)
+
+
+def is_interaction_claim(sentence: str) -> bool:
+    """True si el criterio describe una interacción (pasar el cursor, hacer clic...)."""
+    plain = normalize(sentence)
+    return any(marker in plain for marker in INTERACTION_MARKERS)
+
+
 @dataclass(frozen=True, slots=True)
 class VisualVerdict:
     """Veredicto de VISUAL_QA sobre un criterio, con quién lo emitió y sobre qué capturas.
@@ -1116,6 +1138,23 @@ def _visual_record(
             capability=CAPABILITY_VISION,
             capability_available=capability.available,
             capability_detail=capability.detail,
+        )
+    if verdict is not None and not verdict.provider:
+        # Sin revisor: la interacción no se pudo demostrar (elemento no localizado, hover no
+        # confirmado...). El motivo es un hecho determinista, no un juicio del modelo.
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="NOT_VERIFIED",
+            evidence=f"evidencia visual de interacción no disponible: {verdict.observation}"[:600],
+            evidence_required=claim.evidence_required,
+            capability=CAPABILITY_VISION,
+            capability_available=capability.available,
+            capability_detail=capability.detail,
+            remedy=(
+                "declara la interacción del destino (visual.interactions) con un selector que "
+                "localice el elemento, o aporta una atestación humana explícita"
+            ),
         )
     if verdict is not None and capability.available:
         via = (

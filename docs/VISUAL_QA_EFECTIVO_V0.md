@@ -51,8 +51,46 @@ sesión, navegador o `--image`; no hay `skip` ni PASS simulado).
 
 ## 4. Límites (no se relajan)
 
-- Una captura estática solo demuestra lo que **se ve**. Un criterio de interacción (pasar el cursor)
-  sale `UNCLEAR` y sigue exigiendo evidencia; capturar estados de interacción es trabajo aparte.
+- Una captura estática solo demuestra lo que **se ve**: un criterio de interacción (pasar el cursor)
+  sale `UNCLEAR` con captura estática; se demuestra con la evidencia de interacción de la sección 5.
 - La captura es del servidor de bucle local que el destino declare (p. ej. `next dev`); PUNTO no lo
   arranca. Sin `visual.routes` en el destino no hay captura.
 - Sin autoridad nueva: el veredicto no aprueba gates, no escribe y no publica.
+
+## 5. Evidencia de interacción (hover)
+
+Una captura estática no demuestra «al pasar el cursor sobre un departamento este cambia y aparece su
+nombre»: es una **transición**. `visualqa/interaction.py` la demuestra con un navegador real:
+
+- **Configuración del destino** (`visual.interactions`, nada en el motor): ruta de bucle local, selector
+  CSS del **elemento objetivo**, selector opcional de la **etiqueta** donde debe aparecer el texto,
+  `index` (qué coincidencia) y `settle_ms`.
+- **Ejecución** (Chrome/Edge headless por DevTools sobre `websockets`, que ya trae uvicorn; sin
+  dependencias nuevas): localiza el elemento, halla un punto que **de verdad** lo golpea
+  (`elementFromPoint`), captura el estado inicial, mueve el ratón con eventos de entrada reales, exige
+  que el navegador reporte `:hover` y captura el estado posterior. Las capturas cubren la región
+  **elemento + etiqueta** (si la etiqueta queda bajo el pliegue, se captura igual).
+- **Evaluación**: VISUAL_QA (Codex, ruta efectiva) recibe el par antes/después y los hechos
+  deterministas; el veredicto usa el mismo contrato cerrado.
+- **Fail closed**: elemento no localizado, punto tapado por otro elemento, elemento ya en hover al
+  inicio o hover no confirmado → `UNCLEAR` sin llamar a nadie. Un `PASS` con capturas idénticas byte a
+  byte se degrada a `UNCLEAR`. Sin interacción declarada o sin ejecutor → `UNCLEAR` con el motivo.
+- **Persistencia** (`DevelopmentResult.visual_evidence`, `TaskAttempt.visual`): interacción, ruta,
+  elemento objetivo, `hover_applied`, `pixels_changed`, capturas antes/después con huella, proveedor,
+  modelo, transporte, veredicto y `request_id` de la Task.
+
+Ejemplo de configuración (Punto Inmobiliario HN, `config/targets.local.yaml`, no versionado):
+
+```yaml
+visual:
+  routes: ["http://localhost:3000/propiedades"]
+  viewport: [1280, 900]
+  interactions:
+    - name: hover-departamento
+      route: "http://localhost:3000/propiedades"
+      hover: 'svg.honduras-map a[aria-label="Ver propiedades en Cortés"] path.department-path'
+      label: ".map-active-label"
+```
+
+Gate vivo (Chrome + Codex reales): `tests/integration/test_hover_interaction_live.py`.
+

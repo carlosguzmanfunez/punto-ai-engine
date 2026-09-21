@@ -1383,7 +1383,8 @@ def _visual_summary(result: DevelopmentResult | None) -> str:
     for item in result.visual_evidence:
         counts[item.verdict] = counts.get(item.verdict, 0) + 1
     verdicts = " ".join(f"{name}={total}" for name, total in sorted(counts.items()))
-    return _redacted(f"{first.provider}/{first.transport}: {verdicts}", 120)
+    kind = " (hover)" if any(item.interaction for item in result.visual_evidence) else ""
+    return _redacted(f"{first.provider}/{first.transport}: {verdicts}{kind}", 120)
 
 
 def _task_record(task: ConsoleTask) -> TaskRecord:

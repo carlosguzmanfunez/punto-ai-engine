@@ -83,6 +83,8 @@ class CapturedShot:
     viewport: tuple[int, int]
     data: bytes
     media_type: str = "image/png"
+    #: ``static`` (captura normal), ``before`` / ``after`` (antes y después de una interacción).
+    phase: str = "static"
 
     @property
     def sha256(self) -> str:

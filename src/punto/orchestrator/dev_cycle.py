@@ -54,6 +54,7 @@ from punto.acceptance import (
     claims_result,
     extract_claims,
     ground_request,
+    is_interaction_claim,
     verify_acceptance,
     verify_claims,
 )
@@ -148,6 +149,12 @@ from punto.visualqa.dev_evidence import (
     HeadlessBrowserCapture,
     ScreenshotCapture,
     assess_visual_claims,
+)
+from punto.visualqa.interaction import (
+    BrowserInteraction,
+    InteractionEvidence,
+    InteractionRunner,
+    assess_interaction_claims,
 )
 from punto.workflow.snapshots import FileRepairSnapshots
 from punto.workspace.repository import (
@@ -319,6 +326,8 @@ class DevelopmentCycle:
     #: Captura de la aplicación renderizada para la evidencia visual (opcional). Sin ella, o sin
     #: rutas visuales en el destino, no hay captura y el criterio sigue exigiendo evidencia.
     visual_capture: ScreenshotCapture | None = None
+    #: Ejecutor de interacciones reales (hover) para criterios que una captura no demuestra.
+    visual_interaction: InteractionRunner | None = None
     _snapshots: FileRepairSnapshots | None = field(default=None, init=False, repr=False)
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
     _last_provider: str = field(default="", init=False, repr=False)
@@ -1003,20 +1012,48 @@ class DevelopmentCycle:
         target: DevelopmentTarget,
         visual: VisualCapability,
     ) -> dict[str, VisualVerdict]:
-        """Produce evidencia visual real: captura la app renderizada y la evalúa VISUAL_QA.
+        """Produce evidencia visual real (capturas y/o interacciones) evaluada por VISUAL_QA.
 
-        Solo si hay capacidad **efectiva** de imágenes, un captor inyectado y rutas visuales
-        declaradas por el destino; en cualquier otro caso devuelve ``{}`` y el criterio sigue
-        exigiendo evidencia (nunca se simula). Un fallo de captura o de evaluación tampoco es un
-        PASS: se registra con su causa y el criterio queda sin verificar. La evidencia queda ligada
-        a la Task (``request_id``) y al cambio aplicado (``applied_digest``).
+        Solo con capacidad **efectiva** de imágenes y evidencia real: una captura de la app
+        renderizada para los criterios estáticos, y una interacción real (hover con antes/después)
+        para los de interacción. En cualquier otro caso el criterio sigue exigiendo evidencia
+        (nunca se simula). Un fallo de captura, de interacción o de evaluación tampoco es un PASS.
+        La evidencia queda ligada a la Task (``request_id``) y al cambio aplicado.
         """
-        sentences = [
-            claim.sentence for claim in self._claims if claim.capability == "VISION"
-        ]
-        if not sentences or not visual.available or self.visual_capture is None:
+        claims = [claim.sentence for claim in self._claims if claim.capability == "VISION"]
+        if not claims or not visual.available:
             return {}
-        if not target.visual_routes:
+        interactive = [text for text in claims if is_interaction_claim(text)]
+        static = [text for text in claims if text not in interactive]
+        digest = self._applied_digest(repository)
+        verdicts: dict[str, VisualVerdict] = {}
+        if static:
+            verdicts.update(self._static_verdicts(request, target, static, digest))
+        if interactive:
+            verdicts.update(self._interaction_verdicts(request, target, interactive, digest))
+        return verdicts
+
+    @staticmethod
+    def _applied_digest(repository: GovernedRepository) -> str:
+        """Huella de los ficheros aplicados sobre los que se toma la evidencia."""
+        return hashlib.sha256(
+            "\n".join(
+                f"{path}:{sha}"
+                for path, sha in sorted(
+                    repository.file_hashes(repository.changed_paths()).items()
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _static_verdicts(
+        self,
+        request: BuildRequest,
+        target: DevelopmentTarget,
+        sentences: Sequence[str],
+        digest: str,
+    ) -> dict[str, VisualVerdict]:
+        """Criterios de apariencia estática: captura real de la app renderizada + VISUAL_QA."""
+        if self.visual_capture is None or not target.visual_routes:
             return {}
         try:
             shots = self.visual_capture.capture(target.visual_routes, target.visual_viewport)
@@ -1046,6 +1083,94 @@ class DevelopmentCycle:
             request_id=str(request.request_id),
             max_output_tokens=self.config.max_output_tokens,
         )
+        return self._register_assessment(request, sentences, assessment, digest=digest)
+
+    def _interaction_verdicts(
+        self,
+        request: BuildRequest,
+        target: DevelopmentTarget,
+        sentences: Sequence[str],
+        digest: str,
+    ) -> dict[str, VisualVerdict]:
+        """Criterios de interacción: hover real con antes/después, evaluado por VISUAL_QA.
+
+        Sin interacción declarada por el destino, sin ejecutor o con una interacción que no se puede
+        demostrar (elemento no localizado, hover no confirmado), cada criterio queda ``UNCLEAR`` con
+        el motivo determinista y **no se llama a ningún proveedor**.
+        """
+        if self.visual_interaction is None or not target.visual_interactions:
+            reason = (
+                "el destino no declara una interacción (visual.interactions) que demuestre este "
+                "criterio"
+                if self.visual_interaction is not None
+                else "no hay ejecutor de interacciones configurado"
+            )
+            return self._unproven(request, sentences, reason, digest=digest)
+        evidences = [
+            self.visual_interaction.run(spec, target.visual_viewport)
+            for spec in target.visual_interactions
+        ]
+        self._log(
+            AuditEventType.DEV_VISUAL_CAPTURED,
+            "dev_visual_interaction",
+            request,
+            {
+                "interactions": [item.name for item in evidences],
+                "routes": [item.route for item in evidences],
+                "targets": [item.target for item in evidences],
+                "hover_applied": [item.hover_applied for item in evidences],
+                "pixels_changed": [item.pixels_changed for item in evidences],
+                "errors": [item.error for item in evidences if item.error],
+            },
+            AuditResult.SUCCESS
+            if any(item.usable for item in evidences)
+            else AuditResult.FAILURE,
+        )
+        assessment = assess_interaction_claims(
+            self.router,
+            sentences,
+            evidences,
+            request_id=str(request.request_id),
+            max_output_tokens=self.config.max_output_tokens,
+        )
+        return self._register_assessment(
+            request, sentences, assessment, digest=digest, evidences=evidences
+        )
+
+    def _unproven(
+        self,
+        request: BuildRequest,
+        sentences: Sequence[str],
+        reason: str,
+        *,
+        digest: str,
+    ) -> dict[str, VisualVerdict]:
+        """Deja constancia de que la interacción no es demostrable: ``UNCLEAR`` sin proveedor."""
+        verdicts: dict[str, VisualVerdict] = {}
+        for sentence in sentences:
+            verdicts[sentence] = VisualVerdict(verdict="UNCLEAR", observation=reason[:300])
+            self._visual_evidence.append(
+                VisualEvidenceRecord(
+                    request_id=str(request.request_id),
+                    claim=sentence[:300],
+                    verdict="UNCLEAR",
+                    observation=reason[:300],
+                    applied_digest=digest,
+                    interaction="hover",
+                )
+            )
+        return verdicts
+
+    def _register_assessment(
+        self,
+        request: BuildRequest,
+        sentences: Sequence[str],
+        assessment: Any,
+        *,
+        digest: str,
+        evidences: Sequence[InteractionEvidence] = (),
+    ) -> dict[str, VisualVerdict]:
+        """Audita la evaluación y traduce sus veredictos a evidencia persistida y a verificación."""
         self._log(
             AuditEventType.DEV_VISUAL_ASSESSED,
             "dev_visual_assessed",
@@ -1057,30 +1182,32 @@ class DevelopmentCycle:
                 "transport": assessment.transport,
                 "via_failover": assessment.via_failover,
                 "verdicts": [item.verdict for item in assessment.verdicts],
+                "interaction": bool(evidences),
                 "error": assessment.error,
             },
             AuditResult.SUCCESS if assessment.performed else AuditResult.FAILURE,
         )
         if not assessment.performed:
-            return {}
-        digest = hashlib.sha256(
-            "\n".join(
-                f"{path}:{sha}"
-                for path, sha in sorted(
-                    repository.file_hashes(repository.changed_paths()).items()
+            if evidences:
+                return self._unproven(
+                    request, sentences, assessment.error or "sin evaluación", digest=digest
                 )
-            ).encode("utf-8")
-        ).hexdigest()
+            return {}
         evidence_shots = tuple(
             VisualShotEvidence(
                 url=shot.url[:300],
                 viewport=f"{shot.viewport[0]}x{shot.viewport[1]}",
                 sha256=shot.sha256,
                 size_bytes=len(shot.data),
+                phase=shot.phase,
             )
             for shot in assessment.shots
         )
-        labels = tuple(f"{shot.url} {shot.sha256[:12]}" for shot in assessment.shots)
+        labels = tuple(
+            f"{shot.url} {shot.phase} {shot.sha256[:12]}" for shot in assessment.shots
+        )
+        usable = [item for item in evidences if item.usable]
+        first = usable[0] if usable else None
         verdicts: dict[str, VisualVerdict] = {}
         for index, sentence in enumerate(sentences, start=1):
             found = assessment.verdict_for(index)
@@ -1106,6 +1233,11 @@ class DevelopmentCycle:
                     via_failover=assessment.via_failover,
                     screenshots=evidence_shots,
                     applied_digest=digest,
+                    interaction=f"hover:{first.name}" if first is not None else "",
+                    route=first.route[:300] if first is not None else "",
+                    target_element=first.target[:300] if first is not None else "",
+                    hover_applied=any(item.hover_applied for item in usable),
+                    pixels_changed=any(item.pixels_changed for item in usable),
                 )
             )
         return verdicts
@@ -4077,6 +4209,7 @@ def default_development_cycle(
         audit=audit,
         policy_engine=PolicyEngine.from_config(),
         visual_capture=HeadlessBrowserCapture(),
+        visual_interaction=BrowserInteraction(),
     )
 
 

@@ -98,6 +98,26 @@ class VerificationCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualInteraction:
+    """Interacción **declarada** por el destino para demostrar un criterio de apariencia dinámico.
+
+    Es configuración de confianza (nada viene de una petición ni de un proveedor): dice en qué
+    ruta de bucle local hay que pasar el cursor y sobre **qué elemento**, identificado por un
+    selector CSS. ``hover`` debe localizar un elemento; ``label`` (opcional) es el elemento donde
+    se espera que aparezca un texto tras la interacción. ``index`` elige de forma determinista
+    cuál de los elementos coincidentes se usa. Si el selector no localiza el elemento, la
+    interacción no es demostrable y el criterio queda ``UNCLEAR``.
+    """
+
+    name: str
+    route: str
+    hover: str
+    label: str = ""
+    index: int = 0
+    settle_ms: int = 800
+
+
+@dataclass(frozen=True, slots=True)
 class DevelopmentTarget:
     """Destino de desarrollo: dónde se trabaja, qué se puede hacer y cómo se verifica."""
 
@@ -135,6 +155,8 @@ class DevelopmentTarget:
     #: adivina dónde corre la aplicación ni navega fuera de la máquina.
     visual_routes: tuple[str, ...] = ()
     visual_viewport: tuple[int, int] = (1280, 800)
+    #: Interacciones (hover) declaradas para criterios que una captura estática no demuestra.
+    visual_interactions: tuple[VisualInteraction, ...] = ()
     #: Autoridad persistente del destino (AP000-R01): qué operaciones están previamente
     #: autorizadas. Sin sobre explícito no hay autonomía (todo ``False``): fail closed.
     authority: TargetAuthority = field(default_factory=TargetAuthority)
@@ -408,6 +430,7 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
     )
 
     visual_routes, visual_viewport = _parse_visual(value.get("visual"), target_id=target_id)
+    visual_interactions = _parse_interactions(value.get("visual"), target_id=target_id)
 
     return DevelopmentTarget(
         target_id=target_id,
@@ -430,6 +453,7 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         publish_remote=str(value.get("publish_remote", "origin")).strip() or "origin",
         visual_routes=visual_routes,
         visual_viewport=visual_viewport,
+        visual_interactions=visual_interactions,
         authority=_parse_authority(
             value.get("authority"),
             target_id=target_id,
@@ -477,6 +501,87 @@ def _parse_visual(raw: Any, *, target_id: str) -> tuple[tuple[str, ...], tuple[i
             f"visual.viewport de {target_id!r} debe ser [ancho, alto] entre 320 y 3840 x 2400"
         )
     return tuple(routes), (int(viewport_raw[0]), int(viewport_raw[1]))
+
+
+_INTERACTION_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+
+def _parse_interactions(raw: Any, *, target_id: str) -> tuple[VisualInteraction, ...]:
+    """Lee ``visual.interactions`` con validación estricta (lista de ``VisualInteraction``).
+
+    Forma: ``[{name, route, hover, label?, index?, settle_ms?}]``. La ruta debe ser de bucle local;
+    los selectores son texto plano acotado, sin caracteres de control.
+
+    Raises:
+        DevelopmentTargetError: si la forma es inválida, la ruta sale del bucle local o algún campo
+            no es razonable.
+    """
+    if not isinstance(raw, Mapping):
+        return ()
+    items = raw.get("interactions")
+    if items is None:
+        return ()
+    if not isinstance(items, (list, tuple)) or len(items) > 4:
+        raise DevelopmentTargetError(
+            f"visual.interactions de {target_id!r} debe ser una lista de <= 4"
+        )
+    from urllib.parse import urlparse
+
+    result: list[VisualInteraction] = []
+    names: set[str] = set()
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise DevelopmentTargetError(f"cada interacción de {target_id!r} debe ser un objeto")
+        name = str(item.get("name", "")).strip()
+        if not _INTERACTION_NAME.match(name) or name in names:
+            raise DevelopmentTargetError(
+                f"interacción de {target_id!r}: nombre inválido o repetido {name!r}"
+            )
+        names.add(name)
+        route = str(item.get("route", "")).strip()
+        parsed = urlparse(route)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "localhost",
+            "127.0.0.1",
+        }:
+            raise DevelopmentTargetError(
+                f"interacción {name!r} de {target_id!r}: {route!r} no es una URL de bucle local"
+            )
+        selectors: list[str] = []
+        for key, required in (("hover", True), ("label", False)):
+            selector = str(item.get(key, "")).strip()
+            if (required and not selector) or len(selector) > 300 or any(
+                ord(character) < 32 for character in selector
+            ):
+                raise DevelopmentTargetError(
+                    f"interacción {name!r} de {target_id!r}: {key!r} inválido"
+                )
+            selectors.append(selector)
+        index = item.get("index", 0)
+        settle = item.get("settle_ms", 800)
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index <= 200
+            or isinstance(settle, bool)
+            or not isinstance(settle, int)
+            or not 100 <= settle <= 5000
+        ):
+            raise DevelopmentTargetError(
+                f"interacción {name!r} de {target_id!r}: index (0-200) o settle_ms "
+                "(100-5000) inválido"
+            )
+        result.append(
+            VisualInteraction(
+                name=name,
+                route=route,
+                hover=selectors[0],
+                label=selectors[1],
+                index=index,
+                settle_ms=settle,
+            )
+        )
+    return tuple(result)
 
 
 def load_development_targets(
@@ -647,6 +752,7 @@ __all__ = [
     "DevelopmentTargetError",
     "DevelopmentTargetRegistry",
     "VerificationCommand",
+    "VisualInteraction",
     "load_development_targets",
     "load_local_development_targets",
     "target_from_mapping",

@@ -483,6 +483,8 @@ class VisualShotEvidence(BaseModel):
     viewport: str = Field(default="", max_length=20)
     sha256: str = Field(default="", max_length=64)
     size_bytes: int = Field(default=0, ge=0)
+    #: ``static`` | ``before`` | ``after`` (antes y después de una interacción real).
+    phase: str = Field(default="static", max_length=10)
 
 
 class VisualEvidenceRecord(BaseModel):
@@ -508,6 +510,15 @@ class VisualEvidenceRecord(BaseModel):
     screenshots: tuple[VisualShotEvidence, ...] = Field(default=(), max_length=8)
     #: Huella de los ficheros aplicados sobre los que se tomó la captura.
     applied_digest: str = Field(default="", max_length=64)
+    #: Interacción real ejecutada (``hover:<nombre>``), vacío para una captura estática.
+    interaction: str = Field(default="", max_length=80)
+    route: str = Field(default="", max_length=300)
+    #: Elemento objetivo de la interacción (descripción determinista del elemento localizado).
+    target_element: str = Field(default="", max_length=300)
+    #: El navegador confirmó el elemento en ``:hover`` tras el movimiento real.
+    hover_applied: bool = False
+    #: El estado posterior difiere byte a byte del inicial.
+    pixels_changed: bool = False
     captured_at: datetime = Field(default_factory=utc_now)
 
 

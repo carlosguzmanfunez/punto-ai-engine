@@ -42,6 +42,12 @@ from punto.policy.authority import (
     AuthorityCatalog,
     AuthorityRule,
 )
+from punto.policy.autonomy import (
+    AutonomyContext,
+    AutonomyPolicy,
+    AutonomyQuery,
+    AutonomyVerdict,
+)
 from punto.policy.budgets import BudgetBreach, BudgetPolicy
 from punto.policy.config_loader import ConfigLoader
 from punto.policy.permissions import (
@@ -102,6 +108,9 @@ class PolicyEvaluationContext:
     task_max_execution_minutes: float | None = None
     task_max_files_changed: int | None = None
     actor: str = "camus"
+    #: Hechos de confianza del destino, fijados por código de PUNTO. Sin él no hay autonomía
+    #: delegada: un riesgo HIGH sigue exigiendo persona (fail-closed).
+    autonomy: AutonomyContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +123,7 @@ class PolicyConfigBundle:
     budgets: dict[str, Any] = field(default_factory=dict)
     models: dict[str, Any] = field(default_factory=dict)
     environments: dict[str, Any] = field(default_factory=dict)
+    autonomy: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_loader(cls, loader: ConfigLoader) -> PolicyConfigBundle:
@@ -125,6 +135,7 @@ class PolicyConfigBundle:
             budgets=loader.load("budgets"),
             models=loader.load("models"),
             environments=loader.load("environments"),
+            autonomy=loader.load_optional("autonomy"),
         )
 
     @property
@@ -157,7 +168,9 @@ class PolicyEngine:
         permissions: dict[str, Any] | None = None,
         environments: dict[str, Any] | None = None,
         environment: str = "local",
+        autonomy: AutonomyPolicy | None = None,
     ) -> None:
+        self._autonomy = autonomy or AutonomyPolicy()
         self._catalog = catalog
         self._risk = risk_engine
         self._budgets = budget_policy
@@ -200,6 +213,7 @@ class PolicyEngine:
             permissions=bundle.permissions,
             environments=bundle.environments,
             environment=environment,
+            autonomy=AutonomyPolicy.from_config(bundle.autonomy),
         )
 
     # ---------------------------------------------------------------- accessors
@@ -217,6 +231,11 @@ class PolicyEngine:
     def budget_policy(self) -> BudgetPolicy:
         """Política de presupuesto en uso."""
         return self._budgets
+
+    @property
+    def autonomy(self) -> AutonomyPolicy:
+        """Política de autonomía preautorizada en uso (vacía ⇒ sin autonomía delegada)."""
+        return self._autonomy
 
     @property
     def environment(self) -> str:
@@ -332,8 +351,13 @@ class PolicyEngine:
         breaches = self._effective_breaches(request, rule.level, ctx)
         budget_exceeded = bool(breaches)
 
-        # 6. Regla de autonomía.
-        autonomy_violations = self._autonomy_violations(request, rule.level, assessment)
+        # 6. Autonomía preautorizada: un riesgo HIGH por sí solo no es una frontera de autoridad.
+        preauthorized = self._preauthorize(request, rule, assessment, ctx, reasons)
+
+        # 7. Regla de autonomía.
+        autonomy_violations = self._autonomy_violations(
+            request, rule.level, assessment, preauthorized=preauthorized is not None
+        )
 
         if budget_exceeded:
             reason = "REJECT: presupuesto excedido; " + "; ".join(
@@ -355,7 +379,7 @@ class PolicyEngine:
             self._record(decision)
             return decision
 
-        if assessment.requires_human_gate or rule.level.requires_human:
+        if (assessment.requires_human_gate and preauthorized is None) or rule.level.requires_human:
             human_reasons = [
                 f"autoridad {rule.level.name}",
                 f"riesgo {assessment.effective.name}",
@@ -425,6 +449,11 @@ class PolicyEngine:
             return decision
 
         reasons.append("acción autorizada de forma autónoma dentro de permisos y presupuesto")
+        if preauthorized is not None:
+            reasons.append(
+                f"riesgo {assessment.effective.name} sin frontera de autoridad: "
+                + "; ".join(preauthorized.reasons)
+            )
         decision = PolicyDecision(
             allowed=True,
             authority_level=rule.level,
@@ -474,14 +503,20 @@ class PolicyEngine:
         request: ActionRequest,
         level: AuthorityLevel,
         assessment: RiskAssessment,
+        *,
+        preauthorized: bool = False,
     ) -> tuple[str, ...]:
-        """Devuelve las condiciones de autonomía incumplidas, en orden fijo."""
+        """Devuelve las condiciones de autonomía incumplidas, en orden fijo.
+
+        Con autonomía preautorizada, ``HIGH`` deja de ser por sí mismo una violación: lo es cruzar
+        una frontera (producción, legal, negocio, irreversible, nivel 3), que se sigue comprobando.
+        """
         violations: list[str] = []
         if not request.technical:
             violations.append("la acción no es técnica")
-        if not request.reversible:
+        if not request.reversible and not preauthorized:
             violations.append("la acción no es reversible")
-        if assessment.effective > RiskLevel.MEDIUM:
+        if assessment.effective > RiskLevel.MEDIUM and not preauthorized:
             violations.append(f"riesgo {assessment.effective.name} superior a MEDIUM")
         if request.production_impact:
             violations.append("impacto en producción")
@@ -492,6 +527,58 @@ class PolicyEngine:
         if level >= AuthorityLevel.LEVEL_3_HUMAN:
             violations.append("nivel de autoridad 3 reservado a decisión humana")
         return tuple(violations)
+
+    def _preauthorize(
+        self,
+        request: ActionRequest,
+        rule: AuthorityRule,
+        assessment: RiskAssessment,
+        context: PolicyEvaluationContext,
+        reasons: list[str],
+    ) -> AutonomyVerdict | None:
+        """Veredicto de autonomía si un riesgo HIGH está preautorizado; ``None`` si no aplica.
+
+        Solo actúa sobre ``HIGH`` (``CRITICAL`` sigue siendo Human Gate), solo con contexto de
+        confianza del destino y solo si la acción no es de nivel 3. Cuando no está preautorizado,
+        las **fronteras concretas** quedan en las razones de la decisión: el Human Gate nunca dice
+        solo «riesgo HIGH».
+        """
+        if (
+            not assessment.requires_human_gate
+            or assessment.effective is not RiskLevel.HIGH
+            or rule.level.requires_human
+            or context.autonomy is None
+            or not self._autonomy.enabled
+        ):
+            return None
+        from punto.policy.envelope import AdaptiveAuthorityEnvelope
+
+        classifier = AdaptiveAuthorityEnvelope(constitutional_paths=self.protected_paths)
+        verdict = self._autonomy.evaluate(
+            AutonomyQuery(
+                operation=request.action,
+                resource_classes=tuple(
+                    item.value for item in classifier.classes_of(request.files_changed)
+                ),
+                technical=request.technical,
+                reversible=request.reversible,
+                destructive=request.action.startswith(("delete_", "remove_")),
+                production_impact=request.production_impact,
+                legal_impact=request.legal_impact,
+                business_impact=request.business_impact,
+                cost_usd=request.estimated_cost,
+                minutes=request.estimated_minutes,
+                files=request.files_changed_count,
+            ),
+            context.autonomy,
+        )
+        if verdict.preauthorized:
+            return verdict
+        reasons.append(
+            "riesgo HIGH con frontera de autoridad: "
+            + "; ".join(item.value for item in verdict.boundaries)
+        )
+        return None
 
     def _is_self_elevation(
         self,

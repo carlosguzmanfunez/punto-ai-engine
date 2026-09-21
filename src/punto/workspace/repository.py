@@ -40,7 +40,8 @@ from punto.audit.logger import AuditLogger
 from punto.developer.backend import TrustedLocalBackend
 from punto.developer.context import ExecutionContext
 from punto.memory.experience import ExperienceSecretError, assert_no_secrets
-from punto.policy.policy_engine import PolicyEngine
+from punto.policy.autonomy import AutonomyContext
+from punto.policy.policy_engine import PolicyEngine, PolicyEvaluationContext
 from punto.qa.paths import normalize_relative_path
 from punto.schemas.decision import ActionRequest
 from punto.schemas.dev import ChangeOperation, RepositoryOperation
@@ -327,16 +328,20 @@ class GovernedRepository:
         desplazamiento fijo: un fichero modificado empieza por espacio y un desplazamiento fijo se
         comía el primer carácter de su ruta (`src/...` → `rc/...`).
         """
-        working = [
-            _porcelain_path(line)
-            for line in self.status_lines()
-            if _porcelain_path(line)
-        ]
+        working = [_porcelain_path(line) for line in self.status_lines() if _porcelain_path(line)]
         try:
             committed = list(self._git.diff_names(self._baseline_sha, "HEAD"))
         except Exception:  # pragma: no cover - repositorio sin commits posteriores
             committed = []
         return tuple(dict.fromkeys([*working, *committed]))
+
+    def recoverable_from_git(self, path: str) -> bool:
+        """True si el fichero está versionado en el baseline: Git lo restaura si se borra."""
+        relative = path.replace("\\", "/").lstrip("/")
+        try:
+            return self._git.path_in_revision(self._baseline_sha, relative)
+        except Exception:  # sin garantía de recuperación: se trata como no recuperable
+            return False
 
     def ensure_work_branch(self, slug: str) -> str:
         """Deja el repositorio en su rama de tarea ``ai/<task>-<slug>`` (la crea si hace falta)."""
@@ -510,7 +515,8 @@ class GovernedRepository:
                 business_impact=False,
                 files_changed=list(paths),
                 description=description or f"{operation.value} en el ciclo de desarrollo",
-            )
+            ),
+            PolicyEvaluationContext(autonomy=self._autonomy_context(operation, paths)),
         )
         if not decision.allowed:
             raise PolicyDeniedError(
@@ -520,6 +526,27 @@ class GovernedRepository:
                 f"{decision.reason}",
                 reason=decision.reason,
             )
+
+    def _autonomy_context(
+        self, operation: RepositoryOperation, paths: Sequence[str]
+    ) -> AutonomyContext:
+        """Hechos de confianza para la autonomía preautorizada, comprobados aquí (no declarados).
+
+        Este repositorio gobernado es el destino registrado del ciclo; el alcance y la
+        recuperabilidad por Git se comprueban sobre las rutas reales de la operación.
+        """
+        roots = self.policy.scope_roots
+        in_scope = all(
+            not roots
+            or any(normalized == root or normalized.startswith(f"{root}/") for root in roots)
+            for normalized in (item.replace("\\", "/").lstrip("/") for item in paths)
+        )
+        recoverable = operation is RepositoryOperation.DELETE and all(
+            self.recoverable_from_git(item) for item in paths
+        )
+        return AutonomyContext(
+            target_registered=True, in_scope=in_scope, git_recoverable=recoverable
+        )
 
     # ---------------------------------------------------------------- escritura
     def write_text(
@@ -612,9 +639,7 @@ class GovernedRepository:
         )
         result = ShellRunner(self.context, backend=TrustedLocalBackend()).run(request, name=name)
         if self.audit is not None:
-            self.audit.log_command_executed(
-                task_id=self.task_id, result=result, actor=self.actor
-            )
+            self.audit.log_command_executed(task_id=self.task_id, result=result, actor=self.actor)
         return result
 
     # ------------------------------------------------------------------- commit

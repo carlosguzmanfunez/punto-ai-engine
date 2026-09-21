@@ -21,6 +21,7 @@ from punto.common import basename_of, normalize_path
 CONSTITUTIONAL_PROTECTED_PATHS: Final[tuple[str, ...]] = (
     "config/constitution.yaml",
     "config/permissions.yaml",
+    "config/autonomy.yaml",
 )
 
 #: Nombres base protegidos, para detectar la ruta declarada con cualquier prefijo

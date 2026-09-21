@@ -389,22 +389,118 @@ def find_department_datasets(
     return tuple(reports)
 
 
+_CODE_SUFFIXES: Final[tuple[str, ...]] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+_TEST_MARKERS: Final[tuple[str, ...]] = ("/tests/", "/test/", "/__tests__/", ".test.", ".spec.")
+_IMPORT_SPECIFIER: Final[re.Pattern[str]] = re.compile(
+    r"""(?:from|import)\s*\(?\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)"""
+)
+_RESOLVE_SUFFIXES: Final[tuple[str, ...]] = (
+    "",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    "/index.ts",
+    "/index.tsx",
+    "/index.js",
+)
+
+
+def is_test_path(path: str) -> bool:
+    """Un fichero de pruebas no *renderiza* nada: que referencie el dataset no lo demuestra."""
+    lowered = "/" + path.replace("\\", "/").casefold().lstrip("/")
+    return any(marker in lowered for marker in _TEST_MARKERS)
+
+
+def runtime_surface(
+    paths: Sequence[str],
+    read_text: Callable[[str], str],
+    exists: Callable[[str], bool],
+    *,
+    depth: int = 2,
+    limit: int = 40,
+) -> tuple[str, ...]:
+    """Ficheros de código que ``paths`` alcanzan por imports locales (acotado en profundidad y nº).
+
+    Sirve para medir un estado **sin cambios**: el código que el plan señala puede obtener el
+    dataset a través de un módulo que importa (``@/lib/...``), y ese módulo es parte de lo que se
+    renderiza. Resuelve rutas relativas y el alias ``@/`` → ``src/``; ignora paquetes externos.
+    """
+    seen: dict[str, None] = {}
+    frontier = [p.replace("\\", "/") for p in paths if p.casefold().endswith(_CODE_SUFFIXES)]
+    for path in frontier:
+        seen[path] = None
+    for _ in range(depth):
+        siguiente: list[str] = []
+        for path in frontier:
+            try:
+                content = read_text(path)
+            except Exception:
+                continue
+            base = path.rsplit("/", maxsplit=1)[0] if "/" in path else ""
+            for match in _IMPORT_SPECIFIER.finditer(content):
+                spec = match.group(1) or match.group(2)
+                if spec.startswith("@/"):
+                    target = "src/" + spec[2:]
+                elif spec.startswith("."):
+                    target = _collapse_path(f"{base}/{spec}" if base else spec)
+                else:
+                    continue
+                resolved = next(
+                    (
+                        candidate
+                        for candidate in (target + suffix for suffix in _RESOLVE_SUFFIXES)
+                        if exists(candidate) and _is_file(candidate, read_text)
+                    ),
+                    "",
+                )
+                if resolved and resolved not in seen and len(seen) < limit:
+                    seen[resolved] = None
+                    siguiente.append(resolved)
+        frontier = siguiente
+    return tuple(seen)
+
+
+def _is_file(path: str, read_text: Callable[[str], str]) -> bool:
+    try:
+        read_text(path)
+    except Exception:
+        return False
+    return True
+
+
+def _collapse_path(path: str) -> str:
+    parts: list[str] = []
+    for chunk in path.split("/"):
+        if chunk in {"", "."}:
+            continue
+        if chunk == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(chunk)
+    return "/".join(parts)
+
+
 def renders_from_dataset(
     changed_paths: Sequence[str],
     read_text: Callable[[str], str],
     dataset_path: str,
 ) -> tuple[bool, str]:
-    """True si el código modificado usa el dataset real en vez de geometría propia.
+    """True si el código dado usa el dataset real en vez de geometría propia.
 
-    Es una comprobación textual acotada: algún fichero cambiado tiene que **referenciar** el dataset
-    (import, ``fetch`` o lectura del fichero) **y** construir la navegación a partir de sus nombres
-    (una plantilla que interpola el nombre del departamento), no de una lista escrita a mano.
+    Es una comprobación textual acotada: algún fichero de **código de la aplicación** (no de
+    pruebas) tiene que **referenciar** el dataset (import, ``fetch`` o lectura del fichero) **y**
+    construir la navegación a partir de sus nombres (una plantilla que interpola el nombre del
+    departamento), no de una lista escrita a mano. En un ciclo con cambios son los ficheros
+    cambiados; en un estado sin cambios, la superficie que el plan señala (``runtime_surface``).
     """
     needle = dataset_path.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
     referencia = ""
     navegacion = ""
     for path in changed_paths:
-        if not path.casefold().endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")):
+        if not path.casefold().endswith(_CODE_SUFFIXES) or is_test_path(path):
             continue
         try:
             content = read_text(path)
@@ -415,7 +511,7 @@ def renders_from_dataset(
         if _DATA_DRIVEN_LINK.search(content) and not navegacion:
             navegacion = path
     if not referencia:
-        return False, f"ningún fichero modificado referencia {needle or dataset_path}"
+        return False, f"ningún fichero de código evaluado referencia {needle or dataset_path}"
     if not navegacion:
         return (
             False,

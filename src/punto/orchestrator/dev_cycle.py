@@ -59,7 +59,7 @@ from punto.acceptance import (
     verify_claims,
 )
 from punto.audit.logger import AuditLogger
-from punto.cartography import find_department_datasets, renders_from_dataset
+from punto.cartography import find_department_datasets, renders_from_dataset, runtime_surface
 from punto.memory.experience import ExperienceResult, ExperienceStatus
 from punto.memory.retrieval import (
     MemoryRetriever,
@@ -91,6 +91,7 @@ from punto.orchestrator.proposal_preflight import (
     issue_codes,
     proposal_preflight,
 )
+from punto.policy.autonomy import AutonomyPolicy
 from punto.policy.config_loader import ConfigLoader
 from punto.policy.envelope import (
     AUTONOMOUS_MAX_FILES,
@@ -454,10 +455,16 @@ class DevelopmentCycle:
                 targets = elevation.get("targets", [])
                 if isinstance(targets, list):
                     declared.extend(str(item) for item in targets)
+            autonomy = (
+                self.policy_engine.autonomy
+                if self.policy_engine is not None
+                else AutonomyPolicy.from_config(loader.load_optional("autonomy"))
+            )
             self._envelope = AdaptiveAuthorityEnvelope(
                 constitutional_paths=declared,
                 max_files=self.config.max_files_changed,
                 session_ceiling=self.config.session_ceiling,
+                autonomy=autonomy,
             )
         return self._envelope
 
@@ -908,7 +915,7 @@ class DevelopmentCycle:
         # AP000-OBS-03: las afirmaciones factuales/semánticas se miden con evidencia real. Un
         # criterio requerido sin evidencia no se convierte en PASS: se para y se pide.
         claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
-            request, repository, target
+            request, repository, target, plan
         )
         return _StateEvaluation(
             verification=tuple(verification),
@@ -1065,8 +1072,36 @@ class DevelopmentCycle:
                 encontrados.append(relative)
         return tuple(dict.fromkeys((*repository.changed_paths(), *encontrados)))
 
+    def _rendering_surface(
+        self, repository: GovernedRepository, plan: DevelopmentPlan | None
+    ) -> tuple[str, ...]:
+        """Código sobre el que se mide si el dataset se usa de verdad.
+
+        Con cambios de código, son los ficheros cambiados (lo que este ciclo produjo). En un estado
+        **sin cambios de código** —un no-op— «lo modificado» está vacío por definición y medir sobre
+        eso rechazaría un estado que ya cumple: entonces la superficie es el código que el plan
+        señala más lo que ese código importa (acotado), que es lo que la página renderiza.
+        """
+        changed = repository.changed_paths()
+        if plan is None or any(_is_code_path(path) for path in changed):
+            return changed
+        resources = tuple(
+            path
+            for path in (*plan.files_to_modify, *plan.files_to_create)
+            if repository.exists(path)
+        )
+        return tuple(
+            dict.fromkeys(
+                (*changed, *runtime_surface(resources, repository.read_text, repository.exists))
+            )
+        )
+
     def _verify_semantic_claims(
-        self, request: BuildRequest, repository: GovernedRepository, target: DevelopmentTarget
+        self,
+        request: BuildRequest,
+        repository: GovernedRepository,
+        target: DevelopmentTarget,
+        plan: DevelopmentPlan | None = None,
     ) -> tuple[str, tuple[BuildValidationIssue, ...], tuple[ClaimRecord, ...]]:
         """Mide las afirmaciones factuales/semánticas con la evidencia disponible.
 
@@ -1080,7 +1115,9 @@ class DevelopmentCycle:
         rendered = (False, "no se modificó ningún fichero que use un dataset")
         if datasets:
             rendered = renders_from_dataset(
-                repository.changed_paths(), repository.read_text, datasets[0].path
+                self._rendering_surface(repository, plan),
+                repository.read_text,
+                datasets[0].path,
             )
         visual = self._visual_capability()
         verdicts = self._visual_verdicts(request, repository, target, visual)
@@ -1756,7 +1793,11 @@ class DevelopmentCycle:
         )
 
     def _change_profile(
-        self, proposal: FileChangeProposal, *, created_by_cycle: bool
+        self,
+        proposal: FileChangeProposal,
+        *,
+        created_by_cycle: bool,
+        git_recoverable: bool = False,
     ) -> OperationRisk:
         """Perfil de riesgo de un cambio concreto, deducido de su operación y su ruta."""
         operation = {
@@ -1779,6 +1820,7 @@ class DevelopmentCycle:
             verification_strength=VerificationStrength.MODERATE,
             destructive=proposal.operation is ChangeOperation.DELETE,
             created_by_cycle=created_by_cycle,
+            git_recoverable=git_recoverable,
             provenance=Provenance.EVIDENCE if evidence else Provenance.PUNTO_POLICY,
             evidence=evidence,
             description=proposal.reason,
@@ -2254,6 +2296,10 @@ class DevelopmentCycle:
         pending_feedback = ""
         #: Nº de cambios aplicados cuando se midió el estado por última vez (no-op).
         reconciled_at = -1
+        #: Última medición de un estado sin cambios (para no perderla si el ciclo se agota).
+        last_noop_gap = ""
+        last_noop_claims: tuple[ClaimEvidence, ...] = ()
+        last_noop_claims_result = "NONE"
         for _ in range(max_iterations):
             # La skill de resolución solo actúa sobre un **fallo real ya medido**: sin verificación
             # fallida no hay nada que resolver, y la implementación inicial no la recibe.
@@ -2478,6 +2524,9 @@ class DevelopmentCycle:
                     acceptance_evidence = state.acceptance_evidence
                     claim_evidence = self._claim_evidence(state.claim_records)
                     gap = self._noop_gap(state, plan, repository)
+                    last_noop_gap = gap
+                    last_noop_claims = claim_evidence
+                    last_noop_claims_result = state.claims_outcome
                     self._log(
                         AuditEventType.DEV_NOOP_RECONCILED,
                         "dev_noop_reconciled",
@@ -2555,6 +2604,7 @@ class DevelopmentCycle:
                         f"{proposal_issue.detail}. THE CURRENT STATE DOES NOT SATISFY THE TASK "
                         f"({gap}); an empty answer is not acceptable:\n"
                         + self._failure_evidence(state.verification)
+                        + "".join(f"\n- {issue.detail}" for issue in state.claim_issues)
                     )
                 continue
 
@@ -2940,6 +2990,11 @@ class DevelopmentCycle:
                 "tras las rondas de reparación"
                 if solo_aceptacion
                 else "la verificación no pasó tras las rondas de reparación"
+            )
+            + (
+                f" (último estado sin cambios medido: {last_noop_gap[:200]})"
+                if last_noop_gap
+                else ""
             ),
             provider=provider,
             model=model,
@@ -2954,6 +3009,8 @@ class DevelopmentCycle:
             change_issues=change_issues,
             acceptance=acceptance_evidence,
             acceptance_result=self._acceptance_result(acceptance_evidence),
+            claims=last_noop_claims,
+            claims_result=last_noop_claims_result,
         )
 
     def _handle_context_requests(
@@ -3157,7 +3214,12 @@ class DevelopmentCycle:
                 continue
             created = path in self._created_paths
             decision = self.envelope.assess(
-                self._change_profile(proposal, created_by_cycle=created)
+                self._change_profile(
+                    proposal,
+                    created_by_cycle=created,
+                    git_recoverable=proposal.operation is ChangeOperation.DELETE
+                    and repository.recoverable_from_git(proposal.source_path or path),
+                )
             )
             self._record_decision(decision, request, phase="change")
             if not decision.autonomous:
@@ -4135,6 +4197,14 @@ def _as_text_tuple(value: Any) -> tuple[str, ...]:
                     texts.append(candidate)
                     break
     return tuple(texts)
+
+
+_CODE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+
+
+def _is_code_path(path: str) -> bool:
+    """Un cambio de código de la aplicación (no un fichero de configuración como ``.gitignore``)."""
+    return path.casefold().endswith(_CODE_SUFFIXES)
 
 
 def _context_requests(payload: Mapping[str, Any]) -> tuple[ContextRequest, ...]:

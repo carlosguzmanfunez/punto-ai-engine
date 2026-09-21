@@ -163,6 +163,17 @@ class GitWorkspace:
         )
         return tuple(dict.fromkeys(line.strip() for line in output.splitlines() if line.strip()))
 
+    def path_in_revision(self, revision: str, path: str) -> bool:
+        """True si ``path`` existe (versionado) en ``revision``: Git puede restaurarlo desde ahí."""
+        if not revision or not path:
+            return False
+        output = self._run(
+            "path_in_revision",
+            ["ls-tree", "--name-only", revision, "--", path],
+            "git ls-tree",
+        )
+        return bool(output.strip())
+
     def diff_range(self, base: str, head: str) -> str:
         """Diff unificado entre dos revisiones, tal cual lo da Git.
 
@@ -345,9 +356,7 @@ class GitWorkspace:
     def _run(self, name: str, args: list[str], label: str) -> str:
         """Ejecuta un comando Git y exige éxito."""
         self._assert_repo_root()
-        result = self._shell.run(
-            CommandRequest(executable="git", args=tuple(args)), name=name
-        )
+        result = self._shell.run(CommandRequest(executable="git", args=tuple(args)), name=name)
         self._results.append(result)
         if result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip()

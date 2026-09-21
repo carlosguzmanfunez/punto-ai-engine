@@ -109,7 +109,9 @@ def _repos(tmp_path: Path) -> tuple[Path, Path]:
         "const tipos = ['Casa'];\nexport function Rejilla() { return tipos.length; }\n",
         encoding="utf-8",
     )
-    (repo / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+    # obsoleto.ts NO está versionado: borrarlo no lo restaura Git, y eso sí es una frontera
+    # (un borrado de un fichero versionado es reversible y autónomo: autonomía preautorizada).
+    (repo / ".gitignore").write_text("node_modules\nsrc/lib/obsoleto.ts\n", encoding="utf-8")
     _git(repo, "init", "-b", "main")
     _git(repo, "add", "-A")
     _git(
@@ -219,9 +221,7 @@ def _cambio(*, borrado: bool = False) -> dict[str, Any]:
     return {"summary": "fuente canónica", "changes": changes}
 
 
-def _target(
-    repo: Path, *, remoto: Path | str, publicable: bool = True
-) -> DevelopmentTarget:
+def _target(repo: Path, *, remoto: Path | str, publicable: bool = True) -> DevelopmentTarget:
     """Destino con verificación real y datos de publicación."""
     return DevelopmentTarget(
         target_id=TARGET_ID,
@@ -240,8 +240,8 @@ def _target(
         ),
         verification=(
             VerificationCommand(
-            name="focused", argv=("python", "-c", FOCUSED), timeout_seconds=60.0
-        ),
+                name="focused", argv=("python", "-c", FOCUSED), timeout_seconds=60.0
+            ),
         ),
         work_branch=WORK_BRANCH,
         max_repair_rounds=2,
@@ -357,8 +357,7 @@ def test_a_una_persona_crea_la_tarea_desde_la_consola(
         "/console/tasks",
         json={
             "objective": (
-                "unificar los tipos de propiedad y que los filtros usen la fuente "
-                "canónica"
+                "unificar los tipos de propiedad y que los filtros usen la fuente canónica"
             ),
             "target_id": TARGET_ID,
             "acceptance_criteria": ["una sola fuente de tipos"],
@@ -591,8 +590,12 @@ def test_k_con_aprobacion_se_publica_y_produccion_queda_validada(
     assert _git(remoto, "log", "-1", "--format=%s", "main") == "feat(punto): unificar los tipos"
     # Y el historial de etapas deja la secuencia completa.
     etapas = [item["stage"] for item in publicacion["history"]]
-    assert etapas == ["WAITING_PRODUCTION_APPROVAL", "PUBLISHING", "DEPLOYMENT_VERIFICATION",
-                      "PRODUCTION_VALIDATED"]
+    assert etapas == [
+        "WAITING_PRODUCTION_APPROVAL",
+        "PUBLISHING",
+        "DEPLOYMENT_VERIFICATION",
+        "PRODUCTION_VALIDATED",
+    ]
 
 
 def test_l_publicado_no_es_lo_mismo_que_produccion_validada(tmp_path: Path) -> None:
@@ -815,9 +818,7 @@ def test_a_cada_etapa_completada_tiene_su_evento_real_en_la_auditoria(tmp_path: 
         "/console/tasks",
         json={"objective": "unificar los tipos", "target_id": TARGET_ID, "scope_paths": ["src"]},
     ).json()
-    auditoria = {
-        evento.event_type.value for evento in deps.audit.by_resource(tarea["task_id"])
-    }
+    auditoria = {evento.event_type.value for evento in deps.audit.by_resource(tarea["task_id"])}
 
     assert {
         "DEV_PLAN_VALIDATED",
@@ -1444,9 +1445,7 @@ def test_c_un_destino_no_registrado_no_puede_declarar_produccion(tmp_path: Path)
         assert intento.status_code == 422, f"el cuerpo no admite {campo}"
 
     # Un destino no registrado no se puede elegir, ni con la producción "a mano".
-    ajeno = client.post(
-        "/console/tasks", json={"objective": "x y z", "target_id": "otro-destino"}
-    )
+    ajeno = client.post("/console/tasks", json={"objective": "x y z", "target_id": "otro-destino"})
     assert ajeno.status_code == 400
     # El listado de destinos es de solo lectura: no hay forma de declarar producción desde la API.
     assert client.post("/console/targets", json={}).status_code == 405

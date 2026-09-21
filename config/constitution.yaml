@@ -55,10 +55,20 @@ principles:
   - id: human_gate_for_irreversible
     priority: 5
     statement: >-
-      Las acciones de nivel 3 (humano) y las de riesgo alto o crítico requieren
-      aprobación humana explícita antes de cualquier ejecución.
+      Las acciones de nivel 3 (humano), las de riesgo crítico y las que cruzan
+      una FRONTERA DE AUTORIDAD real (secretos, pagos o coste fuera de
+      presupuesto, borrado o migración irreversible de datos, infraestructura,
+      destino no autorizado, ampliar la propia autoridad, reescribir historial
+      remoto, actos legales, evidencia factual sin resolver o exceder el sobre)
+      requieren aprobación humana explícita antes de cualquier ejecución. Un
+      riesgo ALTO por sí solo no es una frontera: no abre un Human Gate ni
+      concede nada; decide la operación, el recurso, el alcance, la
+      reversibilidad y la autoridad configurada (`config/autonomy.yaml`, que la
+      autoridad del propietario fijó de forma persistente para todos los
+      destinos registrados y que PUNTO no puede ampliar).
     enforced_by:
       - "punto.policy.human_gate.HumanGate"
+      - "punto.policy.autonomy.AutonomyPolicy"
       - "punto.policy.risk.RiskEngine.requires_human_gate"
 
   - id: audit_everything
@@ -102,6 +112,8 @@ protected_files:
     reason: "Define los principios no negociables y los límites de CAMUS."
   - path: "config/permissions.yaml"
     reason: "Define el catálogo de autoridad y la protección constitucional."
+  - path: "config/autonomy.yaml"
+    reason: "Define la autonomía preautorizada por el propietario; PUNTO no puede ampliarla."
 
 # Rutas adicionales que tampoco pueden modificarse autónomamente.
 additional_protected_paths:
@@ -115,7 +127,8 @@ additional_protected_paths:
 hard_rules:
   unknown_action: "DENY"
   authority_level_3: "HUMAN_GATE"
-  risk_high_or_critical: "HUMAN_GATE"
+  risk_critical: "HUMAN_GATE"
+  risk_high: "HUMAN_GATE_ON_AUTHORITY_BOUNDARY"  # ver config/autonomy.yaml
   protected_file_modification: "REJECT"
   budget_exceeded: "REJECT"
   time_exceeded: "REJECT"

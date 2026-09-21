@@ -1,0 +1,77 @@
+# ============================================================================
+# PUNTO AI ENGINE - AUTONOMÍA PREAUTORIZADA V1
+# ============================================================================
+# Autorización PERSISTENTE del propietario, general para todos los destinos
+# registrados. Declara QUÉ operaciones no necesitan una persona cuando se hacen
+# dentro del alcance autorizado y son reversibles. No nombra proyectos, tareas ni
+# proveedores: decide por operación + recurso + alcance + reversibilidad +
+# autoridad configurada.
+#
+# Reglas de lectura:
+#   - Un riesgo HIGH por sí solo NO abre un Human Gate ni concede nada: el Human
+#     Gate se reserva para una FRONTERA DE AUTORIDAD real (lista de abajo).
+#   - Este fichero solo puede AMPLIAR restricciones respecto al piso en código
+#     (punto.policy.autonomy): no puede quitar una frontera del piso ni conceder
+#     una operación que el piso reserva a una persona.
+#   - Es un fichero de autoridad: está protegido (constitution.yaml,
+#     permissions.yaml y el piso en código). PUNTO no puede modificarlo.
+#   - Push, deploy y producción NO se conceden aquí: exigen además que el destino
+#     declare un sobre explícito para esa clase (targets.local.yaml -> authority).
+# ============================================================================
+
+version: "1.0.0"
+
+preauthorized:
+  # Acciones del catálogo (permissions.yaml) preautorizadas dentro del alcance.
+  actions:
+    - create_file
+    - modify_file
+    - delete_file
+    - refactor_code
+    - fix_bug
+    - run_tests
+    - create_branch
+    - create_commit
+    - create_documentation
+    - db_connect_check
+    - db_introspect
+    - db_safe_read
+    - db_migration_apply
+
+  # Operaciones del sobre adaptativo preautorizadas dentro del alcance.
+  operations:
+    - read
+    - write
+    - create
+    - rename
+    - move
+    - delete
+    - execute
+    - visual_qa
+    - browser_qa
+    - local_database
+    - migration_generate
+    - migration_apply_local
+    - commit
+    - branch
+    - checkpoint
+    - rollback
+    - repair
+    - plan_apply
+    - context_expansion
+    - scope_expansion
+
+  # Borrar un fichero es autónomo si Git lo puede restaurar (versionado en el
+  # baseline). Un borrado sin esa garantía sigue siendo una frontera.
+  git_reversible_delete: true
+
+# Clases de recurso que son frontera de autoridad (se suman al piso en código).
+gated_resource_classes:
+  - identity_auth
+
+# Presupuesto del sobre: superarlo es salir de la autoridad concedida.
+budget:
+  max_files: 20
+  max_cost_usd: 10.0
+  max_minutes: 60
+

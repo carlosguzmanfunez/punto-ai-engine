@@ -253,10 +253,15 @@ def test_3b_una_verificacion_fallida_impide_el_no_op() -> None:
 
 # =========================== 4 · criterios visuales: la misma cadena, por la ruta efectiva
 def _consola_visual(
-    tmp_path: Path, *, veredicto: str, con_captura: bool = True
+    tmp_path: Path,
+    *,
+    veredicto: str,
+    con_captura: bool = True,
+    repos: tuple[Path, Path] | None = None,
+    plan: dict[str, Any] | None = None,
 ) -> tuple[TestClient, AuditLogger, _Multimodal, _CapturaFalsa]:
     """Ciclo real: BUILDER sin cambios, repo ya satisfecho, VISUAL_QA por OpenAI/Codex (doble)."""
-    repo, remoto = _repo_ya_satisfecho(tmp_path)
+    repo, remoto = repos or _repo_ya_satisfecho(tmp_path)
     target = replace(
         _target(repo, remoto=remoto),
         visual_routes=("http://localhost:3000/mapa",) if con_captura else (),
@@ -266,9 +271,14 @@ def _consola_visual(
     def gpt_responde(imagenes: int) -> str:
         if imagenes:
             return json.dumps(
-                {"verdicts": [{"claim": 1, "verdict": veredicto, "observation": "así se ve"}]}
+                {
+                    "verdicts": [
+                        {"claim": n, "verdict": veredicto, "observation": "así se ve"}
+                        for n in (1, 2, 3)
+                    ]
+                }
             )
-        return json.dumps(_plan())
+        return json.dumps(plan or _plan())
 
     gpt = _Multimodal("openai", "gpt-5.6-sol", gpt_responde)
     claude = _Multimodal("anthropic", "claude-sonnet-5", lambda n: "{}")
@@ -392,6 +402,162 @@ def test_7_el_contrato_del_builder_permite_cero_cambios_solo_con_justificacion()
 
     assert "empty changes list" in BUILD_CONTRACT
     assert "never accepts an empty answer on its own" in BUILD_CONTRACT
+
+
+# ======================= 8 · intento 12: el dataset lo usa el código que el plan señala, no el diff
+NOMBRE_CORRECTO = "se muestra el nombre correcto del departamento"
+DATASET = "src/lib/honduras-departamentos.geojson"
+
+
+def _repo_con_mapa_ya_materializado(
+    tmp_path: Path, *, usa_dataset: bool = True
+) -> tuple[Path, Path]:
+    """Repositorio del intento 12: el mapa con hover YA está en el baseline y usa el dataset real.
+
+    La cadena es la de Punto Inmobiliario: la vista importa **tipos** de ``@/lib/honduras`` (que es
+    quien lee el GeoJSON) y arma sus enlaces con el nombre del departamento; una prueba también
+    menciona el dataset. El BUILDER no tiene nada que cambiar: ``changed_paths()`` queda vacío.
+    """
+    from punto.cartography import EXPECTED_DEPARTMENTS
+    from test_semantic_qa import _dataset
+
+    repo, remoto = _repo_ya_satisfecho(tmp_path)
+    (repo / "src" / "lib" / "honduras-departamentos.geojson").write_text(
+        _dataset(list(EXPECTED_DEPARTMENTS)), encoding="utf-8"
+    )
+    (repo / "src" / "lib" / "honduras.ts").write_text(
+        'import { readFileSync } from "node:fs";\n'
+        'export const datos = readFileSync("src/lib/honduras-departamentos.geojson", "utf8");\n'
+        "export type DepartmentName = string;\n",
+        encoding="utf-8",
+    )
+    vista = (
+        'import type { DepartmentName } from "@/lib/honduras";\n'
+        "export function Mapa({ nombres }: { nombres: DepartmentName[] }) {\n"
+        "  return nombres.map((n) => (\n"
+        "    <a key={n} href={`/propiedades?departamento=${encodeURIComponent(n)}`}>{n}</a>\n"
+        "  ));\n}\n"
+        if usa_dataset
+        else 'const nombres = ["Cortés"];\nexport function Mapa() { return nombres.length; }\n'
+    )
+    (repo / "src" / "app").mkdir(exist_ok=True)
+    (repo / "src" / "app" / "globals.css").write_text(
+        ".is-active { opacity: 1; }\n", encoding="utf-8"
+    )
+    (repo / "src" / "components" / "Mapa.tsx").write_text(vista, encoding="utf-8")
+    (repo / "src" / "components" / "Mapa.test.tsx").write_text(
+        'import "src/lib/honduras-departamentos.geojson"; // la prueba también lo menciona\n',
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-A")
+    _git(
+        repo,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@punto.local",
+        "commit",
+        "-m",
+        "el mapa ya estaba materializado",
+    )
+    return repo, remoto
+
+
+def _plan_del_mapa() -> dict[str, Any]:
+    plan = _plan()
+    plan["files_to_modify"] = [
+        "src/components/Mapa.tsx",
+        "src/app/globals.css",
+        "src/components/Mapa.test.tsx",
+    ]
+    plan["files_to_read"] = ["src/lib/honduras.ts"]
+    plan["summary"] = "hover con el nombre del departamento sobre el mapa"
+    return plan
+
+
+def _criterios_del_intento_12() -> dict[str, Any]:
+    return SOLICITUD | {"acceptance_criteria": [CRITERIO_VISUAL, NOMBRE_CORRECTO]}
+
+
+def test_8_el_intento_12_ya_satisfecho_completa_aunque_el_dataset_no_este_en_el_diff(
+    tmp_path: Path,
+) -> None:
+    """Reproduce el intento 12: verificación, cadena y visual PASS, y aun así se bloqueaba.
+
+    El predicado que bloqueaba era ``claims_outcome == FAILED``: el criterio cartográfico se medía
+    sobre ``changed_paths()``, vacío en un no-op ⇒ «ningún fichero modificado referencia el
+    dataset». Ahora se mide sobre el código que el plan señala más lo que importa.
+    """
+    repos = _repo_con_mapa_ya_materializado(tmp_path)
+    antes = _commits(repos[0])
+    client, audit, _gpt, _cap = _consola_visual(
+        tmp_path, veredicto="PASS", repos=repos, plan=_plan_del_mapa()
+    )
+
+    tarea = client.post("/console/tasks", json=_criterios_del_intento_12()).json()
+
+    desarrollo = tarea["development"]
+    assert tarea["stage"] == "DEVELOPMENT_COMPLETED", desarrollo
+    assert desarrollo["resolution"] == "ALREADY_SATISFIED" and desarrollo["commit_sha"] == ""
+    assert desarrollo["claims_result"] == "SATISFIED"
+    assert _commits(repos[0]) == antes, "sin commit vacío"
+    (evento,) = audit.by_type(AuditEventType.DEV_NOOP_RECONCILED)
+    assert dict(evento.metadata)["satisfied"] is True
+
+
+def test_8b_si_el_codigo_no_usa_el_dataset_el_no_op_sigue_fallando_cerrado(
+    tmp_path: Path,
+) -> None:
+    """El estado NO satisface el criterio cartográfico: no se fuerza ``ALREADY_SATISFIED``."""
+    repos = _repo_con_mapa_ya_materializado(tmp_path, usa_dataset=False)
+    client, audit, _gpt, _cap = _consola_visual(
+        tmp_path, veredicto="PASS", repos=repos, plan=_plan_del_mapa()
+    )
+
+    tarea = client.post("/console/tasks", json=_criterios_del_intento_12()).json()
+
+    desarrollo = tarea["development"]
+    assert tarea["stage"] != "DEVELOPMENT_COMPLETED"
+    assert desarrollo["resolution"] == "" and desarrollo["commit_sha"] == ""
+    assert desarrollo["claims_result"] == "FAILED", "el fallo conserva qué criterio no se cumplió"
+    assert any(c["result"] == "UNSATISFIED" for c in desarrollo["claims"])
+    assert "criterios factuales/semánticos: FAILED" in desarrollo["error"]
+    (evento,) = audit.by_type(AuditEventType.DEV_NOOP_RECONCILED)
+    assert dict(evento.metadata)["satisfied"] is False
+
+
+def test_8c_una_prueba_que_menciona_el_dataset_no_demuestra_que_se_renderice() -> None:
+    """Un fichero de pruebas no es superficie renderizada: por sí solo no satisface el criterio."""
+    from punto.cartography import is_test_path, renders_from_dataset
+
+    ficheros = {
+        "src/components/Mapa.test.tsx": 'import "honduras-departamentos.geojson";\n'
+        "const l = `?departamento=${encodeURIComponent(n)}`;\n",
+    }
+    ok, detalle = renders_from_dataset(list(ficheros), ficheros.__getitem__, DATASET)
+
+    assert ok is False and "ningún fichero de código" in detalle
+    assert is_test_path("tests/honduras-map.test.mjs") and is_test_path("src/__tests__/a.ts")
+    assert not is_test_path("src/lib/honduras.ts")
+
+
+def test_8d_la_superficie_sigue_imports_locales_con_alias_y_relativos_acotados() -> None:
+    """``runtime_surface``: alias ``@/``, relativos, externos ignorados y profundidad tope."""
+    from punto.cartography import runtime_surface
+
+    ficheros = {
+        "src/a.tsx": 'import x from "@/lib/b";\nimport r from "react";\nimport c from "./c";\n',
+        "src/lib/b.ts": 'export * from "../d";\n',
+        "src/c.ts": "export const c = 1;\n",
+        "src/d.ts": 'import y from "./e";\n',
+        "src/e.ts": "export const e = 1;\n",
+    }
+    superficie = runtime_surface(
+        ["src/a.tsx"], ficheros.__getitem__, lambda p: p in ficheros, depth=2
+    )
+
+    assert set(superficie) == {"src/a.tsx", "src/lib/b.ts", "src/c.ts", "src/d.ts"}
+    assert "src/e.ts" not in superficie, "la profundidad está acotada"
 
 
 _ = PNG  # (el doble de captura comparte la imagen mínima con la suite de VISUAL_QA)

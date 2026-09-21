@@ -230,6 +230,7 @@ never_autonomous:
 protected_files:
   - "config/constitution.yaml"
   - "config/permissions.yaml"
+  - "config/autonomy.yaml"
 
 # ----------------------------------------------------------------------------
 # Operaciones prohibidas sobre archivos protegidos.
@@ -260,3 +261,4 @@ self_elevation:
     - "config/permissions.yaml"
     - "config/budgets.yaml"
     - "config/risk-rules.yaml"
+    - "config/autonomy.yaml"

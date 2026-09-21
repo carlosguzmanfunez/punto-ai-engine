@@ -365,7 +365,7 @@ def test_un_dataset_valido_sin_uso_no_demuestra_la_cartografia() -> None:
         claims,
         datasets=[informe],
         rendered=(
-            False, "ningún fichero modificado referencia honduras-departamentos.geojson"
+            False, "ningún fichero de código evaluado referencia honduras-departamentos.geojson"
         ),
     )
 

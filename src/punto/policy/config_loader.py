@@ -29,6 +29,11 @@ CONFIG_FILES: dict[str, str] = {
     "environments": "environments.yaml",
 }
 
+#: Configuración opcional: si el fichero no existe, la política correspondiente queda desactivada
+#: (fail-closed) en vez de ser un error. ``autonomy`` concede autonomía preautorizada: sin él, no
+#: hay ninguna.
+OPTIONAL_CONFIG_FILES: dict[str, str] = {"autonomy": "autonomy.yaml"}
+
 ENV_OVERRIDES: dict[str, str] = {
     "constitution": "PUNTO_CONSTITUTION_FILE",
     "permissions": "PUNTO_PERMISSIONS_FILE",
@@ -145,6 +150,17 @@ class ConfigLoader:
         if name not in self._cache:
             self._cache[name] = load_yaml_file(self.path_for(name))
         return self._cache[name]
+
+    def load_optional(self, name: str) -> dict[str, Any]:
+        """Carga un fichero opcional; vacío si no existe (la política queda desactivada)."""
+        if name not in OPTIONAL_CONFIG_FILES:
+            msg = f"Nombre de configuración opcional desconocido: {name}"
+            raise ConfigError(msg)
+        key = f"optional:{name}"
+        if key not in self._cache:
+            path = self.config_dir / OPTIONAL_CONFIG_FILES[name]
+            self._cache[key] = load_yaml_file(path) if path.is_file() else {}
+        return self._cache[key]
 
     def load_all(self) -> dict[str, dict[str, Any]]:
         """Carga todos los archivos de configuración conocidos."""

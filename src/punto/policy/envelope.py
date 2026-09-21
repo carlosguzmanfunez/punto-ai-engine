@@ -38,6 +38,11 @@ from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from typing import Any, Final
 
+from punto.policy.autonomy import (
+    AutonomyContext,
+    AutonomyPolicy,
+    AutonomyQuery,
+)
 from punto.schemas.enums import AuthorityLevel, RiskLevel
 from punto.schemas.policy import PolicyOutcome
 
@@ -278,6 +283,9 @@ class OperationRisk:
     destructive: bool = False
     #: ``True`` si el recurso lo creó este mismo ciclo: borrarlo es revertir, no destruir.
     created_by_cycle: bool = False
+    #: ``True`` si Git puede restaurar el recurso (está versionado en el baseline): un borrado no
+    #: es entonces irreversible. Lo fija PUNTO al construir el perfil, nunca el proveedor.
+    git_recoverable: bool = False
     provenance: Provenance = Provenance.EVIDENCE
     confidence: Confidence = Confidence.HIGH
     #: Evidencia observable que sostiene la operación (vacía ⇒ una propuesta del proveedor sin
@@ -308,6 +316,7 @@ class OperationRisk:
             "identity_auth_impact": self.identity_auth_impact,
             "destructive": self.destructive,
             "created_by_cycle": self.created_by_cycle,
+            "git_recoverable": self.git_recoverable,
             "provenance": self.provenance.value,
             "confidence": self.confidence.name,
             "evidence": list(self.evidence),
@@ -556,7 +565,10 @@ class AdaptiveAuthorityEnvelope:
         file_thresholds: Mapping[RiskLevel, int] | None = None,
         autonomous_max_risk: RiskLevel = RiskLevel.MEDIUM,
         session_ceiling: int | None = None,
+        autonomy: AutonomyPolicy | None = None,
     ) -> None:
+        #: Autonomía preautorizada (``config/autonomy.yaml``). Vacía ⇒ comportamiento previo.
+        self._autonomy = autonomy or AutonomyPolicy()
         self._constitutional = frozenset(
             self._normalize(item) for item in (*CONSTITUTIONAL_CODE_PATHS, *constitutional_paths)
         )
@@ -613,10 +625,7 @@ class AdaptiveAuthorityEnvelope:
         relative = self._normalize(path)
         if not relative:
             return False
-        return any(
-            relative == item or relative.startswith(item)
-            for item in self._constitutional
-        )
+        return any(relative == item or relative.startswith(item) for item in self._constitutional)
 
     def classify(self, path: str) -> ResourceClass:
         """Clase de recurso de una ruta, por reglas deterministas y en orden fijo."""
@@ -733,9 +742,7 @@ class AdaptiveAuthorityEnvelope:
         """
         before = self.assess(previous)
         after = self.assess(requested)
-        added = tuple(
-            item for item in requested.resources if item not in set(previous.resources)
-        )
+        added = tuple(item for item in requested.resources if item not in set(previous.resources))
         added_classes = tuple(
             item for item in after.resource_classes if item not in before.resource_classes
         )
@@ -947,6 +954,36 @@ class AdaptiveAuthorityEnvelope:
                 )
             )
             return rules
+        if (
+            profile.destructive
+            and profile.git_recoverable
+            and profile.data_sensitivity not in (DataSensitivity.PERSONAL, DataSensitivity.SECRET)
+            and self._autonomy.enabled
+        ):
+            # Los perfiles del ciclo solo llegan aquí tras la comprobación de alcance del destino
+            # registrado: el contexto lo fija PUNTO, no el perfil que propone el proveedor.
+            verdict = self._autonomy.evaluate(
+                AutonomyQuery(
+                    operation=profile.operation.value,
+                    resource_classes=tuple(item.value for item in classes),
+                    reversible=profile.reversible,
+                    destructive=True,
+                    files=profile.blast_radius,
+                ),
+                AutonomyContext(target_registered=True, in_scope=True, git_recoverable=True),
+            )
+            if verdict.preauthorized:
+                rules.append(
+                    FiredRule(
+                        name="git-reversible-delete",
+                        verdict=PolicyOutcome.ALLOW,
+                        reason=(
+                            "borrar un fichero versionado que Git restaura, dentro del alcance "
+                            "autorizado, es autónomo (autonomía preautorizada)"
+                        ),
+                    )
+                )
+                return rules
         if profile.destructive and profile.data_sensitivity in (
             DataSensitivity.PERSONAL,
             DataSensitivity.SECRET,
@@ -1154,9 +1191,11 @@ class AdaptiveAuthorityEnvelope:
         return RiskLevel.LOW
 
     def _authority_level(self, outcome: PolicyOutcome, risk: RiskLevel) -> AuthorityLevel:
-        if outcome is PolicyOutcome.REJECT or risk.requires_human_gate:
+        if outcome in (PolicyOutcome.REJECT, PolicyOutcome.REQUIRE_HUMAN):
             return AuthorityLevel.LEVEL_3_HUMAN
-        if outcome is PolicyOutcome.ALLOW_WITH_REVIEW:
+        # Un riesgo HIGH con veredicto permitido no es una frontera: sigue siendo autónomo, con la
+        # revisión posterior que ya exige el riesgo, en vez de etiquetarse como decisión humana.
+        if outcome is PolicyOutcome.ALLOW_WITH_REVIEW or risk.requires_human_gate:
             return AuthorityLevel.LEVEL_1_AUTONOMOUS_REVIEW
         return AuthorityLevel.LEVEL_0_AUTONOMOUS
 

@@ -82,6 +82,7 @@ from punto.orchestrator.focused_resolution import (
     resolution_block,
     resource_statuses,
 )
+from punto.orchestrator.proposal_boundary import length_limits_text, normalize_descriptive_fields
 from punto.orchestrator.proposal_preflight import (
     ProposalPreflightResult,
     correction_feedback,
@@ -1966,6 +1967,23 @@ class DevelopmentCycle:
                 failure_evidence = change_issues[0].detail
                 continue
 
+            # Frontera proveedor → propuesta: los campos **descriptivos** que exceden su límite se
+            # ajustan de forma determinista y registrada (nunca path, contenido ni operación).
+            payload, normalized = normalize_descriptive_fields(payload)
+            if normalized:
+                self._log(
+                    AuditEventType.DEV_PROPOSAL_NORMALIZED,
+                    "dev_proposal_normalized",
+                    request,
+                    {
+                        "round": rounds,
+                        "fields": [item.location for item in normalized],
+                        "original_chars": [item.original_chars for item in normalized],
+                        "kept_chars": [item.kept_chars for item in normalized],
+                        "original_sha256": [item.original_sha256 for item in normalized],
+                        "authority": "solo anotaciones: path, operación y contenido no se tocan",
+                    },
+                )
             # Causa raíz: en una reparación, sin hipótesis no se toca nada. Es la regla que impide
             # el «patch until green»: cada ronda explica qué falló, por qué y qué espera conseguir.
             root_cause, root_evidence, expected_effect = _root_cause(payload)
@@ -3675,7 +3693,8 @@ BUILD_CONTRACT: Final[str] = (
     "every change needs the full file content and a reason; do not touch files outside the plan; "
     "do not include credentials. Ask for scope_expansion with evidence when the objective "
     "genuinely requires another resource: PUNTO evaluates it and decides; it is not yours to "
-    "grant. You do not apply anything: PUNTO validates and applies."
+    "grant. You do not apply anything: PUNTO validates and applies. "
+    + length_limits_text()
 )
 
 #: Contrato del plan, escrito en el prompt además de en el ``json_schema``.

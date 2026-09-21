@@ -350,6 +350,10 @@ class AuditEventType(StrEnum):
     #: RESOLUTION PIPELINE HARDENING: la propuesta traía una inconsistencia estructural medible y se
     #: devolvió al proveedor para corregirla **sin** consumir una ronda funcional de reparación.
     DEV_PROPOSAL_PREFLIGHT_FAILED = "DEV_PROPOSAL_PREFLIGHT_FAILED"
+    #: FRONTERA PROVEEDOR→PROPUESTA: un campo descriptivo (``reason``, ``acceptance_criterion``)
+    #: excedía su límite contractual y se ajustó de forma determinista; lleva huella y longitudes,
+    #: no el texto.
+    DEV_PROPOSAL_NORMALIZED = "DEV_PROPOSAL_NORMALIZED"
     #: CONSOLA HUMANA: una persona creó una tarea desde el dashboard local.
     CONSOLE_TASK_CREATED = "CONSOLE_TASK_CREATED"
     #: CONSOLA HUMANA: la tarea cambió de etapa (desarrollo o publicación).

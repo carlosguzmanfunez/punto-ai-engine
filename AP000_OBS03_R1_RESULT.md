@@ -77,7 +77,7 @@ proveedor, modelo, CSS, Honduras ni por la Task concreta.
 | `src/punto/schemas/audit.py`, `src/punto/audit/events.py` | evento `DEV_CAPABILITY_EVALUATED` (recurso `dev_capabilities`) |
 | `src/punto/api/console.py` | `EVIDENCE_REQUIRED` en `HUMAN_REQUIRED_KINDS`; gate con la capacidad ausente; un solo gate durable; la nota aprobada es la atestación |
 | `src/punto/api/dashboard.py`, `src/punto/api/static/dashboard.html` | `/providers` y `/roles` exponen lo efectivo; la interfaz distingue configurado de efectivo |
-| `tests/test_effective_capabilities.py` | **nuevo**: 19 pruebas |
+| `tests/test_effective_capabilities.py` | **nuevo**: 20 pruebas |
 
 ## 4. Corrección aplicada
 
@@ -120,7 +120,10 @@ remedio); el gate declara lo que autoriza (aportar la evidencia que falta o auto
 pueda producirla) y lo que **no** autoriza (publicar en producción, ampliar autoridad, operar otro
 destino, «convertir el criterio en demostrado» sin atestación). Un gate pendiente **se reutiliza** en
 lugar de duplicarse (`_reuse_pending_gate`). La nota de una aprobación `EVIDENCE_REQUIRED` viaja al
-ciclo siguiente como atestación (`_human_attestation`), y solo si no está vacía.
+ciclo siguiente como atestación (`_human_attestation`), y solo si no está vacía. Y «disponible» exige
+**capacidad nombrada**: en un resultado sin capacidad (p. ej. uno anterior a esta corrección) el campo
+`capability_available` conserva su valor por defecto, así que la evidencia del gate no puede leerlo
+como disponible — se falla cerrado sin cambiar el estado ni la autorización.
 
 **f) Configurado vs efectivo en la interfaz.** `/providers` publica `effective_capabilities` y
 `/roles` publica `role_capabilities`; la tabla muestra las capacidades solo declaradas
@@ -159,7 +162,7 @@ significa «el cambio falló», y **nunca** se convierte en `VERIFIED`.
 
 ## 7. Pruebas y resultados
 
-`tests/test_effective_capabilities.py` — **19 passed** (17 s). Cubre las doce condiciones exigidas:
+`tests/test_effective_capabilities.py` — **20 passed** (21 s). Cubre las doce condiciones exigidas:
 
 | # | condición | prueba |
 | --- | --- | --- |
@@ -181,19 +184,41 @@ Además: `test_sin_poder_comprobar_el_transporte_la_capacidad_no_se_afirma` (fal
 `test_la_capacidad_disponible_cambia_el_remedio_no_el_resultado`,
 `test_los_requisitos_de_capacidad_se_calculan_antes_de_construir`,
 `test_una_atestacion_aprobada_viaja_al_ciclo_como_evidencia`, `test_sin_gate_aprobado_no_hay_atestacion`,
-`test_visual_capability_for_role_devuelve_lo_configurado_y_lo_efectivo`.
+`test_visual_capability_for_role_devuelve_lo_configurado_y_lo_efectivo`,
+`test_una_capacidad_sin_nombre_no_se_presenta_como_disponible` (fallo cerrado en la evidencia del gate).
 
 | verificación | resultado |
 | --- | --- |
-| `tests/test_effective_capabilities.py` | **19 passed** en 17 s |
+| `tests/test_effective_capabilities.py` | **20 passed** en 21 s |
 | cadena focal 1 (capacidades efectivas, QA semántico, aceptación, autoridad adaptativa, ciclo) | **133 passed** en 1:51 |
 | cadena focal 2 (consola humana, estado durable, dashboard, coherencia de capacidades, transportes) | **109 passed** en 2:58 |
+| consola + estado durable + dashboard + capacidades efectivas, tras el ajuste de fallo cerrado | **99 passed** en 3:57 |
 | memoria PELL | **42 passed** |
 | `ruff check src tests` | limpio |
 | `mypy src` (estricto) | 203 ficheros, sin avisos |
 
 No se ejecutó la suite completa (no hay cambio transversal que lo justifique: la corrección está
 contenida en la cadena de capacidades y sus consumidores).
+
+### Evidencia del caso real (intento 7, no ejecutado por esta intervención)
+
+El estado durable del motor registra un séptimo intento de la Task `2e7822a0`, **ejecutado desde el
+dashboard en vivo** (20/09 19:01:43 local, `224844 ms`, proveedor real) — no por esta intervención, que
+no reejecutó la Task:
+
+```
+run=7 | DEVELOPMENT_BLOCKED | EVIDENCE_REQUIRED | 2026-09-21T01:01:43.998395Z | 224844 ms
+claims: VISUAL_APPEARANCE NOT_VERIFIED · VISUAL_APPEARANCE NOT_VERIFIED · CARTOGRAPHIC_CORRECTNESS SATISFIED
+```
+
+Es la confirmación empírica de los dos eslabones: el plan ya **no** se rechaza (OBS-05 cerrado) y el
+ciclo llega a medir las afirmaciones, donde la apariencia visual no se puede demostrar por la ruta de
+texto. Y es también la confirmación del defecto que cierra esta intervención: la tarea quedó en
+`DEVELOPMENT_FAILED` con solo el gate histórico `PLAN_REQUIRES_HUMAN`, porque el proceso que servía
+`:8000` tenía cargado el código **anterior** a R1 (`EVIDENCE_REQUIRED` no estaba en
+`HUMAN_REQUIRED_KINDS`). El recargador reapuntó el worker a las 19:32 —`/providers` ya publica
+`effective_capabilities`— y el resultado guardado de ese intento **no** trae los campos de capacidad,
+que es exactamente el caso que el fallo cerrado del apartado 4.e se niega a leer como «disponible».
 
 ## 8. Efecto sobre el fallo cerrado y la seguridad
 
@@ -209,7 +234,9 @@ contenida en la cadena de capacidades y sus consumidores).
 
 ## 9. Estado intacto de la Task `2e7822a0`
 
-- **No aprobada**, **no reejecutada**, **no sustituida**; su gate histórico **no** se aprobó.
+- **No aprobada**, **no sustituida** y **no reejecutada por esta intervención**; su gate histórico
+  `PLAN_REQUIRES_HUMAN` sigue **sin aprobar** y sin resolución, y es el único gate de la Task.
+- El único intento nuevo (`run=7`) lo produjo el dashboard en vivo, no esta intervención (§7).
 - Punto Inmobiliario HN **no tocado**. Sin push, sin deploy, sin release.
 - El QA visual **no se eliminó**: se conserva y ahora se explica por qué no puede ejecutarse en esa
   ruta.
@@ -228,9 +255,9 @@ se conservan como hechos distintos).
 
 | | |
 | --- | --- |
-| Commit SHA (PUNTO AI ENGINE) | `aed6a5a` (implementación y pruebas) + el commit de este informe; **local, sin push** |
-| ¿Requiere reinicio de Uvicorn? | **Sí**: la capacidad efectiva se calcula en el proceso. El dashboard debe ejecutar el código nuevo (y el worker huérfano de un recargador muerto debe pararse antes, como documenta OBS-04-R3): `uvicorn punto.api.app:app --reload --app-dir src` |
-| Task real `2e7822a0` | **NO reejecutada** |
+| Commit SHA (PUNTO AI ENGINE) | `aed6a5a` (implementación y pruebas) + `f6fa860` (fallo cerrado en la evidencia del gate) + el commit de este informe; **local, sin push** |
+| ¿Requiere reinicio de Uvicorn? | **Sí**: la capacidad efectiva se calcula en el proceso. El worker del dashboard ya recargó (`/providers` publica `effective_capabilities`); si se sirviera desde un worker huérfano de un recargador muerto hay que pararlo antes, como documenta OBS-04-R3: `uvicorn punto.api.app:app --reload --app-dir src` |
+| Task real `2e7822a0` | **NO reejecutada** por esta intervención |
 | Punto Inmobiliario HN | **no tocado** |
 
 ## 12. Fronteras declaradas y bloqueo real
@@ -244,4 +271,5 @@ se conservan como hechos distintos).
   persistente de ese destino autoriza `push`/`deploy`/`release` y esta intervención tiene prohibido
   tocar producción. La ruta de esa Task es de texto, así que, cuando el operador la reanude, el
   criterio visual de su solicitud quedará en `EVIDENCE_REQUIRED` gobernado —con la capacidad ausente,
-  el remedio y las alternativas enumeradas— en vez de perderse como un fallo.
+  el remedio y las alternativas enumeradas— en vez de perderse como un fallo: un gate
+  `EVIDENCE_REQUIRED`, uno solo y durable, con lo que la persona autoriza y lo que no.

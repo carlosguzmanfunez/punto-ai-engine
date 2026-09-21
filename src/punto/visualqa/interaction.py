@@ -118,7 +118,9 @@ _FIND_JS: Final[str] = """
   if (!found.length) return { matches: 0 };
   const el = found[index];
   if (!el) return { matches: found.length, missing: true };
-  el.scrollIntoView({ block: 'center', inline: 'center' });
+  // Instantáneo: con `scroll-behavior: smooth` en la página, un scroll animado deja las
+  // coordenadas obsoletas y el hover cae en otro sitio.
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const box = el.getBoundingClientRect();
   const owner = el.closest('[aria-label]');
   const text = (el.textContent || '').trim();
@@ -332,6 +334,16 @@ class BrowserInteraction:
                     error="ningún punto del elemento objetivo recibe el cursor",
                 )
             time.sleep(spec.settle_ms / 1000)  # hidratación y transiciones del estado inicial
+            # Las coordenadas se recalculan **tras** el asentamiento: son las que valen para el
+            # movimiento del ratón (layout, fuentes e imágenes pueden haber movido el elemento).
+            located = cdp.evaluate(find) or {}
+            if not located.get("hit"):
+                return _with(
+                    base,
+                    matches=matches,
+                    target=target,
+                    error="ningún punto del elemento objetivo recibe el cursor",
+                )
             state = _STATE_JS % {
                 "selector": _js_string(spec.hover),
                 "index": spec.index,

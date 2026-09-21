@@ -203,6 +203,14 @@ PAGINA_ETIQUETA_LEJOS = """<!doctype html><html><head><meta charset="utf-8"></he
 <script>document.querySelector('.map a').addEventListener('mouseenter',()=>{
  document.getElementById('lab').textContent='Departamento: Cortés'})</script></body></html>"""
 
+#: `scroll-behavior: smooth` (como el CSS del sitio real) con el elemento bajo el pliegue: un scroll
+#: animado deja las coordenadas obsoletas si no se recalculan tras el desplazamiento.
+PAGINA_SCROLL_SUAVE = """<!doctype html><html style="scroll-behavior:smooth">
+<head><meta charset="utf-8"></head><body style="margin:0"><div style="height:1500px"></div>
+<svg viewBox="0 0 300 200" style="width:600px" class="map">
+ <a aria-label="Ver propiedades en Cortés"><path d="M20 20 L140 30 L120 120 L30 100 Z" class="dep"
+   fill="#f4efe6"/></a></svg><style>.dep:hover{fill:#0b5c72}</style></body></html>"""
+
 NAVEGADOR = None
 try:
     NAVEGADOR = HeadlessBrowserCapture().find_browser()
@@ -224,6 +232,7 @@ def servidor(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         ("tapada.html", PAGINA_TAPADA),
         ("en_hover.html", PAGINA_EN_HOVER_INICIAL),
         ("lejos.html", PAGINA_ETIQUETA_LEJOS),
+        ("suave.html", PAGINA_SCROLL_SUAVE),
     ):
         (raiz / nombre).write_text(html, encoding="utf-8")
 
@@ -293,6 +302,17 @@ def test_3c_la_captura_cubre_el_elemento_y_su_etiqueta_aunque_esta_quede_fuera_d
         "la captura excede el viewport: incluye la etiqueta"
     )
     assert _alto_png(evidencia.before.data) == _alto_png(evidencia.after.data)
+
+
+@necesita_navegador
+def test_3d_el_hover_funciona_con_scroll_suave_y_el_elemento_bajo_el_pliegue(servidor: str) -> None:
+    """Defecto real: con ``scroll-behavior: smooth`` el punto de hover quedaba obsoleto."""
+    evidencia = BrowserInteraction().run(
+        _especificacion(servidor, "suave.html", label=""), (900, 500)
+    )
+
+    assert evidencia.usable, evidencia.error
+    assert evidencia.hover_applied is True and evidencia.pixels_changed is True
 
 
 @necesita_navegador

@@ -13,6 +13,16 @@ Interfaz oficial usada (comprobada contra la CLI instalada):
 La sesión la administra Claude Code (``claude auth login``). Este transporte **no** guarda ni lee
 contraseñas, cookies ni tokens: solo pregunta por el estado.
 
+**Solo texto, sin herramientas (PROVIDER FAILOVER · cierre de autoridad).** Claude Code es un
+agente: por defecto carga sus herramientas integradas (``Bash``, ``Write``, ``Edit``, ``Read``...)
+y los conectores MCP de la cuenta. Un proveedor de PUNTO solo puede **devolver texto**: lo que
+cambia el repositorio lo aplica PUNTO tras validarlo, así que un cliente con herramientas propias
+podría escribir, leer o actuar fuera de la gobernanza (medido con la CLI real: 37 herramientas
+cargadas, entre ellas ``Bash`` y ocho MCP de escritura de la cuenta; la lectura funcionaba sin
+pedir permiso). Por eso cada ejecución lleva ``TEXT_ONLY_ARGV``: ``--tools ""`` desactiva las
+integradas y ``--strict-mcp-config`` (sin ``--mcp-config``) desactiva los MCP; con ambos el
+cliente declara **cero** herramientas.
+
 Limitación declarada: el modo no interactivo de Claude Code recibe **texto**. Este transporte no
 declara soporte de imágenes; para evidencia visual con adjuntos se usa el transporte ``api``
 (multimodal) de forma explícita. No se inventa un canal que la interfaz oficial no ofrece.
@@ -54,12 +64,23 @@ CLAUDE_BINARY: Final[str] = "claude"
 #: ``argv`` oficial del estado de autenticación. Devuelve JSON por defecto (``--json``).
 AUTH_STATUS_ARGV: Final[tuple[str, ...]] = ("auth", "status", "--json")
 
+#: Flags que dejan a Claude Code sin herramientas (integradas y MCP). El orden importa: ``--tools``
+#: es **variádico** y se tragaría el argumento siguiente, así que ``--strict-mcp-config`` lo cierra
+#: y el prompt nunca queda como "nombre de herramienta". Un binario que no conozca un flag falla (y
+#: el transporte lo reporta como ``PROCESS_FAILED``): nunca se degrada a uno con herramientas.
+TEXT_ONLY_ARGV: Final[tuple[str, ...]] = ("--tools", "", "--strict-mcp-config")
+
 #: Modos de autenticación que Claude Code declara y que corresponden a una cuenta Claude.
 ACCOUNT_AUTH_METHODS: Final[tuple[str, ...]] = ("oauth", "claudeai", "claude_ai", "subscription")
 
 
 class ClaudeCodeTransport(CliTransport):
     """Ejecuta Claude Code con la sesión oficial de la cuenta Claude."""
+
+    #: El prompt viaja por ``stdin``: en Windows el binario es un ``.cmd`` de npm y ``cmd.exe``
+    #: corta el argumento en el primer salto de línea (medido con la CLI real: el cliente solo veía
+    #: la primera línea). Por ``stdin`` llega íntegro. Mismo defecto y misma solución que Codex.
+    prompt_via_stdin: bool = True
 
     def __init__(
         self,
@@ -105,12 +126,13 @@ class ClaudeCodeTransport(CliTransport):
     def prompt_argv(self) -> tuple[str, ...]:
         """``argv`` de una ejecución no interactiva, **sin** el prompt.
 
-        El prompt viaja como último argumento (``execution_argv`` lo añade): Claude Code no necesita
-        la vía de ``stdin`` que sí usa el transporte de Codex.
+        El prompt viaja por ``stdin`` (ver ``prompt_via_stdin``); si el runner no sabe entregarlo
+        así, ``execution_argv`` lo añade como último argumento. Siempre lleva ``TEXT_ONLY_ARGV``.
         """
         return (
             self.binary,
             "--print",
+            *TEXT_ONLY_ARGV,
             "--output-format",
             "json",
             "--model",
@@ -326,6 +348,7 @@ __all__ = [
     "ACCOUNT_AUTH_METHODS",
     "AUTH_STATUS_ARGV",
     "CLAUDE_BINARY",
+    "TEXT_ONLY_ARGV",
     "ClaudeCodeTransport",
     "extract_claude_result",
 ]

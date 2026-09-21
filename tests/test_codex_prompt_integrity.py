@@ -242,13 +242,18 @@ def test_codex_declara_la_entrega_por_stdin_y_su_argv_de_inspeccion() -> None:
     transporte.close()
 
 
-def test_claude_code_conserva_la_entrega_por_argumento() -> None:
-    """Claude Code no cambia de vía: su prompt sigue viajando como último argumento."""
+def test_claude_code_tambien_entrega_por_stdin() -> None:
+    """Claude Code sufre el mismo defecto de Windows y usa la misma vía que Codex.
+
+    Antes se supuso que no la necesitaba. Medido con la CLI real: el shim ``claude.CMD`` cortaba el
+    prompt en el primer salto de línea y el cliente solo veía su primera línea. La inspección
+    (``execution_argv``) conserva el prompt como último argumento; lo que se ejecuta no lo lleva.
+    """
     from punto.providers.transports.claude_code import ClaudeCodeTransport
 
     transporte = ClaudeCodeTransport(model="claude-sonnet-5")
 
-    assert transporte.prompt_via_stdin is False
-    assert transporte.delivery_argv("PROMPT")[-1] == "PROMPT"
+    assert transporte.prompt_via_stdin is True
+    assert "PROMPT" not in transporte.delivery_argv("PROMPT")
     assert transporte.execution_argv("PROMPT")[-1] == "PROMPT"
     transporte.close()

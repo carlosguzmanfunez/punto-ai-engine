@@ -50,7 +50,9 @@ instalada en esta máquina):
 
 - `claude --version` — ¿está instalado?
 - `claude auth status --json` — `{"loggedIn": true|false, "authMethod": "oauth|apiKey|none", ...}`
-- `claude --print --output-format json --model <m> <prompt>` — ejecución no interactiva
+- `claude --print --tools "" --strict-mcp-config --output-format json --model <m>` con el prompt por
+  `stdin` — ejecución no interactiva, **solo texto y sin ninguna herramienta** (ni integradas ni MCP;
+  ver `docs/PROVIDER_FAILOVER_V0.md`)
 
 Nunca se automatiza `claude.ai`, ni se copia la sesión web, ni se extraen cookies. **Limitación
 declarada**: `--print` es texto; para evidencia visual con adjuntos se usa `transport: api`

@@ -57,6 +57,22 @@ más herramientas del motor y su salida es inteligencia externa no confiable que
 validaciones, Authority Envelope, alcance, Human Gates y verificaciones. La política solo la declara
 `providers.yaml`; ni una petición, ni un proveedor ni una Task pueden ampliarla.
 
+## Claude Code: solo texto (cierre de autoridad)
+
+Verificado con la CLI real (Claude Code 2.1.263, Windows) antes de corregir:
+
+| Invocación | Herramientas cargadas (evento `init`) |
+| --- | --- |
+| `claude --print` (antes) | 37, incluidas `Bash`, `Write`, `Edit` y 8 MCP de escritura de la cuenta |
+| `--tools ""` | 8 (los MCP siguen) |
+| `--tools "" --strict-mcp-config` (ahora) | **0** |
+
+Además: `Write` se intentaba y solo lo frenaba el permiso por defecto; `Read` funcionaba **sin pedir permiso**
+sobre el cwd del motor. `--tools` es variádico (se traga el prompt posicional) y el shim `claude.CMD` de Windows
+cortaba el prompt en el primer salto de línea, así que el prompt ahora viaja por `stdin`. Prueba viva a través
+del transporte corregido: prompt multilínea íntegro, sin `probe.txt` creado y sin leer el canario del cwd.
+Pruebas: `tests/test_claude_code_text_only.py`.
+
 ## Pruebas
 
 `tests/test_provider_failover.py` (router, registro con evaluador real y ciclo + consola con Git real).

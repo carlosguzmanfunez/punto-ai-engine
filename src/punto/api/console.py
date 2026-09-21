@@ -160,6 +160,23 @@ IN_FLIGHT_STAGES: Final[frozenset[str]] = frozenset(
     {ConsoleStage.QUEUED.value, ConsoleStage.DEVELOPING.value, PublicationStage.PUBLISHING.value}
 )
 
+#: Etapas de **publicación viva**: mientras dura, volver a ejecutar el desarrollo dejaría huérfano
+#: el expediente de publicación. Solo se respetan si el proceso las está ejecutando (una tarea
+#: recuperada de un reinicio en estas etapas no tiene nada corriendo).
+LIVE_PUBLICATION_STAGES: Final[frozenset[str]] = frozenset(
+    {PublicationStage.PUBLISHING.value, PublicationStage.DEPLOYMENT_VERIFICATION.value}
+)
+
+#: Motivos con los que se rechaza volver a ejecutar una tarea. Son texto estable: la interfaz los
+#: muestra tal cual, sin inventar el suyo.
+RERUN_REJECTED_REASON: Final[str] = "la tarea fue rechazada por una persona: no se reanuda"
+RERUN_EXECUTING_REASON: Final[str] = (
+    "la tarea ya tiene una ejecución en curso: espera a que termine antes de volver a ejecutarla"
+)
+RERUN_PUBLISHING_REASON: Final[str] = (
+    "la tarea está publicándose: no se vuelve a ejecutar el desarrollo durante la publicación"
+)
+
 #: Nota con la que se marca una tarea recuperada que quedó a mitad de camino.
 INTERRUPTED_NOTE: Final[str] = (
     "recuperada del estado durable: esta etapa no sigue corriendo en este proceso; "
@@ -257,11 +274,53 @@ class ConsoleTask:
         #: proceso). No es una etapa: es la procedencia real de lo que se está viendo.
         self.recovered_at: datetime | None = None
         self._lock = Lock()
+        #: Interlock de ejecución: **solo en memoria** y por diseño. Una ejecución viva es un hecho
+        #: de este proceso; si el proceso muere, no queda nada corriendo y por tanto ningún bloqueo
+        #: huérfano que limpiar (una tarea recuperada arranca siempre libre).
+        self._executing = False
 
     @property
     def request_id(self) -> UUID:
         """Solicitud gobernada asociada (la misma identidad que la tarea)."""
         return self.task_id
+
+    @property
+    def executing(self) -> bool:
+        """True si este proceso está ejecutando el desarrollo de la tarea ahora mismo."""
+        with self._lock:
+            return self._executing
+
+    def begin_execution(self) -> bool:
+        """Toma el interlock de ejecución de forma **atómica** (comprobar y tomar, bajo un lock).
+
+        Devuelve ``False`` sin tocar nada si ya hay una ejecución viva: el llamante rechaza la
+        solicitud sin crear intento, sin incrementar ``runs`` y sin afectar a la que corre. Es la
+        garantía de exclusión entre solicitudes concurrentes; deshabilitar un botón no lo es.
+        """
+        with self._lock:
+            if self._executing:
+                return False
+            self._executing = True
+            return True
+
+    def end_execution(self) -> None:
+        """Libera el interlock. Idempotente: liberar dos veces no es un error."""
+        with self._lock:
+            self._executing = False
+
+    def rerun_block(self) -> str:
+        """Motivo por el que la tarea **no** puede volver a ejecutarse ahora, o ``""`` si puede.
+
+        Es la única fuente de esa decisión: la usa el endpoint para rechazar y la vista para que la
+        interfaz sepa si ofrecer la acción. La interfaz no decide nada por su cuenta.
+        """
+        if self.stage == ConsoleStage.REJECTED.value:
+            return RERUN_REJECTED_REASON
+        if self.executing:
+            return RERUN_EXECUTING_REASON
+        if self.stage in LIVE_PUBLICATION_STAGES and self.recovered_at is None:
+            return RERUN_PUBLISHING_REASON
+        return ""
 
     def set_stage(self, stage: ConsoleStage | PublicationStage, detail: str = "") -> None:
         """Cambia la etapa visible, dejando constancia del motivo si lo hay.
@@ -387,7 +446,16 @@ class ConsoleTask:
             # desenlace son indistinguibles y parece que la tarea no se volvió a ejecutar.
             "attempts": [item.model_dump(mode="json") for item in self.attempts],
             "notes": list(self.notes),
+            # Control de re-ejecución: lo decide el motor. ``executing`` es un hecho de este proceso
+            # (no se persiste) y ``rerun`` dice si se puede volver a ejecutar y, si no, por qué.
+            "executing": self.executing,
+            "rerun": self._rerun_view(),
         }
+
+    def _rerun_view(self) -> dict[str, Any]:
+        """Elegibilidad de la re-ejecución, con el motivo del motor cuando no es posible."""
+        reason = self.rerun_block()
+        return {"allowed": not reason, "reason": reason}
 
 
 @dataclass
@@ -548,6 +616,8 @@ def register_human_console(
             context=body.context,
         )
         tasks[str(task.task_id)] = task
+        # La primera ejecución toma el mismo interlock: un /run mientras corre se rechaza.
+        started = body.run and task.begin_execution()
         dependencies.audit.log_dev_event(
             AuditEventType.CONSOLE_TASK_CREATED,
             "console_task_created",
@@ -559,8 +629,12 @@ def register_human_console(
                 "authority": "la consola no concede autoridad: PUNTO gobierna",
             },
         )
-        if body.run:
-            _run_development(task, request, dependencies, executor)
+        if started:
+            try:
+                _run_development(task, request, dependencies, executor)
+            except BaseException:
+                task.end_execution()
+                raise
         persist()
         return _task_view(task, dependencies)
 
@@ -598,11 +672,9 @@ def register_human_console(
         avanzar. No se salta ningún guard, ni la política, ni el QA: se vuelve a pasar por todos.
         """
         task = _task_or_404(tasks, task_id)
-        if task.stage == ConsoleStage.REJECTED.value:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail="la tarea fue rechazada por una persona: no se reanuda",
-            )
+        rejected = task.rerun_block()
+        if rejected:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=rejected)
         target = _refresh_target(dependencies, task.target_id)
         request = BuildRequest(
             request_id=task.task_id,
@@ -613,8 +685,17 @@ def register_human_console(
             scope_paths=task.scope_paths,
             context=task.context,
         )
-        tasks[str(task.task_id)] = task
-        _run_development(task, request, dependencies, executor)
+        # Interlock: se toma **antes** de tocar el estado (etapa, ``runs``, intento). Si otra
+        # solicitud ya lo tiene, esta se rechaza sin efecto alguno. Comprobar ``rerun_block`` arriba
+        # es solo el atajo con motivo; la exclusión real es esta toma atómica.
+        if not task.begin_execution():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=RERUN_EXECUTING_REASON)
+        try:
+            tasks[str(task.task_id)] = task
+            _run_development(task, request, dependencies, executor)
+        except BaseException:
+            task.end_execution()
+            raise
         persist()
         return _task_view(task, dependencies)
 
@@ -869,17 +950,32 @@ def register_human_console(
                         ConsoleStage.DEVELOPMENT_FAILED, result.error_kind or "CYCLE_ERROR"
                     )
                     _close_attempt(task, result=result)
+                    task.end_execution()
                     return
                 task.result = result
                 _reflect(task, result, deps)
                 _close_attempt(task, result=result)
+                # El intento cerrado ya es visible: quien reaccione a él (otro /run) no puede
+                # recibir un rechazo espurio por un interlock que sigue tomado.
+                task.end_execution()
             finally:
                 persist()
+                # Red de seguridad idempotente: ninguna salida (excepción incluida) deja el
+                # interlock tomado.
+                task.end_execution()
 
         if pool is None:
             work()
         else:
-            pool.submit(work)
+            try:
+                pool.submit(work)
+            except BaseException:
+                # El trabajo no llegó a arrancar: se cierra el intento abierto con su causa real y
+                # se libera el interlock, en vez de dejar la tarea «en ejecución» sin nadie.
+                task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, "no se pudo iniciar la ejecución")
+                _close_attempt(task, result=None, error="no se pudo iniciar la ejecución")
+                task.end_execution()
+                raise
 
     def _reflect(task: ConsoleTask, result: DevelopmentResult, deps: ConsoleDependencies) -> None:
         """Traduce el resultado del ciclo a la etapa visible y crea el gate si hace falta.

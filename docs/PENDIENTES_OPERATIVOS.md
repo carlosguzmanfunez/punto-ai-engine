@@ -2,14 +2,17 @@
 
 ## Abiertos
 
-1. **Dashboard: botón «Ejecutar de nuevo».** Añadir al Dashboard el llamador de
-   `POST /console/tasks/{id}/run` para reanudar una Task durable bloqueada o fallida como nuevo intento
-   (misma Task, `runs` +1, historial intacto). Hoy el endpoint existe pero solo se invoca a mano.
-2. **Impedir `/run` concurrente sobre la misma Task.** `run_console_task` solo rechaza las Tasks
-   `REJECTED`: un segundo `POST` mientras el ciclo corre lanzaría un segundo ciclo sobre el mismo
-   repositorio. Propuesta: 409 si hay un intento vivo en este proceso (`attempt_started_at` abierto, o
-   etapa `DEVELOPING`/`PUBLISHING` en una Task no recuperada); una Task recuperada de un reinicio
-   (sin nada corriendo) sigue siendo reanudable.
+_Ninguno de los dos anteriores sigue abierto (ver «Cerrados»)._
+
+## Cerrados
+
+1. **Dashboard: botón «Ejecutar de nuevo»** — cerrado. Llama a `POST /console/tasks/{id}/run` sobre la
+   misma Task, se deshabilita mientras corre y representa el rechazo concurrente. Solo se ofrece si el
+   motor dice que la Task se puede volver a ejecutar (`rerun.allowed`).
+2. **`/run` concurrente sobre la misma Task** — cerrado. Interlock atómico en `ConsoleTask`
+   (`begin_execution` / `end_execution`), solo en memoria, liberado al cerrar el intento y en `finally`;
+   un segundo `/run` recibe 409 sin crear intento, sin incrementar `runs` y sin afectar a la ejecución
+   viva. Tasks distintas no se estorban. Pruebas: `tests/test_console_rerun_interlock.py`.
 
 ## Contexto — Task `2e7822a0-5d67-405e-aeb6-3c07a139cbbf`
 

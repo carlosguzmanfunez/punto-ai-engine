@@ -314,6 +314,7 @@
           const detail = payload && payload.detail ? payload.detail : response.statusText;
           const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
           error.payload = payload;
+          error.status = response.status;
           throw error;
         }
         return payload;
@@ -648,7 +649,45 @@
       });
 
       // ------------------------------------------------------------------ consola
-      const consoleState = { targets: [], tasks: [], gates: [], timer: null };
+      const consoleState = { targets: [], tasks: [], gates: [], timer: null, pendingRuns: new Set() };
+
+      // <rerun-control>
+      // Control «Ejecutar de nuevo» (POST /console/tasks/{id}/run). Toda la decisión es del motor:
+      // ``task.rerun`` dice si se puede volver a ejecutar y ``task.executing`` si hay una ejecución
+      // viva. Esta función no inventa reglas; solo las traduce a lo que se pinta.
+      function rerunControl(task, pending) {
+        const rerun = task.rerun || { allowed: false, reason: "" };
+        const running = Boolean(task.executing) || pending.has(task.task_id);
+        if (running) {
+          return { visible: true, disabled: true, running: true, label: "Ejecutando…",
+                   title: "la tarea se está ejecutando" };
+        }
+        if (!rerun.allowed) {
+          return { visible: false, disabled: true, running: false, label: "Ejecutar de nuevo",
+                   title: rerun.reason || "" };
+        }
+        return { visible: true, disabled: false, running: false, label: "Ejecutar de nuevo",
+                 title: "vuelve a ejecutar el ciclo sobre esta misma tarea (nuevo intento)" };
+      }
+
+      // Llama al endpoint existente sobre la MISMA tarea. Nunca crea otra, no aprueba ningún gate y
+      // no publica. ``call`` es ``api``; ``pending`` evita un segundo envío desde esta página, pero
+      // la exclusión real la impone el motor (un 409 es un resultado esperado, no un fallo).
+      async function rerunRequest(taskId, pending, call) {
+        if (pending.has(taskId)) return { status: "ignored" };
+        pending.add(taskId);
+        try {
+          const task = await call(`/console/tasks/${taskId}/run`, { method: "POST" });
+          return { status: "started", task };
+        } catch (error) {
+          const message = String((error && error.message) || error);
+          if (error && error.status === 409) return { status: "conflict", message };
+          return { status: "error", message };
+        } finally {
+          pending.delete(taskId);
+        }
+      }
+      // </rerun-control>
 
       function stageBadge(stage) {
         return `<span class="stage ${stage}">${stage}</span>`;
@@ -753,6 +792,7 @@
           .map((reason) => `<div class="note">${reason}</div>`)
           .join("");
         const canRelease = release.autonomous && dev.status === "DEVELOPMENT_COMPLETED";
+        const rerun = rerunControl(task, consoleState.pendingRuns);
         const notes = (task.notes || []).map((text) => `<div class="note">${text}</div>`).join("");
         return `
           <article class="card" data-task="${task.task_id}" data-testid="tarea-${task.task_id}">
@@ -773,6 +813,7 @@
             ${notes}
             <div class="actions">
               <button class="secondary" data-ver="${task.task_id}" data-testid="ver-${task.task_id}">Ver</button>
+              ${rerun.visible ? `<button class="secondary" data-rerun="${task.task_id}" data-testid="rerun-${task.task_id}" ${rerun.disabled ? "disabled" : ""} title="${esc(rerun.title)}">${rerun.label}</button>` : ""}
               ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}">Release autónomo</button>` : ""}
               ${canPublish ? `<button data-production="${task.task_id}">Pedir gate de publicación</button>` : ""}
               ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
@@ -1016,8 +1057,13 @@
       async function loadTasks() {
         const payload = await api("/console/tasks");
         consoleState.tasks = payload.items;
-        document.getElementById("tasks-list").innerHTML = payload.items.length
-          ? payload.items.map(taskCard).join("")
+        renderTasks();
+      }
+
+      function renderTasks() {
+        const items = consoleState.tasks;
+        document.getElementById("tasks-list").innerHTML = items.length
+          ? items.map(taskCard).join("")
           : `<div class="note">todavía no hay tareas</div>`;
         document.querySelectorAll("[data-production]").forEach((button) =>
           button.addEventListener("click", () => requestProductionGate(button.dataset.production)));
@@ -1027,6 +1073,8 @@
           button.addEventListener("click", () => publishTask(button.dataset.publish)));
         document.querySelectorAll("[data-ver]").forEach((button) =>
           button.addEventListener("click", () => openTaskDetail(button.dataset.ver, button)));
+        document.querySelectorAll("[data-rerun]").forEach((button) =>
+          button.addEventListener("click", () => rerunTask(button.dataset.rerun)));
       }
 
       async function loadGates() {
@@ -1084,10 +1132,29 @@
         if (consoleState.timer) clearInterval(consoleState.timer);
         consoleState.timer = setInterval(async () => {
           await Promise.all([loadTasks(), loadGates()]);
-          const running = consoleState.tasks.some((task) =>
+          const running = consoleState.tasks.some((task) => task.executing ||
             ["QUEUED", "DEVELOPING", "PUBLISHING", "DEPLOYMENT_VERIFICATION"].includes(task.stage));
           if (!running) { clearInterval(consoleState.timer); consoleState.timer = null; }
         }, 3000);
+      }
+
+      async function rerunTask(taskId) {
+        if (consoleState.pendingRuns.has(taskId)) return;
+        const short = taskId.slice(0, 8);
+        consoleNote(`tarea ${short}: volviendo a ejecutar el ciclo…`);
+        const request = rerunRequest(taskId, consoleState.pendingRuns, api);
+        renderTasks();  // el botón pasa a «Ejecutando…» y deshabilitado antes de que responda
+        const outcome = await request;
+        if (outcome.status === "started") {
+          const task = outcome.task;
+          consoleNote(`tarea ${short}: intento ${task.runs} · etapa ${task.stage}`, "ok");
+        } else if (outcome.status === "conflict") {
+          consoleNote(`tarea ${short}: no se volvió a ejecutar — ${outcome.message}`, "warn");
+        } else if (outcome.status === "error") {
+          consoleNote(`tarea ${short}: ${outcome.message}`, "bad");
+        }
+        await Promise.all([loadTasks(), loadGates()]);
+        pollWhileRunning();
       }
 
       async function requestProductionGate(taskId) {

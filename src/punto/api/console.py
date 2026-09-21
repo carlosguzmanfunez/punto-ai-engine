@@ -403,6 +403,14 @@ class ConsoleTask:
             # PROVIDER FAILOVER: quién era el primario, por qué no pudo y quién lo sustituyó. La
             # identidad de la tarea no cambia y la sustitución no concede autoridad adicional.
             "failovers": [item.model_dump() for item in result.failovers],
+            # RECONCILIACION NO-OP: completado sin cambios porque el estado actual ya satisfacía la
+            # Task, con la evidencia de qué se midió (sin commit).
+            "resolution": result.resolution,
+            "no_op_evidence": (
+                None
+                if result.no_op_evidence is None
+                else result.no_op_evidence.model_dump(mode="json")
+            ),
             # VISUAL_QA EFECTIVO: capturas reales (con huella), quién las evaluó y su veredicto.
             "visual_evidence": [
                 item.model_dump(mode="json") for item in result.visual_evidence[:MAX_EVIDENCE_ROWS]
@@ -1357,6 +1365,7 @@ def _close_attempt(
             provider=_redacted(result.provider, 40) if result is not None else "",
             failover=_failover_summary(result),
             visual=_visual_summary(result),
+            resolution=result.resolution if result is not None else "",
         ),
     ]
     task.attempt_started_at = None

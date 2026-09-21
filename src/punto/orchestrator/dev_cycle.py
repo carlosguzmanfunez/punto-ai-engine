@@ -41,7 +41,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from punto.acceptance import (
     CapabilityRequirement,
@@ -115,6 +115,7 @@ from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest, BuildValidationIssue
 from punto.schemas.dev import (
     MAX_PLAN_ITEMS,
+    RESOLUTION_ALREADY_SATISFIED,
     AcceptanceEvidence,
     AppliedChange,
     AuthorityDecisionRecord,
@@ -129,6 +130,7 @@ from punto.schemas.dev import (
     DevelopmentStatus,
     ExpansionStatus,
     FileChangeProposal,
+    NoOpEvidence,
     PellInfluence,
     PlanRevisionRecord,
     PlanStatus,
@@ -273,6 +275,10 @@ class DevelopmentConfig:
     #: límite es pequeño y explícito: no hay reintentos ilimitados, y ``max_repair_rounds`` no se
     #: toca.
     max_structural_corrections: int = 2
+    #: Reconciliación de un **no-op**: si el BUILDER propone cero cambios, se mide el estado actual
+    #: con la misma cadena de verificación y solo se completa si todo pasa. ``False`` conserva el
+    #: comportamiento anterior (``CHANGES_EMPTY`` reintenta y acaba en fallo).
+    reconcile_noop: bool = True
     #: Techo acumulado de recursos distintos para toda la sesión (anti-fragmentación).
     session_ceiling: int = AUTONOMOUS_MAX_FILES * 3
     #: Permitir que el BUILDER pida ampliar alcance con evidencia causal.
@@ -309,6 +315,20 @@ class ContextFile:
     def chars(self) -> int:
         """Longitud del contenido entregado."""
         return len(self.content)
+
+
+class _StateEvaluation(NamedTuple):
+    """Resultado de medir el estado del repositorio con la cadena completa de verificación."""
+
+    verification: tuple[CommandEvidence, ...]
+    chain_ok: bool
+    chain_issues: tuple[BuildValidationIssue, ...]
+    acceptance_ok: bool
+    acceptance_issues: tuple[BuildValidationIssue, ...]
+    acceptance_evidence: tuple[AcceptanceEvidence, ...]
+    claims_outcome: str
+    claim_issues: tuple[BuildValidationIssue, ...]
+    claim_records: tuple[ClaimRecord, ...]
 
 
 @dataclass(slots=True)
@@ -638,6 +658,8 @@ class DevelopmentCycle:
             acceptance_result=outcome["acceptance_result"],
             claims=tuple(outcome["claims"]),
             claims_result=outcome["claims_result"],
+            resolution=outcome["resolution"],
+            no_op_evidence=outcome["no_op_evidence"],
         )
 
     # ------------------------------------------------------------------ destinos
@@ -861,6 +883,96 @@ class DevelopmentCycle:
             },
         )
         return True, (), evidence
+
+    def _evaluate_state(
+        self,
+        request: BuildRequest,
+        target: DevelopmentTarget,
+        repository: GovernedRepository,
+        plan: DevelopmentPlan,
+    ) -> _StateEvaluation:
+        """Mide el estado **actual** del repositorio con la cadena completa de verificación.
+
+        Es la misma medición que sigue a aplicar un cambio: verificaciones del destino, cadena
+        funcional, aceptación, afirmaciones factuales/semánticas y evidencia visual (VISUAL_QA por
+        su ruta efectiva). La usan el flujo normal y la reconciliación de un no-op, de modo que un
+        estado sin cambios no pasa por una vía más laxa.
+        """
+        verification = self._verify(repository, target, plan, request)
+        chain_ok, chain_issues = self._verify_functional_chain(plan, verification, request)
+        # AP000-OBS-02: la aceptación se mide contra la superficie solicitada, después del build y
+        # antes de dar la ronda por buena. Un fallo aquí no es VERIFIED: repara.
+        acceptance_ok, acceptance_issues, acceptance_evidence = self._verify_acceptance(
+            request, repository
+        )
+        # AP000-OBS-03: las afirmaciones factuales/semánticas se miden con evidencia real. Un
+        # criterio requerido sin evidencia no se convierte en PASS: se para y se pide.
+        claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
+            request, repository, target
+        )
+        return _StateEvaluation(
+            verification=tuple(verification),
+            chain_ok=chain_ok,
+            chain_issues=tuple(chain_issues),
+            acceptance_ok=acceptance_ok,
+            acceptance_issues=tuple(acceptance_issues),
+            acceptance_evidence=tuple(acceptance_evidence),
+            claims_outcome=claims_outcome,
+            claim_issues=tuple(claim_issues),
+            claim_records=tuple(claim_records),
+        )
+
+    def _noop_gap(
+        self, state: _StateEvaluation, plan: DevelopmentPlan, repository: GovernedRepository
+    ) -> str:
+        """Qué impide dar un no-op por satisfecho, o ``""`` si el estado actual cumple todo.
+
+        ``CHANGES_EMPTY`` nunca es éxito por sí solo: hace falta que haya **algo que demuestre** el
+        estado (verificaciones ejecutadas), que todo pase y que los recursos del plan estén como el
+        plan los describe. Una evidencia requerida que falta es responsabilidad del llamante
+        (``EVIDENCE_REQUIRED``), no se cuenta aquí como cumplida.
+        """
+        if not state.verification:
+            return "no hay verificaciones que demuestren el estado actual"
+        failed = [item.name for item in state.verification if not item.passed]
+        if failed:
+            return f"verificaciones fallidas: {', '.join(failed)}"
+        if not state.chain_ok:
+            return "la cadena funcional del plan no queda completa"
+        if not state.acceptance_ok:
+            return "la aceptación de la solicitud no queda satisfecha"
+        if state.claims_outcome not in {"SATISFIED", "NONE"}:
+            return f"criterios factuales/semánticos: {state.claims_outcome}"
+        missing = [
+            path
+            for path in (*plan.files_to_modify, *plan.files_to_create)
+            if not repository.exists(path)
+        ]
+        if missing:
+            return f"recursos del plan que no existen: {', '.join(missing[:5])}"
+        lingering = [path for path in plan.files_to_delete if repository.exists(path)]
+        if lingering:
+            return f"recursos que el plan borra y siguen existiendo: {', '.join(lingering[:5])}"
+        return ""
+
+    def _noop_evidence(
+        self, state: _StateEvaluation, plan: DevelopmentPlan, repository: GovernedRepository
+    ) -> NoOpEvidence:
+        """Constancia persistida de por qué un ciclo sin cambios se dio por satisfecho."""
+        return NoOpEvidence(
+            reason=(
+                "el BUILDER no propuso cambios y el estado actual superó la misma cadena de "
+                "verificación que un cambio normal"
+            ),
+            verifications=tuple(item.name for item in state.verification if item.passed),
+            functional_chain=self._functional_chain_result,
+            acceptance_result=self._acceptance_result(state.acceptance_evidence),
+            claims_result=state.claims_outcome,
+            plan_resources=len(plan.touched_paths()),
+            visual_records=len(self._visual_evidence),
+            baseline_sha=repository.baseline_sha,
+            state_digest=self._applied_digest(repository),
+        )
 
     def _visual_capability(self) -> VisualCapability:
         """Capacidad **efectiva** de la ruta asignada a VISUAL_QA para recibir imágenes.
@@ -2140,6 +2252,8 @@ class DevelopmentCycle:
         # La corrección estructural se construye al final de una iteración y se entrega en la
         # siguiente invocación: se consume una sola vez (si no, se perdería antes de viajar).
         pending_feedback = ""
+        #: Nº de cambios aplicados cuando se midió el estado por última vez (no-op).
+        reconciled_at = -1
         for _ in range(max_iterations):
             # La skill de resolución solo actúa sobre un **fallo real ya medido**: sin verificación
             # fallida no hay nada que resolver, y la implementación inicial no la recibe.
@@ -2348,6 +2462,100 @@ class DevelopmentCycle:
             if proposal_issue is not None:
                 change_issues = (proposal_issue,)
                 failure_evidence = proposal_issue.detail
+                if (
+                    proposal_issue.code == "CHANGES_EMPTY"
+                    and self.config.reconcile_noop
+                    and len(applied) != reconciled_at
+                ):
+                    # Cero cambios no es un fallo **ni** un éxito: puede que el estado actual ya
+                    # satisfaga la Task. Se mide con la misma cadena que un cambio normal; solo se
+                    # completa si todo pasa. La medición se hace una vez por estado (si nada se
+                    # aplicó desde la última, repetirla daría el mismo veredicto).
+                    reconciled_at = len(applied)
+                    state = self._evaluate_state(request, target, repository, plan)
+                    verification = list(state.verification)
+                    acceptance_issues = state.acceptance_issues
+                    acceptance_evidence = state.acceptance_evidence
+                    claim_evidence = self._claim_evidence(state.claim_records)
+                    gap = self._noop_gap(state, plan, repository)
+                    self._log(
+                        AuditEventType.DEV_NOOP_RECONCILED,
+                        "dev_noop_reconciled",
+                        request,
+                        {
+                            "satisfied": not gap and state.claims_outcome != "EVIDENCE_REQUIRED",
+                            "gap": gap[:300],
+                            "verifications_passed": [
+                                item.name for item in state.verification if item.passed
+                            ],
+                            "verifications_failed": [
+                                item.name for item in state.verification if not item.passed
+                            ],
+                            "functional_chain": self._functional_chain_result,
+                            "acceptance_ok": state.acceptance_ok,
+                            "claims_result": state.claims_outcome,
+                            "visual_records": len(self._visual_evidence),
+                            "applied_before": len(applied),
+                        },
+                        AuditResult.SUCCESS if not gap else AuditResult.FAILURE,
+                    )
+                    if state.claims_outcome == "EVIDENCE_REQUIRED":
+                        return self._outcome(
+                            status=DevelopmentStatus.BLOCKED,
+                            error_kind="EVIDENCE_REQUIRED",
+                            error=(
+                                "sin cambios: el estado actual no demuestra un criterio "
+                                "factual/semántico requerido con la evidencia disponible: "
+                                + "; ".join(
+                                    item.evidence
+                                    for item in state.claim_records
+                                    if item.not_verified
+                                )[:400]
+                            ),
+                            provider=provider,
+                            model=model,
+                            applied=applied,
+                            verification=verification,
+                            repair_rounds=rounds,
+                            granted=granted,
+                            denied=denied,
+                            checkpoint=checkpoint,
+                            influence=influence,
+                            change_issues=(),
+                            acceptance=acceptance_evidence,
+                            acceptance_result=self._acceptance_result(acceptance_evidence),
+                            claims=claim_evidence,
+                            claims_result=state.claims_outcome,
+                        )
+                    if not gap:
+                        return self._outcome(
+                            status=DevelopmentStatus.COMPLETED,
+                            error_kind="",
+                            error="",
+                            provider=provider,
+                            model=model,
+                            applied=applied,
+                            verification=verification,
+                            repair_rounds=rounds,
+                            granted=granted,
+                            denied=denied,
+                            checkpoint=checkpoint,
+                            influence=influence,
+                            change_issues=(),
+                            acceptance=acceptance_evidence,
+                            acceptance_result=self._acceptance_result(acceptance_evidence),
+                            claims=claim_evidence,
+                            claims_result=state.claims_outcome,
+                            resolution=RESOLUTION_ALREADY_SATISFIED if not applied else "",
+                            no_op_evidence=self._noop_evidence(state, plan, repository)
+                            if not applied
+                            else None,
+                        )
+                    failure_evidence = (
+                        f"{proposal_issue.detail}. THE CURRENT STATE DOES NOT SATISFY THE TASK "
+                        f"({gap}); an empty answer is not acceptable:\n"
+                        + self._failure_evidence(state.verification)
+                    )
                 continue
 
             # Preflight determinista de la propuesta: los hechos del workspace que PUNTO puede
@@ -2506,18 +2714,18 @@ class DevelopmentCycle:
                     request,
                     {"round": rounds, "changes": len(validated)},
                 )
-            verification = self._verify(repository, target, plan, request)
-            chain_ok, chain_issues = self._verify_functional_chain(plan, verification, request)
-            # AP000-OBS-02: la aceptación se mide contra la superficie solicitada, después del
-            # build y antes de dar la ronda por buena. Un fallo aquí no es VERIFIED: repara.
-            acceptance_ok, acceptance_issues, acceptance_evidence = self._verify_acceptance(
-                request, repository
-            )
-            # AP000-OBS-03: las afirmaciones factuales/semánticas se miden con evidencia real.
-            # Un criterio requerido sin evidencia no se convierte en PASS: se para y se pide.
-            claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
-                request, repository, target
-            )
+            (
+                measured,
+                chain_ok,
+                chain_issues,
+                acceptance_ok,
+                acceptance_issues,
+                acceptance_evidence,
+                claims_outcome,
+                claim_issues,
+                claim_records,
+            ) = self._evaluate_state(request, target, repository, plan)
+            verification = list(measured)
             claim_evidence = self._claim_evidence(claim_records)
             if claims_outcome == "EVIDENCE_REQUIRED":
                 rolled_back = False
@@ -3544,6 +3752,8 @@ class DevelopmentCycle:
             "acceptance_result": kwargs.get("acceptance_result", "NOT_MEASURED"),
             "claims": kwargs.get("claims", ()),
             "claims_result": kwargs.get("claims_result", "NONE"),
+            "resolution": kwargs.get("resolution", ""),
+            "no_op_evidence": kwargs.get("no_op_evidence"),
             "plan": self._final_plan,
         }
 
@@ -3586,6 +3796,8 @@ class DevelopmentCycle:
         claims: Sequence[ClaimEvidence] = (),
         claims_result: str = "NONE",
         capabilities: Sequence[CapabilityEvidence] | None = None,
+        resolution: str = "",
+        no_op_evidence: NoOpEvidence | None = None,
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -3598,7 +3810,9 @@ class DevelopmentCycle:
             learning = self._learn(request, target, plan, final_applied, verification)
             if learning is not None:
                 final_influence.append(learning)
-            if not final_rolled_back:
+            # Un no-op verificado (``ALREADY_SATISFIED``) no tiene nada que confirmar: no se
+            # fabrica un commit vacío y la Task no queda con un commit que no existe.
+            if not final_rolled_back and final_applied:
                 try:
                     final_commit = repository.commit_local(
                         [item.path for item in final_applied],
@@ -3665,6 +3879,8 @@ class DevelopmentCycle:
             ),
             failovers=tuple(self._failovers),
             visual_evidence=tuple(self._visual_evidence),
+            resolution=resolution,
+            no_op_evidence=no_op_evidence,
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,
@@ -3959,7 +4175,10 @@ BUILD_CONTRACT: Final[str] = (
     "every change needs the full file content and a reason; do not touch files outside the plan; "
     "do not include credentials. Ask for scope_expansion with evidence when the objective "
     "genuinely requires another resource: PUNTO evaluates it and decides; it is not yours to "
-    "grant. You do not apply anything: PUNTO validates and applies. "
+    "grant. You do not apply anything: PUNTO validates and applies. If the CURRENT repository "
+    "state already satisfies the plan, return an empty changes list and explain it in "
+    "unchanged_resources with evidence: PUNTO then measures the current state with the same "
+    "verifications and never accepts an empty answer on its own. "
     + length_limits_text()
 )
 

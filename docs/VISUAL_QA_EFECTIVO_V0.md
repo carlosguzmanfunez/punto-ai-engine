@@ -94,3 +94,23 @@ visual:
 
 Gate vivo (Chrome + Codex reales): `tests/integration/test_hover_interaction_live.py`.
 
+
+## 6. Reconciliación de un no-op (`ALREADY_SATISFIED`)
+
+Si el BUILDER propone **cero cambios** (`CHANGES_EMPTY`) porque el estado actual ya contiene la
+solución, el ciclo no lo trata como fallo **ni** como éxito: mide el estado actual con la **misma
+cadena** que un cambio normal (`DevelopmentCycle._evaluate_state`): verificaciones del destino, cadena
+funcional, aceptación, afirmaciones factuales/semánticas y evidencia visual (VISUAL_QA por su ruta
+efectiva, incluida la interacción real).
+
+- Solo se completa si **todo** pasa, hay al menos una verificación ejecutada y los recursos del plan
+  están como el plan los describe (los que se crean/modifican existen; los que se borran, no).
+- Cualquier verificación en rojo, criterio `FAIL` o evidencia requerida `UNCLEAR`/ausente ⇒ no se
+  completa (`EVIDENCE_REQUIRED` si falta evidencia; si no, sigue el flujo de reintento).
+- Resultado: `DevelopmentResult.resolution = "ALREADY_SATISFIED"` y `no_op_evidence` (verificaciones
+  que pasaron, cadena funcional, aceptación, afirmaciones, registros visuales, `baseline_sha` y
+  `state_digest`); evento de auditoría `DEV_NOOP_RECONCILED`; `TaskAttempt.resolution`.
+- **Sin commit vacío**: `commit_sha` queda vacío y no hay release/publicación autónomos (no hay nada
+  que confirmar). Sin autoridad nueva.
+- La medición se hace una vez por estado; `DevelopmentConfig.reconcile_noop=False` conserva el
+  comportamiento anterior.

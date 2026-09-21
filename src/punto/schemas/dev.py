@@ -452,6 +452,35 @@ class CapabilityEvidence(BaseModel):
     remedy: str = Field(default="", max_length=300)
 
 
+#: Resolución de un desarrollo completado **sin cambios**: el estado actual ya satisfacía la Task.
+RESOLUTION_ALREADY_SATISFIED = "ALREADY_SATISFIED"
+
+
+class NoOpEvidence(BaseModel):
+    """Por qué un ciclo con **cero cambios** se dio por satisfecho (reconciliación verificada).
+
+    ``CHANGES_EMPTY`` nunca es un éxito por sí solo: el estado actual tuvo que **superar la misma
+    cadena** que habría medido un cambio normal (verificaciones del destino, cadena funcional,
+    aceptación, afirmaciones y evidencia visual). Este registro conserva qué se midió y sobre qué
+    estado (``baseline_sha`` + ``state_digest``), para poder reconstruir la decisión.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reason: str = Field(default="", max_length=300)
+    #: Verificaciones del destino que pasaron sobre el estado actual.
+    verifications: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
+    functional_chain: str = Field(default="", max_length=40)
+    acceptance_result: str = Field(default="", max_length=20)
+    claims_result: str = Field(default="", max_length=20)
+    #: Recursos del plan comprobados (los que debían existir existen; los borrados no).
+    plan_resources: int = Field(default=0, ge=0)
+    #: Registros de evidencia visual (capturas + veredicto) que respaldan los criterios visuales.
+    visual_records: int = Field(default=0, ge=0)
+    baseline_sha: str = Field(default="", max_length=64)
+    state_digest: str = Field(default="", max_length=64)
+
+
 class ProviderFailoverEvidence(BaseModel):
     """Sustitución de proveedor que hubo que hacer durante el ciclo (PROVIDER FAILOVER).
 
@@ -605,6 +634,9 @@ class DevelopmentResult(BaseModel):
     failovers: tuple[ProviderFailoverEvidence, ...] = Field(default=(), max_length=64)
     #: Evidencia visual gobernada (capturas reales + veredicto de VISUAL_QA) de este ciclo.
     visual_evidence: tuple[VisualEvidenceRecord, ...] = Field(default=(), max_length=32)
+    #: ``""`` (cambios aplicados) o ``ALREADY_SATISFIED`` (completado sin cambios, verificado).
+    resolution: str = Field(default="", max_length=40)
+    no_op_evidence: NoOpEvidence | None = None
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
@@ -693,6 +725,10 @@ class DevelopmentResult(BaseModel):
             "functional_chain_result": self.functional_chain_result,
             "failovers": [item.model_dump(mode="json") for item in self.failovers],
             "visual_evidence": [item.model_dump(mode="json") for item in self.visual_evidence],
+            "resolution": self.resolution,
+            "no_op_evidence": (
+                None if self.no_op_evidence is None else self.no_op_evidence.model_dump(mode="json")
+            ),
         }
 
 
@@ -702,6 +738,7 @@ __all__ = [
     "MAX_ITEM_CHARS",
     "MAX_PATH_CHARS",
     "MAX_PLAN_ITEMS",
+    "RESOLUTION_ALREADY_SATISFIED",
     "AppliedChange",
     "AuthorityDecisionRecord",
     "BlockedEvidence",
@@ -715,6 +752,7 @@ __all__ = [
     "ExpansionStatus",
     "FileChangeProposal",
     "FunctionalChainStep",
+    "NoOpEvidence",
     "PellInfluence",
     "PlanRevisionRecord",
     "PlanStatus",

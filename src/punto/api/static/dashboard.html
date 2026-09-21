@@ -807,6 +807,7 @@
             ${releaseReasons}
             ${dev.status ? `<div class="row"><span class="label">Desarrollo</span><span class="value">${dev.status}</span></div>` : ""}
             ${dev.commit_sha ? `<div class="row"><span class="label">Commit local</span><code>${dev.commit_sha.slice(0, 10)}</code></div>` : ""}
+            ${dev.resolution === "ALREADY_SATISFIED" ? `<div class="row"><span class="label">Resolución</span><span class="value">ya satisfecha (sin cambios, verificada)</span></div>` : ""}
             ${dev.functional_chain_result ? `<div class="row"><span class="label">Cadena</span><span class="value">${dev.functional_chain_result}</span></div>` : ""}
             ${dev.repair_rounds !== undefined ? `<div class="row"><span class="label">Reparaciones</span><span class="value">${dev.repair_rounds} (+${dev.structural_corrections || 0} estructurales)</span></div>` : ""}
             <div class="list">${verification}${push}${production}${gates}</div>

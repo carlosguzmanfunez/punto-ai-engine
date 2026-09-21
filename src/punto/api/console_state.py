@@ -192,6 +192,9 @@ class TaskAttempt(BaseModel):
     failover: str = Field(default="", max_length=200)
     #: VISUAL_QA EFECTIVO: resumen de la evidencia visual del intento (proveedor/transporte).
     visual: str = Field(default="", max_length=120)
+    #: ``ALREADY_SATISFIED`` si el intento se completó **sin cambios** porque el estado actual ya
+    #: satisfacía la Task (verificado con la cadena completa); vacío si aplicó cambios.
+    resolution: str = Field(default="", max_length=40)
 
 
 class TaskRecord(BaseModel):

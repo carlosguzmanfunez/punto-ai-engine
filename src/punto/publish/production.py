@@ -452,6 +452,12 @@ class GitPublisher:
         )
         return code == 0
 
+    def head_sha(self) -> str | None:
+        """SHA del HEAD del repositorio local, o ``None`` si no se pudo leer."""
+        code, output = self._runner(("git", "rev-parse", "HEAD"), self._root, self._timeout)
+        candidate = output.strip().splitlines()[0].strip() if output.strip() else ""
+        return candidate if code == 0 and _SHA_PATTERN.match(candidate) else None
+
     def push(self, plan: PushPlan, *, allow_remote: bool = False) -> PushEvidence:
         """Ejecuta el push y devuelve la evidencia, sin declarar nada sobre producción.
 
@@ -482,9 +488,7 @@ class GitPublisher:
         )
 
 
-def _default_git_runner(
-    argv: tuple[str, ...], root: Path, timeout: float
-) -> tuple[int, str]:
+def _default_git_runner(argv: tuple[str, ...], root: Path, timeout: float) -> tuple[int, str]:
     """Ejecuta Git en el repositorio con el entorno **saneado** del motor.
 
     El proceso hijo **no hereda** el entorno del host: se construye con
@@ -696,9 +700,7 @@ class PublicationService:
                 "el destino no declara rama y URL de producción: PUNTO no adivina dónde vive "
                 "producción"
             )
-            record.advance(
-                PublicationStage.BLOCKED_NOT_PUBLISHABLE, record.error
-            )
+            record.advance(PublicationStage.BLOCKED_NOT_PUBLISHABLE, record.error)
             return record
 
         plan = PushPlan(remote=self._remote_name, branch=self._branch, sha=commit_sha)
@@ -756,9 +758,7 @@ class PublicationService:
                 f"{'no apareció' if self._marker else 'no se comprobó'}"
             )
             record.advance(PublicationStage.DEPLOYMENT_NOT_VERIFIED, record.error)
-            self._log(
-                "production_not_verified", record, production.as_dict(), failed=True
-            )
+            self._log("production_not_verified", record, production.as_dict(), failed=True)
             return record
         record.advance(PublicationStage.PRODUCTION_VALIDATED, "producción comprobada")
         self._log("production_verified", record, production.as_dict())

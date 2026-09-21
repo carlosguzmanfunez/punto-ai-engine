@@ -113,6 +113,9 @@ class ReleaseContext:
     destination_remote: str = ""
     mechanism: str = GIT_PUSH_MECHANISM
     commit_present: bool | None = None
+    #: HEAD actual del repositorio del destino (``None`` = no se pudo leer). Solo lo exige un
+    #: artefacto de no-op: el estado verificado tiene que seguir siendo exactamente ese commit.
+    head_sha: str | None = None
     operation: str = ReleaseOperation.PRODUCTION_RELEASE.value
 
 
@@ -349,19 +352,46 @@ def _production_branch_authorized(
 def _commit_from_task(
     context: ReleaseContext, result: DevelopmentResult | None
 ) -> ReleaseCondition:
-    """5. El commit es el que produjo **esta** Task gobernada y existe en el repositorio."""
-    if result is None or not result.commit_sha:
+    """5. El artefacto publicable es el de **esta** Task gobernada y existe en el repositorio.
+
+    Es el commit que produjo el ciclo o, en un no-op verificado (``ALREADY_SATISFIED``), el commit
+    exacto cuyo contenido es el estado verificado (``NoOpEvidence.verified_sha``). Nunca se elige
+    otro: el SHA de la operación tiene que ser **idéntico** al del resultado, y en un no-op el HEAD
+    actual del destino también.
+    """
+    sha, source = result.publishable_artifact if result is not None else ("", "")
+    if result is None or not sha:
+        evidence = result.no_op_evidence if result is not None else None
+        issue = evidence.artifact_issue if evidence is not None else ""
         return _condition(
             "commit_from_governed_task",
-            ConditionState.UNKNOWN,
-            "la tarea no tiene commit local del ciclo",
+            ConditionState.UNSATISFIED if issue else ConditionState.UNKNOWN,
+            (
+                f"el estado verificado sin cambios no identifica un artefacto único: {issue}"
+                if issue
+                else "la tarea no tiene commit local del ciclo ni un estado verificado publicable"
+            ),
         )
-    if not context.commit_sha or context.commit_sha != result.commit_sha:
+    if not context.commit_sha or context.commit_sha != sha:
         return _condition(
             "commit_from_governed_task",
             ConditionState.UNSATISFIED,
-            "el commit de la operación no es el que produjo esta tarea",
+            "el commit de la operación no es el artefacto verificado de esta tarea",
         )
+    if source != "cycle-commit":
+        if context.head_sha is None:
+            return _condition(
+                "commit_from_governed_task",
+                ConditionState.UNKNOWN,
+                "no se pudo leer el HEAD del destino para comprobar el estado verificado",
+            )
+        if context.head_sha != sha:
+            return _condition(
+                "commit_from_governed_task",
+                ConditionState.UNSATISFIED,
+                f"el HEAD del destino ({context.head_sha[:12]}…) ya no es el estado verificado "
+                f"({sha[:12]}…)",
+            )
     if context.commit_present is None:
         return _condition(
             "commit_from_governed_task",
@@ -377,7 +407,12 @@ def _commit_from_task(
     return _condition(
         "commit_from_governed_task",
         ConditionState.SATISFIED,
-        f"commit {context.commit_sha[:12]}… de esta tarea, presente en el repositorio",
+        (
+            f"commit {context.commit_sha[:12]}… de esta tarea, presente en el repositorio"
+            if source == "cycle-commit"
+            else f"estado verificado sin cambios = HEAD {context.commit_sha[:12]}… (sin commit "
+            "nuevo), presente en el repositorio"
+        ),
     )
 
 
@@ -490,9 +525,7 @@ def _no_unauthorized_destructive(
             ConditionState.UNSATISFIED,
             f"el ciclo dejó cambios rechazados: {codes}",
         )
-    deleted = [
-        item.path for item in result.applied if item.operation is ChangeOperation.DELETE
-    ]
+    deleted = [item.path for item in result.applied if item.operation is ChangeOperation.DELETE]
     if deleted and not allow_destructive:
         return _condition(
             "no_unauthorized_destructive_change",

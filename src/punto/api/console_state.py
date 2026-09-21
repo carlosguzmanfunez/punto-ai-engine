@@ -167,6 +167,9 @@ class GateRecord(BaseModel):
     policy_outcome: str | None = Field(default=None, max_length=40)
     #: Decisión de política que originó la solicitud: el vínculo que hace la aprobación trazable.
     policy_decision_id: UUID | None = None
+    #: Intento/evento posterior que volvió obsoleto el gate y razón causal (``SUPERSEDED``).
+    superseded_by: str | None = Field(default=None, max_length=120)
+    supersession_cause: str | None = Field(default=None, max_length=500)
 
 
 class TaskAttempt(BaseModel):

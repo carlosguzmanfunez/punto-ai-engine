@@ -1,0 +1,636 @@
+{
+ "schema_version": 1,
+ "written_at": "2026-09-21T22:50:42.759185Z",
+ "source": "punto-console",
+ "tasks": [
+  {
+   "task_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+   "objective": "Mejorar el mapa interactivo de Honduras para que al pasar el cursor sobre un departamento se destaque visualmente y muestre el nombre del departamento.",
+   "target_id": "punto-inmobiliario-hn",
+   "acceptance_criteria": [
+    "El departamento cambia visualmente al pasar el cursor",
+    "se muestra el nombre correcto del departamento",
+    "al retirar el cursor vuelve a su estado normal",
+    "el clic y la navegación existentes continúan funcionando",
+    "no se altera la geometría cartográfica ni el listado de departamentos",
+    "funciona correctamente en escritorio."
+   ],
+   "scope_paths": [
+    "src"
+   ],
+   "context": "",
+   "stage": "DEVELOPMENT_COMPLETED",
+   "created_at": "2026-09-20T19:57:16.567671Z",
+   "updated_at": "2026-09-21T22:50:42.758185Z",
+   "finished_at": "2026-09-21T22:50:42.758185Z",
+   "runs": 13,
+   "notes": [
+    "VERIFICATION_FAILED",
+    "VERIFICATION_FAILED",
+    "EVIDENCE_REQUIRED",
+    "VERIFICATION_FAILED",
+    "VERIFICATION_FAILED"
+   ],
+   "attempts": [
+    {
+     "run": 3,
+     "started_at": "2026-09-20T21:04:09.888550Z",
+     "status": "CYCLE_ERROR",
+     "error_kind": "el ciclo falló: Ruta fuera del workspace",
+     "commit_sha": "",
+     "duration_ms": null,
+     "provider": "",
+     "failover": "",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 4,
+     "started_at": "2026-09-20T21:39:15.165267Z",
+     "status": "CYCLE_ERROR",
+     "error_kind": "el ciclo falló: Ruta fuera del workspace",
+     "commit_sha": "",
+     "duration_ms": null,
+     "provider": "",
+     "failover": "",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 5,
+     "started_at": "2026-09-20T21:49:14.826594Z",
+     "status": "CYCLE_ERROR",
+     "error_kind": "el ciclo falló: Ruta fuera del workspace",
+     "commit_sha": "",
+     "duration_ms": null,
+     "provider": "",
+     "failover": "",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 6,
+     "started_at": "2026-09-20T22:17:20.732710Z",
+     "status": "DEVELOPMENT_PLAN_REJECTED",
+     "error_kind": "PLAN_REQUIRES_HUMAN",
+     "commit_sha": "",
+     "duration_ms": 55381,
+     "provider": "",
+     "failover": "",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 7,
+     "started_at": "2026-09-21T01:01:43.998395Z",
+     "status": "DEVELOPMENT_BLOCKED",
+     "error_kind": "EVIDENCE_REQUIRED",
+     "commit_sha": "",
+     "duration_ms": 224844,
+     "provider": "",
+     "failover": "",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 8,
+     "started_at": "2026-09-21T03:19:02.383189Z",
+     "status": "DEVELOPMENT_VERIFICATION_FAILED",
+     "error_kind": "VERIFICATION_FAILED",
+     "commit_sha": "",
+     "duration_ms": 313163,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deep",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 9,
+     "started_at": "2026-09-21T04:11:17.913386Z",
+     "status": "DEVELOPMENT_VERIFICATION_FAILED",
+     "error_kind": "VERIFICATION_FAILED",
+     "commit_sha": "",
+     "duration_ms": 449504,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deep",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 10,
+     "started_at": "2026-09-21T04:35:17.410133Z",
+     "status": "DEVELOPMENT_BLOCKED",
+     "error_kind": "EVIDENCE_REQUIRED",
+     "commit_sha": "",
+     "duration_ms": 178379,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 11,
+     "started_at": "2026-09-21T18:13:07.839106Z",
+     "status": "DEVELOPMENT_VERIFICATION_FAILED",
+     "error_kind": "VERIFICATION_FAILED",
+     "commit_sha": "",
+     "duration_ms": 464845,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deep",
+     "visual": "",
+     "resolution": ""
+    },
+    {
+     "run": 12,
+     "started_at": "2026-09-21T18:41:41.861870Z",
+     "status": "DEVELOPMENT_VERIFICATION_FAILED",
+     "error_kind": "VERIFICATION_FAILED",
+     "commit_sha": "",
+     "duration_ms": 376094,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deep",
+     "visual": "openai/codex: PASS=2 (hover)",
+     "resolution": ""
+    },
+    {
+     "run": 13,
+     "started_at": "2026-09-21T22:48:37.977761Z",
+     "status": "DEVELOPMENT_COMPLETED",
+     "error_kind": "",
+     "commit_sha": "",
+     "duration_ms": 124780,
+     "provider": "anthropic",
+     "failover": "deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED; deepseek->anthropic:CREDITS_EXHAUSTED/SUCCEEDED",
+     "visual": "openai/codex: PASS=2 (hover)",
+     "resolution": "ALREADY_SATISFIED"
+    }
+   ],
+   "gate_ids": [
+    "b65e4cef-bf2c-413b-8acc-61acc3ffb3bb",
+    "d0bc1ecf-15c7-45eb-8a4d-745835f878cb"
+   ],
+   "result": {
+    "request_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+    "status": "DEVELOPMENT_COMPLETED",
+    "target_id": "punto-inmobiliario-hn",
+    "branch": "ai/punto-inmobiliario-hn-tasks",
+    "plan": {
+     "summary": "Proponer un estado interactivo de hover y foco que destaque cada departamento y muestre su nombre canónico, conservando geometría, enlaces y navegación existentes.",
+     "files_to_read": [
+      "src/lib/honduras.ts",
+      "src/components/InteractiveHondurasMap.tsx",
+      "src/components/HondurasMapView.tsx",
+      "src/app/globals.css",
+      "src/app/propiedades/page.tsx",
+      "src/components/DepartmentExplorer.tsx",
+      "tests/honduras-map.test.mjs",
+      "tests/property-types.test.mjs"
+     ],
+     "files_to_modify": [
+      "src/components/HondurasMapView.tsx",
+      "src/app/globals.css",
+      "tests/honduras-map.test.mjs"
+     ],
+     "files_to_create": [],
+     "files_to_delete": [],
+     "verification_commands": [
+      "typecheck",
+      "property-types"
+     ],
+     "risks": [
+      "El estado visual podría interferir con los enlaces SVG si los eventos se colocan fuera del elemento interactivo.",
+      "Un contraste insuficiente podría hacer imperceptible el destaque en escritorio.",
+      "Importar valores del módulo server-only de Honduras desde la vista cliente introduciría node:fs en el bundle del navegador.",
+      "Cambiar accidentalmente los trazados, el viewBox o la lista canónica alteraría la geometría o cobertura del mapa."
+     ],
+     "acceptance_mapping": [
+      "El departamento cambia visualmente al pasar el cursor: aplicar clases hover y active con cambios de relleno, trazo y grosor.",
+      "Se muestra el nombre correcto del departamento: renderizar directamente el nombre canónico asociado al trazado activo.",
+      "Al retirar el cursor vuelve a su estado normal: limpiar el estado activo mediante onMouseLeave y onBlur.",
+      "El clic y la navegación existentes continúan funcionando: conservar cada enlace a /propiedades con departamento codificado.",
+      "No se altera la geometría cartográfica ni el listado de departamentos: reutilizar paths, viewBox y departments recibidos desde el componente servidor sin modificarlos.",
+      "Funciona correctamente en escritorio: cubrir interacción mediante puntero y reforzarla con foco de teclado.",
+      "Las pruebas estructurales comprueban la interacción, la etiqueta, los enlaces y la frontera entre cliente y servidor."
+     ],
+     "functional_chain": [
+      {
+       "step": "canonical source",
+       "description": "Mantener src/lib/honduras.ts como fuente única de los 18 nombres, trazados GeoJSON y viewBox, sin modificar su geometría.",
+       "verification": "typecheck"
+      },
+      {
+       "step": "consumers",
+       "description": "Conservar InteractiveHondurasMap como frontera servidor y HondurasMapView como consumidor cliente de datos serializables.",
+       "verification": "typecheck"
+      },
+      {
+       "step": "behaviour",
+       "description": "Gestionar hover, salida, foco y desenfoque en cada enlace SVG para activar el estilo y la etiqueta sin afectar el clic.",
+       "verification": "typecheck"
+      },
+      {
+       "step": "tests",
+       "description": "Extender las comprobaciones del mapa para cubrir eventos, nombre canónico, estilos activos, enlaces y ausencia de imports server-only en clientes.",
+       "verification": "property-types"
+      },
+      {
+       "step": "build",
+       "description": "Validar que los tipos de props, estado y nombres departamentales compilan y que el catálogo canónico de tipos de propiedad permanece intacto.",
+       "verification": "typecheck"
+      }
+     ]
+    },
+    "plan_status": "PLAN_VALID",
+    "plan_issues": [],
+    "change_issues": [],
+    "applied": [],
+    "verification": [
+     {
+      "name": "typecheck",
+      "argv": [
+       "node",
+       "node_modules/typescript/bin/tsc",
+       "--noEmit",
+       "--incremental",
+       "false"
+      ],
+      "exit_code": 0,
+      "duration_ms": 714,
+      "output_excerpt": "",
+      "truncated": false,
+      "timed_out": false,
+      "passed": true
+     },
+     {
+      "name": "property-types",
+      "argv": [
+       "node",
+       "--test",
+       "tests/property-types.test.mjs"
+      ],
+      "exit_code": 0,
+      "duration_ms": 125,
+      "output_excerpt": "✔ la constante canónica de tipos coincide con el catálogo real de seed.sql (3.4185ms)\n✔ la constante canónica no introduce tipos fuera del catálogo (1.6628ms)\n✔ todos los consumidores públicos del tipo de propiedad importan la fuente canónica (0.4504ms)\n✔ el filtro de /propiedades no vuelve a declarar opciones fijas de tipo (0.2318ms)\nℹ tests 4\nℹ suites 0\nℹ pass 4\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 73.431",
+      "truncated": false,
+      "timed_out": false,
+      "passed": true
+     }
+    ],
+    "repair_rounds": 0,
+    "structural_corrections": 0,
+    "context_requests_granted": [
+     "src/app/globals.css"
+    ],
+    "context_requests_denied": [],
+    "checkpoint_id": "",
+    "rolled_back": false,
+    "commit_sha": "",
+    "pell_status": "HIT",
+    "pell_influence": [
+     {
+      "experience_id": "73a40332543d444b",
+      "decision_point": "selección de contexto del repositorio",
+      "how_used": "los tokens de la experiencia recuperada ordenan los candidatos",
+      "observable_effect": "contexto elegido: src/lib/honduras.ts, tests/honduras-map.test.mjs, src/app/propiedades/page.tsx | sin la experiencia habría sido: src/components/HondurasMapView.tsx, src/components/InteractiveHondurasMap.tsx, src/lib/honduras.ts"
+     }
+    ],
+    "initial_scope": [
+     "src/components/HondurasMapView.tsx",
+     "src/app/globals.css",
+     "tests/honduras-map.test.mjs"
+    ],
+    "final_scope": [
+     "src/components/HondurasMapView.tsx",
+     "src/app/globals.css",
+     "tests/honduras-map.test.mjs"
+    ],
+    "plan_versions": [
+     {
+      "plan_version": 1,
+      "parent_version": 0,
+      "reason": "plan inicial validado por PUNTO",
+      "evidence": [
+       "El departamento cambia visualmente al pasar el cursor: aplicar clases hover y active con cambios de relleno, trazo y grosor.",
+       "Se muestra el nombre correcto del departamento: renderizar directamente el nombre canónico asociado al trazado activo.",
+       "Al retirar el cursor vuelve a su estado normal: limpiar el estado activo mediante onMouseLeave y onBlur.",
+       "El clic y la navegación existentes continúan funcionando: conservar cada enlace a /propiedades con departamento codificado.",
+       "No se altera la geometría cartográfica ni el listado de departamentos: reutilizar paths, viewBox y departments recibidos desde el componente servidor sin modificarlos.",
+       "Funciona correctamente en escritorio: cubrir interacción mediante puntero y reforzarla con foco de teclado.",
+       "Las pruebas estructurales comprueban la interacción, la etiqueta, los enlaces y la frontera entre cliente y servidor."
+      ],
+      "added_resources": [
+       "src/components/HondurasMapView.tsx",
+       "src/app/globals.css",
+       "tests/honduras-map.test.mjs"
+      ],
+      "removed_resources": [],
+      "changed_operations": [],
+      "risk_before": "LOW",
+      "risk_after": "LOW",
+      "authority_result": "ALLOW"
+     }
+    ],
+    "risk_envelopes": [
+     {
+      "phase": "plan",
+      "outcome": "ALLOW",
+      "authority_class": "AUTONOMOUS_LOCAL",
+      "authority_level": "LEVEL_0_AUTONOMOUS",
+      "risk": "LOW",
+      "rules": [
+       {
+        "rule": "local-technical-reversible",
+        "verdict": "ALLOW",
+        "reason": "operación técnica, local, reversible y dentro del proyecto autorizado"
+       }
+      ],
+      "required_evidence": [
+       "verificación focalizada del cambio en el entorno"
+      ],
+      "reasons": [
+       "operación técnica, local, reversible y dentro del proyecto autorizado"
+      ],
+      "resource_classes": [
+       "application_code",
+       "test_code"
+      ],
+      "profile": {
+       "operation": "plan_apply",
+       "resources": [
+        "src/components/HondurasMapView.tsx",
+        "src/app/globals.css",
+        "tests/honduras-map.test.mjs"
+       ],
+       "blast_radius": 3,
+       "environment": "local",
+       "reversible": true,
+       "verification_strength": "MODERATE",
+       "data_sensitivity": "none",
+       "external_effect": "none",
+       "production_impact": false,
+       "security_impact": false,
+       "business_impact": false,
+       "cost_impact": false,
+       "identity_auth_impact": false,
+       "destructive": false,
+       "created_by_cycle": false,
+       "git_recoverable": false,
+       "provenance": "punto_policy",
+       "confidence": "HIGH",
+       "evidence": [
+        "El departamento cambia visualmente al pasar el cursor: aplicar clases hover y active con cambios de relleno, trazo y grosor.",
+        "Se muestra el nombre correcto del departamento: renderizar directamente el nombre canónico asociado al trazado activo.",
+        "Al retirar el cursor vuelve a su estado normal: limpiar el estado activo mediante onMouseLeave y onBlur.",
+        "El clic y la navegación existentes continúan funcionando: conservar cada enlace a /propiedades con departamento codificado.",
+        "No se altera la geometría cartográfica ni el listado de departamentos: reutilizar paths, viewBox y departments recibidos desde el componente servidor sin modificarlos.",
+        "Funciona correctamente en escritorio: cubrir interacción mediante puntero y reforzarla con foco de teclado.",
+        "Las pruebas estructurales comprueban la interacción, la etiqueta, los enlaces y la frontera entre cliente y servidor."
+       ],
+       "description": "Proponer un estado interactivo de hover y foco que destaque cada departamento y muestre su nombre canónico, conservando geometría, enlaces y navegación existentes."
+      }
+     }
+    ],
+    "scope_expansions": [],
+    "authority_decisions": [
+     {
+      "operation": "plan_apply",
+      "outcome": "ALLOW",
+      "authority_class": "AUTONOMOUS_LOCAL",
+      "risk": "LOW",
+      "rules": [
+       "local-technical-reversible"
+      ],
+      "reasons": [
+       "operación técnica, local, reversible y dentro del proyecto autorizado"
+      ],
+      "resources": [
+       "src/components/HondurasMapView.tsx",
+       "src/app/globals.css",
+       "tests/honduras-map.test.mjs"
+      ],
+      "required_evidence": [
+       "verificación focalizada del cambio en el entorno"
+      ]
+     }
+    ],
+    "acceptance": [],
+    "acceptance_result": "NOT_MEASURED",
+    "claims": [
+     {
+      "sentence": "Mejorar el mapa interactivo de Honduras para que al pasar el cursor sobre un departamento se destaque visualmente y muestre el nombre del departamento.",
+      "kind": "VISUAL_APPEARANCE",
+      "result": "SATISFIED",
+      "evidence": "QA visual openai/gpt-5.6-sol (codex) sobre 2 captura(s) [http://localhost:3000/propiedades before 5c509993e442, http://localhost:3000/propiedades after 169e7089617d]: Al pasar el cursor, Cortés cambia de beige a azul oscuro y aparece el texto «Departamento: Cortés».",
+      "required": true,
+      "evidence_required": "evidencia visual del resultado renderizado (imagen) o atestación humana explícita",
+      "capability": "VISION",
+      "capability_available": true,
+      "capability_detail": "ruta efectiva por capacidad: openai (codex); el asignado no puede: anthropic: sin capacidad efectiva VISION, VISION en el transporte claude_code",
+      "remedy": ""
+     },
+     {
+      "sentence": "El departamento cambia visualmente al pasar el cursor",
+      "kind": "VISUAL_APPEARANCE",
+      "result": "SATISFIED",
+      "evidence": "QA visual openai/gpt-5.6-sol (codex) sobre 2 captura(s) [http://localhost:3000/propiedades before 5c509993e442, http://localhost:3000/propiedades after 169e7089617d]: El departamento señalado cambia visiblemente de color beige a azul oscuro.",
+      "required": true,
+      "evidence_required": "evidencia visual del resultado renderizado (imagen) o atestación humana explícita",
+      "capability": "VISION",
+      "capability_available": true,
+      "capability_detail": "ruta efectiva por capacidad: openai (codex); el asignado no puede: anthropic: sin capacidad efectiva VISION, VISION en el transporte claude_code",
+      "remedy": ""
+     },
+     {
+      "sentence": "se muestra el nombre correcto del departamento",
+      "kind": "CARTOGRAPHIC_CORRECTNESS",
+      "result": "SATISFIED",
+      "evidence": "dataset src/lib/honduras-departamentos.geojson válido: 18 departamentos, fuente geoBoundaries gbOpen HND ADM1 (OpenStreetMap, Wambacher), licencia Open Data Commons Open Database License 1.0 (ODbL); src/lib/honduras.ts usa honduras-departamentos.geojson y construye la navegación con sus nombres",
+      "required": true,
+      "evidence_required": "dataset administrativo real de Honduras con los 18 departamentos, mapeado a la taxonomía del proyecto y usado por la interfaz",
+      "capability": "",
+      "capability_available": true,
+      "capability_detail": "",
+      "remedy": ""
+     }
+    ],
+    "claims_result": "SATISFIED",
+    "capabilities": [
+     {
+      "kind": "VISUAL_APPEARANCE",
+      "capability": "VISION",
+      "available": true,
+      "criterion": "Mejorar el mapa interactivo de Honduras para que al pasar el cursor sobre un departamento se destaque visualmente y muestre el nombre del departamento.",
+      "detail": "ruta efectiva por capacidad: openai (codex); el asignado no puede: anthropic: sin capacidad efectiva VISION, VISION en el transporte claude_code",
+      "remedy": "aporta la evidencia que falta o habilita una ruta que pueda producirla"
+     },
+     {
+      "kind": "VISUAL_APPEARANCE",
+      "capability": "VISION",
+      "available": true,
+      "criterion": "El departamento cambia visualmente al pasar el cursor",
+      "detail": "ruta efectiva por capacidad: openai (codex); el asignado no puede: anthropic: sin capacidad efectiva VISION, VISION en el transporte claude_code",
+      "remedy": "aporta la evidencia que falta o habilita una ruta que pueda producirla"
+     },
+     {
+      "kind": "CARTOGRAPHIC_CORRECTNESS",
+      "capability": "",
+      "available": true,
+      "criterion": "se muestra el nombre correcto del departamento",
+      "detail": "la evidencia no depende de una capacidad del modelo",
+      "remedy": ""
+     }
+    ],
+    "failovers": [
+     {
+      "role": "BUILDER",
+      "primary_provider": "deepseek",
+      "primary_model": "deepseek-v4-pro",
+      "primary_error_kind": "QUOTA_EXHAUSTED",
+      "cause": "CREDITS_EXHAUSTED",
+      "substitute_provider": "anthropic",
+      "substitute_model": "claude-sonnet-5",
+      "outcome": "SUCCEEDED",
+      "detail": ""
+     },
+     {
+      "role": "BUILDER",
+      "primary_provider": "deepseek",
+      "primary_model": "deepseek-v4-pro",
+      "primary_error_kind": "QUOTA_EXHAUSTED",
+      "cause": "CREDITS_EXHAUSTED",
+      "substitute_provider": "anthropic",
+      "substitute_model": "claude-sonnet-5",
+      "outcome": "SUCCEEDED",
+      "detail": ""
+     }
+    ],
+    "visual_evidence": [
+     {
+      "request_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+      "claim": "Mejorar el mapa interactivo de Honduras para que al pasar el cursor sobre un departamento se destaque visualmente y muestre el nombre del departamento.",
+      "verdict": "PASS",
+      "observation": "Al pasar el cursor, Cortés cambia de beige a azul oscuro y aparece el texto «Departamento: Cortés».",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "transport": "codex",
+      "via_failover": true,
+      "screenshots": [
+       {
+        "url": "http://localhost:3000/propiedades",
+        "viewport": "1280x900",
+        "sha256": "5c509993e4420eabb6a70d42527fef9dec88c4f110d483caa091ef6db7fba313",
+        "size_bytes": 23142,
+        "phase": "before"
+       },
+       {
+        "url": "http://localhost:3000/propiedades",
+        "viewport": "1280x900",
+        "sha256": "169e7089617d95992ced3a4e321f9b5a30153c1aabd51e61cacb3c70f3b2da81",
+        "size_bytes": 23533,
+        "phase": "after"
+       }
+      ],
+      "applied_digest": "57c4b86ea912f0c5e73435f5fe6e5206c0c55fa0ef6a2f65fefe3030fc4eb7c4",
+      "interaction": "hover:hover-departamento",
+      "route": "http://localhost:3000/propiedades",
+      "target_element": "path [Ver propiedades en Cortés]",
+      "hover_applied": true,
+      "pixels_changed": true,
+      "captured_at": "2026-09-21T22:50:42.700196Z"
+     },
+     {
+      "request_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+      "claim": "El departamento cambia visualmente al pasar el cursor",
+      "verdict": "PASS",
+      "observation": "El departamento señalado cambia visiblemente de color beige a azul oscuro.",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "transport": "codex",
+      "via_failover": true,
+      "screenshots": [
+       {
+        "url": "http://localhost:3000/propiedades",
+        "viewport": "1280x900",
+        "sha256": "5c509993e4420eabb6a70d42527fef9dec88c4f110d483caa091ef6db7fba313",
+        "size_bytes": 23142,
+        "phase": "before"
+       },
+       {
+        "url": "http://localhost:3000/propiedades",
+        "viewport": "1280x900",
+        "sha256": "169e7089617d95992ced3a4e321f9b5a30153c1aabd51e61cacb3c70f3b2da81",
+        "size_bytes": 23533,
+        "phase": "after"
+       }
+      ],
+      "applied_digest": "57c4b86ea912f0c5e73435f5fe6e5206c0c55fa0ef6a2f65fefe3030fc4eb7c4",
+      "interaction": "hover:hover-departamento",
+      "route": "http://localhost:3000/propiedades",
+      "target_element": "path [Ver propiedades en Cortés]",
+      "hover_applied": true,
+      "pixels_changed": true,
+      "captured_at": "2026-09-21T22:50:42.700196Z"
+     }
+    ],
+    "resolution": "ALREADY_SATISFIED",
+    "no_op_evidence": {
+     "reason": "el BUILDER no propuso cambios y el estado actual superó la misma cadena de verificación que un cambio normal",
+     "verifications": [
+      "typecheck",
+      "property-types"
+     ],
+     "functional_chain": "VERIFIED",
+     "acceptance_result": "NOT_MEASURED",
+     "claims_result": "SATISFIED",
+     "plan_resources": 3,
+     "visual_records": 2,
+     "baseline_sha": "5a339b410815bef93896e8b1b925f7b40a75d780",
+     "state_digest": "57c4b86ea912f0c5e73435f5fe6e5206c0c55fa0ef6a2f65fefe3030fc4eb7c4"
+    },
+    "functional_chain_result": "VERIFIED",
+    "provider": "anthropic",
+    "model": "claude-sonnet-5",
+    "duration_ms": 124780,
+    "error_kind": "",
+    "error": "",
+    "blocked": null,
+    "authority": "LOCAL_APPLY_ONLY",
+    "published": false,
+    "created_at": "2026-09-21T22:50:42.758185Z"
+   },
+   "publication": null
+  }
+ ],
+ "gates": [
+  {
+   "approval_id": "b65e4cef-bf2c-413b-8acc-61acc3ffb3bb",
+   "task_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+   "action": "PLAN_REQUIRES_HUMAN",
+   "risk": 2,
+   "reason": "PLAN_REQUIRES_HUMAN: el plan toca 1 recurso(s) y el sobre de autoridad devuelve REQUIRE_HUMAN (HUMAN_GATE_REQUIRED, riesgo HIGH): recurso de clase desconocida: se falla cerrado",
+   "status": "PENDING",
+   "requested_at": "2026-09-20T22:18:16.115509Z",
+   "resolved_at": null,
+   "resolved_by": null,
+   "resolution_note": null,
+   "resume_status": "IN_PROGRESS",
+   "policy_outcome": "REQUIRE_HUMAN",
+   "policy_decision_id": "dc843c95-7d08-4dd9-be9d-f4f6e080e638"
+  },
+  {
+   "approval_id": "d0bc1ecf-15c7-45eb-8a4d-745835f878cb",
+   "task_id": "2e7822a0-5d67-405e-aeb6-3c07a139cbbf",
+   "action": "EVIDENCE_REQUIRED",
+   "risk": 2,
+   "reason": "EVIDENCE_REQUIRED: no hay capacidad de QA visual con imágenes en la configuración actual ('anthropic' declara VISION y su transporte activo no la ejecuta: claude --print es texto; para imágenes usa el transporte api); el criterio queda sin verificar y exige evidencia",
+   "status": "PENDING",
+   "requested_at": "2026-09-21T04:38:15.791850Z",
+   "resolved_at": null,
+   "resolved_by": null,
+   "resolution_note": null,
+   "resume_status": "IN_PROGRESS",
+   "policy_outcome": "REQUIRE_HUMAN",
+   "policy_decision_id": "60b1d67e-3d59-4cca-824f-893714d15aee"
+  }
+ ]
+}

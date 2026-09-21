@@ -230,6 +230,10 @@
         <div id="gates-list" data-testid="gates-list" class="grid">
           <div class="note">Sin cargar: pulsa Actualizar o abre la sección de Tareas.</div>
         </div>
+        <details id="gates-history" data-testid="gates-history" style="margin-top: 12px">
+          <summary data-testid="gates-history-summary">Historial de gates (auditoría, sin acciones)</summary>
+          <div id="gates-history-list" class="grid"></div>
+        </details>
         <div id="gates-note" class="note">
           Cada solicitud pertenece a una operación real y está ligada a su decisión de política.
           Aprobar autoriza esa operación; rechazar la impide. Sin aprobación no hay publicación.
@@ -730,7 +734,7 @@
           ? "COMPLETED"
           : (progress.waiting_human ? "WAITING_HUMAN" : (progress.failed ? "FAILED" : ""));
         const pendingGate = (consoleState.gates || []).find(
-          (gate) => gate.task_id === task.task_id && gate.is_pending);
+          (gate) => gate.task_id === task.task_id && gate.is_pending && gate.actionable !== false);
         const dev = task.development || {};
         // Causa real de la parada: el código y el detalle que produjo el ciclo, no una frase genérica.
         const cause = dev.error_kind
@@ -782,7 +786,9 @@
         const gates = (task.gates || []).length
           ? `<div class="item"><span>gates</span><code>${task.gates.length}</code></div>`
           : "";
-        const canPublish = dev.status === "DEVELOPMENT_COMPLETED" && dev.commit_sha;
+        const nextAction = task.next_human_action || { kind: "none" };
+        const canPublish = nextAction.kind === "request_production_gate"
+          || nextAction.kind === "release_autonomous";
         const releaseBadge = release.disposition
           ? `<span class="stage ${release.disposition}">${release.disposition}</span>
              <span class="sub" style="margin: 0 0 0 6px">${release.autonomous ? "dentro de la autoridad del destino" : "requiere persona"}</span>`
@@ -807,6 +813,10 @@
             ${releaseReasons}
             ${dev.status ? `<div class="row"><span class="label">Desarrollo</span><span class="value">${dev.status}</span></div>` : ""}
             ${dev.commit_sha ? `<div class="row"><span class="label">Commit local</span><code>${dev.commit_sha.slice(0, 10)}</code></div>` : ""}
+            ${dev.publishable_sha && !dev.commit_sha ? `<div class="row"><span class="label">Artefacto publicable</span><span class="value"><code>${dev.publishable_sha.slice(0, 10)}</code> · estado verificado sin commit nuevo (${dev.publishable_source})</span></div>` : ""}
+            ${dev.artifact_issue ? `<div class="note warn" data-testid="artifact-issue">No publicable: ${dev.artifact_issue}</div>` : ""}
+            ${nextAction.kind === "decide_gate" ? `<div class="row"><span class="label">Siguiente acción humana</span><span class="value">${nextAction.label}</span></div>` : ""}
+            ${nextAction.kind === "request_production_gate" || nextAction.kind === "release_autonomous" ? `<div class="row"><span class="label">Siguiente paso</span><span class="value" data-testid="next-action">${nextAction.label} (${nextAction.publishable_sha.slice(0, 10)})</span></div>` : ""}
             ${dev.resolution === "ALREADY_SATISFIED" ? `<div class="row"><span class="label">Resolución</span><span class="value">ya satisfecha (sin cambios, verificada)</span></div>` : ""}
             ${dev.functional_chain_result ? `<div class="row"><span class="label">Cadena</span><span class="value">${dev.functional_chain_result}</span></div>` : ""}
             ${dev.repair_rounds !== undefined ? `<div class="row"><span class="label">Reparaciones</span><span class="value">${dev.repair_rounds} (+${dev.structural_corrections || 0} estructurales)</span></div>` : ""}
@@ -816,7 +826,7 @@
               <button class="secondary" data-ver="${task.task_id}" data-testid="ver-${task.task_id}">Ver</button>
               ${rerun.visible ? `<button class="secondary" data-rerun="${task.task_id}" data-testid="rerun-${task.task_id}" ${rerun.disabled ? "disabled" : ""} title="${esc(rerun.title)}">${rerun.label}</button>` : ""}
               ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}">Release autónomo</button>` : ""}
-              ${canPublish ? `<button data-production="${task.task_id}">Pedir gate de publicación</button>` : ""}
+              ${canPublish ? `<button data-production="${task.task_id}" data-testid="production-${task.task_id}">Pedir gate de publicación</button>` : ""}
               ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
               ${publication && publication.approval_id && publication.stage !== "PRODUCTION_VALIDATED" && publication.stage !== "WAITING_PRODUCTION_APPROVAL" ? `<button data-publish="${task.task_id}">Publicar</button>` : ""}
             </div>
@@ -1078,12 +1088,36 @@
           button.addEventListener("click", () => rerunTask(button.dataset.rerun)));
       }
 
+      // Tablero operativo: SOLO los gates accionables (condición vigente). El historial —resueltos y
+      // superados— se conserva completo, pero aparte y sin botones APPROVE/REJECT.
       async function loadGates() {
         const payload = await api("/console/human-gates");
-        consoleState.gates = payload.items;
-        document.getElementById("gates-list").innerHTML = payload.items.length
-          ? payload.items.map(gateCard).join("")
-          : `<div class="note">no hay solicitudes humanas</div>`;
+        const operational = payload.operational || payload.items.filter((gate) => gate.is_pending);
+        const history = payload.history || payload.items.filter((gate) => !gate.is_pending);
+        consoleState.gates = operational;
+        document.getElementById("gates-list").innerHTML = operational.length
+          ? operational.map(gateCard).join("")
+          : `<div class="note" data-testid="gates-empty">no hay acciones humanas pendientes</div>`;
+        document.getElementById("gates-history-summary").textContent =
+          `Historial de gates (${history.length}, auditoría, sin acciones)`;
+        document.getElementById("gates-history-list").innerHTML = history.length
+          ? history.map(historyCard).join("")
+          : `<div class="note">sin historial</div>`;
+      }
+
+      // Tarjeta de historial: conserva la evidencia original y NO ofrece acciones.
+      function historyCard(gate) {
+        const superseded = gate.state === "SUPERSEDED";
+        return `
+          <article class="card" data-gate-history="${gate.approval_id}" data-testid="gate-history-${gate.approval_id}">
+            <h3>${gate.action}</h3>
+            <div class="sub">${gate.objective || gate.task_id}</div>
+            <div class="row"><span class="label">Estado final</span><span class="value">${gate.status}</span></div>
+            <div class="row"><span class="label">Motivo original</span><span class="value">${gate.reason}</span></div>
+            ${superseded ? `<div class="row"><span class="label">Superado por</span><span class="value">${gate.superseded_by}</span></div>
+            <div class="note">${gate.supersession_cause}</div>` : ""}
+            <div class="row"><span class="label">Resuelto</span><span class="value">${gate.resolved_at || "—"} · ${gate.resolved_by || "—"}</span></div>
+          </article>`;
       }
 
       // Delegación: los botones de un gate pueden estar en la tarjeta del gate o dentro del

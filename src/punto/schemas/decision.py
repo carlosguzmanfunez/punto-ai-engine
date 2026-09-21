@@ -231,6 +231,22 @@ class HumanApprovalRequest(BaseModel):
         ),
     )
 
+    superseded_by: str | None = Field(
+        default=None,
+        max_length=120,
+        description="Intento o evento posterior que volvió obsoleto el gate (SUPERSEDED).",
+    )
+    supersession_cause: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Razón causal por la que la condición del gate ya no está vigente.",
+    )
+
+    @property
+    def is_superseded(self) -> bool:
+        """True si el gate quedó obsoleto por progreso posterior (no aprobado ni rechazado)."""
+        return self.status is ApprovalStatus.SUPERSEDED
+
     @property
     def is_pending(self) -> bool:
         """True si la solicitud sigue esperando decisión humana."""

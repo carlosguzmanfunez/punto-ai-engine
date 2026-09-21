@@ -205,6 +205,36 @@ class AuditLogger:
             },
         )
 
+    def log_human_gate_superseded(
+        self,
+        *,
+        approval_id: UUID,
+        task_id: UUID,
+        action: str,
+        superseded_by: str,
+        cause: str,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra que un gate pendiente dejó de ser accionable por progreso posterior.
+
+        No es una resolución humana: queda constancia del gate original, del intento/evento que
+        lo volvió obsoleto y de la razón causal, para que la historia se conserve completa.
+        """
+        return self.record(
+            AuditEventType.HUMAN_GATE_SUPERSEDED,
+            action="supersede_human_gate",
+            resource_id=approval_id,
+            result=AuditResult.SUCCESS,
+            actor=actor,
+            metadata={
+                "task_id": str(task_id),
+                "gate_action": action,
+                "status": "SUPERSEDED",
+                "superseded_by": superseded_by,
+                "cause": cause[:500],
+            },
+        )
+
     def log_human_gate_resume_authorized(
         self,
         *,
@@ -622,9 +652,7 @@ class AuditLogger:
                     "environment_isolated": bool(
                         getattr(capabilities, "environment_isolated", False)
                     ),
-                    "network_isolated": bool(
-                        getattr(capabilities, "network_isolated", False)
-                    ),
+                    "network_isolated": bool(getattr(capabilities, "network_isolated", False)),
                     "process_isolated": bool(getattr(capabilities, "process_isolated", False)),
                 },
             },
@@ -1312,9 +1340,7 @@ class AuditLogger:
         Se registran el nombre, el código de salida y la clasificación: nunca el
         código de las pruebas ni el del producto.
         """
-        event_type = (
-            AuditEventType.QA_CHECK_COMPLETED if passed else AuditEventType.QA_CHECK_FAILED
-        )
+        event_type = AuditEventType.QA_CHECK_COMPLETED if passed else AuditEventType.QA_CHECK_FAILED
         return self.record(
             event_type,
             action=f"qa_check_{'completed' if passed else 'failed'}",
@@ -3875,9 +3901,7 @@ class AuditLogger:
                 if accepted
                 else AuditEventType.PROJECT_REPLAN_GUARD_REJECTED
             ),
-            action=(
-                "project_replan_guard_passed" if accepted else "project_replan_guard_rejected"
-            ),
+            action=("project_replan_guard_passed" if accepted else "project_replan_guard_rejected"),
             project_run_id=project_run_id,
             project_id=project_id,
             node_id=node_id,
@@ -3999,9 +4023,7 @@ class AuditLogger:
             metadata={
                 "generation_index": generation_index,
                 "model_calls": model_calls,
-                "new_generation_id": (
-                    "" if new_generation_id is None else str(new_generation_id)
-                ),
+                "new_generation_id": ("" if new_generation_id is None else str(new_generation_id)),
                 "reason_code": reason_code,
                 "total_tokens": total_tokens,
             },
@@ -5024,6 +5046,7 @@ class AuditLogger:
     def events(self) -> tuple[AuditEvent, ...]:
         """Todos los eventos, en orden de registro."""
         return tuple(self._events)
+
     def count(self) -> int:
         """Número total de eventos registrados."""
         return len(self._events)

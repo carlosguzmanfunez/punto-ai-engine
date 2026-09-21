@@ -348,6 +348,40 @@ class HumanGate:
         approval.resolution_note = note
         return approval
 
+    def supersede(
+        self,
+        approval_id: UUID,
+        *,
+        superseded_by: str,
+        cause: str,
+        actor: str = "punto-engine",
+    ) -> HumanApprovalRequest:
+        """Marca como obsoleto (``SUPERSEDED``) un gate pendiente cuya condición ya no está vigente.
+
+        No es una decisión humana: **no** aprueba ni rechaza, no emite ninguna prueba de
+        autorización y no puede reanudar nada. Conserva la solicitud original intacta (acción,
+        riesgo, motivo, decisión de política) y añade solo la constancia: qué la volvió obsoleta,
+        cuándo y por qué. Solo un gate ``PENDING`` puede quedar obsoleto; uno ya resuelto es
+        historia que no se toca.
+
+        Raises:
+            HumanGateError: si no existe o ya no está pendiente.
+        """
+        approval = self._requests.get(approval_id)
+        if approval is None:
+            msg = f"Solicitud de aprobación no encontrada: {approval_id}"
+            raise HumanGateError(msg)
+        if not approval.is_pending:
+            msg = f"La solicitud {approval_id} ya no está pendiente: {approval.status.value}"
+            raise HumanGateError(msg)
+        approval.status = ApprovalStatus.SUPERSEDED
+        approval.resolved_at = utc_now()
+        approval.resolved_by = actor
+        approval.resolution_note = cause[:500]
+        approval.superseded_by = superseded_by[:120]
+        approval.supersession_cause = cause[:500]
+        return approval
+
     def approve(
         self,
         approval_id: UUID,

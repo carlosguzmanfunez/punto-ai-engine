@@ -94,13 +94,13 @@ class PlanStatus(StrEnum):
 class DevelopmentStatus(StrEnum):
     """Desenlace del ciclo de desarrollo."""
 
-    COMPLETED = "DEVELOPMENT_COMPLETED"          # cambios aplicados y verificados
+    COMPLETED = "DEVELOPMENT_COMPLETED"  # cambios aplicados y verificados
     PLAN_REJECTED = "DEVELOPMENT_PLAN_REJECTED"  # el plan no superó la validación de PUNTO
     CHANGE_REJECTED = "DEVELOPMENT_CHANGE_REJECTED"
     VERIFICATION_FAILED = "DEVELOPMENT_VERIFICATION_FAILED"  # agotó las reparaciones
-    ROLLED_BACK = "DEVELOPMENT_ROLLED_BACK"      # se revirtió a propósito
+    ROLLED_BACK = "DEVELOPMENT_ROLLED_BACK"  # se revirtió a propósito
     PROVIDER_FAILED = "DEVELOPMENT_PROVIDER_FAILED"
-    BLOCKED = "DEVELOPMENT_BLOCKED"              # la frontera denegó algo necesario
+    BLOCKED = "DEVELOPMENT_BLOCKED"  # la frontera denegó algo necesario
 
 
 def _clean_path(value: str) -> str:
@@ -172,8 +172,7 @@ class FileChangeProposal(BaseModel):
         default=None,
         max_length=64,
         description=(
-            "Huella del contenido que el proveedor leyó; evita escribir sobre algo "
-            "distinto."
+            "Huella del contenido que el proveedor leyó; evita escribir sobre algo distinto."
         ),
     )
     reason: str = Field(default="", max_length=MAX_REASON_CHARS)
@@ -270,9 +269,7 @@ class DevelopmentPlan(BaseModel):
     def touched_paths(self) -> tuple[str, ...]:
         """Rutas que el plan declara escribir o borrar, en orden estable."""
         return tuple(
-            dict.fromkeys(
-                (*self.files_to_modify, *self.files_to_create, *self.files_to_delete)
-            )
+            dict.fromkeys((*self.files_to_modify, *self.files_to_create, *self.files_to_delete))
         )
 
 
@@ -479,6 +476,16 @@ class NoOpEvidence(BaseModel):
     visual_records: int = Field(default=0, ge=0)
     baseline_sha: str = Field(default="", max_length=64)
     state_digest: str = Field(default="", max_length=64)
+    #: SHA **exacto** del commit cuyo contenido es el estado verificado (HEAD == baseline, sin
+    #: cambios propios y sin divergencia con lo que el plan toca). Es el único artefacto que un
+    #: no-op puede ofrecer a la cadena de release: nunca se infiere otro.
+    verified_sha: str = Field(default="", max_length=64)
+    #: Por qué el estado verificado **no** identifica un artefacto publicable sin ambigüedad
+    #: (HEAD distinto del baseline, cambios sin confirmar, plan sobre ficheros sin confirmar…).
+    #: Vacío cuando ``verified_sha`` está fijado.
+    artifact_issue: str = Field(default="", max_length=300)
+    #: Rutas con cambios preexistentes al ciclo que no forman parte del estado verificado.
+    preexisting_dirty: tuple[str, ...] = Field(default=(), max_length=MAX_PLAN_ITEMS)
 
 
 class ProviderFailoverEvidence(BaseModel):
@@ -658,6 +665,44 @@ class DevelopmentResult(BaseModel):
         """True solo si los cambios quedaron aplicados y verificados."""
         return self.status is DevelopmentStatus.COMPLETED
 
+    @property
+    def publishable_artifact(self) -> tuple[str, str]:
+        """``(sha, origen)`` del artefacto que este resultado puede ofrecer a la cadena de release.
+
+        Es la **única** fuente de identidad de lo publicable:
+
+        - ``cycle-commit``: el commit que produjo el ciclo;
+        - ``verified-head``: un no-op verificado (``ALREADY_SATISFIED``) sin commit propio, cuyo
+          estado verificado es exactamente el HEAD existente (``NoOpEvidence.verified_sha``);
+        - ``legacy-baseline``: un no-op persistido antes de existir ``verified_sha``: solo se
+          acepta si no aplicó nada y su evidencia declara el baseline sobre el que midió; el
+          release lo vuelve a comprobar contra el HEAD real.
+
+        ``("", "")`` significa que no hay artefacto inequívoco: nada que publicar.
+        """
+        if self.commit_sha:
+            return self.commit_sha, "cycle-commit"
+        evidence = self.no_op_evidence
+        if (
+            self.status is not DevelopmentStatus.COMPLETED
+            or self.resolution != RESOLUTION_ALREADY_SATISFIED
+            or evidence is None
+            or self.applied
+        ):
+            return "", ""
+        if evidence.verified_sha:
+            return evidence.verified_sha, "verified-head"
+        if evidence.artifact_issue:
+            return "", ""
+        if evidence.baseline_sha and evidence.state_digest:
+            return evidence.baseline_sha, "legacy-baseline"
+        return "", ""
+
+    @property
+    def publishable_sha(self) -> str:
+        """SHA del artefacto publicable (vacío si no hay uno inequívoco)."""
+        return self.publishable_artifact[0]
+
     def as_public_dict(self) -> dict[str, object]:
         """Vista serializable, sin contexto interno ni contenido de los ficheros."""
         return {
@@ -695,6 +740,8 @@ class DevelopmentResult(BaseModel):
             "checkpoint_id": self.checkpoint_id,
             "rolled_back": self.rolled_back,
             "commit_sha": self.commit_sha,
+            "publishable_sha": self.publishable_artifact[0],
+            "publishable_source": self.publishable_artifact[1],
             "pell_status": self.pell_status,
             "pell_influence": [
                 {
@@ -716,9 +763,7 @@ class DevelopmentResult(BaseModel):
             "final_scope": list(self.final_scope),
             "plan_versions": [item.model_dump(mode="json") for item in self.plan_versions],
             "risk_envelopes": [dict(item) for item in self.risk_envelopes],
-            "scope_expansions": [
-                item.model_dump(mode="json") for item in self.scope_expansions
-            ],
+            "scope_expansions": [item.model_dump(mode="json") for item in self.scope_expansions],
             "authority_decisions": [
                 item.model_dump(mode="json") for item in self.authority_decisions
             ],

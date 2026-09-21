@@ -962,10 +962,72 @@ class DevelopmentCycle:
             return f"recursos que el plan borra y siguen existiendo: {', '.join(lingering[:5])}"
         return ""
 
+    @staticmethod
+    def _noop_artifact(
+        plan: DevelopmentPlan, repository: GovernedRepository, declared_baseline: str
+    ) -> tuple[str, str, tuple[str, ...]]:
+        """Identifica **sin ambigüedad** el commit que representa el estado verificado de un no-op.
+
+        Un no-op no crea commit: lo verificado es el estado que ya existe. Ese estado se puede
+        ofrecer a release solo si es *exactamente* un commit:
+
+        - el HEAD coincide con el baseline del ciclo y con el baseline declarado por el destino;
+        - no hay rutas cambiadas por el ciclo ni sin confirmar, salvo las **preexistentes** (que el
+          ciclo ya tolera y no confirma jamás) y siempre que no sean recursos del plan.
+
+        Returns:
+            ``(verified_sha, artifact_issue, preexisting_dirty)``. Si no es inequívoco, el SHA
+            queda vacío y la causa explícita; nunca se elige un commit «probable».
+        """
+        try:
+            head = repository.head_sha()
+        except Exception as exc:  # sin HEAD legible no hay artefacto que identificar
+            return "", f"no se pudo leer el HEAD del repositorio: {type(exc).__name__}", ()
+        if not head:
+            return "", "el repositorio no tiene HEAD", ()
+        if head != repository.baseline_sha:
+            return (
+                "",
+                f"el HEAD {head[:12]} difiere del baseline "
+                f"{repository.baseline_sha[:12]} del ciclo",
+                (),
+            )
+        if declared_baseline and head != declared_baseline:
+            return (
+                "",
+                f"el HEAD {head[:12]} difiere del baseline {declared_baseline[:12]} del destino",
+                (),
+            )
+        preexisting = set(repository.preexisting_paths())
+        dirty = tuple(path for path in repository.changed_paths() if path not in preexisting)
+        if dirty:
+            return (
+                "",
+                "hay cambios sin confirmar fuera del estado inicial: " + ", ".join(dirty[:5]),
+                (),
+            )
+        touched = set(plan.touched_paths())
+        overlapping = sorted(path for path in preexisting if path in touched)
+        if overlapping:
+            return (
+                "",
+                "el plan trabaja sobre ficheros con cambios sin confirmar: "
+                + ", ".join(overlapping[:5]),
+                (),
+            )
+        return head, "", tuple(sorted(preexisting))[:MAX_PLAN_ITEMS]
+
     def _noop_evidence(
-        self, state: _StateEvaluation, plan: DevelopmentPlan, repository: GovernedRepository
+        self,
+        state: _StateEvaluation,
+        plan: DevelopmentPlan,
+        repository: GovernedRepository,
+        declared_baseline: str = "",
     ) -> NoOpEvidence:
         """Constancia persistida de por qué un ciclo sin cambios se dio por satisfecho."""
+        verified_sha, artifact_issue, preexisting = self._noop_artifact(
+            plan, repository, declared_baseline
+        )
         return NoOpEvidence(
             reason=(
                 "el BUILDER no propuso cambios y el estado actual superó la misma cadena de "
@@ -979,6 +1041,9 @@ class DevelopmentCycle:
             visual_records=len(self._visual_evidence),
             baseline_sha=repository.baseline_sha,
             state_digest=self._applied_digest(repository),
+            verified_sha=verified_sha,
+            artifact_issue=artifact_issue[:300],
+            preexisting_dirty=preexisting,
         )
 
     def _visual_capability(self) -> VisualCapability:
@@ -2596,7 +2661,9 @@ class DevelopmentCycle:
                             claims=claim_evidence,
                             claims_result=state.claims_outcome,
                             resolution=RESOLUTION_ALREADY_SATISFIED if not applied else "",
-                            no_op_evidence=self._noop_evidence(state, plan, repository)
+                            no_op_evidence=self._noop_evidence(
+                                state, plan, repository, target.baseline_sha
+                            )
                             if not applied
                             else None,
                         )

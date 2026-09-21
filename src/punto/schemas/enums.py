@@ -142,6 +142,9 @@ class ApprovalStatus(StrEnum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    #: La condición que motivó el gate desapareció por progreso posterior demostrado (ni aprobado
+    #: ni rechazado: nadie decidió; el motor lo deja auditado y el gate deja de ser accionable).
+    SUPERSEDED = "SUPERSEDED"
 
 
 class AuditResult(StrEnum):

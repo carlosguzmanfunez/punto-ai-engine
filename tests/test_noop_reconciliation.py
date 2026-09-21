@@ -112,7 +112,7 @@ def test_1_cero_cambios_con_el_estado_ya_satisfecho_completa_como_no_op_verifica
 
 
 def test_1b_el_no_op_no_amplia_autoridad_ni_publica(tmp_path: Path) -> None:
-    """Sin commit no hay nada que publicar: ni gates aprobados ni publicación."""
+    """Sin sobre del destino, el no-op no publica solo ni abre gates: no amplía autoridad."""
     repo, remoto = _repo_ya_satisfecho(tmp_path)
     client, _audit, _t, _d = _app(target=_target(repo, remoto=remoto), respuestas=[_plan()])
 
@@ -120,7 +120,7 @@ def test_1b_el_no_op_no_amplia_autoridad_ni_publica(tmp_path: Path) -> None:
 
     assert tarea["development"]["published"] is False
     assert tarea["gates"] == [] and client.get("/console/human-gates").json()["pending"] == 0
-    assert tarea["release"]["autonomous"] is False, "sin commit no hay release autónomo"
+    assert tarea["release"]["autonomous"] is False, "sin sobre del destino no hay release autónomo"
     assert client.post(f"/console/tasks/{tarea['task_id']}/publish").status_code == 409
 
 

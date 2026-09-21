@@ -26,7 +26,7 @@ from datetime import datetime
 from enum import StrEnum
 from inspect import Parameter, signature
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Final
 from uuid import UUID
 
@@ -46,11 +46,12 @@ from punto.api.console_state import (
     TaskRecord,
     publication_of,
 )
+from punto.api.gate_reconciliation import assess_task_gates
 from punto.api.task_progress import TaskSignals, build_progress
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.orchestrator.dev_cycle import DevelopmentCycle
-from punto.policy.human_gate import HumanGate
+from punto.policy.human_gate import HumanGate, HumanGateError
 from punto.policy.policy_engine import PolicyEngine
 from punto.policy.target_authority import (
     GIT_PUSH_MECHANISM,
@@ -351,6 +352,12 @@ class ConsoleTask:
             "error_kind": _redacted(result.error_kind, 60),
             "error": _redacted(result.error, 300),
             "commit_sha": result.commit_sha,
+            "publishable_sha": result.publishable_sha,
+            "publishable_source": result.publishable_artifact[1],
+            "artifact_issue": _redacted(
+                result.no_op_evidence.artifact_issue if result.no_op_evidence is not None else "",
+                300,
+            ),
             "branch": result.branch,
             "applied": [item.path for item in result.applied],
             "repair_rounds": result.repair_rounds,
@@ -571,6 +578,20 @@ def register_human_console(
                 metadata={"kind": "STATE_UNSERIALIZABLE"},
             )
 
+    def reconcile_recovered_gates() -> None:
+        """Proyecta el estado operativo de lo recuperado: los gates obsoletos pasan a historial.
+
+        Se deriva del estado canónico de cada tarea (nunca de su etapa) y es idempotente: un gate
+        ya superado o resuelto no se toca, así que un reinicio no resucita ni duplica nada.
+        """
+        changed = False
+        for recovered in tasks.values():
+            changed = bool(_reconcile_task_gates(recovered, dependencies)) or changed
+        if changed:
+            persist()
+
+    reconcile_recovered_gates()
+
     # ------------------------------------------------------------------ página
     @application.get(CONSOLE_PATH, response_class=HTMLResponse, tags=["console"])
     def console_page() -> HTMLResponse:
@@ -715,13 +736,25 @@ def register_human_console(
     @application.get("/console/human-gates", tags=["console"], summary="Human Gates")
     def list_console_gates(pending_only: bool = False) -> dict[str, Any]:
         """Solicitudes de aprobación humana, con lo mínimo para decidir."""
+        # El estado operativo se deriva del canónico de cada tarea antes de responder: un gate
+        # cuya condición ya no está vigente no se ofrece como acción (queda en el historial).
+        reconciled = False
+        for task in tasks.values():
+            reconciled = bool(_reconcile_task_gates(task, dependencies)) or reconciled
+        if reconciled:
+            persist()
         approvals = (
             dependencies.gates.list_pending() if pending_only else dependencies.gates.list_all()
         )
+        views = [_gate_view(dependencies, approval.id, tasks) for approval in approvals]
         return {
             "total": len(approvals),
             "pending": len(dependencies.gates.list_pending()),
-            "items": [_gate_view(dependencies, approval.id, tasks) for approval in approvals],
+            "items": views,
+            # Acciones humanas vigentes (lo que muestra el tablero por defecto) frente al
+            # historial/auditoría (todo lo demás, sin acciones).
+            "operational": [item for item in views if item.get("actionable")],
+            "history": [item for item in views if not item.get("actionable")],
         }
 
     @application.post(
@@ -732,6 +765,16 @@ def register_human_console(
     def approve_console_gate(approval_id: UUID, body: GateDecisionBody) -> dict[str, Any]:
         """Aprueba el gate. Solo la aprobación de **publicación** desencadena la publicación."""
         approval = _gate_or_404(dependencies, approval_id)
+        _refuse_if_superseded(approval, tasks, dependencies, persist)
+        if _is_publication_gate(approval.action):
+            # Antes de registrar la decisión: si el estado verificado ya no es el HEAD del destino,
+            # el gate no se aprueba para publicar otra cosa (falla cerrado, sin resolverlo).
+            gated = tasks.get(str(approval.task_id))
+            gated_target = dependencies.targets.get(gated.target_id) if gated is not None else None
+            if gated is not None and gated_target is not None:
+                diverged = _verified_state_block(gated, gated_target)
+                if diverged:
+                    raise HTTPException(status.HTTP_409_CONFLICT, detail=diverged)
         _resolve_gate(dependencies, approval_id, approved=True, body=body)
         # La decisión humana se persiste antes de ejecutar nada: si la publicación falla, lo que la
         # persona decidió sigue siendo durable.
@@ -768,6 +811,7 @@ def register_human_console(
     def reject_console_gate(approval_id: UUID, body: GateDecisionBody) -> dict[str, Any]:
         """Rechaza el gate: la operación queda impedida y no se ejecuta nada."""
         approval = _gate_or_404(dependencies, approval_id)
+        _refuse_if_superseded(approval, tasks, dependencies, persist)
         _resolve_gate(dependencies, approval_id, approved=False, body=body)
         task = tasks.get(str(approval.task_id))
         if task is not None:
@@ -795,79 +839,13 @@ def register_human_console(
         """
         task = _task_or_404(tasks, task_id)
         target = _target_or_400(dependencies, task.target_id)
-        result = task.result
-        if result is None or result.status.value != "DEVELOPMENT_COMPLETED":
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail="la tarea no tiene un desarrollo completado y verificado que publicar",
-            )
-        if not result.commit_sha:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail="la tarea no tiene commit local: no hay nada que publicar",
-            )
-        if not target.publishable:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail=(
-                    "el destino no declara rama y URL de producción (production_branch, "
-                    "production_url): PUNTO no adivina dónde vive producción"
-                ),
-            )
-        decision = dependencies.policy.evaluate(
-            ActionRequest(
-                action=PRODUCTION_ACTION,
-                technical=True,
-                reversible=False,
-                risk_level=RiskLevel.HIGH,
-                production_impact=True,
-                files_changed=[item.path for item in result.applied],
-            )
-        )
-        dependencies.audit.log_policy_decision(decision)
-        if not decision.requires_human:
-            # Con el catálogo vigente no puede pasar; si pasara, publicar en
-            # autonomía sería un fallo de la frontera: se falla cerrado.
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=(
-                    "la política no exigió persona para publicar en producción: "
-                    "se falla cerrado"
-                ),
-            )
-        approval = dependencies.gates.request(
-            task_id=task.task_id,
-            action=PRODUCTION_ACTION,
-            risk=decision.effective_risk,
-            reason=(
-                f"publicar en producción de {target.target_id} el commit "
-                f"{result.commit_sha[:12]} ya verificado en local"
-            ),
-            resume_status=TaskStatus.IN_PROGRESS,
-            policy_outcome=decision.outcome.value,
-            policy_decision_id=decision.id,
-        )
-        dependencies.audit.log_human_gate_created(
-            approval_id=approval.id,
-            task_id=task.task_id,
-            action=approval.action,
-            risk=approval.risk.name,
-            reason=approval.reason,
-        )
-        if approval.id not in task.gates:
-            task.gates.append(approval.id)
-        task.publication = PublicationRecord(
-            task_id=str(task.task_id),
-            request_id=str(task.request_id),
-            target_id=target.target_id,
-            commit_sha=result.commit_sha,
-            approval_id=str(approval.id),
-        )
-        task.publication.advance(
-            PublicationStage.WAITING_PRODUCTION_APPROVAL,
-            "gate de publicación pendiente de decisión humana",
-        )
-        task.set_stage(PublicationStage.WAITING_PRODUCTION_APPROVAL)
+        blocked = _publication_block(task, target)
+        if blocked:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=blocked)
+        try:
+            _open_production_gate(task, target, dependencies)
+        except _PolicyDidNotRequireHuman as exc:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         persist()
         return _task_view(task, dependencies)
 
@@ -944,9 +922,7 @@ def register_human_console(
             # reinicio justo después no pierda el desenlace ni la petición de persona.
             try:
                 try:
-                    result = _run_cycle(
-                        deps.dev_cycle, request, _human_attestation(task, deps)
-                    )
+                    result = _run_cycle(deps.dev_cycle, request, _human_attestation(task, deps))
                 except Exception as exc:  # el ciclo no debe tumbar la consola
                     # El desenlace operativo tiene que ser el de **este** intento: si el ciclo lanza
                     # una excepción en vez de devolver un resultado, la tarea no puede seguir
@@ -1002,6 +978,7 @@ def register_human_console(
             target = deps.targets.get(task.target_id)
             release = _evaluate_and_log(task, target, deps)
             task.release = release
+            _reconcile_task_gates(task, deps)
             if release is not None and release.autonomous and target is not None:
                 _run_publication(task, target, deps, executor, None, release)
             return
@@ -1043,8 +1020,10 @@ def register_human_console(
             if approval.id not in task.gates:
                 task.gates.append(approval.id)
             task.set_stage(ConsoleStage.WAITING_HUMAN, human_kind)
+            _reconcile_task_gates(task, deps)
             return
         task.set_stage(ConsoleStage.DEVELOPMENT_FAILED, result.error_kind or result.status.value)
+        _reconcile_task_gates(task, deps)
 
     def _run_publication(
         task: ConsoleTask,
@@ -1056,16 +1035,31 @@ def register_human_console(
     ) -> None:
         """Ejecuta la publicación gobernada del commit, por gate humano o por sobre del destino."""
         result = task.result
-        if result is None or not result.commit_sha:
+        sha = result.publishable_sha if result is not None else ""
+        if result is None or not sha:
             raise HTTPException(
-                status.HTTP_409_CONFLICT, detail="la tarea no tiene commit que publicar"
+                status.HTTP_409_CONFLICT,
+                detail="la tarea no tiene un artefacto verificado que publicar",
             )
+        if task.publication is not None and task.publication.commit_sha != sha:
+            # Nunca se publica un SHA distinto del que autorizó el gate / del estado verificado.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    "el expediente de publicación es del commit "
+                    f"{task.publication.commit_sha[:12]} y el artefacto verificado vigente es "
+                    f"{sha[:12]}: no se publica"
+                ),
+            )
+        diverged = _verified_state_block(task, target)
+        if diverged:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=diverged)
         if task.publication is None:
             task.publication = PublicationRecord(
                 task_id=str(task.task_id),
                 request_id=str(task.request_id),
                 target_id=target.target_id,
-                commit_sha=result.commit_sha,
+                commit_sha=sha,
                 approval_id="" if approval_id is None else str(approval_id),
             )
         service = (
@@ -1083,7 +1077,7 @@ def register_human_console(
                     record = service.publish(
                         task_id=task.task_id,
                         request_id=str(task.request_id),
-                        commit_sha=result.commit_sha,
+                        commit_sha=sha,
                         approval_id=approval_id,
                         gate=deps.gates,
                         record=task.publication,
@@ -1126,6 +1120,18 @@ def register_human_console(
             "kind": "publication" if publication else "development",
             "status": approval.status.value,
             "is_pending": approval.is_pending,
+            # Separación estricta: ``actionable`` = pendiente y vigente (lleva botones);
+            # ``ARCHIVED`` = historia (resuelto o superado), sin acciones.
+            "actionable": approval.is_pending,
+            "state": (
+                "ACTIONABLE"
+                if approval.is_pending
+                else "SUPERSEDED"
+                if approval.is_superseded
+                else "RESOLVED"
+            ),
+            "superseded_by": approval.superseded_by or "",
+            "supersession_cause": _redacted(approval.supersession_cause or "", 500),
             "task_id": str(approval.task_id),
             "objective": task.objective[:160] if task is not None else "",
             "target_id": task.target_id if task is not None else "",
@@ -1144,6 +1150,14 @@ def register_human_console(
                 "production_url": target.production_url if target is not None else "",
                 "commit_sha": (
                     task.result.commit_sha if task is not None and task.result is not None else ""
+                ),
+                # SHA exacto que autoriza este gate (el artefacto verificado y publicable).
+                "publishable_sha": (
+                    task.publication.commit_sha
+                    if task is not None
+                    and task.publication is not None
+                    and task.publication.approval_id == str(approval.id)
+                    else ""
                 ),
             },
             "verification": task.summary().get("verification", []) if task is not None else [],
@@ -1338,9 +1352,7 @@ def _open_attempt(task: ConsoleTask) -> None:
     task.attempt_started_at = utc_now()
 
 
-def _close_attempt(
-    task: ConsoleTask, *, result: DevelopmentResult | None, error: str = ""
-) -> None:
+def _close_attempt(task: ConsoleTask, *, result: DevelopmentResult | None, error: str = "") -> None:
     """Cierra el intento con el desenlace **real** del ciclo y lo añade al historial.
 
     El historial es lo que permite distinguir un reintento de una tarea que no se volvió a ejecutar
@@ -1462,6 +1474,8 @@ def _gate_record(approval: HumanApprovalRequest) -> GateRecord:
         resume_status=approval.resume_status,
         policy_outcome=approval.policy_outcome,
         policy_decision_id=approval.policy_decision_id,
+        superseded_by=approval.superseded_by,
+        supersession_cause=approval.supersession_cause,
     )
 
 
@@ -1487,6 +1501,8 @@ def _gate_request_from_record(record: GateRecord) -> HumanApprovalRequest:
         resume_status=record.resume_status,
         policy_outcome=record.policy_outcome,
         policy_decision_id=record.policy_decision_id,
+        superseded_by=record.superseded_by,
+        supersession_cause=record.supersession_cause,
     )
 
 
@@ -1530,6 +1546,235 @@ def _gate_or_404(dependencies: ConsoleDependencies, approval_id: UUID) -> Any:
     return approval
 
 
+# ------------------------------------------------- release: artefacto verificado y Human Gates
+#: Cerrojo de las secuencias «leer gates → crear/superar gate → ligar publicación». El ``HumanGate``
+#: del motor no es seguro entre hilos y una petición concurrente no puede duplicar un gate.
+_GATES_LOCK: Final[RLock] = RLock()
+
+
+class _PolicyDidNotRequireHuman(RuntimeError):
+    """La política no exigió persona para publicar: se falla cerrado."""
+
+
+def _publication_block(task: ConsoleTask, target: DevelopmentTarget) -> str:
+    """Motivo por el que la tarea **no** puede abrir un gate de publicación, o ``""`` si puede.
+
+    La identidad de lo publicable la fija el resultado (``publishable_artifact``): el commit del
+    ciclo o, en un no-op verificado, el commit exacto del estado verificado. Sin un artefacto
+    inequívoco no hay nada que publicar y se dice por qué.
+    """
+    result = task.result
+    if result is None or result.status.value != "DEVELOPMENT_COMPLETED":
+        return "la tarea no tiene un desarrollo completado y verificado que publicar"
+    if not result.publishable_sha:
+        issue = result.no_op_evidence.artifact_issue if result.no_op_evidence is not None else ""
+        return "el desarrollo no identifica un artefacto publicable inequívoco" + (
+            f": {issue}" if issue else " (sin commit del ciclo ni estado verificado)"
+        )
+    if not target.publishable:
+        return (
+            "el destino no declara rama y URL de producción (production_branch, "
+            "production_url): PUNTO no adivina dónde vive producción"
+        )
+    return ""
+
+
+def _production_gate_reason(target: DevelopmentTarget, result: DevelopmentResult) -> str:
+    """Motivo del gate de publicación: nombra el SHA **exacto** que autoriza."""
+    sha, source = result.publishable_artifact
+    origin = (
+        f"el commit {sha[:12]} ya verificado en local"
+        if source == "cycle-commit"
+        else f"el estado ya verificado sin cambios nuevos (commit existente {sha[:12]})"
+    )
+    return f"publicar en producción de {target.target_id} {origin}"
+
+
+def _open_production_gate(
+    task: ConsoleTask, target: DevelopmentTarget, deps: ConsoleDependencies
+) -> HumanApprovalRequest:
+    """Abre —o **reutiliza**— el Human Gate ``deploy_production`` ligado al SHA verificado.
+
+    Idempotente: la misma tarea y el mismo artefacto son **una** decisión pendiente, no dos. Un
+    gate de publicación pendiente de **otro** SHA queda superado antes (la reconciliación lo deja
+    auditado), y la política sigue siendo la del motor: sin persona, no se publica.
+    """
+    result = task.result
+    assert result is not None  # ``_publication_block`` ya lo comprobó
+    with _GATES_LOCK:
+        _reconcile_task_gates(task, deps)
+        sha = result.publishable_sha
+        reason = _production_gate_reason(target, result)
+        existing = _reuse_pending_gate(deps, task, PRODUCTION_ACTION, reason)
+        if existing is not None:
+            approval = existing
+        else:
+            decision = deps.policy.evaluate(
+                ActionRequest(
+                    action=PRODUCTION_ACTION,
+                    technical=True,
+                    reversible=False,
+                    risk_level=RiskLevel.HIGH,
+                    production_impact=True,
+                    files_changed=[item.path for item in result.applied],
+                )
+            )
+            deps.audit.log_policy_decision(decision)
+            if not decision.requires_human:
+                # Con el catálogo vigente no puede pasar; si pasara, publicar en autonomía sería un
+                # fallo de la frontera: se falla cerrado.
+                raise _PolicyDidNotRequireHuman(
+                    "la política no exigió persona para publicar en producción: se falla cerrado"
+                )
+            approval = deps.gates.request(
+                task_id=task.task_id,
+                action=PRODUCTION_ACTION,
+                risk=decision.effective_risk,
+                reason=reason,
+                resume_status=TaskStatus.IN_PROGRESS,
+                policy_outcome=decision.outcome.value,
+                policy_decision_id=decision.id,
+            )
+            deps.audit.log_human_gate_created(
+                approval_id=approval.id,
+                task_id=task.task_id,
+                action=approval.action,
+                risk=approval.risk.name,
+                reason=approval.reason,
+            )
+        if approval.id not in task.gates:
+            task.gates.append(approval.id)
+        if task.publication is None or task.publication.approval_id != str(approval.id):
+            task.publication = PublicationRecord(
+                task_id=str(task.task_id),
+                request_id=str(task.request_id),
+                target_id=target.target_id,
+                commit_sha=sha,
+                approval_id=str(approval.id),
+            )
+            task.publication.advance(
+                PublicationStage.WAITING_PRODUCTION_APPROVAL,
+                "gate de publicación pendiente de decisión humana",
+            )
+        task.set_stage(PublicationStage.WAITING_PRODUCTION_APPROVAL)
+        return approval
+
+
+def _reconcile_task_gates(
+    task: ConsoleTask, deps: ConsoleDependencies
+) -> tuple[HumanApprovalRequest, ...]:
+    """Supera (``SUPERSEDED``) los gates pendientes cuya condición ya no está vigente.
+
+    La obsolescencia se deriva del **estado canónico** de la tarea (ver ``gate_reconciliation``),
+    nunca de que avance de etapa. La transición no aprueba ni rechaza: deja el gate original
+    intacto y añade la constancia (qué intento lo superó, cuándo y por qué) más un evento de
+    auditoría. Idempotente: un gate ya superado o resuelto no se vuelve a tocar.
+    """
+    with _GATES_LOCK:
+        approvals = deps.gates.list_for_task(task.task_id)
+        changed: list[HumanApprovalRequest] = []
+        for verdict in assess_task_gates(task, approvals):
+            if verdict.actionable:
+                continue
+            try:
+                approval = deps.gates.supersede(
+                    UUID(verdict.approval_id),
+                    superseded_by=verdict.superseded_by,
+                    cause=verdict.cause,
+                )
+            except HumanGateError:
+                continue
+            deps.audit.log_human_gate_superseded(
+                approval_id=approval.id,
+                task_id=task.task_id,
+                action=approval.action,
+                superseded_by=verdict.superseded_by,
+                cause=verdict.cause,
+            )
+            changed.append(approval)
+            publication = task.publication
+            if (
+                approval.action == PRODUCTION_ACTION
+                and publication is not None
+                and publication.approval_id == str(approval.id)
+                and publication.stage is PublicationStage.WAITING_PRODUCTION_APPROVAL
+            ):
+                task.publication = None
+        if changed:
+            _settle_stage(task, deps)
+        return tuple(changed)
+
+
+def _settle_stage(task: ConsoleTask, deps: ConsoleDependencies) -> None:
+    """Una tarea en espera humana sin ningún gate pendiente vuelve a su etapa canónica."""
+    waiting = {ConsoleStage.WAITING_HUMAN.value, PublicationStage.WAITING_PRODUCTION_APPROVAL.value}
+    if task.stage not in waiting or task.result is None:
+        return
+    if any(item.is_pending for item in deps.gates.list_for_task(task.task_id)):
+        return
+    if task.result.status.value == "DEVELOPMENT_COMPLETED":
+        task.set_stage(ConsoleStage.DEVELOPMENT_COMPLETED)
+    else:
+        task.set_stage(
+            ConsoleStage.DEVELOPMENT_FAILED, task.result.error_kind or task.result.status.value
+        )
+
+
+def _refuse_if_superseded(
+    approval: HumanApprovalRequest,
+    tasks: Mapping[str, ConsoleTask],
+    deps: ConsoleDependencies,
+    persist: Callable[[], None],
+) -> None:
+    """Un gate histórico no se decide: si su condición ya no está vigente, 409 y queda superado.
+
+    Se reconcilia **antes** de resolver, de modo que un gate obsoleto que aún figure como pendiente
+    (por una carrera) no pueda aprobarse ni rechazarse desde el tablero operativo.
+    """
+    task = tasks.get(str(approval.task_id))
+    if task is not None and approval.is_pending and _reconcile_task_gates(task, deps):
+        persist()
+    current = deps.gates.get(approval.id)
+    if current is not None and current.is_superseded:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "el gate es historia: su condición ya no está vigente "
+                f"({current.superseded_by}: {current.supersession_cause})"
+            ),
+        )
+
+
+def _verified_state_block(task: ConsoleTask, target: DevelopmentTarget) -> str:
+    """Motivo por el que el estado verificado ya no es publicable tal cual, o ``""``.
+
+    Un no-op verificado no tiene commit propio: lo que se publica es el HEAD que se verificó. Si el
+    HEAD del destino ya no es ese (o no se puede leer), no se publica ningún otro. Un commit del
+    ciclo no depende del HEAD: es él mismo el artefacto.
+    """
+    result = task.result
+    if result is None:
+        return ""
+    sha, source = result.publishable_artifact
+    if not sha or source == "cycle-commit":
+        return ""
+    head = _current_head(target)
+    if head != sha:
+        return (
+            f"el HEAD del destino ({(head or 'ilegible')[:12]}) ya no es el estado verificado "
+            f"({sha[:12]}): no se publica"
+        )
+    return ""
+
+
+def _current_head(target: DevelopmentTarget) -> str | None:
+    """HEAD actual del repositorio del destino (``None`` si no se pudo leer: fail closed)."""
+    try:
+        return GitPublisher(target.repository).head_sha()
+    except Exception:  # git ausente o repositorio ilegible: no se puede demostrar
+        return None
+
+
 def _is_publication_gate(action: str) -> bool:
     """True si el gate autoriza publicar en producción."""
     return action == PRODUCTION_ACTION
@@ -1538,21 +1783,81 @@ def _is_publication_gate(action: str) -> bool:
 def _task_view(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str, Any]:
     """Vista de la tarea con su recorrido humano, su decisión de release y su bloqueo si lo hay."""
     target = dependencies.targets.get(task.target_id)
+    release = (
+        task.release.as_dict()
+        if task.release is not None
+        else _release_preview(task, target, dependencies)
+    )
     return {
         **task.as_dict(),
-        "progress": _progress(task, dependencies),
-        "release": (
-            task.release.as_dict()
-            if task.release is not None
-            else (_release_preview(task, target, dependencies))
+        # Acciones humanas vigentes: los gates pendientes de esta tarea (``gates`` es el historial
+        # completo de identificadores y no cambia).
+        "pending_gates": [
+            str(item.id)
+            for item in dependencies.gates.list_for_task(task.task_id)
+            if item.is_pending
+        ],
+        "next_human_action": _next_human_action(
+            task, target, dependencies, str((release or {}).get("disposition", ""))
         ),
+        "progress": _progress(task, dependencies),
+        "release": release,
         "blocked": _blocked_view(task, target),
     }
 
 
-def _blocked_view(
-    task: ConsoleTask, target: DevelopmentTarget | None
+def _next_human_action(
+    task: ConsoleTask,
+    target: DevelopmentTarget | None,
+    deps: ConsoleDependencies,
+    disposition: str = "",
 ) -> dict[str, Any]:
+    """La **única** siguiente acción humana vigente de la tarea, derivada de su estado canónico.
+
+    Un gate pendiente es la acción; si no hay ninguno y el desarrollo terminó con un artefacto
+    verificado publicable, la acción es pedir la aprobación de producción; si no, no hay acción
+    (y, si publicar está bloqueado, se dice por qué). El historial no aporta acciones.
+    """
+    pending = [item for item in deps.gates.list_for_task(task.task_id) if item.is_pending]
+    if pending:
+        current = pending[-1]
+        return {
+            "kind": "decide_gate",
+            "approval_id": str(current.id),
+            "gate_action": current.action,
+            "label": f"Decidir el gate {current.action}",
+        }
+    result = task.result
+    if (
+        result is None
+        or target is None
+        or task.publication is not None
+        or result.status.value != "DEVELOPMENT_COMPLETED"
+    ):
+        return {"kind": "none"}
+    blocked = _publication_block(task, target)
+    if blocked:
+        return {"kind": "none", "blocked_reason": _redacted(blocked, 300)}
+    sha, source = result.publishable_artifact
+    if disposition == "AUTO":
+        # La autoridad persistente del destino cubre la cadena completa: no hace falta una
+        # decisión humana; el release autónomo publica exactamente este artefacto verificado.
+        return {
+            "kind": "release_autonomous",
+            "requires_human_decision": False,
+            "publishable_sha": sha,
+            "publishable_source": source,
+            "label": "Release autónomo disponible (dentro de la autoridad del destino)",
+        }
+    return {
+        "kind": "request_production_gate",
+        "publishable_sha": sha,
+        "publishable_source": source,
+        "label": "Pedir la aprobación de producción",
+    }
+
+
+def _blocked_view(task: ConsoleTask, target: DevelopmentTarget | None) -> dict[str, Any]:
     """Evidencia gobernada del bloqueo de una tarea: código, causa, regla, recurso y acción.
 
     Sale **entera** del resultado real del ciclo (la escribió la frontera que denegó) más los datos
@@ -1774,11 +2079,7 @@ def _capability_evidence(result: DevelopmentResult | None) -> dict[str, Any]:
         return {}
     claim = _pending_claim(result)
     requisito = next(
-        (
-            item
-            for item in result.capabilities
-            if claim is None or item.kind == claim.kind
-        ),
+        (item for item in result.capabilities if claim is None or item.kind == claim.kind),
         None,
     )
     if claim is None and requisito is None:
@@ -1805,16 +2106,13 @@ def _capability_evidence(result: DevelopmentResult | None) -> dict[str, Any]:
             or (requisito.detail if requisito is not None else ""),
             300,
         ),
-        "required_evidence": _redacted(
-            claim.evidence_required if claim is not None else "", 300
-        ),
+        "required_evidence": _redacted(claim.evidence_required if claim is not None else "", 300),
         "remedy": _redacted(
             (claim.remedy if claim is not None else "")
             or (requisito.remedy if requisito is not None else ""),
             300,
         ),
     }
-
 
 
 def _planned_changes(result: DevelopmentResult | None) -> dict[str, list[str]]:
@@ -1842,7 +2140,7 @@ def _release_decision(
     persistente del destino y las condiciones verificables deciden si esa operación continúa sola.
     """
     result = task.result
-    commit_sha = result.commit_sha if result is not None else ""
+    commit_sha, artifact_source = result.publishable_artifact if result is not None else ("", "")
     policy_decision = deps.policy.evaluate(
         ActionRequest(
             action=PRODUCTION_ACTION,
@@ -1869,6 +2167,11 @@ def _release_decision(
             destination_remote=target.publish_remote if target is not None else "",
             mechanism=GIT_PUSH_MECHANISM,
             commit_present=_commit_present(task, target, commit_sha),
+            head_sha=(
+                _current_head(target)
+                if target is not None and commit_sha and artifact_source != "cycle-commit"
+                else None
+            ),
         )
     )
 

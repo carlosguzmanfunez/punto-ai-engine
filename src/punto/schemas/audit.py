@@ -383,6 +383,9 @@ class AuditEventType(StrEnum):
     #: AP000-OBS-03: se evaluaron las afirmaciones factuales/semánticas de la solicitud y su
     #: evidencia (dataset real, capacidad visual, atestación), con su resultado.
     DEV_CLAIMS_EVALUATED = "DEV_CLAIMS_EVALUATED"
+    #: AP000-OBS-03-R1: se comprobaron **antes de construir** las capacidades efectivas que exigen
+    #: las afirmaciones (capacidad configurada frente a la que ejecuta el transporte activo).
+    DEV_CAPABILITY_EVALUATED = "DEV_CAPABILITY_EVALUATED"
 
 
 class AuditEvent(BaseModel):

@@ -29,7 +29,9 @@ from enum import StrEnum
 from typing import Any, Final
 
 __all__ = [
+    "CAPABILITY_VISION",
     "AcceptanceRecord",
+    "CapabilityRequirement",
     "ClaimKind",
     "ClaimRecord",
     "ElementKind",
@@ -38,6 +40,7 @@ __all__ = [
     "RequestReference",
     "SemanticClaim",
     "VisualCapability",
+    "capability_requirements",
     "claims_result",
     "extract_claims",
     "extract_references",
@@ -811,15 +814,25 @@ VISUAL_MARKERS: Final[tuple[str, ...]] = (
     "aspecto",
 )
 
+#: Capacidad efectiva que exige mirar el resultado renderizado. Se toma del vocabulario del
+#: catálogo de proveedores (``punto.providers.registry``) para no inventar una taxonomía paralela.
+CAPABILITY_VISION: Final[str] = "VISION"
+
 
 @dataclass(frozen=True, slots=True)
 class SemanticClaim:
-    """Afirmación factual/semántica de la solicitud, con la evidencia que exige."""
+    """Afirmación factual/semántica de la solicitud, con la evidencia que exige.
+
+    ``capability`` es la capacidad **efectiva** que hace falta para producir esa evidencia: vacía
+    cuando la demostración no depende de ninguna capacidad del modelo (un dataset, por ejemplo) y
+    ``VISION`` cuando exige mirar el resultado renderizado.
+    """
 
     sentence: str
     kind: str
     evidence_required: str
     required: bool = True
+    capability: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """Vista serializable."""
@@ -828,18 +841,29 @@ class SemanticClaim:
             "kind": self.kind,
             "evidence_required": self.evidence_required,
             "required": self.required,
+            "capability": self.capability,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class ClaimRecord:
-    """Evidencia de una afirmación: resultado y por qué."""
+    """Evidencia de una afirmación: resultado, por qué y con qué capacidad."""
 
     sentence: str
     kind: str
     result: str
     evidence: str
     required: bool = True
+    #: Evidencia que exige la afirmación, tal como la declaró la extracción.
+    evidence_required: str = ""
+    #: Capacidad efectiva que exigía la demostración (vacía si no exigía ninguna).
+    capability: str = ""
+    #: True si esa capacidad estaba disponible en la ruta efectiva (o no hacía falta).
+    capability_available: bool = True
+    #: Detalle real de la capacidad cuando no está disponible (transporte, motivo).
+    capability_detail: str = ""
+    #: Qué corresponde hacer para obtener la evidencia que falta.
+    remedy: str = ""
 
     @property
     def satisfied(self) -> bool:
@@ -864,23 +888,68 @@ class ClaimRecord:
             "result": self.result,
             "evidence": self.evidence,
             "required": self.required,
+            "evidence_required": self.evidence_required,
+            "capability": self.capability,
+            "capability_available": self.capability_available,
+            "capability_detail": self.capability_detail,
+            "remedy": self.remedy,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityRequirement:
+    """Lo que una afirmación exige de la ruta efectiva, evaluado **antes** de construir.
+
+    Es la comprobación que evita exigir una verificación imposible: si la ruta activa no puede
+    producir la evidencia, el ciclo lo sabe desde el principio y el desenlace es el gobernado
+    (``EVIDENCE_REQUIRED``), nunca un ``VERIFIED`` inventado.
+    """
+
+    kind: str
+    capability: str
+    available: bool
+    criterion: str = ""
+    detail: str = ""
+    remedy: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Vista serializable."""
+        return {
+            "kind": self.kind,
+            "capability": self.capability,
+            "available": self.available,
+            "criterion": self.criterion,
+            "detail": self.detail,
+            "remedy": self.remedy,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class VisualCapability:
-    """Capacidad real del transporte asignado a VISUAL_QA para recibir imágenes."""
+    """Capacidad de evidencia visual de la ruta asignada: lo configurado y lo **efectivo**.
+
+    ``available`` es la capacidad **efectiva** (el transporte activo puede recibir imágenes), no lo
+    que el modelo soporte teóricamente: si el transporte no las acepta, no hay evidencia visual por
+    esa ruta (AP000-OBS-03-R1). ``configured`` conserva lo declarado para poder decir en la interfaz
+    que difieren, y ``remedy`` qué corresponde hacer.
+    """
 
     available: bool
     detail: str
     provider: str = ""
+    configured: bool = False
+    transport: str = ""
+    remedy: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """Vista serializable."""
         return {
             "available": self.available,
+            "configured": self.configured,
             "detail": self.detail,
             "provider": self.provider,
+            "transport": self.transport,
+            "remedy": self.remedy,
         }
 
 
@@ -914,6 +983,7 @@ def extract_claims(
                             "evidencia visual del resultado renderizado (imagen) o atestación "
                             "humana explícita"
                         ),
+                        capability=CAPABILITY_VISION,
                     )
                 )
                 continue
@@ -977,6 +1047,7 @@ def _cartographic_record(
                 "no hay ningún dataset administrativo válido de Honduras con los 18 departamentos "
                 "en el repositorio: la geometría propia no es evidencia cartográfica"
             ),
+            evidence_required=claim.evidence_required,
         )
     dataset = validos[0]
     if not rendered[0]:
@@ -987,6 +1058,7 @@ def _cartographic_record(
             evidence=(
                 f"existe un dataset válido ({dataset.path}) pero el cambio no lo usa: {rendered[1]}"
             ),
+            evidence_required=claim.evidence_required,
         )
     return ClaimRecord(
         sentence=claim.sentence,
@@ -997,21 +1069,31 @@ def _cartographic_record(
             f"{dataset.source or 'declarada'}, licencia {dataset.license or 'declarada'}; "
             f"{rendered[1]}"
         ),
+        evidence_required=claim.evidence_required,
     )
 
 
 def _visual_record(
     claim: SemanticClaim, visual: VisualCapability | None, attestation: str
 ) -> ClaimRecord:
-    """La apariencia se demuestra con imagen evaluada o con atestación humana, no por suposición."""
+    """La apariencia se demuestra con imagen evaluada o con atestación humana, no por suposición.
+
+    Si la ruta no tiene capacidad efectiva de imágenes, el registro lo dice con su causa, la
+    capacidad que faltaba y qué corresponde hacer; el resultado sigue siendo ``NOT_VERIFIED`` (nunca
+    un PASS inventado).
+    """
+    capability = visual or VisualCapability(available=False, detail="capacidad no comprobada")
     if attestation.strip():
         return ClaimRecord(
             sentence=claim.sentence,
             kind=claim.kind,
             result="SATISFIED",
             evidence=f"atestación humana explícita: {attestation.strip()[:200]}",
+            evidence_required=claim.evidence_required,
+            capability=CAPABILITY_VISION,
+            capability_available=capability.available,
+            capability_detail=capability.detail,
         )
-    capability = visual or VisualCapability(available=False, detail="capacidad no comprobada")
     if not capability.available:
         return ClaimRecord(
             sentence=claim.sentence,
@@ -1021,6 +1103,12 @@ def _visual_record(
                 "no hay capacidad de QA visual con imágenes en la configuración actual "
                 f"({capability.detail}); el criterio queda sin verificar y exige evidencia"
             ),
+            evidence_required=claim.evidence_required,
+            capability=CAPABILITY_VISION,
+            capability_available=False,
+            capability_detail=capability.detail,
+            remedy=capability.remedy
+            or "aporta una atestación humana explícita o habilita una ruta con imágenes",
         )
     return ClaimRecord(
         sentence=claim.sentence,
@@ -1029,7 +1117,51 @@ def _visual_record(
         evidence=(
             "el transporte puede recibir imágenes pero no se aportó ninguna para este resultado"
         ),
+        evidence_required=claim.evidence_required,
+        capability=CAPABILITY_VISION,
+        capability_available=True,
+        capability_detail=capability.detail,
+        remedy="aporta una imagen renderizada del cambio para que el QA visual la evalúe",
     )
+
+
+def capability_requirements(
+    claims: Sequence[SemanticClaim], *, visual: VisualCapability | None = None
+) -> tuple[CapabilityRequirement, ...]:
+    """Capacidades que exigen las afirmaciones, evaluadas contra la ruta **efectiva**.
+
+    Se calcula antes de construir: así el ciclo sabe desde el principio qué criterio podrá demostrar
+    por sí mismo y cuál necesitará una persona, en vez de descubrirlo después de completar todo el
+    trabajo. Una afirmación que no depende de ninguna capacidad del modelo (cartográfica: se
+    demuestra con el dataset) aparece con ``capability`` vacía y ``available=True``.
+    """
+    requisitos: list[CapabilityRequirement] = []
+    for claim in claims:
+        if not claim.capability:
+            requisitos.append(
+                CapabilityRequirement(
+                    kind=claim.kind,
+                    capability="",
+                    available=True,
+                    criterion=claim.sentence,
+                    detail="la evidencia no depende de una capacidad del modelo",
+                )
+            )
+            continue
+        capability = visual or VisualCapability(available=False, detail="capacidad no comprobada")
+        requisitos.append(
+            CapabilityRequirement(
+                kind=claim.kind,
+                capability=claim.capability,
+                available=capability.available,
+                criterion=claim.sentence,
+                detail=capability.detail,
+                remedy=capability.remedy
+                or "aporta la evidencia que falta o habilita una ruta que pueda producirla",
+            )
+        )
+    return tuple(requisitos)
+
 
 
 def claims_result(records: Sequence[ClaimRecord]) -> str:

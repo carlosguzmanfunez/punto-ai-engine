@@ -11,6 +11,7 @@ Configurar un proveedor no habilita ninguna acción del motor; el Human Gate sig
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
 
@@ -19,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from punto.providers.contract import ProviderRole
+from punto.providers.effective import effective_capabilities_table
 from punto.providers.registry import (
     CAPABILITIES,
     InvalidProviderError,
@@ -101,11 +103,20 @@ def register_dashboard(application: FastAPI, registry: ProviderRegistry | None =
 
     @application.get("/providers", tags=["dashboard"], summary="Catálogo de proveedores")
     def list_providers() -> dict[str, Any]:
-        """Proveedores con su configuración y su estado real, sin credenciales."""
+        """Proveedores con su configuración y su estado real, sin credenciales.
+
+        AP000-OBS-03-R1: además de lo declarado, se expone la capacidad **efectiva** de cada ruta
+        (configurada ∩ transporte activo ∩ disponibilidad). Si el transporte no ejecuta algo que la
+        configuración declara —por ejemplo, imágenes por Claude Code—, la interfaz puede decirlo en
+        vez de ofrecerlo como utilizable.
+        """
         return {
             "providers": list(catalog.status_table()),
             "capabilities": list(CAPABILITIES),
             "roles": catalog.roles(),
+            "effective_capabilities": [
+                dict(item) for item in effective_capabilities_table(catalog=catalog)
+            ],
         }
 
     @application.get("/providers/{provider}", tags=["dashboard"], summary="Ficha de un proveedor")
@@ -211,12 +222,25 @@ def register_dashboard(application: FastAPI, registry: ProviderRegistry | None =
 
     @application.get("/roles", tags=["dashboard"], summary="Asignación de roles")
     def list_roles() -> dict[str, Any]:
-        """Asignación vigente y proveedores disponibles para cada rol."""
+        """Asignación vigente, proveedores disponibles y **capacidad efectiva** de cada rol.
+
+        Un rol puede estar asignado a un proveedor que declara la capacidad que el rol necesita y
+        cuyo transporte activo, en cambio, no puede ejecutarla. Aquí se dice cuál es el caso, con el
+        motivo real, en vez de dejar que la interfaz suponga que la asignación es suficiente.
+        """
+        efectivas = {
+            item["provider"]: item for item in effective_capabilities_table(catalog=catalog)
+        }
+        roles = catalog.roles()
         return {
-            "roles": catalog.roles(),
+            "roles": roles,
             "required_capability": {
                 role.value: capability
                 for role, capability in _required_capabilities().items()
+            },
+            "role_capabilities": {
+                role: _role_capability_view(role, provider, efectivas)
+                for role, provider in roles.items()
             },
             "providers": [descriptor.provider for descriptor in catalog.descriptors()],
         }
@@ -254,6 +278,41 @@ def register_dashboard(application: FastAPI, registry: ProviderRegistry | None =
                 "usage_states": [item.value for item in TransportUsageStatus],
             }
         )
+
+
+def _role_capability_view(
+    role: str, provider: str, efectivas: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Si la capacidad que exige un rol es efectiva en la ruta que lo atiende, y por qué no.
+
+    ``required`` vacío significa que el rol no exige ninguna capacidad concreta del catálogo; en ese
+    caso ``available`` es ``True`` y no hay nada que advertir.
+    """
+    required = _required_capability_of(role)
+    fila = efectivas.get(provider) or {}
+    if not required:
+        return {"provider": provider, "required": "", "available": True, "detail": ""}
+    disponible = required in tuple(fila.get("effective", ()))
+    detalle = ""
+    if not disponible:
+        motivos = tuple(str(item) for item in fila.get("reasons", ()))
+        detalle = motivos[0] if motivos else "la capacidad no se pudo comprobar en esa ruta"
+    return {
+        "provider": provider,
+        "required": required,
+        "available": disponible,
+        "transport": str(fila.get("transport", "")),
+        "configured": required in tuple(fila.get("configured", ())),
+        "detail": detalle[:300],
+    }
+
+
+def _required_capability_of(role: str) -> str:
+    """Capacidad que exige un rol, según el catálogo de roles del motor."""
+    try:
+        return str(_required_capabilities().get(ProviderRole(role), "") or "")
+    except ValueError:
+        return ""
 
 
 def _required_capabilities() -> dict[ProviderRole, str]:

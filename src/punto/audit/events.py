@@ -206,6 +206,8 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_ACCEPTANCE_VERIFIED: "dev_acceptance",
     AuditEventType.DEV_ACCEPTANCE_FAILED: "dev_acceptance",
     AuditEventType.DEV_CLAIMS_EVALUATED: "dev_claims",
+    #: AP000-OBS-03-R1: la comprobación de capacidades efectivas se registra sobre la solicitud.
+    AuditEventType.DEV_CAPABILITY_EVALUATED: "dev_capabilities",
     AuditEventType.DEV_CHANGE_VALIDATED: "dev_change",
     AuditEventType.DEV_CHANGE_REJECTED: "dev_change",
     AuditEventType.DEV_VERIFICATION_STARTED: "dev_verification",

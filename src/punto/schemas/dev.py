@@ -406,6 +406,11 @@ class ClaimEvidence(BaseModel):
     la presencia de algo: exige evidencia (dataset real, imagen o atestación humana). Este registro
     dice qué se afirmó, con qué evidencia y con qué resultado, incluido ``NOT_VERIFIED`` cuando no
     hay forma de demostrarlo.
+
+    AP000-OBS-03-R1 añade **con qué capacidad**: qué capacidad efectiva exigía la demostración, si
+    estaba disponible en la ruta activa, el detalle real cuando no lo estaba (transporte) y qué
+    corresponde hacer. Así el motivo de un ``EVIDENCE_REQUIRED`` viaja en el resultado gobernado y
+    una persona puede decidir sin adivinar.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -415,6 +420,36 @@ class ClaimEvidence(BaseModel):
     result: str = Field(default="", max_length=20)
     evidence: str = Field(default="", max_length=600)
     required: bool = True
+    #: Evidencia que la solicitud exige para ese criterio (imagen o atestación humana, por ejemplo).
+    evidence_required: str = Field(default="", max_length=300)
+    #: Capacidad efectiva que exigía la evidencia (``VISION`` para la apariencia; vacía si no
+    #: exigía ninguna).
+    capability: str = Field(default="", max_length=40)
+    #: True si esa capacidad estaba disponible en la ruta efectiva (o no hacía falta).
+    capability_available: bool = True
+    #: Detalle real de la capacidad cuando no está disponible (transporte activo y motivo).
+    capability_detail: str = Field(default="", max_length=300)
+    #: Qué corresponde hacer para obtener la evidencia que falta.
+    remedy: str = Field(default="", max_length=300)
+
+
+class CapabilityEvidence(BaseModel):
+    """Capacidad efectiva que exigía una afirmación de la solicitud, comprobada antes de construir.
+
+    AP000-OBS-03-R1: dice qué capacidad hacía falta, si la ruta activa la tiene **de verdad** (no
+    solo en el catálogo), el detalle real cuando no la tiene y qué corresponde hacer. Es la prueba
+    de que PUNTO comprobó la capacidad antes de asignar el trabajo, y la explicación de un
+    ``EVIDENCE_REQUIRED``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str = Field(default="", max_length=40)
+    capability: str = Field(default="", max_length=40)
+    available: bool = True
+    criterion: str = Field(default="", max_length=300)
+    detail: str = Field(default="", max_length=300)
+    remedy: str = Field(default="", max_length=300)
 
 
 class PellInfluence(BaseModel):
@@ -494,6 +529,8 @@ class DevelopmentResult(BaseModel):
     claims: tuple[ClaimEvidence, ...] = ()
     #: ``SATISFIED`` | ``FAILED`` | ``EVIDENCE_REQUIRED`` | ``NONE``.
     claims_result: str = Field(default="NONE", max_length=20)
+    #: AP000-OBS-03-R1: capacidades efectivas que exigían las afirmaciones, comprobadas al empezar.
+    capabilities: tuple[CapabilityEvidence, ...] = ()
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
@@ -592,6 +629,7 @@ __all__ = [
     "AppliedChange",
     "AuthorityDecisionRecord",
     "BlockedEvidence",
+    "CapabilityEvidence",
     "ChangeOperation",
     "CommandEvidence",
     "ContextRequest",

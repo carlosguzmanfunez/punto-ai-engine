@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from inspect import Parameter, signature
 from pathlib import Path
 from threading import Lock
 from typing import Any, Final
@@ -119,6 +120,9 @@ HUMAN_REQUIRED_KINDS: Final[frozenset[str]] = frozenset(
         "CHANGE_REQUIRES_HUMAN",
         "PLAN_OUTSIDE_AUTHORITY",
         "CHANGE_OUTSIDE_AUTHORITY",
+        # AP000-OBS-03-R1: un criterio que exige evidencia que ninguna ruta automática puede
+        # producir **no** es un fallo del desarrollo: es una petición de evidencia a una persona.
+        "EVIDENCE_REQUIRED",
     }
 )
 
@@ -319,6 +323,35 @@ class ConsoleTask:
             # AP000-OBS-02: evidencia de aceptación medida contra la superficie solicitada.
             "acceptance_result": result.acceptance_result,
             "acceptance": [item.model_dump() for item in result.acceptance[:MAX_EVIDENCE_ROWS]],
+            # AP000-OBS-03 / OBS-03-R1: afirmaciones de la solicitud y capacidades **efectivas** que
+            # exigían, para que la interfaz pueda explicar por qué un criterio queda sin evidencia.
+            "claims_result": result.claims_result,
+            "claims": [
+                {
+                    "sentence": _redacted(item.sentence, 300),
+                    "kind": _redacted(item.kind, 40),
+                    "result": _redacted(item.result, 20),
+                    "evidence": _redacted(item.evidence, 600),
+                    "required": item.required,
+                    "evidence_required": _redacted(item.evidence_required, 300),
+                    "capability": _redacted(item.capability, 40),
+                    "capability_available": item.capability_available,
+                    "capability_detail": _redacted(item.capability_detail, 300),
+                    "remedy": _redacted(item.remedy, 300),
+                }
+                for item in result.claims[:MAX_EVIDENCE_ROWS]
+            ],
+            "capabilities": [
+                {
+                    "kind": _redacted(item.kind, 40),
+                    "capability": _redacted(item.capability, 40),
+                    "available": item.available,
+                    "criterion": _redacted(item.criterion, 300),
+                    "detail": _redacted(item.detail, 300),
+                    "remedy": _redacted(item.remedy, 300),
+                }
+                for item in result.capabilities[:MAX_EVIDENCE_ROWS]
+            ],
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -815,7 +848,9 @@ def register_human_console(
             # reinicio justo después no pierda el desenlace ni la petición de persona.
             try:
                 try:
-                    result = deps.dev_cycle.run(request)
+                    result = _run_cycle(
+                        deps.dev_cycle, request, _human_attestation(task, deps)
+                    )
                 except Exception as exc:  # el ciclo no debe tumbar la consola
                     # El desenlace operativo tiene que ser el de **este** intento: si el ciclo lanza
                     # una excepción en vez de devolver un resultado, la tarea no puede seguir
@@ -875,22 +910,25 @@ def register_human_console(
                 )
             )
             deps.audit.log_policy_decision(decision)
-            approval = deps.gates.request(
-                task_id=task.task_id,
-                action=human_kind,
-                risk=decision.effective_risk,
-                reason=_gate_reason(human_kind, result, task.target_id),
-                resume_status=TaskStatus.IN_PROGRESS,
-                policy_outcome=decision.outcome.value,
-                policy_decision_id=decision.id,
-            )
-            deps.audit.log_human_gate_created(
-                approval_id=approval.id,
-                task_id=task.task_id,
-                action=approval.action,
-                risk=approval.risk.name,
-                reason=approval.reason,
-            )
+            motivo = _gate_reason(human_kind, result, task.target_id)
+            approval = _reuse_pending_gate(deps, task, human_kind, motivo)
+            if approval is None:
+                approval = deps.gates.request(
+                    task_id=task.task_id,
+                    action=human_kind,
+                    risk=decision.effective_risk,
+                    reason=motivo,
+                    resume_status=TaskStatus.IN_PROGRESS,
+                    policy_outcome=decision.outcome.value,
+                    policy_decision_id=decision.id,
+                )
+                deps.audit.log_human_gate_created(
+                    approval_id=approval.id,
+                    task_id=task.task_id,
+                    action=approval.action,
+                    risk=approval.risk.name,
+                    reason=approval.reason,
+                )
             if approval.id not in task.gates:
                 task.gates.append(approval.id)
             task.set_stage(ConsoleStage.WAITING_HUMAN, human_kind)
@@ -1558,13 +1596,81 @@ def _human_cause(result: DevelopmentResult | None) -> dict[str, str]:
 
     El detalle lo compone el ciclo (``el plan toca N recurso(s) y el sobre de autoridad devuelve
     REQUIRE_HUMAN (HUMAN_GATE_REQUIRED, riesgo HIGH): recurso de clase desconocida: se falla
-    cerrado``), no la interfaz: aquí solo se propaga.
+    cerrado``), no la interfaz: aquí solo se propaga. Cuando la parada es por **evidencia** que
+    falta
+    (``EVIDENCE_REQUIRED``), la causa es el criterio concreto que no se pudo demostrar y con qué
+    capacidad, no un texto genérico (AP000-OBS-03-R1).
     """
     if result is None:
         return {"code": "", "detail": ""}
     for issue in (*result.plan_issues, *result.change_issues):
         return {"code": _redacted(issue.code, 60), "detail": _redacted(issue.detail, 300)}
+    pendiente = _pending_claim(result)
+    if pendiente is not None:
+        return {
+            "code": _redacted(result.error_kind or "EVIDENCE_REQUIRED", 60),
+            "detail": _redacted(pendiente.evidence, 300),
+        }
     return {"code": _redacted(result.error_kind, 60), "detail": _redacted(result.error, 300)}
+
+
+def _pending_claim(result: DevelopmentResult | None) -> Any | None:
+    """Primer criterio requerido que quedó **sin evidencia** (``NOT_VERIFIED``), si lo hay."""
+    if result is None:
+        return None
+    for item in result.claims:
+        if item.required and item.result == "NOT_VERIFIED":
+            return item
+    return None
+
+
+def _capability_evidence(result: DevelopmentResult | None) -> dict[str, Any]:
+    """Evidencia de la capacidad que faltaba: qué criterio, qué capacidad y qué corresponde.
+
+    Sale del resultado real del ciclo (la comprobación previa y la medición posterior), nunca de la
+    interfaz: es lo que permite a una persona decidir sin adivinar y saber qué **no** autoriza.
+    """
+    if result is None:
+        return {}
+    claim = _pending_claim(result)
+    requisito = next(
+        (
+            item
+            for item in result.capabilities
+            if claim is None or item.kind == claim.kind
+        ),
+        None,
+    )
+    if claim is None and requisito is None:
+        return {}
+    return {
+        "criterion": _redacted(claim.sentence if claim is not None else "", 300),
+        "kind": _redacted(claim.kind if claim is not None else "", 40),
+        "required": _redacted(
+            (claim.capability if claim is not None else "")
+            or (requisito.capability if requisito else ""),
+            40,
+        ),
+        "available": bool(
+            claim.capability_available
+            if claim is not None
+            else (requisito.available if requisito else False)
+        ),
+        "detail": _redacted(
+            (claim.capability_detail if claim is not None else "")
+            or (requisito.detail if requisito is not None else ""),
+            300,
+        ),
+        "required_evidence": _redacted(
+            claim.evidence_required if claim is not None else "", 300
+        ),
+        "remedy": _redacted(
+            (claim.remedy if claim is not None else "")
+            or (requisito.remedy if requisito is not None else ""),
+            300,
+        ),
+    }
+
 
 
 def _planned_changes(result: DevelopmentResult | None) -> dict[str, list[str]]:
@@ -1668,6 +1774,8 @@ def _gate_evidence(
     destination = target.human_name if target is not None else ""
     decisions = _gate_decisions(result)[:3] if result is not None else ()
     scope = list(_result_scope(result)) if result is not None else []
+    capability = _capability_evidence(result)
+    evidencia = bool(capability) and approval.action == "EVIDENCE_REQUIRED"
     return {
         "risk": approval.risk.name,
         "policy_outcome": approval.policy_outcome or "",
@@ -1685,6 +1793,8 @@ def _gate_evidence(
             "paths": [_redacted(item, 200) for item in scope[:MAX_EVIDENCE_ROWS]],
             "total": len(scope),
         },
+        # AP000-OBS-03-R1: el criterio pendiente, la capacidad que falta y qué corresponde hacer.
+        "capability": capability,
         "cause": _human_cause(result),
         "conditions": [_decision_view(item) for item in decisions],
         "authorizes": (
@@ -1692,9 +1802,15 @@ def _gate_evidence(
             "comprobar que sirve lo esperado."
             if publication
             else (
-                f"Que PUNTO continúe **esta** operación en "
-                f"{destination or 'el destino autorizado'}: el plan declarado se aplicará en el "
-                "alcance permitido y se verificará con el catálogo del destino. Nada más."
+                "Aportar la evidencia que falta para el criterio pendiente (una atestación humana "
+                "explícita de lo observado) o autorizar el cambio de ruta que pueda producirla. La "
+                "atestación entra como evidencia de ese criterio en el siguiente intento."
+                if evidencia
+                else (
+                    f"Que PUNTO continúe **esta** operación en "
+                    f"{destination or 'el destino autorizado'}: el plan declarado se aplicará en "
+                    "el alcance permitido y se verificará con el catálogo del destino. Nada más."
+                )
             )
         ),
         "does_not_authorize": (
@@ -1708,10 +1824,74 @@ def _gate_evidence(
                 "Publicar en producción: eso exige su propio Human Gate de publicación.",
                 "Autoridad nueva: la aprobación no amplía permisos, alcance ni reglas de PUNTO.",
                 "Operar sobre otro destino: el gate está ligado a esta tarea y a este destino.",
-                "Saltar la verificación: el ciclo sigue verificando y puede fallar igualmente.",
+                (
+                    "Convertir el criterio en demostrado: aprobar sin atestación no aporta "
+                    "evidencia; el ciclo vuelve a medirlo y sin evidencia sigue sin verificarse."
+                    if evidencia
+                    else "Saltar la verificación: el ciclo sigue verificando y puede fallar igual."
+                ),
             ]
         ),
     }
+
+
+def _reuse_pending_gate(
+    deps: ConsoleDependencies, task: ConsoleTask, action: str, reason: str
+) -> HumanApprovalRequest | None:
+    """Gate **pendiente** de la misma tarea, acción y causa: se reutiliza en vez de duplicarlo.
+
+    Dos intentos que se detienen por lo mismo son **una** decisión humana pendiente, no dos: la
+    persona decide una vez y el registro no se llena de solicitudes idénticas. Solo se reutiliza lo
+    que sigue pendiente y coincide en acción y motivo; en cuanto se resuelve, un nuevo bloqueo
+    vuelve a pedirla (AP000-OBS-03-R1).
+    """
+    for approval in deps.gates.list_for_task(task.task_id):
+        if approval.is_pending and approval.action == action and approval.reason == reason:
+            return approval
+    return None
+
+
+def _human_attestation(task: ConsoleTask, deps: ConsoleDependencies) -> str:
+    """Atestación humana explícita de la tarea: las notas de sus gates de evidencia aprobados.
+
+    Una persona que aprueba el gate de ``EVIDENCE_REQUIRED`` **con una nota** está aportando la
+    evidencia que PUNTO no puede producir por su ruta (por ejemplo, que ha mirado el resultado). La
+    nota sale del registro de gates —durable— y no de ningún campo inventado; sin nota no hay
+    atestación, porque aprobar en blanco no demuestra nada.
+    """
+    notas: list[str] = []
+    for approval in deps.gates.list_for_task(task.task_id):
+        if approval.action != "EVIDENCE_REQUIRED" or not approval.is_approved:
+            continue
+        nota = (approval.resolution_note or "").strip()
+        if nota:
+            notas.append(_redacted(nota, 200))
+    return " | ".join(notas)[:600]
+
+
+def _run_cycle(cycle: Any, request: BuildRequest, attestation: str) -> DevelopmentResult:
+    """Ejecuta el ciclo pasándole la atestación humana **si su contrato la acepta**.
+
+    El contrato del ciclo es ``run(request)``; ``human_attestation`` es la extensión gobernada de
+    AP000-OBS-03-R1. Un ciclo inyectado que no la declare se ejecuta igual: no se le pasa un
+    argumento que no entiende, y sin atestación no hace falta ninguno.
+    """
+    if not attestation:
+        resultado: DevelopmentResult = cycle.run(request)
+        return resultado
+    try:
+        firma = signature(cycle.run)
+    except (TypeError, ValueError):  # firma no inspeccionable: se usa el contrato básico
+        sin_firma: DevelopmentResult = cycle.run(request)
+        return sin_firma
+    acepta = "human_attestation" in firma.parameters or any(
+        item.kind is Parameter.VAR_KEYWORD for item in firma.parameters.values()
+    )
+    if not acepta:
+        basico: DevelopmentResult = cycle.run(request)
+        return basico
+    con_atestacion: DevelopmentResult = cycle.run(request, human_attestation=attestation)
+    return con_atestacion
 
 
 def _issue_human_kind(result: DevelopmentResult) -> str:

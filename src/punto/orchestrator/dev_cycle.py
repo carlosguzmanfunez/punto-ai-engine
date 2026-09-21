@@ -44,10 +44,12 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from punto.acceptance import (
+    CapabilityRequirement,
     ClaimRecord,
     RequestReference,
     SemanticClaim,
     VisualCapability,
+    capability_requirements,
     claims_result,
     extract_claims,
     ground_request,
@@ -113,6 +115,7 @@ from punto.schemas.dev import (
     AppliedChange,
     AuthorityDecisionRecord,
     BlockedEvidence,
+    CapabilityEvidence,
     ChangeOperation,
     ClaimEvidence,
     CommandEvidence,
@@ -335,6 +338,12 @@ class DevelopmentCycle:
     _claims: tuple[SemanticClaim, ...] = field(default=(), init=False, repr=False)
     #: Ficheros candidatos del inventario, para buscar datasets entre ellos.
     _inventory_paths: tuple[str, ...] = field(default=(), init=False, repr=False)
+    #: AP000-OBS-03-R1: capacidades efectivas exigidas por las afirmaciones, comprobadas al empezar.
+    _capabilities: tuple[CapabilityRequirement, ...] = field(
+        default=(), init=False, repr=False
+    )
+    #: Atestación humana explícita (nota de un gate resuelto) que puede demostrar la apariencia.
+    _attestation: str = field(default="", init=False, repr=False)
 
     def _reset_run_state(self) -> None:
         """Deja limpio el estado de la ejecución: el mismo ciclo puede correr dos veces."""
@@ -357,6 +366,10 @@ class DevelopmentCycle:
         #: AP000-OBS-03: afirmaciones factuales/semánticas y su evidencia.
         self._claims = ()
         self._inventory_paths = ()
+        #: AP000-OBS-03-R1: capacidades efectivas que exigen esas afirmaciones, comprobadas al
+        #: empezar (antes de construir) y atestación humana aportada por una persona, si la hay.
+        self._capabilities = ()
+        self._attestation = ""
 
     @property
     def envelope(self) -> AdaptiveAuthorityEnvelope:
@@ -395,10 +408,18 @@ class DevelopmentCycle:
         return self._envelope
 
     # ------------------------------------------------------------------ público
-    def run(self, request: BuildRequest) -> DevelopmentResult:
-        """Ejecuta el ciclo completo sobre el destino de la solicitud."""
+    def run(self, request: BuildRequest, *, human_attestation: str = "") -> DevelopmentResult:
+        """Ejecuta el ciclo completo sobre el destino de la solicitud.
+
+        Args:
+            human_attestation: Atestación **humana explícita** (la nota de un Human Gate resuelto
+                por una persona) que puede demostrar un criterio de apariencia cuando ninguna ruta
+                automática puede producir la imagen (AP000-OBS-03-R1). Sin ella, ese criterio queda
+                ``NOT_VERIFIED`` y el desenlace es el gobernado; nunca se inventa la evidencia.
+        """
         started = time.perf_counter()
         self._reset_run_state()
+        self._attestation = human_attestation.strip()[:600]
         target = self._target_or_none(request)
         if target is None:
             return self._blocked(
@@ -492,6 +513,10 @@ class DevelopmentCycle:
         # que la verificación sepa **qué** hay que demostrar, no solo qué superficie tocar.
         self._inventory_paths = tuple(inventory["paths"])
         self._claims = extract_claims(request.objective, request.acceptance_criteria)
+        # AP000-OBS-03-R1: **antes de planificar y construir** se comprueba qué capacidad efectiva
+        # exige cada afirmación. Si la ruta activa no puede producir la evidencia, se sabe desde el
+        # principio y queda escrito; el criterio no se convierte en VERIFIED por ello.
+        self._capabilities = self._capability_preflight(request)
 
         plan, plan_issues = self._plan(
             request, target, inventory["selected"], retrieval, repository
@@ -804,31 +829,67 @@ class DevelopmentCycle:
         return True, (), evidence
 
     def _visual_capability(self) -> VisualCapability:
-        """Capacidad **real** del transporte asignado a VISUAL_QA para recibir imágenes.
+        """Capacidad **efectiva** de la ruta asignada a VISUAL_QA para recibir imágenes.
 
-        No se supone: se pregunta al transporte que el router usaría. Si no se puede comprobar,
-        la respuesta es «no disponible» (fail closed) y el criterio visual quedará ``NOT_VERIFIED``.
+        No se supone: la calcula la fuente canónica de capacidades efectivas
+        (``punto.providers.effective``), que interseca lo que el proveedor declara con lo que su
+        **transporte activo** ejecuta de verdad. Si el transporte no acepta imágenes —Claude Code en
+        modo no interactivo, por ejemplo— la respuesta es «no disponible» (fail closed), el detalle
+        dice por qué y el remedio qué corresponde, incluidas las rutas autorizadas que sí podrían.
         """
-        from punto.providers.contract import ProviderRole
-        from punto.providers.transport_registry import transport_client
+        from punto.providers.effective import visual_capability_for_role
 
-        try:
-            provider = self.router.get_provider_for_role(ProviderRole.VISUAL_QA)
-            model = self.router.model_of(provider)
-            cliente = transport_client(provider, model=model)
-            soporta = bool(getattr(cliente, "supports_images", False))
-            consulta = getattr(cliente, "capabilities", None)
-            detalle = str(getattr(consulta(), "detail", "") or "") if callable(consulta) else ""
-            return VisualCapability(
-                available=soporta,
-                detail=detalle[:200],
-                provider=provider,
+        return visual_capability_for_role(router=self.router)
+
+    def _capability_preflight(
+        self, request: BuildRequest
+    ) -> tuple[CapabilityRequirement, ...]:
+        """Comprueba **antes de construir** qué capacidades exigen las afirmaciones de la solicitud.
+
+        Es la comprobación que impide exigir una verificación imposible: si un criterio de
+        apariencia exige imágenes y la ruta efectiva no las acepta, el ciclo lo sabe desde el
+        principio y lo deja escrito (auditoría y resultado). No cambia el desenlace por sí sola —el
+        criterio se mide después con la evidencia real, y sin ella el estado es
+        ``EVIDENCE_REQUIRED``—, pero hace que ese estado sea explicable desde el primer paso y no
+        una sorpresa al final.
+        """
+        if not self._claims:
+            return ()
+        visual = self._visual_capability()
+        requisitos = capability_requirements(self._claims, visual=visual)
+        self._log(
+            AuditEventType.DEV_CAPABILITY_EVALUATED,
+            "dev_capability_evaluated",
+            request,
+            {
+                "capabilities": [item.as_dict() for item in requisitos],
+                "visual": visual.as_dict(),
+                "missing": [
+                    item.capability for item in requisitos if not item.available and item.capability
+                ],
+            },
+            AuditResult.SUCCESS
+            if all(item.available for item in requisitos)
+            else AuditResult.FAILURE,
+        )
+        return requisitos
+
+    @staticmethod
+    def _capability_evidence(
+        requirements: Sequence[CapabilityRequirement],
+    ) -> tuple[CapabilityEvidence, ...]:
+        """Traduce los requisitos comprobados a la evidencia del resultado."""
+        return tuple(
+            CapabilityEvidence(
+                kind=item.kind,
+                capability=item.capability,
+                available=item.available,
+                criterion=item.criterion,
+                detail=item.detail,
+                remedy=item.remedy,
             )
-        except Exception as exc:  # sin transporte resoluble: no hay evidencia visual
-            return VisualCapability(
-                available=False,
-                detail=f"no se pudo comprobar el transporte de VISUAL_QA: {type(exc).__name__}",
-            )
+            for item in requirements
+        )
 
     def _dataset_candidates(
         self, repository: GovernedRepository, target: DevelopmentTarget
@@ -877,7 +938,11 @@ class DevelopmentCycle:
             )
         visual = self._visual_capability()
         registros = verify_claims(
-            self._claims, datasets=datasets, rendered=rendered, visual=visual
+            self._claims,
+            datasets=datasets,
+            rendered=rendered,
+            visual=visual,
+            attestation=self._attestation,
         )
         resultado = claims_result(registros)
         self._log(
@@ -914,6 +979,11 @@ class DevelopmentCycle:
                 result=item.result,
                 evidence=item.evidence,
                 required=item.required,
+                evidence_required=item.evidence_required[:300],
+                capability=item.capability[:40],
+                capability_available=item.capability_available,
+                capability_detail=item.capability_detail[:300],
+                remedy=item.remedy[:300],
             )
             for item in records
         )
@@ -3182,6 +3252,7 @@ class DevelopmentCycle:
         acceptance_result: str = "NOT_MEASURED",
         claims: Sequence[ClaimEvidence] = (),
         claims_result: str = "NONE",
+        capabilities: Sequence[CapabilityEvidence] | None = None,
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -3254,6 +3325,11 @@ class DevelopmentCycle:
             acceptance_result=acceptance_result,
             claims=tuple(claims),
             claims_result=claims_result,
+            capabilities=(
+                tuple(capabilities)
+                if capabilities is not None
+                else self._capability_evidence(self._capabilities)
+            ),
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,

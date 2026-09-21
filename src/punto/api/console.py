@@ -403,6 +403,10 @@ class ConsoleTask:
             # PROVIDER FAILOVER: quién era el primario, por qué no pudo y quién lo sustituyó. La
             # identidad de la tarea no cambia y la sustitución no concede autoridad adicional.
             "failovers": [item.model_dump() for item in result.failovers],
+            # VISUAL_QA EFECTIVO: capturas reales (con huella), quién las evaluó y su veredicto.
+            "visual_evidence": [
+                item.model_dump(mode="json") for item in result.visual_evidence[:MAX_EVIDENCE_ROWS]
+            ],
             "capabilities": [
                 {
                     "kind": _redacted(item.kind, 40),
@@ -1352,6 +1356,7 @@ def _close_attempt(
             duration_ms=duracion,
             provider=_redacted(result.provider, 40) if result is not None else "",
             failover=_failover_summary(result),
+            visual=_visual_summary(result),
         ),
     ]
     task.attempt_started_at = None
@@ -1367,6 +1372,18 @@ def _failover_summary(result: DevelopmentResult | None) -> str:
         for item in result.failovers
     ]
     return _redacted("; ".join(partes), 200)
+
+
+def _visual_summary(result: DevelopmentResult | None) -> str:
+    """Resumen breve de la evidencia visual del intento (quién evaluó, qué veredictos), o ``""``."""
+    if result is None or not result.visual_evidence:
+        return ""
+    first = result.visual_evidence[0]
+    counts: dict[str, int] = {}
+    for item in result.visual_evidence:
+        counts[item.verdict] = counts.get(item.verdict, 0) + 1
+    verdicts = " ".join(f"{name}={total}" for name, total in sorted(counts.items()))
+    return _redacted(f"{first.provider}/{first.transport}: {verdicts}", 120)
 
 
 def _task_record(task: ConsoleTask) -> TaskRecord:

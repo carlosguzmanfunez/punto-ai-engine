@@ -15,17 +15,29 @@ El **App Server** de Codex (``codex app-server``, JSON-RPC) es la vía preferent
 integración programática rica; este transporte lo deja anotado como la sustitución natural sin
 cambiar el contrato: lo que está debajo es un detalle del transporte, no del provider ni de ENGINE.
 
-Limitación declarada: el modo no interactivo de Codex es de texto. Este transporte **no** acepta
-imágenes; si un rol necesita evidencia visual, se configura el transporte ``api`` por separado.
+**Imágenes (comprobado con la CLI real, no supuesto).** ``codex exec --image <FICHERO>`` adjunta
+imágenes al prompt inicial. Medido con Codex 0.155 y la sesión ChatGPT: sobre una captura real de
+navegador leyó título, departamento, botón, color y un código aleatorio que no estaba en el prompt;
+sin imagen respondió ``NO_IMAGE``. Por eso este transporte **no** declara imágenes por catálogo ni
+por modelo: lo declara solo si el binario instalado **anuncia** ``--image`` en ``codex exec --help``
+(un binario más antiguo, no instalado o sin respuesta no las acepta: fail closed).
+
+Los adjuntos los controla PUNTO: se validan con los límites del contrato multimodal, se escriben en
+un directorio temporal **privado** solo para esa ejecución y se borran al terminar. El modelo nunca
+recibe una ruta para leer ficheros por su cuenta y el sandbox sigue en ``read-only``.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Final
 
+from punto.providers.base import ImageLimits, ImagePayload
 from punto.providers.contract import (
     PROVIDER_OPENAI,
     ProviderHealth,
@@ -69,6 +81,20 @@ UNAUTHENTICATED_MARKERS: Final[tuple[str, ...]] = (
     "run `codex login`",
 )
 
+#: Flag con el que ``codex exec`` adjunta imágenes al prompt inicial (variádico).
+IMAGE_FLAG: Final[str] = "--image"
+
+#: Extensión del fichero temporal según el media type (la CLI decide el formato por la extensión).
+IMAGE_SUFFIX: Final[Mapping[str, str]] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+
+#: Resultado de la detección por binario. Solo se comparte con el runner real: un runner inyectado
+#: (pruebas) responde lo que la prueba diga y nunca contamina a los demás.
+_IMAGE_SUPPORT: dict[str, bool] = {}
+
 #: Claves donde puede aparecer el texto del modelo en la salida estructurada de ``codex exec``.
 TEXT_KEYS: Final[tuple[str, ...]] = ("text", "message", "content", "output_text", "result")
 
@@ -102,6 +128,9 @@ class CodexTransport(CliTransport):
             ),
         )
 
+    _images: bool | None = None
+    _attached: tuple[str, ...] = ()
+
     @property
     def kind(self) -> TransportKind:
         """Transporte de suscripción de Codex."""
@@ -129,6 +158,9 @@ class CodexTransport(CliTransport):
         corta el argumento en el primer salto de línea (defecto medido en PILOT-01R · R1). Por
         ``stdin`` el prompt llega íntegro, sin reparseo y sin que el shell lo interprete.
         """
+        # ``--image`` es variádico: va justo antes de otro flag (``--model``) para no tragarse el
+        # prompt posicional del modo sin ``stdin``.
+        attached = (IMAGE_FLAG, *self._attached) if self._attached else ()
         return (
             self.binary,
             "exec",
@@ -136,6 +168,7 @@ class CodexTransport(CliTransport):
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
+            *attached,
             "--model",
             self.model,
         )
@@ -149,13 +182,39 @@ class CodexTransport(CliTransport):
         return (*self.prompt_argv(), prompt)
 
     def capabilities(self) -> TransportCapabilities:
-        """Codex no interactivo trabaja con texto: sin imágenes por esta vía."""
+        """Capacidades **comprobadas en el binario instalado**, no declaradas por catálogo.
+
+        Las imágenes se acreditan solo si ``codex exec --help`` anuncia ``--image``. Sin binario,
+        sin respuesta o con un binario que no lo anuncia, no hay imágenes (fail closed) y el
+        detalle dice por qué.
+        """
+        images = self.accepts_images()
         return TransportCapabilities(
-            supports_images=False,
+            supports_images=images,
             supports_json_schema=False,
             streaming=False,
-            detail="codex exec es texto; para evidencia visual usa el transporte api",
+            detail=(
+                "codex exec adjunta imágenes con --image (anunciado por el binario instalado)"
+                if images
+                else "el binario de Codex no anuncia --image en `codex exec --help`: sin imágenes; "
+                "para evidencia visual usa otro transporte con imágenes"
+            ),
         )
+
+    def accepts_images(self) -> bool:
+        """True si el binario instalado de Codex anuncia ``--image`` (barato, en caché)."""
+        from punto.providers.transport import RealSubprocessRunner
+
+        shared = isinstance(self._runner, RealSubprocessRunner)
+        key = shutil.which(self.binary) or self.binary
+        if shared and key in _IMAGE_SUPPORT:
+            return _IMAGE_SUPPORT[key]
+        if self._images is None:
+            process = self._run((self.binary, "exec", "--help"))
+            self._images = process.ok and IMAGE_FLAG in f"{process.stdout}\n{process.stderr}"
+        if shared:
+            _IMAGE_SUPPORT[key] = self._images
+        return self._images
 
     def _interpret_auth(self, process: TransportProcess) -> TransportAuthStatus:
         """Traduce la respuesta de ``codex login status`` a un estado del contrato."""
@@ -218,11 +277,12 @@ class CodexTransport(CliTransport):
                 timeout, proceso fallido o respuesta ilegible).
         """
         del json_schema, max_output_tokens  # la CLI no acepta ni esquema ni tope de salida
-        if request.attachments:
+        if request.attachments and not self.accepts_images():
             raise TransportError(
                 TransportErrorKind.UNAVAILABLE,
-                "el transporte codex no acepta imágenes; configura el transporte api para "
-                "evidencia visual (no se descartan en silencio)",
+                "el transporte codex no acepta imágenes: el binario instalado no anuncia --image; "
+                "configura un transporte con imágenes para evidencia visual (no se descartan en "
+                "silencio)",
             )
         status = self.auth_status()
         if status is TransportAuthStatus.NOT_INSTALLED:
@@ -240,7 +300,10 @@ class CodexTransport(CliTransport):
             )
 
         started = time.perf_counter()
-        process = self.run_prompt(_prompt_of(request))
+        if request.attachments:
+            process = self._run_with_images(_prompt_of(request), request.attachments)
+        else:
+            process = self.run_prompt(_prompt_of(request))
         content = extract_codex_text(process.stdout)
         if not content:
             raise TransportError(
@@ -254,6 +317,29 @@ class CodexTransport(CliTransport):
             content=content,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
+
+
+    def _run_with_images(self, prompt: str, images: Sequence[ImagePayload]) -> TransportProcess:
+        """Ejecuta el prompt con imágenes que PUNTO controla, en un directorio temporal privado.
+
+        Se validan con los límites del contrato multimodal (número, tamaño, tipo) antes de escribir
+        nada; el directorio se borra siempre, también si la ejecución falla.
+        """
+        validated = ImageLimits().validate(images)
+        directory = Path(tempfile.mkdtemp(prefix="punto-codex-img-"))
+        try:
+            paths: list[str] = []
+            for index, image in enumerate(validated):
+                target = directory / f"imagen-{index + 1}{IMAGE_SUFFIX[image.media_type]}"
+                target.write_bytes(image.data)
+                paths.append(str(target))
+            self._attached = tuple(paths)
+            try:
+                return self.run_prompt(prompt)
+            finally:
+                self._attached = ()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 def _prompt_of(request: ProviderRequest) -> str:

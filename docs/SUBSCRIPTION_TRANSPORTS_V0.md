@@ -40,8 +40,9 @@ implementa la misma interfaz y se registra.
 Nunca se automatiza `chatgpt.com`, ni se extraen cookies, ni se copian tokens: la sesión la
 administra Codex. El **App Server** (`codex app-server`, JSON-RPC) es la vía preferente para una
 integración programática rica y puede sustituir a la CLI dentro de este transporte sin cambiar el
-contrato. **Limitación declarada**: `codex exec` es texto; no acepta nuestras imágenes (con
-`transport: api` sí).
+contrato. **Imágenes (comprobado con la CLI real)**: `codex exec --image <FICHERO>` las adjunta. El
+transporte solo las declara si el binario instalado anuncia `--image` (fail closed); ver
+`docs/VISUAL_QA_EFECTIVO_V0.md`.
 
 ## Claude Code transport
 

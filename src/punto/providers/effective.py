@@ -288,6 +288,15 @@ def visual_capability_for_role(
     disponible = capacidad.has(CAPABILITY_VISION)
     motivo = ""
     if not disponible:
+        # Solo si el llamante entrega su router y no fija un cliente: con un cliente fijado se
+        # pregunta por **esa** ruta, y sin router no se consulta la configuración de la máquina.
+        efectiva = (
+            _effective_visual_route(role, router)
+            if router is not None and client is None
+            else None
+        )
+        if efectiva is not None:
+            return efectiva
         motivo = capacidad.reasons[0] if capacidad.reasons else "no hay ruta visual disponible"
         alternativas = capability_routes(CAPABILITY_VISION, catalog=catalog) if routes else ()
         if alternativas:
@@ -306,6 +315,39 @@ def visual_capability_for_role(
                 "(transporte 'api')"
             )
         ),
+    )
+
+
+def _effective_visual_route(
+    role: ProviderRole | str, router: Any | None
+) -> VisualCapability | None:
+    """Ruta visual **efectiva** cuando la asignada no puede: un sustituto declarado que sí puede.
+
+    Sale del propio router (``resolve_route``): juzga con capacidad **efectiva** —conexión y
+    transporte activo— a los sustitutos que la política de failover declara para el rol. Si nadie
+    puede, o no hay política/evaluador, devuelve ``None`` y quien llama conserva el «no disponible»
+    (fail closed). No cambia la asignación ni concede nada: dice por dónde se ejecutaría.
+    """
+    try:
+        resolve = getattr(router, "resolve_route", None)
+        if not callable(resolve):
+            return None
+        name = role.value if isinstance(role, ProviderRole) else str(role)
+        route = resolve(_role_of(name), needs_vision=True)
+    except Exception:  # sin ruta resoluble no hay capacidad que afirmar
+        return None
+    if not (route.available and route.via_failover):
+        return None
+    return VisualCapability(
+        available=True,
+        detail=(
+            f"ruta efectiva por capacidad: {route.provider} ({route.transport}); el asignado "
+            f"no puede: {route.reason}"
+        )[:200],
+        provider=route.provider,
+        configured=True,
+        transport=route.transport,
+        remedy="",
     )
 
 

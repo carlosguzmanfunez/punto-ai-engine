@@ -354,6 +354,10 @@ class AuditEventType(StrEnum):
     #: excedía su límite contractual y se ajustó de forma determinista; lleva huella y longitudes,
     #: no el texto.
     DEV_PROPOSAL_NORMALIZED = "DEV_PROPOSAL_NORMALIZED"
+    #: VISUAL_QA EFECTIVO: PUNTO capturó la aplicación renderizada (o no pudo, con su causa).
+    DEV_VISUAL_CAPTURED = "DEV_VISUAL_CAPTURED"
+    #: VISUAL_QA EFECTIVO: una ruta con imágenes efectivas evaluó las capturas (por criterio).
+    DEV_VISUAL_ASSESSED = "DEV_VISUAL_ASSESSED"
     #: CONSOLA HUMANA: una persona creó una tarea desde el dashboard local.
     CONSOLE_TASK_CREATED = "CONSOLE_TASK_CREATED"
     #: CONSOLA HUMANA: la tarea cambió de etapa (desarrollo o publicación).

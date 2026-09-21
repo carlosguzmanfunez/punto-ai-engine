@@ -62,7 +62,9 @@ from punto.providers.contract import (
     parse_structured_output,
 )
 from punto.providers.failover import (
+    FailoverCause,
     FailoverPolicy,
+    RouteChoice,
     SubstituteEvaluator,
     SubstituteVerdict,
     failover_cause_of,
@@ -319,14 +321,31 @@ class ProviderRouter:
                 error_kind=ProviderErrorKind.CONFIG,
             )
 
-        primary = self._run_entry(
-            role,
-            request,
-            entry,
-            request_id=request_id,
-            json_schema=json_schema,
-            max_output_tokens=max_output_tokens,
-        )
+        gap = self._capability_gap(role, request, entry)
+        if gap:
+            # El asignado no tiene la capacidad efectiva que la petición exige (p. ej. imágenes en
+            # un transporte de solo texto): no se gasta el primario, se pasa directo a los
+            # sustitutos que la política declara y que sí la tienen.
+            primary = ProviderResult(
+                request_id=request_id,
+                provider=entry.name,
+                model=entry.model,
+                status=ProviderStatus.UNAVAILABLE,
+                role=role,
+                error=gap,
+                error_kind=ProviderErrorKind.UNAVAILABLE,
+            )
+            cause: FailoverCause | None = FailoverCause.CAPABILITY_MISSING
+        else:
+            primary = self._run_entry(
+                role,
+                request,
+                entry,
+                request_id=request_id,
+                json_schema=json_schema,
+                max_output_tokens=max_output_tokens,
+            )
+            cause = None
         return self._failover(
             role,
             request,
@@ -334,7 +353,74 @@ class ProviderRouter:
             request_id=request_id,
             json_schema=json_schema,
             max_output_tokens=max_output_tokens,
+            cause=cause,
         )
+
+    def _capability_gap(
+        self, role: ProviderRole, request: ProviderRequest, entry: ProviderEntry
+    ) -> str:
+        """Motivo por el que el asignado **no puede** con la petición por falta de capacidad.
+
+        Solo aplica con política de failover para el rol, evaluador y una petición con imágenes: sin
+        alguna de las tres cosas no se decide nada por adelantado y se ejecuta el asignado como
+        siempre. ``""`` significa «el asignado sirve» (o «no se puede afirmar lo contrario»).
+        """
+        policy = self._failover_policy
+        if (
+            policy is None
+            or not policy.covers(role)
+            or self._failover_evaluator is None
+            or not request.has_attachments
+        ):
+            return ""
+        verdict = self._judge_substitute(role, entry.name, True)
+        return "" if verdict.eligible or not verdict.capability_gap else verdict.reason
+
+    def resolve_route(self, role: ProviderRole, *, needs_vision: bool = False) -> RouteChoice:
+        """Ruta **efectiva** del rol: quién lo ejecutaría ahora, por capacidad efectiva.
+
+        No ejecuta nada ni cambia la asignación. Juzga primero al asignado; si no sirve y la
+        política de failover cubre el rol, al primer sustituto declarado que sí sirva. Sin evaluador
+        no se puede acreditar capacidad efectiva: se devuelve el asignado **sin** afirmar nada
+        (``reason`` lo dice) para que el llamante falle cerrado si lo necesita.
+        """
+        try:
+            assigned = self.get_provider_for_role(role)
+        except ProviderRouteError as error:
+            return RouteChoice(assigned="", reason=str(error))
+        if self._failover_evaluator is None:
+            return RouteChoice(assigned=assigned, reason="sin evaluador: capacidad no acreditada")
+        first = self._judge_substitute(role, assigned, needs_vision)
+        if first.eligible:
+            return RouteChoice(
+                assigned=assigned,
+                provider=assigned,
+                model=self._models.get(assigned, ""),
+                transport=first.transport,
+            )
+        rejections = [f"{assigned}: {first.reason or 'no elegible'}"]
+        policy = self._failover_policy
+        if policy is not None and policy.covers(role):
+            for name, unusable in self._substitute_candidates(role, assigned, policy):
+                if unusable:
+                    rejections.append(f"{name}: {unusable}")
+                    continue
+                verdict = self._judge_substitute(role, name, needs_vision)
+                if verdict.eligible and verdict.metered and not policy.allow_metered:
+                    rejections.append(f"{name}: transporte de pago por uso (allow_metered=false)")
+                    continue
+                if not verdict.eligible:
+                    rejections.append(f"{name}: {verdict.reason or 'no elegible'}")
+                    continue
+                return RouteChoice(
+                    assigned=assigned,
+                    provider=name,
+                    model=self._models.get(name, ""),
+                    transport=verdict.transport,
+                    via_failover=True,
+                    reason=rejections[0],
+                )
+        return RouteChoice(assigned=assigned, reason="; ".join(rejections))
 
     def _run_entry(
         self,
@@ -445,6 +531,7 @@ class ProviderRouter:
         request_id: str,
         json_schema: Mapping[str, object] | None,
         max_output_tokens: int | None,
+        cause: FailoverCause | None = None,
     ) -> ProviderResult:
         """Intenta sustitutos **solo** si la política lo permite y el primario no estaba operativo.
 
@@ -465,10 +552,15 @@ class ProviderRouter:
         policy = self._failover_policy
         if primary.ok or policy is None or not policy.covers(role):
             return primary
-        cause = failover_cause_of(primary.error_kind)
+        capability_gap = cause is FailoverCause.CAPABILITY_MISSING
+        cause = cause or failover_cause_of(primary.error_kind)
         if cause is None:
             return primary
-        primary_kind = "" if primary.error_kind is None else primary.error_kind.value
+        primary_kind = (
+            "CAPABILITY_GAP"
+            if capability_gap
+            else ("" if primary.error_kind is None else primary.error_kind.value)
+        )
         records: list[FailoverRecord] = []
         rejections: list[str] = []
         last = primary

@@ -41,6 +41,7 @@ __all__ = [
     "OPERATIONAL_CAUSES",
     "FailoverCause",
     "FailoverPolicy",
+    "RouteChoice",
     "SubstituteEvaluator",
     "SubstituteVerdict",
     "failover_cause_of",
@@ -57,6 +58,9 @@ class FailoverCause(StrEnum):
     RATE_LIMITED = "RATE_LIMITED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVIDER_DISCONNECTED = "PROVIDER_DISCONNECTED"
+    #: El asignado **no tiene** la capacidad efectiva que la petición exige (por ejemplo imágenes en
+    #: un transporte de solo texto). No es una caída: se comprueba antes de gastar el primario.
+    CAPABILITY_MISSING = "CAPABILITY_MISSING"
 
 
 #: Fallos normalizados que **sí** demuestran indisponibilidad operativa. Todo lo que no esté aquí
@@ -115,6 +119,32 @@ class SubstituteVerdict:
     reason: str = ""
     #: El transporte del candidato es de pago por uso (API con clave).
     metered: bool = False
+    #: True si el motivo es que **falta** una capacidad efectiva (y no, por ejemplo, la conexión).
+    capability_gap: bool = False
+    #: Transporte activo del candidato, como evidencia de por dónde se ejecutaría.
+    transport: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RouteChoice:
+    """Ruta **efectiva** de un rol para una petición: quién lo ejecutaría de verdad y por qué.
+
+    ``assigned`` es la asignación configurada (no cambia nunca); ``provider`` es quien ejecutaría
+    ahora, por capacidad **efectiva** y no solo declarada. Vacío si nadie puede.
+    """
+
+    assigned: str
+    provider: str = ""
+    model: str = ""
+    transport: str = ""
+    via_failover: bool = False
+    #: Por qué el asignado no sirvió (vacío si sirvió) o, si nadie sirve, cada rechazo.
+    reason: str = ""
+
+    @property
+    def available(self) -> bool:
+        """True si hay algún proveedor que pueda ejecutar el rol con lo que la petición exige."""
+        return bool(self.provider)
 
 
 #: Quien conoce el estado real de los proveedores (catálogo, sesión, transporte) juzga a un

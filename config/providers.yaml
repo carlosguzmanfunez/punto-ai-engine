@@ -71,3 +71,7 @@ failover:
     # BUILDER: primario deepseek (API de pago). Si se queda sin creditos, continua con Claude por su
     # cuenta (suscripcion), en el orden declarado.
     BUILDER: [anthropic]
+    # VISUAL_QA: primario anthropic (Claude Code, solo texto: sin imagenes efectivas). Cuando una
+    # peticion lleva imagenes se elige por capacidad EFECTIVA: Codex (cuenta ChatGPT) si su binario
+    # anuncia --image. Claude BUILDER sigue siendo solo texto y sin herramientas.
+    VISUAL_QA: [openai]

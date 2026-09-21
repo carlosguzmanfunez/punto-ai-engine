@@ -474,6 +474,43 @@ class ProviderFailoverEvidence(BaseModel):
     detail: str = Field(default="", max_length=300)
 
 
+class VisualShotEvidence(BaseModel):
+    """Captura real entregada a VISUAL_QA: de qué URL, a qué tamaño y su huella exacta."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(default="", max_length=300)
+    viewport: str = Field(default="", max_length=20)
+    sha256: str = Field(default="", max_length=64)
+    size_bytes: int = Field(default=0, ge=0)
+
+
+class VisualEvidenceRecord(BaseModel):
+    """Evidencia visual **gobernada** de un criterio de apariencia, ligada a la Task.
+
+    Dice qué criterio, qué capturas reales del estado renderizado (con huella), quién las evaluó
+    (proveedor, modelo y transporte **efectivos**), qué veredicto dio y sobre qué cambio se tomó
+    (``applied_digest``). ``request_id`` es la identidad de la Task. El veredicto es evidencia, no
+    autoridad: no aprueba nada por sí mismo.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: str = Field(default="", max_length=64)
+    claim: str = Field(default="", max_length=300)
+    #: ``PASS`` | ``FAIL`` | ``UNCLEAR``.
+    verdict: str = Field(default="", max_length=20)
+    observation: str = Field(default="", max_length=300)
+    provider: str = Field(default="", max_length=40)
+    model: str = Field(default="", max_length=120)
+    transport: str = Field(default="", max_length=40)
+    via_failover: bool = False
+    screenshots: tuple[VisualShotEvidence, ...] = Field(default=(), max_length=8)
+    #: Huella de los ficheros aplicados sobre los que se tomó la captura.
+    applied_digest: str = Field(default="", max_length=64)
+    captured_at: datetime = Field(default_factory=utc_now)
+
+
 class PellInfluence(BaseModel):
     """Cómo una experiencia recuperada cambió una decisión del ciclo, con efecto observable."""
 
@@ -555,6 +592,8 @@ class DevelopmentResult(BaseModel):
     capabilities: tuple[CapabilityEvidence, ...] = ()
     #: PROVIDER FAILOVER: sustituciones de proveedor de este ciclo (vacío si nadie falló).
     failovers: tuple[ProviderFailoverEvidence, ...] = Field(default=(), max_length=64)
+    #: Evidencia visual gobernada (capturas reales + veredicto de VISUAL_QA) de este ciclo.
+    visual_evidence: tuple[VisualEvidenceRecord, ...] = Field(default=(), max_length=32)
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
@@ -642,6 +681,7 @@ class DevelopmentResult(BaseModel):
             ],
             "functional_chain_result": self.functional_chain_result,
             "failovers": [item.model_dump(mode="json") for item in self.failovers],
+            "visual_evidence": [item.model_dump(mode="json") for item in self.visual_evidence],
         }
 
 
@@ -670,4 +710,6 @@ __all__ = [
     "ProviderFailoverEvidence",
     "RepositoryOperation",
     "ScopeExpansionRecord",
+    "VisualEvidenceRecord",
+    "VisualShotEvidence",
 ]

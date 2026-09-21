@@ -28,7 +28,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import yaml
 
@@ -130,6 +130,11 @@ class DevelopmentTarget:
     production_url: str = ""
     production_marker: str = ""
     publish_remote: str = "origin"
+    #: Rutas **de bucle local** de la aplicación renderizada que se capturan como evidencia visual
+    #: (por ejemplo ``http://localhost:3000/propiedades``). Sin ellas no hay captura: PUNTO no
+    #: adivina dónde corre la aplicación ni navega fuera de la máquina.
+    visual_routes: tuple[str, ...] = ()
+    visual_viewport: tuple[int, int] = (1280, 800)
     #: Autoridad persistente del destino (AP000-R01): qué operaciones están previamente
     #: autorizadas. Sin sobre explícito no hay autonomía (todo ``False``): fail closed.
     authority: TargetAuthority = field(default_factory=TargetAuthority)
@@ -402,6 +407,8 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         for name, raw in verification_raw.items()
     )
 
+    visual_routes, visual_viewport = _parse_visual(value.get("visual"), target_id=target_id)
+
     return DevelopmentTarget(
         target_id=target_id,
         repository=repository,
@@ -421,12 +428,55 @@ def target_from_mapping(target_id: str, value: Mapping[str, object]) -> Developm
         production_url=str(value.get("production_url", "")).strip(),
         production_marker=str(value.get("production_marker", "")).strip()[:200],
         publish_remote=str(value.get("publish_remote", "origin")).strip() or "origin",
+        visual_routes=visual_routes,
+        visual_viewport=visual_viewport,
         authority=_parse_authority(
             value.get("authority"),
             target_id=target_id,
             production_branch=str(value.get("production_branch", "")).strip(),
         ),
     )
+
+
+def _parse_visual(raw: Any, *, target_id: str) -> tuple[tuple[str, ...], tuple[int, int]]:
+    """Lee ``visual: {routes: [...], viewport: [ancho, alto]}`` con validación estricta.
+
+    Solo URLs ``http(s)`` de ``localhost``/``127.0.0.1``: la evidencia visual es de esta máquina.
+
+    Raises:
+        DevelopmentTargetError: si la forma es inválida, una URL sale del bucle local o el tamaño no
+            es razonable.
+    """
+    if raw is None:
+        return (), (1280, 800)
+    if not isinstance(raw, Mapping):
+        raise DevelopmentTargetError(f"visual de {target_id!r} debe ser un objeto")
+    from urllib.parse import urlparse
+
+    routes_raw = raw.get("routes", [])
+    if not isinstance(routes_raw, (list, tuple)) or len(routes_raw) > 4:
+        raise DevelopmentTargetError(f"visual.routes de {target_id!r} debe ser una lista de <= 4")
+    routes: list[str] = []
+    for item in routes_raw:
+        url = str(item).strip()
+        parsed = urlparse(url)
+        loopback = parsed.hostname in {"localhost", "127.0.0.1"}
+        if parsed.scheme not in {"http", "https"} or not loopback:
+            raise DevelopmentTargetError(
+                f"visual.routes de {target_id!r}: {url!r} no es una URL de bucle local"
+            )
+        routes.append(url)
+    viewport_raw = raw.get("viewport", [1280, 800])
+    if (
+        not isinstance(viewport_raw, (list, tuple))
+        or len(viewport_raw) != 2
+        or not all(isinstance(v, int) and not isinstance(v, bool) for v in viewport_raw)
+        or not (320 <= viewport_raw[0] <= 3840 and 320 <= viewport_raw[1] <= 2400)
+    ):
+        raise DevelopmentTargetError(
+            f"visual.viewport de {target_id!r} debe ser [ancho, alto] entre 320 y 3840 x 2400"
+        )
+    return tuple(routes), (int(viewport_raw[0]), int(viewport_raw[1]))
 
 
 def load_development_targets(

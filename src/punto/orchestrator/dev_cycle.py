@@ -49,6 +49,7 @@ from punto.acceptance import (
     RequestReference,
     SemanticClaim,
     VisualCapability,
+    VisualVerdict,
     capability_requirements,
     claims_result,
     extract_claims,
@@ -133,6 +134,8 @@ from punto.schemas.dev import (
     ProviderFailoverEvidence,
     RepositoryOperation,
     ScopeExpansionRecord,
+    VisualEvidenceRecord,
+    VisualShotEvidence,
 )
 from punto.schemas.enums import AuditResult
 from punto.schemas.execution import CommandResult
@@ -140,6 +143,12 @@ from punto.schemas.repair import RepairSnapshot
 from punto.security.deterministic import SECRET_PATTERNS
 from punto.skills import SkillActivation
 from punto.tools.errors import WorkspaceNotResolvedError, WorkspaceViolationError
+from punto.visualqa.dev_evidence import (
+    CaptureError,
+    HeadlessBrowserCapture,
+    ScreenshotCapture,
+    assess_visual_claims,
+)
 from punto.workflow.snapshots import FileRepairSnapshots
 from punto.workspace.repository import (
     GovernedRepository,
@@ -307,6 +316,9 @@ class DevelopmentCycle:
     audit: AuditLogger | None = None
     policy_engine: PolicyEngine | None = None
     actor: str = "punto-dev-cycle"
+    #: Captura de la aplicación renderizada para la evidencia visual (opcional). Sin ella, o sin
+    #: rutas visuales en el destino, no hay captura y el criterio sigue exigiendo evidencia.
+    visual_capture: ScreenshotCapture | None = None
     _snapshots: FileRepairSnapshots | None = field(default=None, init=False, repr=False)
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
     _last_provider: str = field(default="", init=False, repr=False)
@@ -325,6 +337,10 @@ class DevelopmentCycle:
     )
     #: PROVIDER FAILOVER: sustituciones de proveedor de la ejecución en curso.
     _failovers: list[ProviderFailoverEvidence] = field(
+        default_factory=list, init=False, repr=False
+    )
+    #: Evidencia visual gobernada de la ejecución en curso.
+    _visual_evidence: list[VisualEvidenceRecord] = field(
         default_factory=list, init=False, repr=False
     )
     _cumulative_resources: set[str] = field(default_factory=set, init=False, repr=False)
@@ -359,6 +375,7 @@ class DevelopmentCycle:
         self._plan_versions.clear()
         self._scope_expansions.clear()
         self._failovers.clear()
+        self._visual_evidence.clear()
         self._cumulative_resources.clear()
         self._created_paths.clear()
         self._functional_chain_result = ""
@@ -945,12 +962,14 @@ class DevelopmentCycle:
                 repository.changed_paths(), repository.read_text, datasets[0].path
             )
         visual = self._visual_capability()
+        verdicts = self._visual_verdicts(request, repository, target, visual)
         registros = verify_claims(
             self._claims,
             datasets=datasets,
             rendered=rendered,
             visual=visual,
             attestation=self._attestation,
+            visual_verdicts=verdicts,
         )
         resultado = claims_result(registros)
         self._log(
@@ -976,6 +995,120 @@ class DevelopmentCycle:
             if item.unsatisfied and item.required
         )
         return resultado, issues, registros
+
+    def _visual_verdicts(
+        self,
+        request: BuildRequest,
+        repository: GovernedRepository,
+        target: DevelopmentTarget,
+        visual: VisualCapability,
+    ) -> dict[str, VisualVerdict]:
+        """Produce evidencia visual real: captura la app renderizada y la evalúa VISUAL_QA.
+
+        Solo si hay capacidad **efectiva** de imágenes, un captor inyectado y rutas visuales
+        declaradas por el destino; en cualquier otro caso devuelve ``{}`` y el criterio sigue
+        exigiendo evidencia (nunca se simula). Un fallo de captura o de evaluación tampoco es un
+        PASS: se registra con su causa y el criterio queda sin verificar. La evidencia queda ligada
+        a la Task (``request_id``) y al cambio aplicado (``applied_digest``).
+        """
+        sentences = [
+            claim.sentence for claim in self._claims if claim.capability == "VISION"
+        ]
+        if not sentences or not visual.available or self.visual_capture is None:
+            return {}
+        if not target.visual_routes:
+            return {}
+        try:
+            shots = self.visual_capture.capture(target.visual_routes, target.visual_viewport)
+        except CaptureError as error:
+            self._log(
+                AuditEventType.DEV_VISUAL_CAPTURED,
+                "dev_visual_captured",
+                request,
+                {"captured": 0, "error": str(error)[:300]},
+                AuditResult.FAILURE,
+            )
+            return {}
+        self._log(
+            AuditEventType.DEV_VISUAL_CAPTURED,
+            "dev_visual_captured",
+            request,
+            {
+                "captured": len(shots),
+                "urls": [shot.url for shot in shots],
+                "sha256": [shot.sha256 for shot in shots],
+            },
+        )
+        assessment = assess_visual_claims(
+            self.router,
+            sentences,
+            shots,
+            request_id=str(request.request_id),
+            max_output_tokens=self.config.max_output_tokens,
+        )
+        self._log(
+            AuditEventType.DEV_VISUAL_ASSESSED,
+            "dev_visual_assessed",
+            request,
+            {
+                "performed": assessment.performed,
+                "provider": assessment.provider,
+                "model": assessment.model,
+                "transport": assessment.transport,
+                "via_failover": assessment.via_failover,
+                "verdicts": [item.verdict for item in assessment.verdicts],
+                "error": assessment.error,
+            },
+            AuditResult.SUCCESS if assessment.performed else AuditResult.FAILURE,
+        )
+        if not assessment.performed:
+            return {}
+        digest = hashlib.sha256(
+            "\n".join(
+                f"{path}:{sha}"
+                for path, sha in sorted(
+                    repository.file_hashes(repository.changed_paths()).items()
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        evidence_shots = tuple(
+            VisualShotEvidence(
+                url=shot.url[:300],
+                viewport=f"{shot.viewport[0]}x{shot.viewport[1]}",
+                sha256=shot.sha256,
+                size_bytes=len(shot.data),
+            )
+            for shot in assessment.shots
+        )
+        labels = tuple(f"{shot.url} {shot.sha256[:12]}" for shot in assessment.shots)
+        verdicts: dict[str, VisualVerdict] = {}
+        for index, sentence in enumerate(sentences, start=1):
+            found = assessment.verdict_for(index)
+            if found is None:
+                continue
+            verdicts[sentence] = VisualVerdict(
+                verdict=found.verdict,
+                observation=found.observation,
+                provider=assessment.provider,
+                model=assessment.model,
+                transport=assessment.transport,
+                screenshots=labels,
+            )
+            self._visual_evidence.append(
+                VisualEvidenceRecord(
+                    request_id=str(request.request_id),
+                    claim=sentence[:300],
+                    verdict=found.verdict,
+                    observation=found.observation,
+                    provider=assessment.provider,
+                    model=assessment.model,
+                    transport=assessment.transport,
+                    via_failover=assessment.via_failover,
+                    screenshots=evidence_shots,
+                    applied_digest=digest,
+                )
+            )
+        return verdicts
 
     @staticmethod
     def _claim_evidence(records: Sequence[ClaimRecord]) -> tuple[ClaimEvidence, ...]:
@@ -3399,6 +3532,7 @@ class DevelopmentCycle:
                 else self._capability_evidence(self._capabilities)
             ),
             failovers=tuple(self._failovers),
+            visual_evidence=tuple(self._visual_evidence),
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,
@@ -3942,6 +4076,7 @@ def default_development_cycle(
         store=ExperienceStore(),
         audit=audit,
         policy_engine=PolicyEngine.from_config(),
+        visual_capture=HeadlessBrowserCapture(),
     )
 
 

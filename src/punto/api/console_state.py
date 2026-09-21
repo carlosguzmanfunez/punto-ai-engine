@@ -190,6 +190,8 @@ class TaskAttempt(BaseModel):
     #: PROVIDER FAILOVER: resumen de las sustituciones del intento (``primario->sustituto:causa``).
     #: Vacío si el primario respondió. La identidad de la Task no cambia por un failover.
     failover: str = Field(default="", max_length=200)
+    #: VISUAL_QA EFECTIVO: resumen de la evidencia visual del intento (proveedor/transporte).
+    visual: str = Field(default="", max_length=120)
 
 
 class TaskRecord(BaseModel):

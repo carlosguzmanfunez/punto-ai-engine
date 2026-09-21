@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Final
@@ -953,6 +953,23 @@ class VisualCapability:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class VisualVerdict:
+    """Veredicto de VISUAL_QA sobre un criterio, con quién lo emitió y sobre qué capturas.
+
+    Es evidencia, no autoridad: ``PASS`` satisface el criterio solo porque una ruta con capacidad
+    **efectiva** de imágenes lo demostró sobre capturas reales; ``FAIL`` es reparable y ``UNCLEAR``
+    deja el criterio sin verificar.
+    """
+
+    verdict: str
+    observation: str = ""
+    provider: str = ""
+    model: str = ""
+    transport: str = ""
+    screenshots: tuple[str, ...] = ()
+
+
 def extract_claims(
     objective: str, criteria: Iterable[str] = ()
 ) -> tuple[SemanticClaim, ...]:
@@ -1010,6 +1027,7 @@ def verify_claims(
     rendered: tuple[bool, str] = (False, "no se comprobó el uso del dataset"),
     visual: VisualCapability | None = None,
     attestation: str = "",
+    visual_verdicts: Mapping[str, VisualVerdict] | None = None,
 ) -> tuple[ClaimRecord, ...]:
     """Mide cada afirmación con la evidencia disponible, sin inventar PASS.
 
@@ -1019,6 +1037,7 @@ def verify_claims(
         rendered: Si el código modificado usa el dataset real, con su evidencia.
         visual: Capacidad real del transporte de VISUAL_QA (imágenes).
         attestation: Atestación humana explícita de la apariencia visual, si existe.
+        visual_verdicts: Veredictos de VISUAL_QA por frase del criterio, si se evaluaron capturas.
 
     Returns:
         Un registro por afirmación con ``SATISFIED``, ``UNSATISFIED`` (reparable) o
@@ -1030,7 +1049,8 @@ def verify_claims(
         if claim.kind == ClaimKind.CARTOGRAPHIC_CORRECTNESS.value:
             records.append(_cartographic_record(claim, validos, rendered))
             continue
-        records.append(_visual_record(claim, visual, attestation))
+        verdict = (visual_verdicts or {}).get(claim.sentence)
+        records.append(_visual_record(claim, visual, attestation, verdict))
     return tuple(records)
 
 
@@ -1074,7 +1094,10 @@ def _cartographic_record(
 
 
 def _visual_record(
-    claim: SemanticClaim, visual: VisualCapability | None, attestation: str
+    claim: SemanticClaim,
+    visual: VisualCapability | None,
+    attestation: str,
+    verdict: VisualVerdict | None = None,
 ) -> ClaimRecord:
     """La apariencia se demuestra con imagen evaluada o con atestación humana, no por suposición.
 
@@ -1093,6 +1116,47 @@ def _visual_record(
             capability=CAPABILITY_VISION,
             capability_available=capability.available,
             capability_detail=capability.detail,
+        )
+    if verdict is not None and capability.available:
+        via = (
+            f"QA visual {verdict.provider}/{verdict.model} ({verdict.transport}) sobre "
+            f"{len(verdict.screenshots)} captura(s) [{', '.join(verdict.screenshots)}]"
+        )
+        if verdict.verdict == "PASS":
+            return ClaimRecord(
+                sentence=claim.sentence,
+                kind=claim.kind,
+                result="SATISFIED",
+                evidence=f"{via}: {verdict.observation}"[:600],
+                evidence_required=claim.evidence_required,
+                capability=CAPABILITY_VISION,
+                capability_available=True,
+                capability_detail=capability.detail,
+            )
+        if verdict.verdict == "FAIL":
+            return ClaimRecord(
+                sentence=claim.sentence,
+                kind=claim.kind,
+                result="UNSATISFIED",
+                evidence=f"{via} no lo demuestra: {verdict.observation}"[:600],
+                evidence_required=claim.evidence_required,
+                capability=CAPABILITY_VISION,
+                capability_available=True,
+                capability_detail=capability.detail,
+            )
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="NOT_VERIFIED",
+            evidence=f"{via} no pudo decidir: {verdict.observation}"[:600],
+            evidence_required=claim.evidence_required,
+            capability=CAPABILITY_VISION,
+            capability_available=True,
+            capability_detail=capability.detail,
+            remedy=(
+                "el criterio no es demostrable con una captura estática: aporta evidencia de la "
+                "interacción o una atestación humana explícita"
+            ),
         )
     if not capability.available:
         return ClaimRecord(

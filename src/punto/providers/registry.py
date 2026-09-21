@@ -85,7 +85,9 @@ ROLE_REQUIRED_CAPABILITY: Final[Mapping[ProviderRole, str]] = {
 
 #: Capacidades por defecto de los proveedores conocidos.
 DEFAULT_CAPABILITIES: Final[Mapping[str, tuple[str, ...]]] = {
-    "openai": ("TEXT", "CODING", "STRUCTURED_OUTPUT", "TOOL_USE"),
+    # VISION se declara aqui, pero NO basta: solo es efectiva si el transporte activo la ejecuta (en
+    # Codex, si el binario instalado anuncia --image; con la API, siempre).
+    "openai": ("TEXT", "CODING", "VISION", "STRUCTURED_OUTPUT", "TOOL_USE"),
     "deepseek": ("TEXT", "CODING", "STRUCTURED_OUTPUT"),
     "anthropic": ("TEXT", "CODING", "STRUCTURED_OUTPUT", "VISION"),
 }
@@ -588,11 +590,16 @@ class ProviderRegistry:
         except UnknownProviderError:
             return SubstituteVerdict(eligible=False, reason="no está en el catálogo")
         metered = descriptor.transport in (TransportKind.API.value, TransportKind.EXISTING.value)
+        transport = descriptor.transport
         if not descriptor.enabled:
-            return SubstituteVerdict(False, "deshabilitado en la configuración", metered)
+            return SubstituteVerdict(
+                False, "deshabilitado en la configuración", metered, transport=transport
+            )
         state = self.offline_status(descriptor)
         if state != STATUS_CONNECTED:
-            return SubstituteVerdict(False, f"no está conectado ({state})", metered)
+            return SubstituteVerdict(
+                False, f"no está conectado ({state})", metered, transport=transport
+            )
         required = [ROLE_REQUIRED_CAPABILITY[role]] if role in ROLE_REQUIRED_CAPABILITY else []
         if needs_vision:
             required.append(CAPABILITY_VISION)
@@ -600,7 +607,10 @@ class ProviderRegistry:
             client = self._factory_for(descriptor.provider)(descriptor.model)
         except Exception as error:  # sin cliente no hay transporte que acredite capacidades
             return SubstituteVerdict(
-                False, f"no se pudo comprobar el transporte ({type(error).__name__})", metered
+                False,
+                f"no se pudo comprobar el transporte ({type(error).__name__})",
+                metered,
+                transport=transport,
             )
         try:
             effective = effective_capability(
@@ -622,8 +632,10 @@ class ProviderRegistry:
                 f"sin capacidad efectiva {', '.join(missing)} en el transporte "
                 f"{descriptor.transport}",
                 metered,
+                capability_gap=True,
+                transport=transport,
             )
-        return SubstituteVerdict(eligible=True, metered=metered)
+        return SubstituteVerdict(eligible=True, metered=metered, transport=transport)
 
     def role_warnings(self, role: ProviderRole, provider: str) -> tuple[str, ...]:
         """Advertencias (no bloqueos) al asignar un proveedor a un rol."""

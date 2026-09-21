@@ -185,6 +185,8 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_CAUSAL_STAGNATION: "dev_resolution",
     AuditEventType.DEV_PROPOSAL_PREFLIGHT_FAILED: "dev_repair",
     AuditEventType.DEV_PROPOSAL_NORMALIZED: "dev_proposal",
+    AuditEventType.DEV_VISUAL_CAPTURED: "dev_visual",
+    AuditEventType.DEV_VISUAL_ASSESSED: "dev_visual",
     # --- Consola humana local + publicación a producción ----------------------
     AuditEventType.CONSOLE_TASK_CREATED: "console_task",
     AuditEventType.CONSOLE_TASK_STAGE_CHANGED: "console_task",

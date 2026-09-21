@@ -669,12 +669,15 @@ def test_12b_un_failover_sin_sustituto_se_audita_como_fallo() -> None:
 
 
 # --------------------------------------------------------------------------------- configuración
-def test_13_la_configuracion_del_repositorio_declara_failover_solo_para_builder() -> None:
-    """``providers.yaml`` es el único sitio donde se declara: BUILDER → anthropic, sin cargos."""
+def test_13_la_configuracion_del_repositorio_declara_failover_por_rol_explicito() -> None:
+    """``providers.yaml`` es el único sitio donde se declara: BUILDER y VISUAL_QA, sin cargos."""
     politica = load_provider_settings().failover
 
     assert politica is not None
-    assert dict(politica.roles) == {ProviderRole.BUILDER: ("anthropic",)}
+    assert dict(politica.roles) == {
+        ProviderRole.BUILDER: ("anthropic",),
+        ProviderRole.VISUAL_QA: ("openai",),
+    }
     assert politica.allow_metered is False
 
 

@@ -43,7 +43,8 @@ result = router.execute(ProviderRole.ARCHITECT, request)   # ProviderResult norm
 ```
 
 No hay `if role == BUILDER: llamar_deepseek()`: el rol solo se consulta en el mapa de asignaciones, y
-**no hay fallback automático** entre proveedores. Si el asignado falla, el resultado lleva su causa.
+**no hay fallback automático implícito** entre proveedores. Si el asignado falla, el resultado lleva su
+causa. La única excepción es el failover **explícito** por rol de [PROVIDER_FAILOVER_V0.md](PROVIDER_FAILOVER_V0.md).
 
 ## Roles
 

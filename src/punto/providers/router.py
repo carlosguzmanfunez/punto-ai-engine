@@ -10,9 +10,13 @@ Lo que este módulo **no** hace, y es lo importante:
 
 - **no** hay lógica del tipo ``if role == BUILDER: llamar_deepseek()``. El rol solo se consulta en
   el mapa de asignaciones;
-- **no** hay fallback automático entre proveedores. Si el asignado falla, el resultado es ``FAILED``
-  o ``UNAVAILABLE`` con su causa: cambiar de proveedor sin que nadie lo haya decidido convertiría
-  una auditoría en la respuesta del mismo modelo de siempre (ENGINE-5.2 ya fijó esa regla);
+- **no** hay fallback automático **implícito** entre proveedores. Si el asignado falla, el
+  resultado es ``FAILED`` o ``UNAVAILABLE`` con su causa: cambiar de proveedor sin que nadie lo
+  haya decidido convertiría una auditoría en la respuesta del mismo modelo de siempre (ENGINE-5.2
+  ya fijó esa regla). La única excepción es el **failover explícito** de
+  ``punto.providers.failover``: una política de configuración, por rol, solo ante indisponibilidad
+  operativa demostrable y solo hacia un proveedor conectado con las capacidades efectivas del
+  rol. Sin política, no hay failover;
 - **no** hay autoridad. Un ``ProviderResult`` es inteligencia externa no confiable: el router no
   conoce capacidades, ``ResourceSet``, Human Gate ni políticas, y no puede conceder nada.
 
@@ -25,7 +29,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import httpx
@@ -45,6 +49,8 @@ from punto.providers.base import (
 )
 from punto.providers.contract import (
     PROVIDER_OPENAI,
+    FailoverOutcome,
+    FailoverRecord,
     ProviderContractError,
     ProviderErrorKind,
     ProviderHealth,
@@ -54,6 +60,12 @@ from punto.providers.contract import (
     ProviderRole,
     ProviderStatus,
     parse_structured_output,
+)
+from punto.providers.failover import (
+    FailoverPolicy,
+    SubstituteEvaluator,
+    SubstituteVerdict,
+    failover_cause_of,
 )
 from punto.providers.openai import OpenAIError
 from punto.providers.transport import TransportError, provider_error_kind_of
@@ -133,6 +145,8 @@ class ProviderRouter:
         if models is not None:
             self._models.update(models)
         self._audit = audit
+        self._failover_policy: FailoverPolicy | None = None
+        self._failover_evaluator: SubstituteEvaluator | None = None
 
     # ------------------------------------------------------------------ registro
     def register_provider(
@@ -227,6 +241,23 @@ class ProviderRouter:
         """Asignación completa rol → proveedor, para la capa de configuración."""
         return {role.value: provider for role, provider in self._assignment.items()}
 
+    # ----------------------------------------------------------------- failover
+    def configure_failover(
+        self, policy: FailoverPolicy | None, evaluator: SubstituteEvaluator | None = None
+    ) -> None:
+        """Declara la política de failover (configuración de confianza) y quién juzga candidatos.
+
+        Sin ``evaluator`` **no** hay failover aunque haya política: el router no conoce sesiones,
+        transportes ni capacidades, y un sustituto que nadie pudo juzgar no se usa (falla cerrado).
+        ``None`` como política lo desactiva. La asignación de roles no se toca.
+        """
+        self._failover_policy = policy
+        self._failover_evaluator = evaluator
+
+    def failover_policy(self) -> FailoverPolicy | None:
+        """Política de failover vigente, o ``None`` si el failover está desactivado."""
+        return self._failover_policy
+
     # ---------------------------------------------------------------- ejecución
     def execute(
         self,
@@ -238,8 +269,11 @@ class ProviderRouter:
     ) -> ProviderResult:
         """Ejecuta una petición normalizada contra el proveedor asignado al rol.
 
-        No hay fallback: si el proveedor asignado falla, el resultado lleva su causa y su estado
-        normalizado. Un fallo del proveedor **no** rompe el motor: siempre vuelve un
+        Cada petición empieza por el proveedor **asignado**. Si falla y la política de failover
+        cubre el rol y el fallo es una indisponibilidad operativa demostrable, se intenta un
+        sustituto conectado con las capacidades efectivas del rol (ver
+        :mod:`punto.providers.failover`); en cualquier otro caso el resultado lleva su causa y su
+        estado normalizado. Un fallo del proveedor **no** rompe el motor: siempre vuelve un
         ``ProviderResult``.
 
         Args:
@@ -285,6 +319,35 @@ class ProviderRouter:
                 error_kind=ProviderErrorKind.CONFIG,
             )
 
+        primary = self._run_entry(
+            role,
+            request,
+            entry,
+            request_id=request_id,
+            json_schema=json_schema,
+            max_output_tokens=max_output_tokens,
+        )
+        return self._failover(
+            role,
+            request,
+            primary,
+            request_id=request_id,
+            json_schema=json_schema,
+            max_output_tokens=max_output_tokens,
+        )
+
+    def _run_entry(
+        self,
+        role: ProviderRole,
+        request: ProviderRequest,
+        entry: ProviderEntry,
+        *,
+        request_id: str,
+        json_schema: Mapping[str, object] | None,
+        max_output_tokens: int | None,
+    ) -> ProviderResult:
+        """Ejecuta la petición contra **un** proveedor concreto, sin failover."""
+        provider = entry.name
         self._audit_started(request_id=request_id, role=role, entry=entry)
         started = time.perf_counter()
         client: StructuredModelClient | None = None
@@ -356,7 +419,11 @@ class ProviderRouter:
             )
         except Exception as error:  # un fallo no clasificado del adaptador queda contenido
             # Un proveedor caído no puede romper PUNTO: cualquier fallo inesperado del adaptador se
-            # normaliza como UNKNOWN en vez de propagarse. El detalle se sanea igual que los demás.
+            # normaliza en vez de propagarse. Los errores propios de un adaptador que no heredan de
+            # ``ProviderError`` (los de DeepSeek son ``RuntimeError``) atraviesan el transporte sin
+            # traducirse: se clasifican por su clase y solo lo que no se reconoce queda ``UNKNOWN``.
+            # Antes se forzaba ``UNKNOWN`` aquí y un 402 (sin saldo) era indistinguible de cualquier
+            # otro fallo, así que el motor no podía saber que el proveedor no estaba operativo.
             return self._fail(
                 request_id=request_id,
                 role=role,
@@ -364,11 +431,156 @@ class ProviderRouter:
                 error=error,
                 started=started,
                 client=client,
-                kind=ProviderErrorKind.UNKNOWN,
             )
         finally:
             if client is not None:
                 _close_quietly(client)
+
+    def _failover(
+        self,
+        role: ProviderRole,
+        request: ProviderRequest,
+        primary: ProviderResult,
+        *,
+        request_id: str,
+        json_schema: Mapping[str, object] | None,
+        max_output_tokens: int | None,
+    ) -> ProviderResult:
+        """Intenta sustitutos **solo** si la política lo permite y el primario no estaba operativo.
+
+        Es la única puerta de failover del motor y es estrecha a propósito:
+
+        - sin política, o con un rol que la política no cubre, el resultado del primario se devuelve
+          tal cual;
+        - un fallo que no es indisponibilidad operativa demostrable (respuesta inválida, negativa,
+          timeout, error desconocido...) también: cambiar de proveedor escondería el problema;
+        - cada candidato lo juzga el evaluador (conectado + capacidades efectivas del rol) y un
+          proveedor de pago por uso solo entra si la política lo permite;
+        - cada proveedor se intenta como mucho una vez y el total está acotado: no hay bucles, y el
+          resultado de un sustituto nunca dispara otro failover si su fallo no es operativo;
+        - el sustituto recibe la **misma** petición del **mismo** rol: no hereda autoridad alguna.
+
+        Si nadie es compatible se falla cerrado con el fallo del primario y la causa explícita.
+        """
+        policy = self._failover_policy
+        if primary.ok or policy is None or not policy.covers(role):
+            return primary
+        cause = failover_cause_of(primary.error_kind)
+        if cause is None:
+            return primary
+        primary_kind = "" if primary.error_kind is None else primary.error_kind.value
+        records: list[FailoverRecord] = []
+        rejections: list[str] = []
+        last = primary
+        attempts = 0
+        for name, unusable in self._substitute_candidates(role, primary.provider, policy):
+            if attempts >= policy.max_substitutes:
+                break
+            if unusable:
+                rejections.append(f"{name}: {unusable}")
+                continue
+            verdict = self._judge_substitute(role, name, request.has_attachments)
+            if verdict.eligible and verdict.metered and not policy.allow_metered:
+                verdict = SubstituteVerdict(
+                    eligible=False,
+                    reason=(
+                        "transporte de pago por uso: la política no lo permite "
+                        "(allow_metered=false)"
+                    ),
+                    metered=True,
+                )
+            if not verdict.eligible:
+                rejections.append(f"{name}: {verdict.reason or 'no elegible'}")
+                continue
+            attempts += 1
+            entry = self._entries[name]
+            result = self._run_entry(
+                role,
+                request,
+                entry,
+                request_id=request_id,
+                json_schema=json_schema,
+                max_output_tokens=max_output_tokens,
+            )
+            record = FailoverRecord(
+                role=role,
+                primary_provider=primary.provider,
+                primary_model=primary.model,
+                primary_error_kind=primary_kind,
+                cause=cause.value,
+                substitute_provider=entry.name,
+                substitute_model=entry.model,
+                outcome=FailoverOutcome.SUCCEEDED if result.ok else FailoverOutcome.FAILED,
+                detail="" if result.ok else _clip(result.error),
+            )
+            records.append(record)
+            self._audit_failover(request_id, record)
+            last = result
+            if result.ok or failover_cause_of(result.error_kind) is None:
+                break
+        if attempts == 0:
+            detail = "; ".join(rejections) or "no hay otros proveedores registrados"
+            record = FailoverRecord(
+                role=role,
+                primary_provider=primary.provider,
+                primary_model=primary.model,
+                primary_error_kind=primary_kind,
+                cause=cause.value,
+                substitute_provider="",
+                substitute_model="",
+                outcome=FailoverOutcome.NO_COMPATIBLE_SUBSTITUTE,
+                detail=_clip(detail),
+            )
+            self._audit_failover(request_id, record)
+            return replace(
+                primary,
+                error=_clip(
+                    f"{primary.error} | failover de {role.value} ({cause.value}): ningún "
+                    f"sustituto compatible ({detail})",
+                    600,
+                ),
+                failovers=(record,),
+            )
+        return replace(last, failovers=tuple(records))
+
+    def _substitute_candidates(
+        self, role: ProviderRole, primary: str, policy: FailoverPolicy
+    ) -> tuple[tuple[str, str], ...]:
+        """Candidatos en orden determinista, sin el primario y sin repetidos.
+
+        Cada uno viaja con el motivo por el que ya no sirve (vacío si sigue en pie): un nombre
+        declarado en la política que no está registrado se explica en vez de desaparecer.
+        """
+        declared = policy.preferred(role)
+        names = declared if declared else tuple(self._entries)
+        seen: set[str] = {primary}
+        candidates: list[tuple[str, str]] = []
+        for raw in names:
+            name = raw.strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            candidates.append(
+                (name, "" if name in self._entries else "no está registrado en el router")
+            )
+        return tuple(candidates)
+
+    def _judge_substitute(
+        self, role: ProviderRole, provider: str, needs_vision: bool
+    ) -> SubstituteVerdict:
+        """Veredicto del evaluador sobre un candidato; sin evaluador o si falla, no es elegible."""
+        evaluator = self._failover_evaluator
+        if evaluator is None:
+            return SubstituteVerdict(
+                eligible=False,
+                reason="no hay evaluador: no se puede acreditar conexión ni capacidades efectivas",
+            )
+        try:
+            return evaluator(role, provider, needs_vision)
+        except Exception as error:  # un evaluador roto nunca habilita a un sustituto
+            return SubstituteVerdict(
+                eligible=False, reason=f"no se pudo evaluar ({type(error).__name__})"
+            )
 
     def _invoke(
         self,
@@ -433,7 +645,12 @@ class ProviderRouter:
         resolved = kind if kind is not None else classify_provider_error(error)
         status = (
             ProviderStatus.UNAVAILABLE
-            if resolved in (ProviderErrorKind.UNAVAILABLE, ProviderErrorKind.AUTHENTICATION)
+            if resolved
+            in (
+                ProviderErrorKind.UNAVAILABLE,
+                ProviderErrorKind.AUTHENTICATION,
+                ProviderErrorKind.QUOTA_EXHAUSTED,
+            )
             else ProviderStatus.FAILED
         )
         result = ProviderResult(
@@ -577,6 +794,12 @@ class ProviderRouter:
             usage=result.usage,
         )
 
+    def _audit_failover(self, request_id: str, record: FailoverRecord) -> None:
+        """Registra la sustitución de proveedor con su causa y su desenlace."""
+        if self._audit is None:
+            return
+        self._audit.log_provider_failover(request_id=request_id, record=record.as_dict())
+
     def _audit_failed(self, result: ProviderResult) -> None:
         """Registra el fallo normalizado de una petición."""
         if self._audit is None:
@@ -618,8 +841,18 @@ def classify_provider_error(error: BaseException) -> ProviderErrorKind:
     name = type(error).__name__
     if "Timeout" in name:
         return ProviderErrorKind.TIMEOUT
+    # Sin créditos/saldo/cuota (402 de DeepSeek): antes caía en UNKNOWN y era indistinguible de un
+    # fallo cualquiera. Se decide por la clase que declara el adaptador, nunca por el texto.
+    if any(marker in name for marker in ("Balance", "Quota", "Credit")):
+        return ProviderErrorKind.QUOTA_EXHAUSTED
     if "RateLimit" in name:
         return ProviderErrorKind.RATE_LIMIT
+    # 401 del adaptador de DeepSeek: sin credencial válida es «desconectado».
+    if "AuthError" in name or "Authentication" in name:
+        return ProviderErrorKind.AUTHENTICATION
+    # 5xx tras agotar los reintentos: el proveedor no está sirviendo.
+    if "ServerError" in name:
+        return ProviderErrorKind.UNAVAILABLE
     if "Transport" in name:
         return ProviderErrorKind.NETWORK
     if "InvalidResponse" in name or "Truncated" in name:
@@ -670,6 +903,11 @@ def _transport_factory(
         return transport_client(provider, model=model, settings=settings, runner=runner)
 
     return _build
+
+
+def _clip(text: str, limit: int = 300) -> str:
+    """Acota un texto que viaja en la constancia de un failover."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _redact_without_client(text: str) -> str:

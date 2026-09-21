@@ -18,6 +18,7 @@ Reglas que este módulo hace cumplir:
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from punto.providers.contract import (
     ProviderHealthStatus,
     ProviderRole,
 )
+from punto.providers.failover import SubstituteVerdict
 from punto.providers.router import ProviderRouter
 from punto.providers.secrets import SecretStore, SecretStoreError, default_secrets_path
 from punto.providers.settings import ProviderSettings, load_provider_settings
@@ -364,6 +366,9 @@ class ProviderRegistry:
                 router.assign_role(ProviderRole(str(role_name)), str(provider))
             except (ValueError, ProviderRouteError):
                 continue
+        # Failover explícito (providers.yaml): el router conserva la asignación y solo consulta
+        # este evaluador para saber si un candidato está conectado y puede hacer el trabajo.
+        router.configure_failover(self.settings().failover, self._judge_substitute)
         self.router = router
 
     def router_instance(self) -> ProviderRouter:
@@ -564,6 +569,61 @@ class ProviderRegistry:
         finally:
             transport.close()
         return usage.as_dict()
+
+    def _judge_substitute(
+        self, role: ProviderRole, provider: str, needs_vision: bool
+    ) -> SubstituteVerdict:
+        """¿Puede ``provider`` hacer el trabajo de ``role`` ahora mismo? (failover, sin red).
+
+        Exige, todo a la vez: proveedor del catálogo y habilitado, estado real ``CONNECTED`` (sesión
+        o credencial acreditada) y la capacidad que el rol necesita **efectiva** en su transporte
+        activo —configurada ∩ transporte ∩ disponibilidad—, no solo declarada. Una capacidad
+        declarada que el transporte no ejecuta no cuenta. El veredicto no concede nada: solo dice si
+        el candidato puede ser elegido por el router.
+        """
+        from punto.providers.effective import CAPABILITY_VISION, effective_capability
+
+        try:
+            descriptor = self.descriptor(provider)
+        except UnknownProviderError:
+            return SubstituteVerdict(eligible=False, reason="no está en el catálogo")
+        metered = descriptor.transport in (TransportKind.API.value, TransportKind.EXISTING.value)
+        if not descriptor.enabled:
+            return SubstituteVerdict(False, "deshabilitado en la configuración", metered)
+        state = self.offline_status(descriptor)
+        if state != STATUS_CONNECTED:
+            return SubstituteVerdict(False, f"no está conectado ({state})", metered)
+        required = [ROLE_REQUIRED_CAPABILITY[role]] if role in ROLE_REQUIRED_CAPABILITY else []
+        if needs_vision:
+            required.append(CAPABILITY_VISION)
+        try:
+            client = self._factory_for(descriptor.provider)(descriptor.model)
+        except Exception as error:  # sin cliente no hay transporte que acredite capacidades
+            return SubstituteVerdict(
+                False, f"no se pudo comprobar el transporte ({type(error).__name__})", metered
+            )
+        try:
+            effective = effective_capability(
+                descriptor.provider,
+                model=descriptor.model,
+                role=role.value,
+                configured=descriptor.capabilities,
+                client=client,
+            )
+        finally:
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                with contextlib.suppress(Exception):  # cerrar no cambia el veredicto
+                    closer()
+        missing = [item for item in required if not effective.has(item)]
+        if missing:
+            return SubstituteVerdict(
+                False,
+                f"sin capacidad efectiva {', '.join(missing)} en el transporte "
+                f"{descriptor.transport}",
+                metered,
+            )
+        return SubstituteVerdict(eligible=True, metered=metered)
 
     def role_warnings(self, role: ProviderRole, provider: str) -> tuple[str, ...]:
         """Advertencias (no bloqueos) al asignar un proveedor a un rol."""

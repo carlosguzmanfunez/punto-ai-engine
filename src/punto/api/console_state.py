@@ -185,6 +185,11 @@ class TaskAttempt(BaseModel):
     error_kind: str = Field(default="", max_length=40)
     commit_sha: str = Field(default="", max_length=64)
     duration_ms: int | None = Field(default=None, ge=0)
+    #: Proveedor que produjo la última respuesta del ciclo en este intento.
+    provider: str = Field(default="", max_length=40)
+    #: PROVIDER FAILOVER: resumen de las sustituciones del intento (``primario->sustituto:causa``).
+    #: Vacío si el primario respondió. La identidad de la Task no cambia por un failover.
+    failover: str = Field(default="", max_length=200)
 
 
 class TaskRecord(BaseModel):

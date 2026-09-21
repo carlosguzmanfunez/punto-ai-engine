@@ -248,6 +248,9 @@ class AuditEventType(StrEnum):
     PROVIDER_REQUEST_COMPLETED = "PROVIDER_REQUEST_COMPLETED"
     #: MULTI-PROVIDER v0: el proveedor falló; el fallo queda normalizado y contenido.
     PROVIDER_REQUEST_FAILED = "PROVIDER_REQUEST_FAILED"
+    #: PROVIDER FAILOVER: el primario de un rol no estaba operativo y se sustituyó (o no hubo
+    #: sustituto compatible). Lleva causa, primario, sustituto y desenlace; nunca contenido.
+    PROVIDER_FAILOVER = "PROVIDER_FAILOVER"
     #: DB AUTHORITY v0: el controlador comprobó la conectividad con el destino autorizado.
     DB_CONNECT_CHECKED = "DB_CONNECT_CHECKED"
     #: DB AUTHORITY v0: el controlador leyó el esquema real de la base de datos.

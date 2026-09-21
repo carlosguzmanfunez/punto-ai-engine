@@ -452,6 +452,28 @@ class CapabilityEvidence(BaseModel):
     remedy: str = Field(default="", max_length=300)
 
 
+class ProviderFailoverEvidence(BaseModel):
+    """Sustitución de proveedor que hubo que hacer durante el ciclo (PROVIDER FAILOVER).
+
+    Es la constancia **persistida con la Task** de que el primario de un rol no estaba operativo,
+    por qué, quién lo sustituyó y cómo acabó. No concede nada: el sustituto hizo el mismo trabajo
+    del mismo rol bajo las mismas reglas, y todo lo que produjo pasó por las mismas validaciones.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: str = Field(default="", max_length=40)
+    primary_provider: str = Field(default="", max_length=40)
+    primary_model: str = Field(default="", max_length=120)
+    primary_error_kind: str = Field(default="", max_length=40)
+    cause: str = Field(default="", max_length=40)
+    substitute_provider: str = Field(default="", max_length=40)
+    substitute_model: str = Field(default="", max_length=120)
+    #: ``SUCCEEDED`` | ``FAILED`` | ``NO_COMPATIBLE_SUBSTITUTE``.
+    outcome: str = Field(default="", max_length=40)
+    detail: str = Field(default="", max_length=300)
+
+
 class PellInfluence(BaseModel):
     """Cómo una experiencia recuperada cambió una decisión del ciclo, con efecto observable."""
 
@@ -531,6 +553,8 @@ class DevelopmentResult(BaseModel):
     claims_result: str = Field(default="NONE", max_length=20)
     #: AP000-OBS-03-R1: capacidades efectivas que exigían las afirmaciones, comprobadas al empezar.
     capabilities: tuple[CapabilityEvidence, ...] = ()
+    #: PROVIDER FAILOVER: sustituciones de proveedor de este ciclo (vacío si nadie falló).
+    failovers: tuple[ProviderFailoverEvidence, ...] = Field(default=(), max_length=64)
     functional_chain_result: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=40)
     model: str = Field(default="", max_length=120)
@@ -617,6 +641,7 @@ class DevelopmentResult(BaseModel):
                 item.model_dump(mode="json") for item in self.authority_decisions
             ],
             "functional_chain_result": self.functional_chain_result,
+            "failovers": [item.model_dump(mode="json") for item in self.failovers],
         }
 
 
@@ -642,6 +667,7 @@ __all__ = [
     "PellInfluence",
     "PlanRevisionRecord",
     "PlanStatus",
+    "ProviderFailoverEvidence",
     "RepositoryOperation",
     "ScopeExpansionRecord",
 ]

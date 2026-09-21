@@ -98,7 +98,9 @@ conserva porque no es lo mismo que «no se sabe qué pasó».
 - **Saneado**: todo texto que sale de un transporte (contenido y error) pasa por un borrado de
   patrones de credencial antes de llegar a un resultado, un evento o un log.
 - **Sin fallback**: un límite agotado o un fallo del transporte de suscripción **no** cambia a la API
-  de pago. Eso podría generar cargos; el cambio de transporte es configuración explícita.
+  de pago. Eso podría generar cargos; el cambio de transporte es configuración explícita. El failover
+  entre **proveedores** (`docs/PROVIDER_FAILOVER_V0.md`) tampoco usa un sustituto de pago por uso salvo
+  `allow_metered: true`.
 
 ## Configuración
 

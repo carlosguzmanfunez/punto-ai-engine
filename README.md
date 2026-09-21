@@ -2352,7 +2352,9 @@ La regla más importante de la fase:
 
 Un fallback automático convertiría la auditoría cruzada en una auditoría del mismo modelo, que
 es exactamente lo que deja de tener valor. Si algún día hace falta un fallback, tendrá que ser
-una política explícita de CAMUS, no una conveniencia del cliente.
+una política explícita de CAMUS, no una conveniencia del cliente. Esa política existe desde
+**PROVIDER FAILOVER v0** ([docs/PROVIDER_FAILOVER_V0.md](docs/PROVIDER_FAILOVER_V0.md)): declarada en
+`config/providers.yaml`, por rol y solo ante indisponibilidad operativa demostrable del primario.
 
 ### Auditoría cruzada
 
@@ -2452,7 +2454,8 @@ Los gates vivos están endurecidos para no poder confundir un bloqueo con un éx
 - Los tres roles visuales están **preparados** (ruta declarada) pero **sin runner**: sus
   interfaces llegarán en ENGINE-5.3.
 - No hay routing autónomo ni bucle de reparación: eso es ENGINE-6.
-- Sin fallback entre proveedores, por diseño. Un proveedor caído bloquea; no se sustituye.
+- Sin fallback **implícito** entre proveedores, por diseño. Un proveedor caído bloquea salvo que el rol
+  declare failover explícito (`failover:` en `config/providers.yaml`, ver `docs/PROVIDER_FAILOVER_V0.md`).
 
 ---
 

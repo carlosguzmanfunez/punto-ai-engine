@@ -11,9 +11,18 @@
 # Modelo = configuracion. Proveedor = adaptador. Transporte = camino. Rol = asignacion.
 # Cambiar cualquiera de los cuatro NO requiere tocar el motor.
 #
-# SIN FALLBACK AUTOMATICO: si el transporte de suscripcion agota su limite o falla, la peticion
+# SIN FALLBACK IMPLICITO: si el transporte de suscripcion agota su limite o falla, la peticion
 # vuelve con su fallo normalizado. NO se cambia a la API de pago por iniciativa del motor; eso
 # podria generar cargos, asi que es una decision de configuracion explicita.
+#
+# FAILOVER EXPLICITO (seccion `failover`, mas abajo): es la unica excepcion y solo existe si este
+# fichero la declara. Un rol con failover puede continuar con OTRO proveedor cuando el primario no
+# esta operativo de forma demostrable (creditos/cuota, limite de tasa, proveedor no disponible o sin
+# sesion) y el sustituto esta CONNECTED con las capacidades EFECTIVAS del rol. El sustituto hace el
+# mismo trabajo del mismo rol y NO hereda autoridad: Human Gates, Authority Envelope, alcance y
+# verificaciones no cambian. Un error del proyecto o una respuesta incorrecta del proveedor NO
+# dispara failover. El primario sigue siendo la asignacion de `roles` y vuelve a responder en cuanto
+# se recupera. `allow_metered: false` impide sustitutos de pago por uso (API con clave).
 #
 # CREDENCIALES: no viven aqui. La sesion de Codex y la de Claude Code las administran sus propios
 # clientes oficiales (`codex login`, `claude auth login`); la API lee su clave del entorno
@@ -54,3 +63,11 @@ roles:
   ARCHITECT: openai
   BUILDER: deepseek
   VISUAL_QA: anthropic
+
+failover:
+  allow_metered: false
+  max_substitutes: 2
+  roles:
+    # BUILDER: primario deepseek (API de pago). Si se queda sin creditos, continua con Claude por su
+    # cuenta (suscripcion), en el orden declarado.
+    BUILDER: [anthropic]

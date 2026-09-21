@@ -80,6 +80,10 @@ class ProviderErrorKind(StrEnum):
     #: ``NETWORK`` (no hubo red) y de ``UNKNOWN`` (sí se sabe qué pasó): el cliente oficial terminó
     #: con error y su salida normalizada se conserva en el detalle.
     PROCESS_FAILED = "PROCESS_FAILED"
+    #: PROVIDER FAILOVER: el proveedor rechazó la petición porque la cuenta no tiene créditos, saldo
+    #: o cuota (402 en DeepSeek). Es distinto de ``RATE_LIMIT`` (espera y reintenta) y de
+    #: ``UNKNOWN``: es una indisponibilidad **operativa** demostrable, no un fallo del contenido.
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
     UNKNOWN = "UNKNOWN"
 
 
@@ -151,6 +155,51 @@ def make_request(
     )
 
 
+class FailoverOutcome(StrEnum):
+    """Desenlace de un intento de failover."""
+
+    #: El sustituto respondió con éxito.
+    SUCCEEDED = "SUCCEEDED"
+    #: El sustituto se intentó y también falló.
+    FAILED = "FAILED"
+    #: Ningún proveedor conectado y con las capacidades efectivas requeridas: se falla cerrado.
+    NO_COMPATIBLE_SUBSTITUTE = "NO_COMPATIBLE_SUBSTITUTE"
+
+
+@dataclass(frozen=True, slots=True)
+class FailoverRecord:
+    """Constancia de una sustitución de proveedor dentro de **una** petición.
+
+    Dice quién era el primario, por qué no pudo (causa operativa demostrable), quién lo sustituyó y
+    cómo acabó. No lleva contenido, ni prompt, ni credenciales, y **no concede nada**: el sustituto
+    ejecuta el mismo trabajo del mismo rol bajo las mismas reglas.
+    """
+
+    role: ProviderRole
+    primary_provider: str
+    primary_model: str
+    primary_error_kind: str
+    cause: str
+    substitute_provider: str
+    substitute_model: str
+    outcome: FailoverOutcome
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        """Vista serializable."""
+        return {
+            "role": self.role.value,
+            "primary_provider": self.primary_provider,
+            "primary_model": self.primary_model,
+            "primary_error_kind": self.primary_error_kind,
+            "cause": self.cause,
+            "substitute_provider": self.substitute_provider,
+            "substitute_model": self.substitute_model,
+            "outcome": self.outcome.value,
+            "detail": self.detail,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderResult:
     """Resultado normalizado: el único formato en el que ENGINE ve lo que dijo un proveedor.
@@ -172,6 +221,9 @@ class ProviderResult:
     duration_ms: int = 0
     finish_reason: str = ""
     transport_retries: int = 0
+    #: Sustituciones de proveedor que hubo que hacer para producir este resultado (vacío si el
+    #: primario respondió). ``provider`` es siempre quien produjo **este** resultado.
+    failovers: tuple[FailoverRecord, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -196,6 +248,7 @@ class ProviderResult:
             "duration_ms": self.duration_ms,
             "finish_reason": self.finish_reason,
             "transport_retries": self.transport_retries,
+            "failovers": [record.as_dict() for record in self.failovers],
             "trusted": False,
         }
 
@@ -245,6 +298,8 @@ __all__ = [
     "MAX_METADATA_CHARS",
     "MAX_METADATA_ITEMS",
     "PROVIDER_OPENAI",
+    "FailoverOutcome",
+    "FailoverRecord",
     "ProviderContractError",
     "ProviderErrorKind",
     "ProviderHealth",

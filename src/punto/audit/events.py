@@ -133,6 +133,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.PROVIDER_REQUEST_STARTED: "provider_request",
     AuditEventType.PROVIDER_REQUEST_COMPLETED: "provider_request",
     AuditEventType.PROVIDER_REQUEST_FAILED: "provider_request",
+    AuditEventType.PROVIDER_FAILOVER: "provider_failover",
     # --- Database authority (DB AUTHORITY v0) ---------------------------------
     #: Se registran sobre el ``project_id``, de modo que ``AuditLogger.by_resource(project_id)``
     #: reconstruye la operación de base de datos completa. Nunca llevan el DSN.

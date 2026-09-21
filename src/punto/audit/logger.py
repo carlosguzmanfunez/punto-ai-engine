@@ -4368,6 +4368,30 @@ class AuditLogger:
             actor=actor,
         )
 
+    def log_provider_failover(
+        self,
+        *,
+        request_id: str,
+        record: Mapping[str, Any],
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Registra la sustitución de un proveedor por indisponibilidad operativa (FAILOVER).
+
+        Se indexa por ``request_id`` —que es la identidad de la Task— para que la traza de la Task
+        muestre quién era el primario, por qué no pudo, quién lo sustituyó y cómo acabó. Un
+        ``NO_COMPATIBLE_SUBSTITUTE`` es un fallo cerrado, no un éxito. Nunca lleva prompt, contenido
+        ni credenciales: los motivos pasan por el saneado de los eventos de la fase.
+        """
+        outcome = str(record.get("outcome", ""))
+        return self._log_redacted(
+            AuditEventType.PROVIDER_FAILOVER,
+            "provider_failover",
+            resource_id=request_id,
+            metadata={**record, "authority": "sin autoridad adicional: mismo rol, mismas reglas"},
+            result=AuditResult.SUCCESS if outcome == "SUCCEEDED" else AuditResult.FAILURE,
+            actor=actor,
+        )
+
     # ------------------------------------------------------------------ database
     def _log_database(
         self,

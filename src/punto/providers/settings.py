@@ -20,6 +20,7 @@ from typing import Final
 
 from punto.policy.config_loader import ConfigError, find_config_dir, load_yaml_file
 from punto.providers.contract import ProviderRole
+from punto.providers.failover import DEFAULT_MAX_SUBSTITUTES, FailoverPolicy
 from punto.providers.router import (
     DEFAULT_PROVIDER_MODELS,
     DEFAULT_ROLE_ASSIGNMENT,
@@ -72,6 +73,8 @@ class ProviderSettings:
     assignment: Mapping[ProviderRole, str] = field(default_factory=dict)
     transports: Mapping[str, str] = field(default_factory=dict)
     auth_modes: Mapping[str, str] = field(default_factory=dict)
+    #: Política de failover declarada en ``providers.yaml``; ``None`` = sin failover (por defecto).
+    failover: FailoverPolicy | None = None
 
     def model_of(self, provider: str) -> str:
         """Modelo configurado de un proveedor, o el conocido por el motor."""
@@ -103,6 +106,17 @@ class ProviderSettings:
             "roles": {role.value: provider for role, provider in self.assignment.items()},
             "transports": {name: self.transport_of(name) for name in self.providers},
             "auth_modes": {name: self.auth_mode_of(name) for name in self.providers},
+            "failover": (
+                None
+                if self.failover is None
+                else {
+                    "roles": {
+                        role.value: list(subs) for role, subs in self.failover.roles.items()
+                    },
+                    "max_substitutes": self.failover.max_substitutes,
+                    "allow_metered": self.failover.allow_metered,
+                }
+            ),
         }
 
 
@@ -217,6 +231,7 @@ def load_provider_settings(
     assignment = dict(base.assignment)
     transports = dict(base.transports)
     auth_modes = dict(base.auth_modes)
+    failover: FailoverPolicy | None = base.failover
 
     if path is not None and path.is_file():
         raw = load_yaml_file(path)
@@ -224,6 +239,7 @@ def load_provider_settings(
             raw, providers, enabled, transports, auth_modes
         )
         assignment = _read_roles(raw, assignment)
+        failover = _read_failover(raw)
 
     for name in KNOWN_PROVIDERS:
         override = env.get(f"PUNTO_{name.upper()}{PROVIDER_MODEL_ENV_SUFFIX}", "").strip()
@@ -254,6 +270,7 @@ def load_provider_settings(
         assignment=assignment,
         transports=transports,
         auth_modes=auth_modes,
+        failover=failover,
     )
 
 
@@ -309,6 +326,65 @@ def _read_providers(
         if auth_mode:
             auth_modes[key] = auth_mode
     return providers, enabled, transports, auth_modes
+
+
+def _read_failover(raw: Mapping[str, object]) -> FailoverPolicy | None:
+    """Lee la sección ``failover`` del fichero: roles con sustitutos, tope y política de coste.
+
+    Forma::
+
+        failover:
+          allow_metered: false        # sustitutos de pago por uso (API con clave): no por defecto
+          max_substitutes: 2
+          roles:
+            BUILDER: [anthropic]      # orden de preferencia; lista vacía = cualquier proveedor
+
+    La sección es **opcional**: sin ella no hay failover. Es configuración de confianza: solo este
+    fichero la declara, ni una petición ni un proveedor ni una Task pueden ampliarla.
+
+    Raises:
+        ProviderRouteError: si la forma es inválida, el rol o el proveedor no existen o el tope
+            no es un entero positivo. Una política mal escrita no se ignora en silencio.
+    """
+    section = raw.get("failover")
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise ProviderRouteError("la sección 'failover' debe ser un mapa")
+    unknown = sorted(set(section) - {"roles", "max_substitutes", "allow_metered"})
+    if unknown:
+        raise ProviderRouteError(f"claves desconocidas en 'failover': {', '.join(unknown)}")
+    allow_metered = section.get("allow_metered", False)
+    if not isinstance(allow_metered, bool):
+        raise ProviderRouteError("failover.allow_metered debe ser booleano")
+    maximum = section.get("max_substitutes", DEFAULT_MAX_SUBSTITUTES)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ProviderRouteError("failover.max_substitutes debe ser un entero positivo")
+    roles_section = section.get("roles", {})
+    if roles_section is None:
+        roles_section = {}
+    if not isinstance(roles_section, Mapping):
+        raise ProviderRouteError("failover.roles debe ser un mapa rol -> lista de proveedores")
+    roles: dict[ProviderRole, tuple[str, ...]] = {}
+    for role_name, substitutes in roles_section.items():
+        try:
+            role = ProviderRole(str(role_name))
+        except ValueError as exc:
+            known = ", ".join(item.value for item in ProviderRole)
+            raise ProviderRouteError(
+                f"rol desconocido en failover.roles: {role_name!r}. Conocidos: {known}"
+            ) from exc
+        if substitutes is None:
+            substitutes = []
+        if not isinstance(substitutes, (list, tuple)):
+            raise ProviderRouteError(f"failover.roles.{role.value} debe ser una lista")
+        roles[role] = tuple(
+            _validate_provider(str(name), source=f"failover.roles.{role.value}")
+            for name in substitutes
+        )
+    if not roles:
+        return None
+    return FailoverPolicy(roles=roles, max_substitutes=maximum, allow_metered=allow_metered)
 
 
 def _validate_transport(name: str, *, key: str) -> str:

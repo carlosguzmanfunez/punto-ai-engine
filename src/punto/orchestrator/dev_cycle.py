@@ -100,6 +100,7 @@ from punto.policy.envelope import (
 )
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.contract import (
+    FailoverOutcome,
     ProviderRequest,
     ProviderResult,
     ProviderRole,
@@ -128,6 +129,7 @@ from punto.schemas.dev import (
     PellInfluence,
     PlanRevisionRecord,
     PlanStatus,
+    ProviderFailoverEvidence,
     RepositoryOperation,
     ScopeExpansionRecord,
 )
@@ -320,6 +322,10 @@ class DevelopmentCycle:
     _scope_expansions: list[ScopeExpansionRecord] = field(
         default_factory=list, init=False, repr=False
     )
+    #: PROVIDER FAILOVER: sustituciones de proveedor de la ejecución en curso.
+    _failovers: list[ProviderFailoverEvidence] = field(
+        default_factory=list, init=False, repr=False
+    )
     _cumulative_resources: set[str] = field(default_factory=set, init=False, repr=False)
     _created_paths: set[str] = field(default_factory=set, init=False, repr=False)
     _final_plan: DevelopmentPlan | None = field(default=None, init=False, repr=False)
@@ -351,6 +357,7 @@ class DevelopmentCycle:
         self._risk_envelopes.clear()
         self._plan_versions.clear()
         self._scope_expansions.clear()
+        self._failovers.clear()
         self._cumulative_resources.clear()
         self._created_paths.clear()
         self._functional_chain_result = ""
@@ -3175,7 +3182,50 @@ class DevelopmentCycle:
         )
         self._last_provider = result.provider or self._last_provider
         self._last_model = result.model or self._last_model
+        self._note_failover(role, request, result, phase=phase)
         return result
+
+    def _note_failover(
+        self, role: ProviderRole, request: BuildRequest, result: ProviderResult, *, phase: str
+    ) -> None:
+        """Deja constancia, en la traza de la Task, de una sustitución de proveedor.
+
+        El router decide y ejecuta el failover; el ciclo solo lo **registra** (auditoría por
+        ``request_id`` y evidencia persistida en el resultado). No cambia el flujo: lo que produjo
+        el sustituto sigue siendo una propuesta que pasa por las mismas validaciones, autoridad y
+        verificaciones que la del primario.
+        """
+        for record in result.failovers:
+            evidence = ProviderFailoverEvidence(
+                role=record.role.value,
+                primary_provider=record.primary_provider,
+                primary_model=record.primary_model,
+                primary_error_kind=record.primary_error_kind,
+                cause=record.cause,
+                substitute_provider=record.substitute_provider,
+                substitute_model=record.substitute_model,
+                outcome=record.outcome.value,
+                detail=record.detail[:300],
+            )
+            self._failovers.append(evidence)
+            self._log(
+                AuditEventType.BUILD_PROVIDER_SELECTED,
+                "dev_provider_failover",
+                request,
+                {
+                    "role": role.value,
+                    "provider": record.substitute_provider or record.primary_provider,
+                    "fallback": record.outcome is not FailoverOutcome.NO_COMPATIBLE_SUBSTITUTE,
+                    "primary_provider": record.primary_provider,
+                    "cause": record.cause,
+                    "outcome": record.outcome.value,
+                    "phase": phase,
+                    "authority": "sin autoridad adicional: mismo rol, mismas reglas",
+                },
+                AuditResult.SUCCESS
+                if record.outcome is FailoverOutcome.SUCCEEDED
+                else AuditResult.FAILURE,
+            )
 
     # ------------------------------------------------------------- resultado
     def _outcome(self, **kwargs: Any) -> dict[str, Any]:
@@ -3330,6 +3380,7 @@ class DevelopmentCycle:
                 if capabilities is not None
                 else self._capability_evidence(self._capabilities)
             ),
+            failovers=tuple(self._failovers),
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,

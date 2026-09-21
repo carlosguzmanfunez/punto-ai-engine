@@ -341,6 +341,9 @@ class ConsoleTask:
                 }
                 for item in result.claims[:MAX_EVIDENCE_ROWS]
             ],
+            # PROVIDER FAILOVER: quién era el primario, por qué no pudo y quién lo sustituyó. La
+            # identidad de la tarea no cambia y la sustitución no concede autoridad adicional.
+            "failovers": [item.model_dump() for item in result.failovers],
             "capabilities": [
                 {
                     "kind": _redacted(item.kind, 40),
@@ -1251,9 +1254,23 @@ def _close_attempt(
             ),
             commit_sha=result.commit_sha if result is not None else "",
             duration_ms=duracion,
+            provider=_redacted(result.provider, 40) if result is not None else "",
+            failover=_failover_summary(result),
         ),
     ]
     task.attempt_started_at = None
+
+
+def _failover_summary(result: DevelopmentResult | None) -> str:
+    """Resumen breve de las sustituciones de proveedor del intento, o cadena vacía."""
+    if result is None or not result.failovers:
+        return ""
+    partes = [
+        f"{item.primary_provider}->{item.substitute_provider or 'ninguno'}:"
+        f"{item.cause}/{item.outcome}"
+        for item in result.failovers
+    ]
+    return _redacted("; ".join(partes), 200)
 
 
 def _task_record(task: ConsoleTask) -> TaskRecord:

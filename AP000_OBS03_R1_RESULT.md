@@ -237,7 +237,25 @@ que es exactamente el caso que el fallo cerrado del apartado 4.e se niega a leer
 - **No aprobada**, **no sustituida** y **no reejecutada por esta intervención**; su gate histórico
   `PLAN_REQUIRES_HUMAN` sigue **sin aprobar** y sin resolución, y es el único gate de la Task.
 - El único intento nuevo (`run=7`) lo produjo el dashboard en vivo, no esta intervención (§7).
-- Punto Inmobiliario HN **no tocado**. Sin push, sin deploy, sin release.
+- Punto Inmobiliario HN: **sin commit, sin push, sin deploy, sin release**. Su historia es la misma
+  (`HEAD = 864a314`). Lo que sí existe —y no lo produjo esta intervención— es el **árbol de trabajo
+  sucio** que dejó el intento 7 cuando se aplicó y quedó a la espera de la persona
+  (`rolled_back = False`, ficheros escritos a las 19:05:24, el mismo instante en que el ciclo
+  terminaba):
+
+  ```
+   M .gitignore                              (ajeno al ciclo: 18/09)
+   M src/app/globals.css
+   M src/app/propiedades/page.tsx
+   M src/components/DepartmentExplorer.tsx
+   M tests/honduras-map.test.mjs
+  ?? src/components/InteractiveHondurasMap.tsx
+  ```
+
+  Es el estado que un `EVIDENCE_REQUIRED` deja: el cambio está aplicado y **sin comprometer**, esperando
+  la evidencia. No se revirtió ni se limpió desde aquí: eso sería tocar el destino y destruir el estado
+  real del intento. **Frontera declarada**: que un ciclo parado por evidencia deje el árbol aplicado
+  —en vez de revertirlo— es comportamiento previo a esta intervención y no se cambió.
 - El QA visual **no se eliminó**: se conserva y ahora se explica por qué no puede ejecutarse en esa
   ruta.
 
@@ -266,6 +284,9 @@ se conservan como hechos distintos).
   proveedor: PUNTO no cambia de transporte por su cuenta.
 - La verificación del criterio por atestación humana es una capacidad **real** del sistema, no un
   atajo: exige una persona, una nota explícita y un gate aprobado, y queda registrada como evidencia.
+- El intento 7 dejó el árbol de trabajo del destino aplicado y sin comprometer (§9): aprobar el gate
+  con atestación hará que el ciclo vuelva a medir el criterio; sin atestación, el criterio seguirá sin
+  verificarse y el cambio seguirá sin commitear. Nada de eso es un efecto de esta intervención.
 - Bloqueo real restante: **el mismo que antes de esta intervención** — ejecutar la Task `2e7822a0`
   contra Punto Inmobiliario HN requiere una decisión del operador, porque el sobre de autoridad
   persistente de ese destino autoriza `push`/`deploy`/`release` y esta intervención tiene prohibido

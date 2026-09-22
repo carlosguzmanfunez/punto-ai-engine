@@ -86,15 +86,27 @@ def test_a2_equivalencia_por_texto_parecido_no_por_igualdad_literal() -> None:
 
 
 # ============================== B · duplicado histórico → SUPERSEDED, historial intacto
-def _inyectar_task_historica(objetivo: str, *, stage: str = "QUEUED") -> UUID:
+def _inyectar_task_historica(
+    objetivo: str, *, stage: str = "QUEUED", result_branch: str = ""
+) -> UUID:
     """Escribe directamente un ``TaskRecord`` en el estado durable (como si fuera anterior a la
-    deduplicación por creación: dos Tasks activas y equivalentes, sin relación entre ellas)."""
+    deduplicación por creación: dos Tasks activas y equivalentes, sin relación entre ellas).
+
+    ``result_branch`` reproduce el caso real: una Task anterior a la huella de identidad, cuyo
+    resultado se produjo en una rama que ya no es la de trabajo canónica del destino (un fixture).
+    """
     from punto.api.console_state import ConsoleStateStore, TaskRecord, default_console_state_path
+    from punto.schemas.dev import DevelopmentResult, DevelopmentStatus
 
     store = ConsoleStateStore(default_console_state_path())
     existing = store.load().tasks if default_console_state_path().is_file() else ()
     task_id = uuid4()
     now = utc_now()
+    result = (
+        DevelopmentResult(status=DevelopmentStatus.VERIFICATION_FAILED, branch=result_branch)
+        if result_branch
+        else None
+    )
     record = TaskRecord(
         task_id=task_id,
         objective=objetivo,
@@ -104,6 +116,7 @@ def _inyectar_task_historica(objetivo: str, *, stage: str = "QUEUED") -> UUID:
         stage=stage,
         created_at=now,
         updated_at=now,
+        result=result,
     )
     store.save(tasks=(*existing, record), gates=())
     return task_id
@@ -361,7 +374,7 @@ def test_i_sin_comprobar_identidad_una_task_de_otra_rama_seguiria_operativa(tmp_
         fingerprint="",
         work_branch="",
         production_branch="",
-        result_branch="ai/console-fixture",
+        result_branch="ai/otra-rama-de-fixture",
         target=destino,
     )
 
@@ -414,6 +427,107 @@ def test_i3_canonical_rank_prefiere_lo_mas_avanzado_y_con_mas_evidencia() -> Non
     )
 
     assert canonical_rank(rico) > canonical_rank(pobre)
+
+
+# ================================================================ J · continuación de af50fbe
+# Defecto real observado tras af50fbe: el estado durable y la API ya reconciliaban el linaje
+# (SUPERSEDED, sin operativas de más), pero el Dashboard seguía pintando TODAS las tareas —
+# incluidas las superadas— en el tablero operativo, y una superada en una etapa "intermedia"
+# (``HUMAN_APPROVED``, sin más eventos) caía en el texto por defecto "PUNTO está trabajando en
+# esta tarea": la proyección server-side no marcaba el linaje en el titular/espera, y la página no
+# consumía ``operational``/``history`` para las tareas (solo lo hacía para los Human Gates).
+def test_j_persistir_reiniciar_y_proyectar_no_muestra_superadas_como_operativas(
+    tmp_path: Path,
+) -> None:
+    """Reproduce exactamente: persistir dos duplicadas → reiniciar/recovery → API/Dashboard."""
+    repo, remoto = _repos(tmp_path)
+    destino = replace(_target(repo, remoto=remoto), target_id=TARGET_A)
+    import os
+
+    os.environ["PUNTO_CONSOLE_STATE_PATH"] = str(tmp_path / "console-state.json")
+    # Dos Tasks históricas activas y equivalentes, ambas con el resultado producido en la rama de
+    # un fixture (no la rama de trabajo canónica del destino): el caso real observado, donde
+    # NINGUNA de las dos es la identidad vigente y ambas quedan superadas por identidad.
+    _inyectar_task_historica(
+        OBJETIVO, stage="DEVELOPMENT_FAILED", result_branch="ai/otra-rama-de-fixture"
+    )
+    _inyectar_task_historica(
+        OBJETIVO_EQUIVALENTE, stage="DEVELOPMENT_FAILED", result_branch="ai/otra-rama-de-fixture"
+    )
+
+    # 1) recovery: la consolidación corre al montar la consola sobre el estado persistido.
+    reiniciado, _audit = _reiniciar(destino)
+
+    # 2) estado durable real que consume el runtime: ambas quedan SUPERSEDED, íntegras.
+    from punto.api.console_state import ConsoleStateStore, default_console_state_path
+
+    documento = ConsoleStateStore(default_console_state_path()).load()
+    persistidas = {str(item.task_id): item for item in documento.tasks}
+    assert len(persistidas) == 2
+    assert all(item.lineage_status == "SUPERSEDED" for item in persistidas.values())
+    assert all(item.objective and item.acceptance_criteria for item in persistidas.values())
+
+    # 3) API: ninguna aparece como operativa; el historial la conserva completa.
+    listado = reiniciado.get("/console/tasks").json()
+    assert listado["operational"] == [], "ninguna operativa: ambas están fuera del flujo"
+    assert {item["task_id"] for item in listado["history"]} == set(persistidas)
+    for item in listado["history"]:
+        assert item["operational"] is False
+        assert item["lineage"]["status"] == "SUPERSEDED"
+        # 4) ninguna se proyecta como "trabajando": ni titular genérico ni espera humana.
+        assert item["progress"]["headline"] != "PUNTO está trabajando en esta tarea"
+        assert "superada" in item["progress"]["headline"].lower()
+        assert item["progress"]["waiting_human"] is False
+
+    # 5) un segundo reinicio reproduce exactamente el mismo estado (idempotente).
+    otro, _audit2 = _reiniciar(destino)
+    de_nuevo = otro.get("/console/tasks").json()
+    assert de_nuevo["operational"] == [] and len(de_nuevo["history"]) == 2
+    assert {item["task_id"]: item["lineage"] for item in de_nuevo["history"]} == {
+        item["task_id"]: item["lineage"] for item in listado["history"]
+    }
+
+    # 6) el grafo deriva de la misma fuente: las Tasks superadas siguen presentes (con su linaje),
+    # no operativas, y relacionadas entre sí.
+    grafo = otro.get(f"/console/graph?target_id={TARGET_A}").json()
+    nodos_task = {n["id"]: n for n in grafo["nodes"] if n["kind"] == "task"}
+    assert len(nodos_task) == 2
+    assert all(n["attrs"]["lineage"] == "SUPERSEDED" for n in nodos_task.values())
+    assert all(n["attrs"]["operational"] is False for n in nodos_task.values())
+    relations = {edge["relation"] for edge in grafo["edges"]}
+    # Superadas de forma independiente (identidad), no una por la otra: la relación explícita que
+    # les corresponde es ``duplicate_of`` (equivalencia), no ``supersedes``/``superseded_by`` (esa
+    # combinación, cuando SÍ hay una canónica activa que sustituye a otra, la cubre test_h2).
+    assert "duplicate_of" in relations
+
+
+def test_j2_el_titular_de_una_tarea_superada_nunca_dice_que_punto_esta_trabajando() -> None:
+    """Unidad de la causa exacta: ``_headline``/``_waiting_kind`` son conscientes del linaje."""
+    from datetime import datetime as _dt
+
+    from punto.api.task_progress import TaskSignals, build_progress
+
+    ahora = _dt(2026, 1, 2, tzinfo=UTC)
+    congelada = TaskSignals(
+        created_at=_dt(2026, 1, 1, tzinfo=UTC),
+        now=ahora,
+        task_stage="HUMAN_APPROVED",
+        lineage_status="SUPERSEDED",
+    )
+    activa = TaskSignals(
+        created_at=_dt(2026, 1, 1, tzinfo=UTC),
+        now=ahora,
+        task_stage="HUMAN_APPROVED",
+        lineage_status="ACTIVE",
+    )
+
+    progreso_superada = build_progress(congelada)
+    progreso_activa = build_progress(activa)
+
+    assert progreso_superada["headline"] != "PUNTO está trabajando en esta tarea"
+    assert progreso_superada["waiting_human"] is False
+    # La misma etapa, con linaje ACTIVE, sigue siendo la frase genérica real (no se rompe nada).
+    assert progreso_activa["headline"] == "PUNTO está trabajando en esta tarea"
 
 
 _ = DevelopmentTarget

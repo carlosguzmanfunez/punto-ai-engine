@@ -2382,6 +2382,7 @@ def _progress(task: ConsoleTask, dependencies: ConsoleDependencies) -> dict[str,
             publishable=target.publishable if target is not None else False,
             publication_gate_status=_publication_gate_status(publication, dependencies),
             finished_at=task.finished_at,
+            lineage_status=task.lineage_status,
         )
     )
 

@@ -188,6 +188,9 @@ class TaskSignals:
     publishable: bool = False
     publication_gate_status: str = ""
     finished_at: datetime | None = None
+    #: Linaje real de la tarea (``ACTIVE`` / ``SUPERSEDED``). Una tarea superada nunca es "trabajo
+    #: en curso": lo dice la proyección, no una inferencia de la interfaz sobre la etapa a secas.
+    lineage_status: str = "ACTIVE"
 
 
 def elapsed_seconds(created_at: datetime, until: datetime) -> int:
@@ -340,6 +343,9 @@ def _states(
 
 def _waiting_kind(signals: TaskSignals) -> str:
     """Qué espera una persona, si es que espera: ``development``, ``publication`` o nada."""
+    if signals.lineage_status == "SUPERSEDED":
+        # Una tarea superada no espera a nadie: su etapa congelada no vuelve a pedir una decisión.
+        return ""
     if signals.publication_stage == PublicationStage.WAITING_PRODUCTION_APPROVAL.value:
         return "publication"
     if signals.task_stage == "WAITING_HUMAN":
@@ -376,6 +382,10 @@ def _percent(completed: int, total: int) -> int:
 
 def _headline(signals: TaskSignals, waiting_kind: str) -> str:
     """Frase humana del momento real de la tarea."""
+    if signals.lineage_status == "SUPERSEDED":
+        # Una tarea superada es historial: PUNTO no está trabajando en ella y no espera a nadie,
+        # aunque su etapa real (congelada en el momento de la sustitución) diga lo contrario.
+        return "Historial: esta tarea fue superada, no está en curso"
     if waiting_kind == "publication":
         return "Esperando tu aprobación para publicar en producción"
     if waiting_kind == "development":

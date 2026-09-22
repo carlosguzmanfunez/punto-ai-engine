@@ -223,6 +223,10 @@
           <div class="note">Los datos de la consola se cargan al usarla (Actualizar, crear una tarea
           o abrir esta sección). Necesita el motor configurado en esta instancia.</div>
         </div>
+        <details id="tasks-history" data-testid="tasks-history" style="margin-top: 12px">
+          <summary id="tasks-history-summary" data-testid="tasks-history-summary">Historial de tareas (auditoría, sin acciones)</summary>
+          <div id="tasks-history-list" class="grid"></div>
+        </details>
       </section>
 
       <section id="gates">
@@ -653,7 +657,7 @@
       });
 
       // ------------------------------------------------------------------ consola
-      const consoleState = { targets: [], tasks: [], gates: [], timer: null, pendingRuns: new Set(), pendingReleases: new Set() };
+      const consoleState = { targets: [], tasks: [], gates: [], timer: null, pendingRuns: new Set(), pendingReleases: new Set(), tasksHistory: [] };
 
       // <rerun-control>
       // Control «Ejecutar de nuevo» (POST /console/tasks/{id}/run). Toda la decisión es del motor:
@@ -768,6 +772,28 @@
                  data-prefix="${progress.finished ? "Finalizada en" : "Tiempo"}">${progress.time_label}</div>
           </div>
           ${waiting}`;
+      }
+
+      // Historial de tareas: evidencia real, sin acciones (ni release, ni gate, ni rerun) y con el
+      // linaje explícito (por qué salió del flujo operativo).
+      function taskHistoryCard(task) {
+        const dev = task.development || {};
+        const lineage = task.lineage || {};
+        const superseded = lineage.status === "SUPERSEDED";
+        return `
+          <article class="card" data-history-task="${task.task_id}" data-testid="tarea-historial-${task.task_id}">
+            <h3>${esc(task.objective.slice(0, 90))}</h3>
+            <div class="sub">${task.target_id} · <code>${task.task_id.slice(0, 8)}</code></div>
+            <div class="row"><span class="label">Etapa real (congelada)</span><span class="value">${stageBadge(task.stage)}</span></div>
+            <div class="row"><span class="label">Linaje</span><span class="value">${lineage.status || "ACTIVE"}</span></div>
+            ${superseded ? `<div class="row"><span class="label">Superada por</span><span class="value">${(lineage.superseded_by || "").slice(0, 8)}</span></div>
+            <div class="note">${esc(lineage.supersession_cause || "")}: ${esc((lineage.relations || []).map((r) => r.cause).join(", "))}</div>` : ""}
+            ${dev.commit_sha ? `<div class="row"><span class="label">Commit local</span><code>${dev.commit_sha.slice(0, 10)}</code></div>` : ""}
+            <div class="actions">
+              <button class="secondary" data-ver="${task.task_id}" data-testid="ver-historial-${task.task_id}">Ver</button>
+            </div>
+            <div class="detail" data-detail="${task.task_id}" hidden></div>
+          </article>`;
       }
 
       function taskCard(task) {
@@ -1069,9 +1095,15 @@
         await Promise.all([loadTasks(), loadGates()]);
       }
 
+      // Tablero operativo: solo las tareas cuyo linaje sigue vigente (``operational``); el historial
+      // —superadas y terminadas— va aparte, con la misma evidencia pero sin implicar que PUNTO
+      // sigue trabajando en ellas. Es la misma separación que ya rige los Human Gates.
       async function loadTasks() {
         const payload = await api("/console/tasks");
-        consoleState.tasks = payload.items;
+        const operational = payload.operational || payload.items.filter((task) => task.operational);
+        const history = payload.history || payload.items.filter((task) => !task.operational);
+        consoleState.tasks = operational;
+        consoleState.tasksHistory = history;
         renderTasks();
       }
 
@@ -1079,7 +1111,12 @@
         const items = consoleState.tasks;
         setHtml("tasks-list", items.length
           ? items.map(taskCard).join("")
-          : `<div class="note">todavía no hay tareas</div>`);
+          : `<div class="note" data-testid="tasks-empty">no hay tareas activas</div>`);
+        const history = consoleState.tasksHistory || [];
+        setText("tasks-history-summary", `Historial de tareas (${history.length}, auditoría, sin acciones)`);
+        setHtml("tasks-history-list", history.length
+          ? history.map(taskHistoryCard).join("")
+          : `<div class="note">sin historial</div>`);
         document.querySelectorAll("[data-production]").forEach((button) =>
           button.addEventListener("click", () => requestProductionGate(button.dataset.production)));
         document.querySelectorAll("[data-release]").forEach((button) =>

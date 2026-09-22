@@ -371,6 +371,9 @@ class ProviderRegistry:
         # Failover explícito (providers.yaml): el router conserva la asignación y solo consulta
         # este evaluador para saber si un candidato está conectado y puede hacer el trabajo.
         router.configure_failover(self.settings().failover, self._judge_substitute)
+        # TAKEOVER de calidad (providers.yaml, sección `takeover:`): política INDEPENDIENTE del
+        # failover operativo (mismo evaluador de capacidad/conexión, candidatos distintos).
+        router.configure_takeover(self.settings().takeover, self._judge_substitute)
         self.router = router
 
     def router_instance(self) -> ProviderRouter:
@@ -422,9 +425,7 @@ class ProviderRegistry:
                 name, str((custom or {}).get("display_name", name))
             ),
             adapter_type=(
-                _adapter_of(name)
-                if builtin
-                else str((custom or {}).get("adapter_type", "custom"))
+                _adapter_of(name) if builtin else str((custom or {}).get("adapter_type", "custom"))
             ),
             transports=transports,
             transport=transport,
@@ -440,9 +441,7 @@ class ProviderRegistry:
             api_key_configured=self.secrets.has_api_key(name),
             builtin=builtin,
             enabled=True if builtin else bool((custom or {}).get("enabled", True)),
-            roles=tuple(
-                role for role, assigned in self.roles().items() if assigned == name
-            ),
+            roles=tuple(role for role, assigned in self.roles().items() if assigned == name),
         )
 
     def descriptors(self) -> tuple[ProviderDescriptor, ...]:
@@ -527,9 +526,7 @@ class ProviderRegistry:
                 descriptor.model,
             )
         except (ProviderError, TransportError, TransportConfigError) as error:
-            return ProviderTestResult(
-                name, STATUS_UNAVAILABLE, _safe(str(error)), descriptor.model
-            )
+            return ProviderTestResult(name, STATUS_UNAVAILABLE, _safe(str(error)), descriptor.model)
         try:
             health: ProviderHealth = transport.health_check()
         except ProviderError as error:

@@ -26,6 +26,7 @@ from punto.providers.router import (
     DEFAULT_ROLE_ASSIGNMENT,
     KNOWN_PROVIDERS,
 )
+from punto.providers.takeover import DEFAULT_MAX_TAKEOVER_SUBSTITUTES, TakeoverPolicy
 from punto.tools.errors import ProviderRouteError
 
 #: Nombre del fichero de configuración dentro del directorio ``config/``.
@@ -75,6 +76,9 @@ class ProviderSettings:
     auth_modes: Mapping[str, str] = field(default_factory=dict)
     #: Política de failover declarada en ``providers.yaml``; ``None`` = sin failover (por defecto).
     failover: FailoverPolicy | None = None
+    #: Política de TAKEOVER de calidad (``providers.yaml``, sección ``takeover:``) —
+    #: independiente de ``failover``: ``None`` = sin takeover (por defecto).
+    takeover: TakeoverPolicy | None = None
 
     def model_of(self, provider: str) -> str:
         """Modelo configurado de un proveedor, o el conocido por el motor."""
@@ -110,11 +114,18 @@ class ProviderSettings:
                 None
                 if self.failover is None
                 else {
-                    "roles": {
-                        role.value: list(subs) for role, subs in self.failover.roles.items()
-                    },
+                    "roles": {role.value: list(subs) for role, subs in self.failover.roles.items()},
                     "max_substitutes": self.failover.max_substitutes,
                     "allow_metered": self.failover.allow_metered,
+                }
+            ),
+            "takeover": (
+                None
+                if self.takeover is None
+                else {
+                    "roles": {role.value: list(subs) for role, subs in self.takeover.roles.items()},
+                    "max_substitutes": self.takeover.max_substitutes,
+                    "allow_metered": self.takeover.allow_metered,
                 }
             ),
         }
@@ -232,6 +243,7 @@ def load_provider_settings(
     transports = dict(base.transports)
     auth_modes = dict(base.auth_modes)
     failover: FailoverPolicy | None = base.failover
+    takeover: TakeoverPolicy | None = base.takeover
 
     if path is not None and path.is_file():
         raw = load_yaml_file(path)
@@ -240,6 +252,7 @@ def load_provider_settings(
         )
         assignment = _read_roles(raw, assignment)
         failover = _read_failover(raw)
+        takeover = _read_takeover(raw)
 
     for name in KNOWN_PROVIDERS:
         override = env.get(f"PUNTO_{name.upper()}{PROVIDER_MODEL_ENV_SUFFIX}", "").strip()
@@ -271,6 +284,7 @@ def load_provider_settings(
         transports=transports,
         auth_modes=auth_modes,
         failover=failover,
+        takeover=takeover,
     )
 
 
@@ -385,6 +399,67 @@ def _read_failover(raw: Mapping[str, object]) -> FailoverPolicy | None:
     if not roles:
         return None
     return FailoverPolicy(roles=roles, max_substitutes=maximum, allow_metered=allow_metered)
+
+
+def _read_takeover(raw: Mapping[str, object]) -> TakeoverPolicy | None:
+    """Lee la sección ``takeover`` del fichero: candidatos de recuperación de CALIDAD, en orden.
+
+    Forma (independiente de ``failover:`` — misma forma, sección distinta, para que la política
+    de recuperación de calidad no herede en silencio la de indisponibilidad operativa)::
+
+        takeover:
+          allow_metered: false
+          max_substitutes: 2
+          roles:
+            BUILDER: [openai]         # Codex, prioridad de recuperación de PUNTO para causas
+                                       # de otros modelos (DeepSeek, Claude, futuros)
+
+    La sección es **opcional**: sin ella no hay takeover. Es configuración de confianza: solo
+    este fichero la declara, ni una petición ni un proveedor ni una Task pueden ampliarla.
+
+    Raises:
+        ProviderRouteError: si la forma es inválida, el rol o el proveedor no existen o el tope
+            no es un entero positivo. Una política mal escrita no se ignora en silencio.
+    """
+    section = raw.get("takeover")
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise ProviderRouteError("la sección 'takeover' debe ser un mapa")
+    unknown = sorted(set(section) - {"roles", "max_substitutes", "allow_metered"})
+    if unknown:
+        raise ProviderRouteError(f"claves desconocidas en 'takeover': {', '.join(unknown)}")
+    allow_metered = section.get("allow_metered", False)
+    if not isinstance(allow_metered, bool):
+        raise ProviderRouteError("takeover.allow_metered debe ser booleano")
+    maximum = section.get("max_substitutes", DEFAULT_MAX_TAKEOVER_SUBSTITUTES)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ProviderRouteError("takeover.max_substitutes debe ser un entero positivo")
+    roles_section = section.get("roles", {})
+    if roles_section is None:
+        roles_section = {}
+    if not isinstance(roles_section, Mapping):
+        raise ProviderRouteError("takeover.roles debe ser un mapa rol -> lista de proveedores")
+    roles: dict[ProviderRole, tuple[str, ...]] = {}
+    for role_name, substitutes in roles_section.items():
+        try:
+            role = ProviderRole(str(role_name))
+        except ValueError as exc:
+            known = ", ".join(item.value for item in ProviderRole)
+            raise ProviderRouteError(
+                f"rol desconocido en takeover.roles: {role_name!r}. Conocidos: {known}"
+            ) from exc
+        if substitutes is None:
+            substitutes = []
+        if not isinstance(substitutes, (list, tuple)):
+            raise ProviderRouteError(f"takeover.roles.{role.value} debe ser una lista")
+        roles[role] = tuple(
+            _validate_provider(str(name), source=f"takeover.roles.{role.value}")
+            for name in substitutes
+        )
+    if not roles:
+        return None
+    return TakeoverPolicy(roles=roles, max_substitutes=maximum, allow_metered=allow_metered)
 
 
 def _validate_transport(name: str, *, key: str) -> str:

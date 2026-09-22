@@ -39,8 +39,8 @@ from punto.orchestrator.dev_cycle import DevelopmentConfig, DevelopmentCycle
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.contract import ProviderRole
-from punto.providers.failover import FailoverPolicy
 from punto.providers.router import ProviderRouter
+from punto.providers.takeover import TakeoverPolicy
 from punto.schemas.audit import AuditEventType
 from punto.schemas.decision import ApprovalStatus, HumanApprovalRequest, RiskLevel
 from punto.schemas.dev import DevelopmentResult, DevelopmentStatus
@@ -189,8 +189,8 @@ def _consola_estructural(
         router.register_provider(
             sustituto.provider, lambda _m, c=sustituto: c, model=sustituto.model
         )
-        router.configure_failover(
-            FailoverPolicy(roles={ProviderRole.BUILDER: ("deepseek",)}), _conectados("deepseek")
+        router.configure_takeover(
+            TakeoverPolicy(roles={ProviderRole.BUILDER: ("deepseek",)}), _conectados("deepseek")
         )
     ciclo = DevelopmentCycle(
         router=router,

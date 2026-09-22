@@ -9,13 +9,18 @@ en ``VERIFICATION_FAILED``.
 Primera causa (710abcf, ya cerrada): la evidencia llegaba incompleta y engañosa al BUILDER
 (faltaba el remedio, y el texto fijo presuponía un dataset). Corregida: el remedio ya llega.
 
-Segunda causa (esta ronda): con la evidencia ya accionable, PUNTO seguía dándole al MISMO BUILDER
-una segunda oportunidad para la misma causa en vez de tomar el trabajo con otro proveedor
-autorizado y capaz — BUILDER TAKEOVER. Cuando el asignado responde con éxito (``CHANGES_EMPTY``)
-ante un criterio ``FAILED`` con remedio accionable, PUNTO prueba con el siguiente candidato
-declarado en la política de failover (misma configuración que ya usa el failover operativo:
-``FailoverPolicy.preferred``), sin gastar de nuevo al mismo, dentro de un presupuesto declarativo
-(``DevelopmentConfig.max_builder_takeovers``).
+Segunda causa (710abcf → 3c48db6, ya cerrada): con la evidencia ya accionable, PUNTO seguía
+dándole al MISMO BUILDER una segunda oportunidad para la misma causa. Corregida con BUILDER
+TAKEOVER: cuando el asignado responde con éxito (``CHANGES_EMPTY``) ante un criterio ``FAILED``
+con remedio accionable, PUNTO prueba con el siguiente candidato de recuperación.
+
+Tercera causa (esta ronda): ese takeover reutilizaba la MISMA política que el failover operativo
+(``FailoverPolicy``), mezclando dos causas distintas (indisponibilidad demostrable vs. respuesta
+exitosa pero inútil) bajo una sola lista de preferencia. Corregida: ``TakeoverPolicy``
+(``punto.providers.takeover``), declarada en su propia sección (``providers.yaml``:
+``takeover:``), independiente de ``failover:`` — la política real prioriza Codex (``openai``)
+como recuperación de calidad para BUILDER, sin tocar su prioridad de ARCHITECT ni la lista de
+failover operativo.
 
     pytest tests/test_structural_repair_evidence.py -q
 """
@@ -38,8 +43,8 @@ from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.base import ModelCompletion
 from punto.providers.contract import ModelUsage, ProviderRole
-from punto.providers.failover import FailoverPolicy
 from punto.providers.router import ProviderRouter
+from punto.providers.takeover import TakeoverPolicy
 from punto.schemas.audit import AuditEventType
 from punto.workspace.target import DevelopmentTargetRegistry
 from test_human_console import TARGET_ID, _git, _plan, _target
@@ -163,8 +168,8 @@ def _consola_con_takeover(
     sustituto: _Espia | None = None
     if substitute_script is not None:
         sustituto = _Espia(router, name="sustituto", model="sustituto-1", script=substitute_script)
-        router.configure_failover(
-            FailoverPolicy(roles={ProviderRole.BUILDER: ("sustituto",)}),
+        router.configure_takeover(
+            TakeoverPolicy(roles={ProviderRole.BUILDER: ("sustituto",)}),
             _conectados("sustituto"),
         )
     ciclo = DevelopmentCycle(
@@ -357,8 +362,8 @@ def test_f2_execute_alternative_nunca_reelige_a_quien_ya_esta_excluido() -> None
     c = Fake("c", "c-1", {"changes": ["c respondió"]})
     _registrar(router, a, b, c)
     router.assign_role(ProviderRole.BUILDER, "a")
-    router.configure_failover(
-        FailoverPolicy(roles={ProviderRole.BUILDER: ("b", "c")}), _conectados("a", "b", "c")
+    router.configure_takeover(
+        TakeoverPolicy(roles={ProviderRole.BUILDER: ("b", "c")}), _conectados("a", "b", "c")
     )
 
     result = router.execute_alternative(

@@ -79,3 +79,19 @@ failover:
     # peticion lleva imagenes se elige por capacidad EFECTIVA: Codex (cuenta ChatGPT) si su binario
     # anuncia --image. Claude BUILDER sigue siendo solo texto y sin herramientas.
     VISUAL_QA: [openai]
+
+# TAKEOVER de calidad: independiente de `failover` (arriba). `failover` es para cuando el
+# primario NO PUEDE responder (cuota, limite de tasa, desconexion); `takeover` es para cuando SI
+# respondio pero el resultado no resuelve la causa (CHANGES_EMPTY ante un criterio FAILED con
+# remedio accionable, una reparacion causal no resuelta). Comparten el mismo evaluador de
+# capacidad/conexion, pero la prioridad de recuperacion puede -y aqui debe- ser distinta.
+takeover:
+  allow_metered: false
+  max_substitutes: 2
+  roles:
+    # Politica de PUNTO: Codex es el proveedor prioritario de recuperacion de calidad para
+    # fallos causales de OTROS modelos (DeepSeek, Claude, futuros) -- Codex sigue siendo el
+    # ARCHITECT principal; esto es solo una autorizacion para tomar temporalmente el trabajo de
+    # BUILDER cuando el primario respondio sin resolver la causa. Si Codex no esta disponible,
+    # continua con el siguiente candidato autorizado y capaz (Claude).
+    BUILDER: [openai, anthropic]

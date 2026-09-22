@@ -70,6 +70,7 @@ from punto.providers.failover import (
     failover_cause_of,
 )
 from punto.providers.openai import OpenAIError
+from punto.providers.takeover import TakeoverPolicy
 from punto.providers.transport import TransportError, provider_error_kind_of
 from punto.tools.errors import ProviderRouteError
 
@@ -149,6 +150,9 @@ class ProviderRouter:
         self._audit = audit
         self._failover_policy: FailoverPolicy | None = None
         self._failover_evaluator: SubstituteEvaluator | None = None
+        #: QUALITY TAKEOVER (independiente del failover operativo): ver ``configure_takeover``.
+        self._takeover_policy: TakeoverPolicy | None = None
+        self._takeover_evaluator: SubstituteEvaluator | None = None
 
     # ------------------------------------------------------------------ registro
     def register_provider(
@@ -260,6 +264,24 @@ class ProviderRouter:
         """Política de failover vigente, o ``None`` si el failover está desactivado."""
         return self._failover_policy
 
+    # ----------------------------------------------------------------- takeover
+    def configure_takeover(
+        self, policy: TakeoverPolicy | None, evaluator: SubstituteEvaluator | None = None
+    ) -> None:
+        """Declara la política de TAKEOVER de calidad — independiente de ``configure_failover``.
+
+        Mismo contrato de seguridad que el failover operativo (sin ``evaluator`` no hay
+        recuperación aunque haya política; ``None`` la desactiva; la asignación de roles no se
+        toca), pero es una política **distinta**: un candidato de failover operativo no tiene por
+        qué ser el mismo candidato de recuperación de calidad, ni al revés.
+        """
+        self._takeover_policy = policy
+        self._takeover_evaluator = evaluator
+
+    def takeover_policy(self) -> TakeoverPolicy | None:
+        """Política de TAKEOVER vigente, o ``None`` si está desactivada."""
+        return self._takeover_policy
+
     # ---------------------------------------------------------------- ejecución
     def execute(
         self,
@@ -366,19 +388,23 @@ class ProviderRouter:
         max_output_tokens: int | None = None,
     ) -> ProviderResult:
         """Ejecuta el rol con el primer candidato EFECTIVO (conectado, capaz, autorizado por la
-        política de failover) que no esté en ``exclude`` — sin gastar de nuevo a quien ya haya
+        política de TAKEOVER) que no esté en ``exclude`` — sin gastar de nuevo a quien ya haya
         respondido para la misma causa.
 
         No es el failover operativo de :meth:`execute` (ese existe solo para indisponibilidad
         **demostrable** del primario: cuota, límite de tasa, desconexión). Este método es para un
-        TAKEOVER: el asignado respondió con éxito pero **no produjo** el cambio material que la
-        evidencia ya entregada pedía — una llamada más al mismo proveedor con la misma causa no
-        cambiaría el resultado. Reutiliza exactamente los mismos candidatos declarados
-        (``FailoverPolicy.preferred``) y el mismo evaluador de capacidad/conexión que el failover
-        operativo: ninguna ruta ni autoridad nuevas, solo un turno distinto dentro de lo ya
-        autorizado.
+        TAKEOVER de CALIDAD: el asignado respondió con éxito pero **no produjo** el cambio
+        material que la evidencia ya entregada pedía — una llamada más al mismo proveedor con la
+        misma causa no cambiaría el resultado. Usa su propia política
+        (``TakeoverPolicy.preferred``, independiente de ``FailoverPolicy``: un candidato puede
+        ser buen sustituto por disponibilidad y mal candidato de calidad, o al revés — la
+        prioridad de recuperación de PUNTO, p. ej. Codex, se declara aquí, no en el failover
+        operativo) y el mismo evaluador de capacidad/conexión (o el del failover operativo si no
+        se configuró uno propio: la pregunta «¿puede hacer el trabajo ahora?» no depende de por
+        qué se busca un sustituto). Ninguna ruta ni autoridad nuevas, solo un turno distinto
+        dentro de lo ya autorizado; el rol asignado no cambia.
 
-        Sin política de failover para el rol, o si todos los candidatos declarados están en
+        Sin política de takeover para el rol, o si todos los candidatos declarados están en
         ``exclude`` o no son elegibles, devuelve un resultado ``UNAVAILABLE`` explícito: no hay
         bucle de sustitutos infinito.
         """
@@ -395,7 +421,8 @@ class ProviderRouter:
                 error=str(error),
                 error_kind=ProviderErrorKind.CONFIG,
             )
-        policy = self._failover_policy
+        policy = self._takeover_policy
+        evaluator = self._takeover_evaluator or self._failover_evaluator
         declared = policy.preferred(role) if policy is not None and policy.covers(role) else ()
         ordered = dict.fromkeys((assigned, *declared))
         rejections: list[str] = []
@@ -407,7 +434,7 @@ class ProviderRouter:
             if entry is None:
                 rejections.append(f"{name}: no está registrado en el router")
                 continue
-            verdict = self._judge_substitute(role, name, request.has_attachments)
+            verdict = self._judge_with(evaluator, role, name, request.has_attachments)
             if not verdict.eligible:
                 rejections.append(f"{name}: {verdict.reason or 'no elegible'}")
                 continue
@@ -739,8 +766,22 @@ class ProviderRouter:
     def _judge_substitute(
         self, role: ProviderRole, provider: str, needs_vision: bool
     ) -> SubstituteVerdict:
-        """Veredicto del evaluador sobre un candidato; sin evaluador o si falla, no es elegible."""
-        evaluator = self._failover_evaluator
+        """Veredicto del evaluador de failover sobre un candidato (indisponibilidad operativa)."""
+        return self._judge_with(self._failover_evaluator, role, provider, needs_vision)
+
+    @staticmethod
+    def _judge_with(
+        evaluator: SubstituteEvaluator | None,
+        role: ProviderRole,
+        provider: str,
+        needs_vision: bool,
+    ) -> SubstituteVerdict:
+        """Veredicto de ``evaluator`` sobre un candidato; sin evaluador o si falla, no es elegible.
+
+        Compartido por el failover operativo y el TAKEOVER de calidad: la pregunta («¿puede este
+        proveedor hacer el trabajo del rol, conectado y con capacidad efectiva, ahora?») es la
+        misma en los dos casos, solo cambia qué política decide la lista de candidatos.
+        """
         if evaluator is None:
             return SubstituteVerdict(
                 eligible=False,

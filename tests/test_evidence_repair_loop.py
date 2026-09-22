@@ -37,7 +37,7 @@ from punto.providers.failover import FailoverPolicy
 from punto.providers.router import ProviderRouter
 from punto.schemas.audit import AuditEventType
 from punto.workspace.target import DevelopmentTargetRegistry
-from test_human_console import TARGET_ID, _plan, _target
+from test_human_console import TARGET_ID, _cambio, _plan, _repos, _target
 from test_noop_reconciliation import SOLICITUD, _repo_ya_satisfecho
 from test_visual_qa_effective import _CapturaFalsa, _evaluador_visual, _Multimodal
 
@@ -463,6 +463,133 @@ def test_8_dos_gates_pendientes_ya_creados_se_colapsan_a_uno_al_reconciliar() ->
     assert {item.id for item in todos} == {antiguo.id, reciente.id}
     # Idempotente: reconciliar de nuevo no cambia nada más.
     assert _dedupe_pending_gates(task, deps) == ()
+
+
+def test_10_reinicio_conserva_evidence_attempts_y_el_gate_unico(tmp_path: Path) -> None:
+    """El presupuesto/estado de evidencia consumido sobrevive a un reinicio del proceso.
+
+    Reutiliza el mismo fichero de estado durable (``isolated_console_state``, autouse): montar la
+    consola dos veces sobre el mismo ``tmp_path`` simula un reinicio real. Ni el conteo de intentos
+    ni el gate único deben perderse ni duplicarse al recuperar.
+    """
+    # El fichero de estado durable lo fija la fixture ``isolated_console_state`` (autouse) para
+    # todo ``tmp_path``: cada montaje usa su propio subdirectorio de repositorio Git (evita el
+    # choque de crear el mismo repo dos veces), pero ambos comparten el MISMO estado durable —
+    # justo lo que hace un reinicio real del proceso.
+    client, _audit, llamadas = _ciclo_evidencia(
+        tmp_path / "montaje-1", veredictos=["UNCLEAR"] * 6, max_evidence_attempts=6
+    )
+    tarea = client.post("/console/tasks", json=_solicitud_visual()).json()
+    assert tarea["development"]["evidence_attempts"] == 2
+    assert len(llamadas) == 2
+
+    # «Reinicio»: se vuelve a montar la consola (nuevo HumanGate/AuditLogger en memoria), sobre el
+    # MISMO fichero de estado durable que la fixture ya fija para todo el test.
+    otro, _audit2, llamadas2 = _ciclo_evidencia(
+        tmp_path / "montaje-2", veredictos=["UNCLEAR"] * 6, max_evidence_attempts=6
+    )
+    recuperada = otro.get("/console/tasks").json()["items"][0]
+    assert recuperada["task_id"] == tarea["task_id"]
+    assert recuperada["development"]["evidence_attempts"] == 2, (
+        "el presupuesto ya consumido no se pierde ni se reinicia a 0 al recargar"
+    )
+    gates = otro.get("/console/human-gates").json()
+    assert gates["total"] == 1 and gates["pending"] == 1, "el gate sigue siendo único tras recargar"
+    blocked = otro.get(f"/console/tasks/{tarea['task_id']}").json()["blocked"]
+    assert blocked["rule"] == "evidence-strategies-exhausted", "la causa del bloqueo no se pierde"
+    assert len(llamadas2) == 0, "recuperar el estado no vuelve a ejecutar el ciclo por sí solo"
+
+
+def test_11_un_veredicto_fail_repara_dentro_del_mismo_ciclo_sin_gate_y_reevidencia(
+    tmp_path: Path,
+) -> None:
+    """FAILED (no INCONCLUSIVE) entra por el bucle de reparación YA existente, en el MISMO ciclo.
+
+    Ninguna reparación ya autorizada por el sobre de autoridad del destino pide una persona solo
+    para empezar: el criterio visual FAILED se suma a ``change_issues`` (igual que cualquier otra
+    verificación fallida) y el ARCHITECT/BUILDER lo ven en la ronda siguiente, dentro de la MISMA
+    Task y el MISMO ciclo causal — reparación → verificación → evidencia nueva → reevaluación.
+    """
+    repo, remoto = _repos(tmp_path)
+    target = replace(
+        _target(repo, remoto=remoto),
+        visual_routes=("http://localhost:3000/propiedades",),
+        max_repair_rounds=2,
+    )
+    audit = AuditLogger()
+    llamadas: list[int] = []
+    cola_visual = ["FAIL", "PASS"]
+
+    def gpt_responde(imagenes: int) -> str:
+        if imagenes:
+            llamadas.append(len(llamadas) + 1)
+            veredicto = cola_visual.pop(0) if cola_visual else "PASS"
+            return json.dumps(
+                {"verdicts": [{"claim": 1, "verdict": veredicto, "observation": "revisión real"}]}
+            )
+        return json.dumps(_plan())
+
+    def cambio_reparacion() -> dict[str, Any]:
+        # Una ronda de reparación exige causa raíz declarada (no un parche a ciegas): el mismo
+        # cambio real de ``_cambio()``, con la hipótesis que la reparación automática debe aportar.
+        payload = _cambio()
+        payload["root_cause"] = "el criterio visual exige el tipo 'Apartamento' en la fuente"
+        payload["evidence"] = ["el veredicto visual marcó FAIL sobre el criterio solicitado"]
+        payload["expected_effect"] = "el criterio visual pasa a PASS tras aplicar el cambio"
+        return payload
+
+    gpt = _Multimodal("openai", "gpt-5.6-sol", gpt_responde)
+    architect = _Multimodal("architect", "architect-1", lambda n: json.dumps(_plan()))
+    # El BUILDER propone la corrección real (no un no-op): la reparación cambia código de verdad.
+    builder = _Multimodal("anthropic", "claude-sonnet-5", lambda n: json.dumps(cambio_reparacion()))
+    router = ProviderRouter()
+    for cliente in (gpt, architect, builder):
+        router.register_provider(cliente.provider, lambda _m, c=cliente: c, model=cliente.model)
+    router.assign_role(ProviderRole.ARCHITECT, "architect")
+    router.assign_role(ProviderRole.BUILDER, "anthropic")
+    router.assign_role(ProviderRole.VISUAL_QA, "anthropic")
+    router.configure_failover(
+        FailoverPolicy(
+            roles={ProviderRole.BUILDER: ("anthropic",), ProviderRole.VISUAL_QA: ("openai",)}
+        ),
+        _evaluador_visual,
+    )
+    ciclo = DevelopmentCycle(
+        router=router,
+        targets=DevelopmentTargetRegistry({TARGET_ID: target}),
+        config=DevelopmentConfig(
+            max_repair_rounds=2, max_structural_corrections=2, max_evidence_attempts=2
+        ),
+        audit=audit,
+        policy_engine=PolicyEngine.from_config(),
+        visual_capture=_CapturaFalsa(),
+    )
+    dependencias = ConsoleDependencies(
+        dev_cycle=ciclo,
+        gates=HumanGate(),
+        audit=audit,
+        policy=PolicyEngine.from_config(),
+        targets={TARGET_ID: target},
+        run_inline=True,
+        environ={},
+    )
+    aplicacion = FastAPI()
+    register_dashboard(aplicacion)
+    register_human_console(aplicacion, dependencias)
+    client = TestClient(aplicacion)
+
+    tarea = client.post("/console/tasks", json=_solicitud_visual()).json()
+
+    assert tarea["stage"] == "DEVELOPMENT_COMPLETED", tarea["development"]
+    assert tarea["gates"] == [], "ninguna reparación ya autorizada pidió una persona para empezar"
+    assert tarea["development"]["claims_result"] == "SATISFIED"
+    assert len(llamadas) == 2, "dos veredictos reales: FAIL y, tras reparar, PASS"
+    eventos = audit.by_type(AuditEventType.DEV_REPAIR_STARTED)
+    assert len(eventos) >= 1, "el FAIL sí disparó una ronda de reparación real, no una escalada"
+    # Grafo reconstruible (Evidence → Evaluation → Repair → Verification → Evidence): un evento de
+    # evaluación de criterios por cada veredicto real (antes y después de reparar), durable.
+    evaluaciones = audit.by_type(AuditEventType.DEV_CLAIMS_EVALUATED)
+    assert [dict(e.metadata)["result"] for e in evaluaciones] == ["FAILED", "SATISFIED"]
 
 
 def test_m2_presupuesto_de_evidencia_es_declarativo_y_configurable() -> None:

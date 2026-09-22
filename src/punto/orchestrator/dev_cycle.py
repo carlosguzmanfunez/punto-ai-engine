@@ -1460,7 +1460,10 @@ class DevelopmentCycle:
         issues = tuple(
             BuildValidationIssue(
                 code="CLAIM_NOT_SATISFIED",
-                detail=f"{item.kind}: {item.evidence}"[:300],
+                detail=(
+                    f"{item.kind}: {item.evidence}"
+                    + (f" REMEDY: {item.remedy}" if item.remedy else "")
+                )[:500],
             )
             for item in registros
             if item.unsatisfied and item.required
@@ -3261,10 +3264,10 @@ class DevelopmentCycle:
             if claim_issues:
                 failure_evidence += (
                     "\nFACTUAL/SEMANTIC CLAIM NOT SATISFIED (the requested property is not proven "
-                    "by the implementation):\n"
-                    + "\n".join(f"- {issue.detail}" for issue in claim_issues)
-                    + "\nProvide real evidence for the claim (an authoritative dataset that the "
-                    "code actually uses), not an approximation."
+                    "by the implementation). Each line below names the concrete defect and, after "
+                    "REMEDY, the specific change that closes it — follow that REMEDY exactly, do "
+                    "not invent a different fix (do not assume this is about a dataset unless the "
+                    "line says so):\n" + "\n".join(f"- {issue.detail}" for issue in claim_issues)
                 )
             if acceptance_issues:
                 failure_evidence += (

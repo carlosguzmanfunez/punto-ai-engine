@@ -605,6 +605,52 @@ def test_16_con_el_techo_en_cero_el_ciclo_se_comporta_como_antes(tmp_path: Path)
     assert rechazos[0]["round"] == 1
 
 
+def test_16b_source_path_ambiguo_vuelve_al_builder_y_conserva_la_causa(tmp_path: Path) -> None:
+    """MOVE sin origen se corrige antes de apply y no degenera en VERIFICATION_FAILED genérico."""
+    ambiguo = _propuesta_d7()
+    ambiguo["changes"] = [
+        {
+            "path": "src/lib/tipos.ts",
+            "operation": "MOVE",
+            "source_path": "",
+            "reason": "mover la fuente",
+            "acceptance_criterion": "una sola fuente de tipos",
+        }
+    ]
+    responses = [_plan(), _impl_inicial(), ambiguo, _propuesta_corregida()]
+
+    result, detalle, client = _run_e2e(tmp_path, responses)
+
+    fallos = _meta(detalle, "DEV_PROPOSAL_PREFLIGHT_FAILED")
+    assert any(item["issue_codes"] == ("CHANGE_SOURCE_PATH_REQUIRED",) for item in fallos)
+    assert "CHANGE_SOURCE_PATH_REQUIRED" in client.prompts[3]
+    assert "no inventará una ruta" in client.prompts[3]
+    assert result.status is DevelopmentStatus.COMPLETED
+
+
+def test_16c_source_path_ambiguo_agotado_termina_con_codigo_causal(tmp_path: Path) -> None:
+    """Sin presupuesto de corrección, el resultado expone la causa útil, nunca el genérico."""
+    ambiguo = _propuesta_corregida()
+    ambiguo["changes"] = [
+        {
+            "path": "src/lib/tipos.ts",
+            "operation": "RENAME",
+            "reason": "renombrar la fuente",
+            "acceptance_criterion": "una sola fuente de tipos",
+        }
+    ]
+    responses = [_plan(), _impl_inicial(), ambiguo]
+
+    result, _detalle, _client = _run_e2e(
+        tmp_path, responses, max_structural_corrections=0
+    )
+
+    assert result.status is DevelopmentStatus.CHANGE_REJECTED
+    assert result.error_kind == "CHANGE_SOURCE_PATH_REQUIRED"
+    assert result.change_issues[0].code == "CHANGE_SOURCE_PATH_REQUIRED"
+    assert "no inventará una ruta" in result.error
+
+
 def test_17_una_propuesta_repetida_ya_aplicada_no_gasta_ronda(tmp_path: Path) -> None:
     """Reintroducir exactamente lo ya aplicado se detecta antes de verificar."""
     responses = [

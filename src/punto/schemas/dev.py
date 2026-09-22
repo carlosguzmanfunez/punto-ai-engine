@@ -180,11 +180,25 @@ class FileChangeProposal(BaseModel):
         default="", max_length=MAX_ITEM_CHARS, description="Criterio del encargo que satisface."
     )
 
-    @field_validator("path", "source_path")
+    @field_validator("path")
     @classmethod
-    def validate_path(cls, value: str | None) -> str | None:
-        """Acepta solo rutas declarables."""
-        return None if value is None else _clean_path(value)
+    def validate_path(cls, value: str) -> str:
+        """Acepta solo una ruta destino declarable y no vacía."""
+        return _clean_path(value)
+
+    @field_validator("source_path")
+    @classmethod
+    def validate_source_path(cls, value: str | None) -> str | None:
+        """Normaliza la representación vacía de «sin origen» antes de juzgar la operación.
+
+        Algunos dialectos de salida estructurada materializan campos opcionales de texto como
+        ``""``. Eso no es una ruta: para CREATE/MODIFY/DELETE significa exactamente que el campo
+        no aplica. La validación de forma posterior sigue exigiendo un origen real y no vacío a
+        RENAME/MOVE, de modo que esta normalización no inventa ni relaja ninguna ruta.
+        """
+        if value is None or not value.strip():
+            return None
+        return _clean_path(value)
 
     @model_validator(mode="after")
     def validate_shape(self) -> FileChangeProposal:

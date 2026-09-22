@@ -95,7 +95,11 @@ from punto.orchestrator.focused_resolution import (
     resolution_block,
     resource_statuses,
 )
-from punto.orchestrator.proposal_boundary import length_limits_text, normalize_descriptive_fields
+from punto.orchestrator.proposal_boundary import (
+    length_limits_text,
+    normalize_change_shape,
+    normalize_descriptive_fields,
+)
 from punto.orchestrator.proposal_preflight import (
     ProposalPreflightResult,
     correction_feedback,
@@ -2609,9 +2613,17 @@ class DevelopmentCycle:
         # fallo dejó de avanzar). Es local a la ejecución: un ciclo nuevo empieza sin memoria.
         resolution = ResolutionState()
 
-        # El techo de iteraciones es explícito: rondas funcionales de reparación + correcciones
-        # estructurales + la implementación inicial. Ni bucle abierto ni rondas escondidas.
-        max_iterations = self.config.max_repair_rounds + 1 + self.config.max_structural_corrections
+        # El techo de iteraciones es explícito: implementación inicial, rondas funcionales,
+        # correcciones estructurales, entregas de contexto y takeovers. Cada presupuesto es
+        # independiente y declarado; sumar sus máximos evita que una entrega válida consuma la
+        # ranura necesaria para devolver feedback estructural, sin abrir ningún bucle ilimitado.
+        max_iterations = (
+            self.config.max_repair_rounds
+            + 1
+            + self.config.max_structural_corrections
+            + self.config.max_context_rounds
+            + self.config.max_builder_takeovers
+        )
         # La corrección estructural se construye al final de una iteración y se entrega en la
         # siguiente invocación: se consume una sola vez (si no, se perdería antes de viajar).
         pending_feedback = ""
@@ -2737,6 +2749,22 @@ class DevelopmentCycle:
                         "authority": "solo anotaciones: path, operación y contenido no se tocan",
                     },
                 )
+            payload, shape_normalized = normalize_change_shape(payload)
+            if shape_normalized:
+                self._log(
+                    AuditEventType.DEV_PROPOSAL_NORMALIZED,
+                    "dev_proposal_normalized",
+                    request,
+                    {
+                        "round": rounds,
+                        "fields": [item.location for item in shape_normalized],
+                        "operations": [item.operation for item in shape_normalized],
+                        "actions": [item.action for item in shape_normalized],
+                        "authority": (
+                            "ausencia opcional inequívoca: no se inventan ni alteran rutas"
+                        ),
+                    },
+                )
             # Causa raíz: en una reparación, sin hipótesis no se toca nada. Es la regla que impide
             # el «patch until green»: cada ronda explica qué falló, por qué y qué espera conseguir.
             root_cause, root_evidence, expected_effect = _root_cause(payload)
@@ -2835,7 +2863,63 @@ class DevelopmentCycle:
             proposals, proposal_issue = self._proposals(payload)
             if proposal_issue is not None:
                 change_issues = (proposal_issue,)
-                failure_evidence = proposal_issue.detail
+                failure_evidence = (
+                    "REJECTED PROPOSAL (fix this exact structural defect and answer again):\n"
+                    f"- {proposal_issue.code}: {proposal_issue.detail}"
+                )
+                if proposal_issue.code not in {"CHANGES_EMPTY", "CHANGE_MALFORMED"}:
+                    self._log(
+                        AuditEventType.DEV_CHANGE_REJECTED,
+                        "dev_change_rejected",
+                        request,
+                        {"issue_codes": [proposal_issue.code], "round": rounds, "phase": "parse"},
+                        AuditResult.FAILURE,
+                    )
+                if proposal_issue.code != "CHANGES_EMPTY":
+                    if self._structural_corrections < self.config.max_structural_corrections:
+                        self._structural_corrections += 1
+                        pending_feedback = failure_evidence
+                        self._log(
+                            AuditEventType.DEV_PROPOSAL_PREFLIGHT_FAILED,
+                            "dev_proposal_preflight_failed",
+                            request,
+                            {
+                                "round": rounds,
+                                "structural_correction": self._structural_corrections,
+                                "max_structural_corrections": (
+                                    self.config.max_structural_corrections
+                                ),
+                                "issue_codes": [proposal_issue.code],
+                                "issues": [
+                                    {
+                                        "code": proposal_issue.code,
+                                        "detail": proposal_issue.detail,
+                                        "phase": "parse",
+                                    }
+                                ],
+                                "advisory_codes": [],
+                                "repair_round_consumed": False,
+                            },
+                            AuditResult.FAILURE,
+                        )
+                        continue
+                    return self._outcome(
+                        status=DevelopmentStatus.CHANGE_REJECTED,
+                        error_kind=proposal_issue.code,
+                        error=proposal_issue.detail,
+                        provider=provider,
+                        model=model,
+                        applied=applied,
+                        verification=verification,
+                        repair_rounds=rounds,
+                        granted=granted,
+                        denied=denied,
+                        checkpoint=checkpoint,
+                        influence=influence,
+                        change_issues=change_issues,
+                        acceptance=acceptance_evidence,
+                        acceptance_result=self._acceptance_result(acceptance_evidence),
+                    )
                 if (
                     proposal_issue.code == "CHANGES_EMPTY"
                     and self.config.reconcile_noop
@@ -3373,11 +3457,19 @@ class DevelopmentCycle:
         solo_aceptacion = bool(acceptance_issues) and all(item.passed for item in verification)
         return self._outcome(
             status=DevelopmentStatus.VERIFICATION_FAILED,
-            error_kind="ACCEPTANCE_NOT_SATISFIED" if solo_aceptacion else "VERIFICATION_FAILED",
+            error_kind=(
+                "ACCEPTANCE_NOT_SATISFIED"
+                if solo_aceptacion
+                else change_issues[0].code
+                if change_issues
+                else "VERIFICATION_FAILED"
+            ),
             error=(
                 "el criterio de aceptación no quedó satisfecho en la superficie solicitada "
                 "tras las rondas de reparación"
                 if solo_aceptacion
+                else change_issues[0].detail
+                if change_issues
                 else "la verificación no pasó tras las rondas de reparación"
             )
             + (
@@ -3460,15 +3552,51 @@ class DevelopmentCycle:
                 code="CHANGES_EMPTY", detail="el BUILDER no propuso ningún cambio"
             )
         proposals: list[FileChangeProposal] = []
-        for item in raw:
+        for index, item in enumerate(raw):
             if not isinstance(item, Mapping):
                 return (), BuildValidationIssue(
                     code="CHANGE_MALFORMED", detail="un cambio no es un objeto"
                 )
+            operation = item.get("operation")
+            path = item.get("path")
+            source = item.get("source_path")
+            if not isinstance(path, str) or not path.strip():
+                return (), BuildValidationIssue(
+                    code="CHANGE_PATH_REQUIRED",
+                    detail=(
+                        f"changes[{index}] exige path destino no vacío; no se puede inferir una "
+                        "ruta con seguridad"
+                    ),
+                )
+            if operation in {ChangeOperation.RENAME.value, ChangeOperation.MOVE.value} and (
+                not isinstance(source, str) or not source.strip()
+            ):
+                return (), BuildValidationIssue(
+                    code="CHANGE_SOURCE_PATH_REQUIRED",
+                    detail=(
+                        f"changes[{index}] {operation} exige source_path no vacío; devuelve el "
+                        "origen real, PUNTO no inventará una ruta"
+                    ),
+                )
+            if operation in {
+                ChangeOperation.CREATE.value,
+                ChangeOperation.MODIFY.value,
+                ChangeOperation.DELETE.value,
+            } and isinstance(source, str) and source.strip():
+                return (), BuildValidationIssue(
+                    code="CHANGE_SOURCE_PATH_FORBIDDEN",
+                    detail=(
+                        f"changes[{index}] {operation} identifica el recurso con path y no admite "
+                        "source_path; omite el campo"
+                    ),
+                )
             try:
                 proposals.append(FileChangeProposal.model_validate(dict(item)))
             except Exception as exc:
-                return (), BuildValidationIssue(code="CHANGE_INVALID", detail=str(exc)[:300])
+                return (), BuildValidationIssue(
+                    code="CHANGE_INVALID",
+                    detail=f"changes[{index}] no cumple FileChangeProposal: {str(exc)[:240]}",
+                )
         return tuple(proposals), None
 
     def _validate_changes(
@@ -4685,7 +4813,6 @@ BUILD_CONTRACT: Final[str] = (
     "DELIVERABLE: a JSON object with EXACTLY these keys:\n"
     '{"summary": "one sentence", '
     '"changes": [{"path": "relative/path", "operation": "CREATE|MODIFY|DELETE|RENAME|MOVE", '
-    '"source_path": "origin for RENAME/MOVE", '
     '"content": "the FULL new file content", "reason": "why", '
     '"acceptance_criterion": "which criterion it satisfies"}], '
     '"context_requests": [{"path": "relative/path", "reason": "why you need it"}], '
@@ -4699,6 +4826,8 @@ BUILD_CONTRACT: Final[str] = (
     '"resources": ["relative/path"], "operations": ["MODIFY"], '
     '"relationship": "why this resource is part of the same functional chain"}}\n'
     "Rules: only paths declared in the validated plan; DELETE/RENAME/MOVE must not carry content; "
+    "source_path is REQUIRED and non-empty for RENAME/MOVE, and MUST be omitted for "
+    "CREATE/MODIFY/DELETE (DELETE identifies the file to remove with path); "
     "every change needs the full file content and a reason; do not touch files outside the plan; "
     "do not include credentials. Ask for scope_expansion with evidence when the objective "
     "genuinely requires another resource: PUNTO evaluates it and decides; it is not yours to "
@@ -4784,7 +4913,13 @@ BUILD_SCHEMA: Final[Mapping[str, Any]] = {
                         "type": "string",
                         "enum": ["CREATE", "MODIFY", "DELETE", "RENAME", "MOVE"],
                     },
-                    "source_path": {"type": "string"},
+                    "source_path": {
+                        "type": "string",
+                        "description": (
+                            "Non-empty origin, required only for RENAME/MOVE; omit for "
+                            "CREATE/MODIFY/DELETE."
+                        ),
+                    },
                     "content": {"type": "string"},
                     "expected_sha256": {"type": "string"},
                     "reason": {"type": "string"},

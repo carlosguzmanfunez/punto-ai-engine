@@ -18,12 +18,10 @@ La corrección son dos cosas, y ninguna relaja una validación:
   los campos *descriptivos* (``reason`` y ``acceptance_criterion``): texto que solo se usa como
   evidencia legible y que no decide qué se escribe, dónde ni con qué autoridad.
 
-Lo que **no** se normaliza nunca, y sigue fallando cerrado: ``path``, ``source_path``,
-``operation``, ``content``, ``expected_sha256`` y cualquier otro campo. Recortar una ruta o un
-contenido cambiaría lo que se escribe; una anotación recortada solo pierde su cola. Un valor que
-no es texto tampoco se toca: el modelo lo rechaza como siempre. Nada de esto amplía autoridad: el
-resultado sigue siendo la misma propuesta, con las mismas rutas, operaciones y contenidos, que
-pasa por las mismas validaciones, el mismo sobre de autoridad y las mismas verificaciones.
+Las rutas no se recortan ni se inventan. Hay una única normalización semántica adicional:
+``source_path=""`` (o solo espacios) se elimina para CREATE/MODIFY/DELETE, operaciones en las que
+el origen no aplica. Para RENAME/MOVE permanece intacto y se rechaza con causa estructurada porque
+esas operaciones sí necesitan un origen real. Un valor no vacío nunca se modifica.
 """
 
 from __future__ import annotations
@@ -39,10 +37,12 @@ from punto.schemas.dev import ContextRequest, FileChangeProposal
 
 __all__ = [
     "DESCRIPTIVE_FIELDS",
+    "ChangeShapeNormalization",
     "Normalization",
     "field_limit",
     "fit_annotation",
     "length_limits_text",
+    "normalize_change_shape",
     "normalize_descriptive_fields",
 ]
 
@@ -78,6 +78,66 @@ class Normalization:
             "kept_chars": self.kept_chars,
             "original_sha256": self.original_sha256,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeShapeNormalization:
+    """Constancia de una ausencia opcional expresada como cadena vacía por el proveedor."""
+
+    location: str
+    operation: str
+    action: str = "EMPTY_SOURCE_PATH_TO_ABSENT"
+
+    def as_dict(self) -> dict[str, str]:
+        """Vista serializable sin contenido ni rutas."""
+        return {
+            "location": self.location,
+            "operation": self.operation,
+            "action": self.action,
+        }
+
+
+def normalize_change_shape(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], tuple[ChangeShapeNormalization, ...]]:
+    """Normaliza solo ausencias inequívocas de ``source_path`` según la operación.
+
+    CREATE, MODIFY y DELETE identifican su recurso mediante ``path`` y no tienen ruta de origen.
+    Si un proveedor serializa el campo opcional como texto vacío, quitarlo conserva exactamente la
+    misma semántica. RENAME/MOVE, operaciones desconocidas, rutas no vacías y formas no-objeto se
+    dejan intactas para que la validación las rechace sin adivinar nada.
+    """
+    raw = payload.get("changes")
+    if not isinstance(raw, list):
+        return payload, ()
+    notes: list[ChangeShapeNormalization] = []
+    items: list[Any] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            items.append(item)
+            continue
+        operation = item.get("operation")
+        source = item.get("source_path")
+        if (
+            operation in {"CREATE", "MODIFY", "DELETE"}
+            and isinstance(source, str)
+            and not source.strip()
+        ):
+            fixed = dict(item)
+            fixed.pop("source_path", None)
+            items.append(fixed)
+            notes.append(
+                ChangeShapeNormalization(
+                    location=f"changes[{index}].source_path", operation=str(operation)
+                )
+            )
+            continue
+        items.append(item)
+    if not notes:
+        return payload, ()
+    result = dict(payload)
+    result["changes"] = items
+    return result, tuple(notes)
 
 
 def field_limit(model: type[BaseModel], name: str) -> int | None:

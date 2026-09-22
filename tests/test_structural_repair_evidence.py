@@ -214,6 +214,9 @@ def _reparacion(*, content: str = "export { TIPOS } from './tipos';\n") -> dict[
             {
                 "path": "src/lib/tipos_legacy.ts",
                 "operation": "MODIFY",
+                # Reproduce la forma cruda real del takeover Codex: un opcional de texto
+                # materializado como cadena vacía. Para MODIFY significa «sin origen».
+                "source_path": "",
                 "content": content,
                 "reason": "fuente duplicada: reexporta la canónica en vez de declarar la suya",
                 "acceptance_criterion": CRITERIO,
@@ -263,6 +266,13 @@ def test_b_el_sustituto_produce_el_cambio_y_llega_a_satisfied(tmp_path: Path) ->
         dict(e.metadata)["result"] for e in audit.by_type(AuditEventType.DEV_CLAIMS_EVALUATED)
     ]
     assert eventos == ["FAILED", "SATISFIED"]
+    normalizaciones = [
+        dict(e.metadata) for e in audit.by_type(AuditEventType.DEV_PROPOSAL_NORMALIZED)
+    ]
+    assert any(
+        tuple(item.get("actions", ())) == ("EMPTY_SOURCE_PATH_TO_ABSENT",)
+        for item in normalizaciones
+    ), "el payload reparable del takeover se normaliza y queda auditado"
 
 
 # =========================================== D · el sustituto puede SALVAGE

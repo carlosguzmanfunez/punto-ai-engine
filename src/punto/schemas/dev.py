@@ -635,6 +635,9 @@ class DevelopmentResult(BaseModel):
     claims: tuple[ClaimEvidence, ...] = ()
     #: ``SATISFIED`` | ``FAILED`` | ``EVIDENCE_REQUIRED`` | ``NONE``.
     claims_result: str = Field(default="NONE", max_length=20)
+    #: AUTONOMOUS EVIDENCE + REPAIR LOOP v0: intentos de evidencia consumidos en la última medición
+    #: (1 si no hizo falta reintentar). Presupuesto propio, distinto de ``repair_rounds``.
+    evidence_attempts: int = Field(default=0, ge=0, le=1_000)
     #: AP000-OBS-03-R1: capacidades efectivas que exigían las afirmaciones, comprobadas al empezar.
     capabilities: tuple[CapabilityEvidence, ...] = ()
     #: PROVIDER FAILOVER: sustituciones de proveedor de este ciclo (vacío si nadie falló).

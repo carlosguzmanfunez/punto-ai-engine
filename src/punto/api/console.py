@@ -416,6 +416,7 @@ class ConsoleTask:
             "branch": result.branch,
             "applied": [item.path for item in result.applied],
             "repair_rounds": result.repair_rounds,
+            "evidence_attempts": result.evidence_attempts,
             "structural_corrections": result.structural_corrections,
             "functional_chain_result": result.functional_chain_result,
             "verification": [

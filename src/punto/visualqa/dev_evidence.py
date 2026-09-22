@@ -101,9 +101,7 @@ class CapturedShot:
 class ScreenshotCapture(Protocol):
     """Captura la aplicación renderizada en URLs de bucle local."""
 
-    def capture(
-        self, urls: Sequence[str], viewport: tuple[int, int]
-    ) -> tuple[CapturedShot, ...]:
+    def capture(self, urls: Sequence[str], viewport: tuple[int, int]) -> tuple[CapturedShot, ...]:
         """Devuelve una captura por URL o lanza :class:`CaptureError`."""
         ...  # pragma: no cover - protocolo
 
@@ -132,9 +130,7 @@ class HeadlessBrowserCapture:
                 return candidate
         raise CaptureError("no hay un navegador instalado (Chrome/Edge) para capturar la app")
 
-    def capture(
-        self, urls: Sequence[str], viewport: tuple[int, int]
-    ) -> tuple[CapturedShot, ...]:
+    def capture(self, urls: Sequence[str], viewport: tuple[int, int]) -> tuple[CapturedShot, ...]:
         """Una captura por URL de bucle local; cualquier fallo es un error explícito."""
         if not urls:
             raise CaptureError("el destino no declara rutas visuales que capturar")
@@ -231,6 +227,7 @@ def assess_visual_claims(
     *,
     request_id: str,
     max_output_tokens: int | None = None,
+    guidance: Mapping[str, str] | None = None,
 ) -> VisualAssessment:
     """Evalúa los criterios de apariencia con la ruta **efectiva** de VISUAL_QA.
 
@@ -245,7 +242,12 @@ def assess_visual_claims(
         return VisualAssessment(
             shots=tuple(shots), error=f"sin ruta visual efectiva: {route.reason}"[:300]
         )
-    listing = "\n".join(f"{index}. {text}" for index, text in enumerate(sentences, start=1))
+    hints = guidance or {}
+    listing = "\n".join(
+        f"{index}. {text}"
+        + (f" (previous attempt was INCONCLUSIVE: {hints[text][:200]})" if hints.get(text) else "")
+        for index, text in enumerate(sentences, start=1)
+    )
     views = "\n".join(
         f"Screenshot {index}: {shot.url} at {shot.viewport[0]}x{shot.viewport[1]}"
         for index, shot in enumerate(shots, start=1)
@@ -258,9 +260,7 @@ def assess_visual_claims(
         metadata={"purpose": "dev-cycle-visual-evidence"},
         request_id=request_id,
     )
-    result = router.execute(
-        ProviderRole.VISUAL_QA, request, max_output_tokens=max_output_tokens
-    )
+    result = router.execute(ProviderRole.VISUAL_QA, request, max_output_tokens=max_output_tokens)
     if not result.ok:
         detail = f"{result.provider or route.provider}: {result.error or result.status.value}"
         return VisualAssessment(

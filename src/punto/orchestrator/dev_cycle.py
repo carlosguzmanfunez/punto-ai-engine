@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
 from punto.acceptance import (
+    RETRYABLE_EVIDENCE_CLASSES,
     CapabilityRequirement,
     ClaimRecord,
     RequestReference,
@@ -227,8 +228,28 @@ _PATH_TUPLE_FIELDS: Final[frozenset[str]] = frozenset(
 #: Palabras vacías para el ranking determinista de candidatos.
 _STOPWORDS: Final[frozenset[str]] = frozenset(
     {
-        "and", "for", "from", "with", "que", "los", "las", "del", "una", "uno", "por",
-        "para", "con", "como", "mas", "más", "sin", "sobre", "the", "add", "new", "fix",
+        "and",
+        "for",
+        "from",
+        "with",
+        "que",
+        "los",
+        "las",
+        "del",
+        "una",
+        "uno",
+        "por",
+        "para",
+        "con",
+        "como",
+        "mas",
+        "más",
+        "sin",
+        "sobre",
+        "the",
+        "add",
+        "new",
+        "fix",
     }
 )
 
@@ -270,6 +291,13 @@ class DevelopmentConfig:
     max_context_rounds: int = 2
     #: Rondas seguidas con el mismo fallo y la misma estrategia antes de declarar estancamiento.
     stagnation_limit: int = 2
+    #: AUTONOMOUS EVIDENCE + REPAIR LOOP v0. Presupuesto **de evidencia**, distinto del de
+    #: reparación (``max_repair_rounds``): cuántas veces PUNTO puede volver a obtener evidencia
+    #: real (nueva captura + veredicto) para un criterio INCONCLUSIVE o con fallo técnico antes de
+    #: escalar. No consume rondas de reparación: no hace falta que el BUILDER proponga nada para
+    #: reintentar la evidencia. ``CAPABILITY_UNAVAILABLE`` nunca reintenta con este presupuesto
+    #: (ninguna ruta puede producir la evidencia; reintentar no cambia nada).
+    max_evidence_attempts: int = 2
     #: Correcciones **estructurales** admitidas por ciclo: una propuesta que PUNTO puede rechazar
     #: por un hecho medible (CREATE sobre algo que existe, MODIFY sobre algo que no está, cambios
     #: contradictorios o sin efecto) se corrige sin gastar una ronda funcional de reparación. El
@@ -359,16 +387,12 @@ class DevelopmentCycle:
         default_factory=list, init=False, repr=False
     )
     _risk_envelopes: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
-    _plan_versions: list[PlanRevisionRecord] = field(
-        default_factory=list, init=False, repr=False
-    )
+    _plan_versions: list[PlanRevisionRecord] = field(default_factory=list, init=False, repr=False)
     _scope_expansions: list[ScopeExpansionRecord] = field(
         default_factory=list, init=False, repr=False
     )
     #: PROVIDER FAILOVER: sustituciones de proveedor de la ejecución en curso.
-    _failovers: list[ProviderFailoverEvidence] = field(
-        default_factory=list, init=False, repr=False
-    )
+    _failovers: list[ProviderFailoverEvidence] = field(default_factory=list, init=False, repr=False)
     #: Evidencia visual gobernada de la ejecución en curso.
     _visual_evidence: list[VisualEvidenceRecord] = field(
         default_factory=list, init=False, repr=False
@@ -392,9 +416,7 @@ class DevelopmentCycle:
     #: Ficheros candidatos del inventario, para buscar datasets entre ellos.
     _inventory_paths: tuple[str, ...] = field(default=(), init=False, repr=False)
     #: AP000-OBS-03-R1: capacidades efectivas exigidas por las afirmaciones, comprobadas al empezar.
-    _capabilities: tuple[CapabilityRequirement, ...] = field(
-        default=(), init=False, repr=False
-    )
+    _capabilities: tuple[CapabilityRequirement, ...] = field(default=(), init=False, repr=False)
     #: Atestación humana explícita (nota de un gate resuelto) que puede demostrar la apariencia.
     _attestation: str = field(default="", init=False, repr=False)
 
@@ -667,6 +689,8 @@ class DevelopmentCycle:
             claims_result=outcome["claims_result"],
             resolution=outcome["resolution"],
             no_op_evidence=outcome["no_op_evidence"],
+            blocked=outcome["blocked"],
+            evidence_attempts=outcome["evidence_attempts"],
         )
 
     # ------------------------------------------------------------------ destinos
@@ -915,7 +939,10 @@ class DevelopmentCycle:
         # AP000-OBS-03: las afirmaciones factuales/semánticas se miden con evidencia real. Un
         # criterio requerido sin evidencia no se convierte en PASS: se para y se pide.
         claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
-            request, repository, target, plan
+            request,
+            repository,
+            target,
+            plan,
         )
         return _StateEvaluation(
             verification=tuple(verification),
@@ -928,6 +955,106 @@ class DevelopmentCycle:
             claim_issues=tuple(claim_issues),
             claim_records=tuple(claim_records),
         )
+
+    def _evidence_recovery(
+        self,
+        request: BuildRequest,
+        target: DevelopmentTarget,
+        repository: GovernedRepository,
+        plan: DevelopmentPlan,
+        state: _StateEvaluation,
+    ) -> tuple[_StateEvaluation, int, tuple[str, ...]]:
+        """AUTONOMOUS EVIDENCE + REPAIR LOOP v0 (sección 3): recupera evidencia antes de escalar.
+
+        No repite verificación ni construcción: reintenta **solo** la obtención de evidencia
+        (nueva captura real + veredicto real) para los criterios cuya clase lo justifica
+        (``INCONCLUSIVE`` / ``EVIDENCE_TECHNICAL_FAILURE``), con un presupuesto propio
+        (``max_evidence_attempts``) distinto del de reparación. ``CAPABILITY_UNAVAILABLE`` nunca
+        reintenta aquí: ninguna ruta autorizada puede producir la evidencia, y reintentar sin
+        cambiar de ruta no cambia nada (la ruta efectiva ya se resuelve por capacidad y failover en
+        ``_visual_capability``/``resolve_route``, no aquí).
+
+        La estrategia de reintento se deriva del propio criterio: la observación del intento
+        anterior ("qué no permitió decidir") viaja como guía al siguiente veredicto, en vez de una
+        regla fija por proyecto.
+
+        Returns:
+            El estado final (con los últimos ``claim_records`` si hubo reintentos), los intentos de
+            evidencia consumidos (para el presupuesto) y una traza legible de cada intento (la
+            auditoría real, ya durable, es ``DEV_CLAIMS_EVALUATED``: uno por intento).
+        """
+        attempts = 1
+        current = state
+        trail = [self._evidence_attempt_note(1, current)]
+        while (
+            current.claims_outcome == "EVIDENCE_REQUIRED"
+            and attempts < self.config.max_evidence_attempts
+        ):
+            pending = {
+                item.sentence: item
+                for item in current.claim_records
+                if item.required and item.not_verified
+            }
+            classes = {item.evidence_class for item in pending.values()}
+            if not classes & RETRYABLE_EVIDENCE_CLASSES:
+                break
+            guidance = {
+                sentence: item.evidence
+                for sentence, item in pending.items()
+                if item.evidence_class == "INCONCLUSIVE"
+            }
+            attempts += 1
+            claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
+                request, repository, target, plan, guidance=guidance
+            )
+            current = current._replace(
+                claims_outcome=claims_outcome,
+                claim_issues=tuple(claim_issues),
+                claim_records=tuple(claim_records),
+            )
+            trail.append(self._evidence_attempt_note(attempts, current))
+        return current, attempts, tuple(trail)
+
+    @staticmethod
+    def _evidence_blocked_evidence(
+        state: _StateEvaluation, attempts: int, trail: tuple[str, ...]
+    ) -> BlockedEvidence:
+        """Evidencia auditable del bloqueo (sección 6): por qué PUNTO ya no puede seguir solo.
+
+        Incluye el criterio pendiente, su clasificación, los intentos realizados (la traza) y qué
+        capacidad/proveedor intervino en el último; la auditoría completa —un evento por intento—
+        ya vive en ``DEV_CLAIMS_EVALUATED`` (durable, sin segunda fuente).
+        """
+        pending = [item for item in state.claim_records if item.required and item.not_verified]
+        primary = pending[0] if pending else None
+        classes = sorted({item.evidence_class or "NOT_VERIFIED" for item in pending})
+        return BlockedEvidence(
+            code="EVIDENCE_REQUIRED",
+            detail=(
+                f"criterio pendiente: {primary.sentence[:200] if primary else '(desconocido)'} | "
+                f"clasificación: {', '.join(classes)} | "
+                f"intentos: {' / '.join(trail)}"
+            )[:1_000],
+            rule=(
+                "capability-unavailable"
+                if classes == ["CAPABILITY_UNAVAILABLE"]
+                else "evidence-budget-exhausted"
+            ),
+            resource=primary.sentence[:300] if primary else "",
+            remedy=(primary.remedy if primary else "")
+            or ("aporta la evidencia que falta o una atestación humana explícita"),
+        )
+
+    @staticmethod
+    def _evidence_attempt_note(attempt: int, state: _StateEvaluation) -> str:
+        """Línea legible de un intento de evidencia (para el mensaje de bloqueo, no auditoría)."""
+        pending = [item for item in state.claim_records if item.required and item.not_verified]
+        if not pending:
+            return f"intento {attempt}: {state.claims_outcome}"
+        detail = "; ".join(
+            f"{item.kind}={item.evidence_class or 'NOT_VERIFIED'}" for item in pending
+        )
+        return f"intento {attempt}: {state.claims_outcome} ({detail})"
 
     def _noop_gap(
         self, state: _StateEvaluation, plan: DevelopmentPlan, repository: GovernedRepository
@@ -1059,9 +1186,7 @@ class DevelopmentCycle:
 
         return visual_capability_for_role(router=self.router)
 
-    def _capability_preflight(
-        self, request: BuildRequest
-    ) -> tuple[CapabilityRequirement, ...]:
+    def _capability_preflight(self, request: BuildRequest) -> tuple[CapabilityRequirement, ...]:
         """Comprueba **antes de construir** qué capacidades exigen las afirmaciones de la solicitud.
 
         Es la comprobación que impide exigir una verificación imposible: si un criterio de
@@ -1167,6 +1292,8 @@ class DevelopmentCycle:
         repository: GovernedRepository,
         target: DevelopmentTarget,
         plan: DevelopmentPlan | None = None,
+        *,
+        guidance: Mapping[str, str] | None = None,
     ) -> tuple[str, tuple[BuildValidationIssue, ...], tuple[ClaimRecord, ...]]:
         """Mide las afirmaciones factuales/semánticas con la evidencia disponible.
 
@@ -1185,7 +1312,7 @@ class DevelopmentCycle:
                 datasets[0].path,
             )
         visual = self._visual_capability()
-        verdicts = self._visual_verdicts(request, repository, target, visual)
+        verdicts = self._visual_verdicts(request, repository, target, visual, guidance=guidance)
         registros = verify_claims(
             self._claims,
             datasets=datasets,
@@ -1225,6 +1352,8 @@ class DevelopmentCycle:
         repository: GovernedRepository,
         target: DevelopmentTarget,
         visual: VisualCapability,
+        *,
+        guidance: Mapping[str, str] | None = None,
     ) -> dict[str, VisualVerdict]:
         """Produce evidencia visual real (capturas y/o interacciones) evaluada por VISUAL_QA.
 
@@ -1242,7 +1371,9 @@ class DevelopmentCycle:
         digest = self._applied_digest(repository)
         verdicts: dict[str, VisualVerdict] = {}
         if static:
-            verdicts.update(self._static_verdicts(request, target, static, digest))
+            verdicts.update(
+                self._static_verdicts(request, target, static, digest, guidance=guidance)
+            )
         if interactive:
             verdicts.update(self._interaction_verdicts(request, target, interactive, digest))
         return verdicts
@@ -1253,9 +1384,7 @@ class DevelopmentCycle:
         return hashlib.sha256(
             "\n".join(
                 f"{path}:{sha}"
-                for path, sha in sorted(
-                    repository.file_hashes(repository.changed_paths()).items()
-                )
+                for path, sha in sorted(repository.file_hashes(repository.changed_paths()).items())
             ).encode("utf-8")
         ).hexdigest()
 
@@ -1265,6 +1394,8 @@ class DevelopmentCycle:
         target: DevelopmentTarget,
         sentences: Sequence[str],
         digest: str,
+        *,
+        guidance: Mapping[str, str] | None = None,
     ) -> dict[str, VisualVerdict]:
         """Criterios de apariencia estática: captura real de la app renderizada + VISUAL_QA."""
         if self.visual_capture is None or not target.visual_routes:
@@ -1296,6 +1427,7 @@ class DevelopmentCycle:
             shots,
             request_id=str(request.request_id),
             max_output_tokens=self.config.max_output_tokens,
+            guidance=guidance,
         )
         return self._register_assessment(request, sentences, assessment, digest=digest)
 
@@ -1336,9 +1468,7 @@ class DevelopmentCycle:
                 "pixels_changed": [item.pixels_changed for item in evidences],
                 "errors": [item.error for item in evidences if item.error],
             },
-            AuditResult.SUCCESS
-            if any(item.usable for item in evidences)
-            else AuditResult.FAILURE,
+            AuditResult.SUCCESS if any(item.usable for item in evidences) else AuditResult.FAILURE,
         )
         assessment = assess_interaction_claims(
             self.router,
@@ -1417,9 +1547,7 @@ class DevelopmentCycle:
             )
             for shot in assessment.shots
         )
-        labels = tuple(
-            f"{shot.url} {shot.phase} {shot.sha256[:12]}" for shot in assessment.shots
-        )
+        labels = tuple(f"{shot.url} {shot.phase} {shot.sha256[:12]}" for shot in assessment.shots)
         usable = [item for item in evidences if item.usable]
         first = usable[0] if usable else None
         verdicts: dict[str, VisualVerdict] = {}
@@ -1680,9 +1808,7 @@ class DevelopmentCycle:
                         added_resources=plan.touched_paths(),
                         risk_before="LOW",
                         risk_after=(
-                            self._authority_decisions[-1].risk
-                            if self._authority_decisions
-                            else ""
+                            self._authority_decisions[-1].risk if self._authority_decisions else ""
                         ),
                         authority_result=(
                             self._authority_decisions[-1].outcome
@@ -1872,14 +1998,10 @@ class DevelopmentCycle:
             ChangeOperation.RENAME: EnvelopeOperation.RENAME,
             ChangeOperation.MOVE: EnvelopeOperation.MOVE,
         }[proposal.operation]
-        evidence = tuple(
-            item for item in (proposal.reason, proposal.acceptance_criterion) if item
-        )
+        evidence = tuple(item for item in (proposal.reason, proposal.acceptance_criterion) if item)
         return OperationRisk(
             operation=operation,
-            resources=tuple(
-                item for item in (proposal.source_path, proposal.path) if item
-            ),
+            resources=tuple(item for item in (proposal.source_path, proposal.path) if item),
             environment=Environment.LOCAL,
             reversible=True,
             verification_strength=VerificationStrength.MODERATE,
@@ -1891,9 +2013,7 @@ class DevelopmentCycle:
             description=proposal.reason,
         )
 
-    def _record_decision(
-        self, decision: Any, request: BuildRequest, *, phase: str
-    ) -> None:
+    def _record_decision(self, decision: Any, request: BuildRequest, *, phase: str) -> None:
         """Registra una decisión de autoridad en el resultado y en la auditoría."""
         profile: OperationRisk | None = decision.profile
         # Regla de esta frontera: **todo campo de evidencia acotado por esquema recibe una secuencia
@@ -1951,11 +2071,7 @@ class DevelopmentCycle:
         if constitutional is not None:
             issues.append(constitutional)
         if not decision.autonomous:
-            code = (
-                "PLAN_OUTSIDE_AUTHORITY"
-                if decision.prohibited
-                else "PLAN_REQUIRES_HUMAN"
-            )
+            code = "PLAN_OUTSIDE_AUTHORITY" if decision.prohibited else "PLAN_REQUIRES_HUMAN"
             issues.append(
                 BuildValidationIssue(
                     code=code,
@@ -2051,9 +2167,7 @@ class DevelopmentCycle:
         # petición grande no puede reventar la construcción del registro: se acota lo que se guarda
         # y **los totales reales viajan en el evento de auditoría**, que es donde vive la decisión.
         # El desenlace sigue siendo el que decidió el sobre (DENIED / HUMAN_GATE), no una excepción.
-        acumulados = tuple(
-            str(item) for item in decision.record.get("cumulative_resources", ())
-        )
+        acumulados = tuple(str(item) for item in decision.record.get("cumulative_resources", ()))
         declarados = payload.get("resources")
         total_declarados = len(declarados) if isinstance(declarados, list) else len(requested)
         total_pedidos = len(requested)
@@ -2238,9 +2352,7 @@ class DevelopmentCycle:
             state.touched.update(touched_now)
             return
         explained_now = {
-            item.path: item.evidence
-            for item in statuses
-            if item.status == UNCHANGED_BY_EVIDENCE
+            item.path: item.evidence for item in statuses if item.status == UNCHANGED_BY_EVIDENCE
         }
         record = causal_progress(
             round_index=rounds,
@@ -2263,9 +2375,7 @@ class DevelopmentCycle:
             {
                 **record.as_dict(),
                 # Lista plana y legible: los metadatos de auditoría se congelan, no se anidan.
-                "resources_status": [
-                    f"{item.path}={item.status}" for item in statuses
-                ],
+                "resources_status": [f"{item.path}={item.status}" for item in statuses],
                 "verification_result": "PASSED" if passed else "FAILED",
             },
             AuditResult.SUCCESS if passed else AuditResult.FAILURE,
@@ -2351,11 +2461,7 @@ class DevelopmentCycle:
 
         # El techo de iteraciones es explícito: rondas funcionales de reparación + correcciones
         # estructurales + la implementación inicial. Ni bucle abierto ni rondas escondidas.
-        max_iterations = (
-            self.config.max_repair_rounds
-            + 1
-            + self.config.max_structural_corrections
-        )
+        max_iterations = self.config.max_repair_rounds + 1 + self.config.max_structural_corrections
         # La corrección estructural se construye al final de una iteración y se entrega en la
         # siguiente invocación: se consume una sola vez (si no, se perdería antes de viajar).
         pending_feedback = ""
@@ -2370,9 +2476,7 @@ class DevelopmentCycle:
             # fallida no hay nada que resolver, y la implementación inicial no la recibe.
             failed_now = tuple(item for item in verification if not item.passed)
             resolution_phase = bool(failed_now)
-            current_failure = (
-                failure_map(verification, target, plan) if resolution_phase else None
-            )
+            current_failure = failure_map(verification, target, plan) if resolution_phase else None
             block = ""
             proposal_feedback = pending_feedback
             pending_feedback = ""
@@ -2399,8 +2503,7 @@ class DevelopmentCycle:
                         "failed": list(current_failure.failed),
                         "resource_paths": list(current_failure.paths),
                         "resource_relations": [
-                            f"{item.path}={item.relation}"
-                            for item in current_failure.resources
+                            f"{item.path}={item.relation}" for item in current_failure.resources
                         ],
                         "unmapped": list(current_failure.unmapped),
                         "previous_patch": sorted(resolution.touched),
@@ -2584,6 +2687,12 @@ class DevelopmentCycle:
                     # aplicó desde la última, repetirla daría el mismo veredicto).
                     reconciled_at = len(applied)
                     state = self._evaluate_state(request, target, repository, plan)
+                    evidence_attempts = 1
+                    evidence_trail: tuple[str, ...] = ()
+                    if state.claims_outcome == "EVIDENCE_REQUIRED":
+                        state, evidence_attempts, evidence_trail = self._evidence_recovery(
+                            request, target, repository, plan, state
+                        )
                     verification = list(state.verification)
                     acceptance_issues = state.acceptance_issues
                     acceptance_evidence = state.acceptance_evidence
@@ -2614,17 +2723,20 @@ class DevelopmentCycle:
                         AuditResult.SUCCESS if not gap else AuditResult.FAILURE,
                     )
                     if state.claims_outcome == "EVIDENCE_REQUIRED":
+                        claim_evidence = self._claim_evidence(state.claim_records)
                         return self._outcome(
                             status=DevelopmentStatus.BLOCKED,
                             error_kind="EVIDENCE_REQUIRED",
                             error=(
                                 "sin cambios: el estado actual no demuestra un criterio "
-                                "factual/semántico requerido con la evidencia disponible: "
+                                "factual/semántico requerido tras agotar las rutas autónomas "
+                                f"de evidencia ({evidence_attempts}/"
+                                f"{self.config.max_evidence_attempts} intentos): "
                                 + "; ".join(
                                     item.evidence
                                     for item in state.claim_records
                                     if item.not_verified
-                                )[:400]
+                                )[:300]
                             ),
                             provider=provider,
                             model=model,
@@ -2640,6 +2752,10 @@ class DevelopmentCycle:
                             acceptance_result=self._acceptance_result(acceptance_evidence),
                             claims=claim_evidence,
                             claims_result=state.claims_outcome,
+                            blocked=self._evidence_blocked_evidence(
+                                state, evidence_attempts, evidence_trail
+                            ),
+                            evidence_attempts=evidence_attempts,
                         )
                     if not gap:
                         return self._outcome(
@@ -2666,6 +2782,7 @@ class DevelopmentCycle:
                             )
                             if not applied
                             else None,
+                            evidence_attempts=evidence_attempts,
                         )
                     failure_evidence = (
                         f"{proposal_issue.detail}. THE CURRENT STATE DOES NOT SATISFY THE TASK "
@@ -2695,9 +2812,7 @@ class DevelopmentCycle:
                             "max_structural_corrections": self.config.max_structural_corrections,
                             "issue_codes": list(issue_codes(preflight)),
                             "issues": [item.as_dict() for item in preflight.blocking[:5]],
-                            "advisory_codes": [
-                                item.code for item in preflight.advisory[:5]
-                            ],
+                            "advisory_codes": [item.code for item in preflight.advisory[:5]],
                             "repair_round_consumed": False,
                         },
                         AuditResult.FAILURE,
@@ -2727,11 +2842,7 @@ class DevelopmentCycle:
                 # con otra ronda gasta proveedor y presupuesto de reparación para acabar en el mismo
                 # sitio. Se corta aquí, con su código, para que la persona decida (Human Gate).
                 human_kind = next(
-                    (
-                        issue.code
-                        for issue in issues
-                        if issue.code in _HUMAN_REQUIRED_CHANGE_CODES
-                    ),
+                    (issue.code for issue in issues if issue.code in _HUMAN_REQUIRED_CHANGE_CODES),
                     "",
                 )
                 if human_kind or rounds >= self.config.max_repair_rounds:
@@ -2802,9 +2913,7 @@ class DevelopmentCycle:
                     {"issue_codes": [aborted.code], "applied_before": len(aborted.applied)},
                     AuditResult.FAILURE,
                 )
-                rolled_back = self._rollback(
-                    request, checkpoint, repository, aborted.applied
-                )
+                rolled_back = self._rollback(request, checkpoint, repository, aborted.applied)
                 return self._outcome(
                     status=DevelopmentStatus.CHANGE_REJECTED,
                     error_kind=aborted.code,
@@ -2831,6 +2940,13 @@ class DevelopmentCycle:
                     request,
                     {"round": rounds, "changes": len(validated)},
                 )
+            round_state = self._evaluate_state(request, target, repository, plan)
+            evidence_attempts = 1
+            evidence_trail = ()
+            if round_state.claims_outcome == "EVIDENCE_REQUIRED":
+                round_state, evidence_attempts, evidence_trail = self._evidence_recovery(
+                    request, target, repository, plan, round_state
+                )
             (
                 measured,
                 chain_ok,
@@ -2841,7 +2957,7 @@ class DevelopmentCycle:
                 claims_outcome,
                 claim_issues,
                 claim_records,
-            ) = self._evaluate_state(request, target, repository, plan)
+            ) = round_state
             verification = list(measured)
             claim_evidence = self._claim_evidence(claim_records)
             if claims_outcome == "EVIDENCE_REQUIRED":
@@ -2850,11 +2966,12 @@ class DevelopmentCycle:
                     status=DevelopmentStatus.BLOCKED,
                     error_kind="EVIDENCE_REQUIRED",
                     error=(
-                        "hay un criterio factual/semántico requerido que no se puede demostrar con "
-                        "la evidencia disponible: "
-                        + "; ".join(
-                            item.evidence for item in claim_records if item.not_verified
-                        )[:400]
+                        "hay un criterio factual/semántico requerido que no se puede demostrar "
+                        "tras agotar las rutas autónomas de evidencia "
+                        f"({evidence_attempts}/{self.config.max_evidence_attempts} intentos): "
+                        + "; ".join(item.evidence for item in claim_records if item.not_verified)[
+                            :300
+                        ]
                     ),
                     provider=provider,
                     model=model,
@@ -2871,13 +2988,15 @@ class DevelopmentCycle:
                     acceptance_result=self._acceptance_result(acceptance_evidence),
                     claims=claim_evidence,
                     claims_result=claims_outcome,
+                    blocked=self._evidence_blocked_evidence(
+                        round_state, evidence_attempts, evidence_trail
+                    ),
+                    evidence_attempts=evidence_attempts,
                 )
             # El progreso causal se registra **antes** de decidir: la ronda que resuelve el fallo
             # también es evidencia (qué recurso lo resolvió), no solo la que vuelve a fallar.
             signature = _failure_signature(verification)
-            strategy = tuple(
-                f"{item.path}:{item.operation.value}" for item in round_applied
-            )
+            strategy = tuple(f"{item.path}:{item.operation.value}" for item in round_applied)
             # Recursos que este parche tocó de verdad (incluido el origen de un RENAME/MOVE, que se
             # borra: contar solo el destino dejaría fuera un recurso modificado).
             touched_now = tuple(
@@ -2905,16 +3024,10 @@ class DevelopmentCycle:
                 strategy=strategy,
                 signature=signature,
                 previous_signature=previous_signature,
-                still_failing=tuple(
-                    item.name for item in verification if not item.passed
-                ),
+                still_failing=tuple(item.name for item in verification if not item.passed),
                 # Ampliar el alcance con evidencia es una de las salidas legítimas de una
                 # reparación: cuenta como progreso causal solo si PUNTO la aprobó en esta ronda.
-                escalated=(
-                    escalation_resources(payload)
-                    if expansion_status == "APPROVED"
-                    else ()
-                ),
+                escalated=(escalation_resources(payload) if expansion_status == "APPROVED" else ()),
                 passed=passed,
             )
             if passed:
@@ -2936,6 +3049,7 @@ class DevelopmentCycle:
                     acceptance_result=self._acceptance_result(acceptance_evidence),
                     claims=claim_evidence,
                     claims_result=claims_outcome,
+                    evidence_attempts=evidence_attempts,
                 )
             if chain_issues:
                 change_issues = (*change_issues, *chain_issues)
@@ -3191,8 +3305,8 @@ class DevelopmentCycle:
                 )
                 continue
             if (
-                proposal.operation in (ChangeOperation.DELETE, ChangeOperation.RENAME,
-                                       ChangeOperation.MOVE)
+                proposal.operation
+                in (ChangeOperation.DELETE, ChangeOperation.RENAME, ChangeOperation.MOVE)
                 and RepositoryOperation.DELETE not in target.allowed_operations
             ):
                 issues.append(
@@ -3268,9 +3382,7 @@ class DevelopmentCycle:
                 ):
                     repository.assert_no_secrets_in_text(path, proposal.content or "")
             except SecretBoundaryViolation as exc:
-                issues.append(
-                    BuildValidationIssue(code="CHANGE_SECRET", detail=exc.detail[:300])
-                )
+                issues.append(BuildValidationIssue(code="CHANGE_SECRET", detail=exc.detail[:300]))
                 continue
             except RepositoryDenied as exc:
                 issues.append(
@@ -3309,8 +3421,11 @@ class DevelopmentCycle:
             self._cumulative_resources.add(path)
             if proposal.operation is ChangeOperation.CREATE:
                 self._created_paths.add(path)
-            if proposal.operation in (ChangeOperation.DELETE, ChangeOperation.RENAME,
-                                      ChangeOperation.MOVE):
+            if proposal.operation in (
+                ChangeOperation.DELETE,
+                ChangeOperation.RENAME,
+                ChangeOperation.MOVE,
+            ):
                 self._created_paths.discard((proposal.source_path or path).replace("\\", "/"))
         if not issues:
             self._log(
@@ -3538,9 +3653,7 @@ class DevelopmentCycle:
         """Devuelve el árbol al estado capturado, todo o nada."""
         if checkpoint is None or self._snapshots is None:
             return False
-        expected = {
-            entry.path: repository.sha256(entry.path) or "" for entry in checkpoint.entries
-        }
+        expected = {entry.path: repository.sha256(entry.path) or "" for entry in checkpoint.entries}
         verdict = self._snapshots.rollback(snapshot=checkpoint, expected=expected)
         self._log(
             AuditEventType.DEV_ROLLBACK_COMPLETED,
@@ -3734,9 +3847,7 @@ class DevelopmentCycle:
                 },
                 AuditResult.FAILURE,
             )
-            raise DevelopmentCycleError(
-                f"la skill declarada no se pudo activar: {exc}"
-            ) from exc
+            raise DevelopmentCycleError(f"la skill declarada no se pudo activar: {exc}") from exc
         self._skill_activations[key] = activation
         self._log(
             AuditEventType.DEV_SKILL_ACTIVATED,
@@ -3883,6 +3994,8 @@ class DevelopmentCycle:
             "claims_result": kwargs.get("claims_result", "NONE"),
             "resolution": kwargs.get("resolution", ""),
             "no_op_evidence": kwargs.get("no_op_evidence"),
+            "blocked": kwargs.get("blocked"),
+            "evidence_attempts": kwargs.get("evidence_attempts", 0),
             "plan": self._final_plan,
         }
 
@@ -3927,6 +4040,8 @@ class DevelopmentCycle:
         capabilities: Sequence[CapabilityEvidence] | None = None,
         resolution: str = "",
         no_op_evidence: NoOpEvidence | None = None,
+        blocked: BlockedEvidence | None = None,
+        evidence_attempts: int = 0,
     ) -> DevelopmentResult:
         """Cierra el ciclo: aprende (si procede), confirma lo suyo y publica el resultado."""
         final_status = status
@@ -4010,6 +4125,8 @@ class DevelopmentCycle:
             visual_evidence=tuple(self._visual_evidence),
             resolution=resolution,
             no_op_evidence=no_op_evidence,
+            blocked=blocked,
+            evidence_attempts=evidence_attempts,
         )
         self._log(
             AuditEventType.BUILD_CYCLE_COMPLETED,
@@ -4050,8 +4167,7 @@ class DevelopmentCycle:
         rounds = sum(1 for item in applied if item.round_index > 0)
         evidence = [
             f"PILOT-05: {len(applied)} cambios aplicados y verificados en {target.target_id}",
-            "verificación: "
-            + ", ".join(f"{item.name}={item.exit_code}" for item in verification),
+            "verificación: " + ", ".join(f"{item.name}={item.exit_code}" for item in verification),
             "rutas: " + ", ".join(item.path for item in applied),
             f"causa raíz de la reparación: {self._last_root_cause or '(sin reparación)'}",
             f"cadena funcional: {self._functional_chain_result or 'NOT_DECLARED'}",
@@ -4315,8 +4431,7 @@ BUILD_CONTRACT: Final[str] = (
     "grant. You do not apply anything: PUNTO validates and applies. If the CURRENT repository "
     "state already satisfies the plan, return an empty changes list and explain it in "
     "unchanged_resources with evidence: PUNTO then measures the current state with the same "
-    "verifications and never accepts an empty answer on its own. "
-    + length_limits_text()
+    "verifications and never accepts an empty answer on its own. " + length_limits_text()
 )
 
 #: Contrato del plan, escrito en el prompt además de en el ``json_schema``.
@@ -4541,8 +4656,7 @@ def causal_handoff(plan: DevelopmentPlan) -> str:
         "goal": plan.summary,
         "resources": list(plan.touched_paths()),
         "chain": [
-            {"step": step.step, "verification": step.verification}
-            for step in plan.functional_chain
+            {"step": step.step, "verification": step.verification} for step in plan.functional_chain
         ],
         "done": list(plan.acceptance_mapping),
         "verify": list(plan.verification_commands),

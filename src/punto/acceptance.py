@@ -30,12 +30,14 @@ from typing import Any, Final
 
 __all__ = [
     "CAPABILITY_VISION",
+    "EVIDENCE_CLASSES",
     "INTERACTION_MARKERS",
     "AcceptanceRecord",
     "CapabilityRequirement",
     "ClaimKind",
     "ClaimRecord",
     "ElementKind",
+    "EvidenceClass",
     "LocatedSurface",
     "RequestIntent",
     "RequestReference",
@@ -99,32 +101,78 @@ class ElementKind(StrEnum):
 #: Verbos/marcas de intención, en español e inglés.
 INTENT_MARKERS: Final[dict[str, tuple[str, ...]]] = {
     RequestIntent.REPLACE.value: (
-        "reemplazar", "reemplaza", "sustituir", "sustituye", "replace", "swap", "en lugar de",
+        "reemplazar",
+        "reemplaza",
+        "sustituir",
+        "sustituye",
+        "replace",
+        "swap",
+        "en lugar de",
     ),
     RequestIntent.DELETE.value: (
-        "eliminar", "elimina", "borrar", "borra", "quitar", "quita", "retirar", "retira",
-        "delete", "remove", "drop",
+        "eliminar",
+        "elimina",
+        "borrar",
+        "borra",
+        "quitar",
+        "quita",
+        "retirar",
+        "retira",
+        "delete",
+        "remove",
+        "drop",
     ),
     RequestIntent.MODIFY.value: (
-        "modificar", "modifica", "actualizar", "actualiza", "cambiar", "cambia", "ajustar",
-        "ajusta", "update", "change", "modify",
+        "modificar",
+        "modifica",
+        "actualizar",
+        "actualiza",
+        "cambiar",
+        "cambia",
+        "ajustar",
+        "ajusta",
+        "update",
+        "change",
+        "modify",
     ),
     RequestIntent.CREATE.value: (
-        "crear", "crea", "añadir", "añade", "agregar", "agrega", "incorporar", "incorpora",
-        "implementar", "implementa", "create", "add", "build",
+        "crear",
+        "crea",
+        "añadir",
+        "añade",
+        "agregar",
+        "agrega",
+        "incorporar",
+        "incorpora",
+        "implementar",
+        "implementa",
+        "create",
+        "add",
+        "build",
     ),
     RequestIntent.PRESERVE.value: (
-        "conservar", "conserva", "mantener", "mantén", "manteniendo", "sin romper", "no romper",
-        "no se rompe", "continúa funcionando", "continua funcionando", "sigue funcionando",
-        "preserve", "keep", "without breaking",
+        "conservar",
+        "conserva",
+        "mantener",
+        "mantén",
+        "manteniendo",
+        "sin romper",
+        "no romper",
+        "no se rompe",
+        "continúa funcionando",
+        "continua funcionando",
+        "sigue funcionando",
+        "preserve",
+        "keep",
+        "without breaking",
     ),
 }
 
 #: Marcadores con los que cada tipo de elemento aparece en el código.
 KIND_MARKERS: Final[dict[str, tuple[str, ...]]] = {
     ElementKind.PLACEHOLDER.value: ("placeholder", "marcador", "coming soon", "proximamente"),
-    ElementKind.SECTION.value: ("<section", "classname=\"section", "class=\"section"),
-    ElementKind.BUTTON.value: ("<button", "classname=\"button", "class=\"button", "role=\"button"),
+    ElementKind.SECTION.value: ("<section", 'classname="section', 'class="section'),
+    ElementKind.BUTTON.value: ("<button", 'classname="button', 'class="button', 'role="button'),
     ElementKind.FIELD.value: ("<input", "<select", "<textarea", "<label"),
     ElementKind.LIST.value: ("listado", "grid", "lista", "list"),
     ElementKind.COMPONENT.value: ("export function", "export default function", "component"),
@@ -186,15 +234,99 @@ TOPIC_SYNONYMS: Final[dict[str, tuple[str, ...]]] = {
 #: Palabras vacías que no describen ningún tema.
 STOPWORDS: Final[frozenset[str]] = frozenset(
     {
-        "que", "los", "las", "del", "una", "uno", "unos", "unas", "por", "para", "con", "como",
-        "mas", "sin", "sobre", "entre", "desde", "hasta", "este", "esta", "estos", "estas", "ese",
-        "esa", "esos", "esas", "actual", "actualmente", "existente", "existentes", "nuevo", "nueva",
-        "debe", "deben", "deberia", "debeia", "puede", "puedan", "poder", "hacer", "hacerlo",
-        "usar", "usando", "utilizar", "utilizando", "seguir", "sigue", "siguiente", "todo", "toda",
-        "todos", "todas", "cada", "donde", "cuando", "tambien", "solo", "sola", "parte", "tipo",
-        "and", "for", "from", "with", "the", "add", "new", "fix", "use", "using", "should", "must",
-        "when", "where", "this", "that", "these", "those", "into", "your", "their", "its", "all",
-        "any", "can", "will", "not", "but", "porque", "pues", "sea", "sean", "ser",
+        "que",
+        "los",
+        "las",
+        "del",
+        "una",
+        "uno",
+        "unos",
+        "unas",
+        "por",
+        "para",
+        "con",
+        "como",
+        "mas",
+        "sin",
+        "sobre",
+        "entre",
+        "desde",
+        "hasta",
+        "este",
+        "esta",
+        "estos",
+        "estas",
+        "ese",
+        "esa",
+        "esos",
+        "esas",
+        "actual",
+        "actualmente",
+        "existente",
+        "existentes",
+        "nuevo",
+        "nueva",
+        "debe",
+        "deben",
+        "deberia",
+        "debeia",
+        "puede",
+        "puedan",
+        "poder",
+        "hacer",
+        "hacerlo",
+        "usar",
+        "usando",
+        "utilizar",
+        "utilizando",
+        "seguir",
+        "sigue",
+        "siguiente",
+        "todo",
+        "toda",
+        "todos",
+        "todas",
+        "cada",
+        "donde",
+        "cuando",
+        "tambien",
+        "solo",
+        "sola",
+        "parte",
+        "tipo",
+        "and",
+        "for",
+        "from",
+        "with",
+        "the",
+        "add",
+        "new",
+        "fix",
+        "use",
+        "using",
+        "should",
+        "must",
+        "when",
+        "where",
+        "this",
+        "that",
+        "these",
+        "those",
+        "into",
+        "your",
+        "their",
+        "its",
+        "all",
+        "any",
+        "can",
+        "will",
+        "not",
+        "but",
+        "porque",
+        "pues",
+        "sea",
+        "sean",
+        "ser",
     }
 )
 
@@ -408,9 +540,7 @@ def extract_references(
             intent = _intent_of(sentence)
             # Sin tipo, sin literal y sin ruta no hay nada medible de forma determinista: no se
             # inventa una comprobación y el criterio sigue su camino hacia el QA que corresponda.
-            if not _is_groundable(
-                sentence, literal=literal, paths=paths, intent=intent, kind=kind
-            ):
+            if not _is_groundable(sentence, literal=literal, paths=paths, intent=intent, kind=kind):
                 continue
             if kind == ElementKind.NONE.value and not literal and len(topics) < MIN_TOPIC_SCORE:
                 continue
@@ -821,6 +951,42 @@ VISUAL_MARKERS: Final[tuple[str, ...]] = (
 CAPABILITY_VISION: Final[str] = "VISION"
 
 
+class EvidenceClass(StrEnum):
+    """Semántica explícita de un intento de evidencia (AUTONOMOUS EVIDENCE + REPAIR LOOP v0).
+
+    Se fija **en el punto donde se produce el registro** (``_visual_record`` /
+    ``_cartographic_record``), no se infiere después por texto: es la única fuente de la
+    clasificación que gobierna el bucle de evidencia/reparación.
+
+    - ``SATISFIED`` / ``FAILED``: la evidencia decide, en uno u otro sentido.
+    - ``INCONCLUSIVE``: hay evidencia real (un veredicto de un revisor con capacidad efectiva)
+      pero no permite decidir (``UNCLEAR``). Reintentar con más evidencia puede resolverlo.
+    - ``EVIDENCE_TECHNICAL_FAILURE``: la herramienta que produce la evidencia falló (captura,
+      interacción no demostrable, transporte sin respuesta) — no es un juicio sobre el criterio.
+    - ``CAPABILITY_UNAVAILABLE``: ninguna ruta autorizada y efectiva puede producir la evidencia
+      que este criterio exige. Reintentar sin cambiar de ruta no ayuda.
+    """
+
+    SATISFIED = "SATISFIED"
+    FAILED = "FAILED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    EVIDENCE_TECHNICAL_FAILURE = "EVIDENCE_TECHNICAL_FAILURE"
+    CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+
+
+#: Clasificaciones válidas, en el orden en que se listan en la documentación del encargo.
+EVIDENCE_CLASSES: Final[tuple[str, ...]] = tuple(item.value for item in EvidenceClass)
+
+#: Clasificaciones que **sí** justifican reintentar la obtención de evidencia (con presupuesto):
+#: hay una vía real de conseguir un veredicto mejor. ``CAPABILITY_UNAVAILABLE`` no está aquí porque
+#: ninguna ruta puede producir la evidencia. ``EVIDENCE_TECHNICAL_FAILURE`` tampoco: en esta
+#: arquitectura ese registro se produce **sin** llamar a ningún proveedor (un selector que no
+#: localiza el elemento, un transporte sin capturar); repetir la misma medición sobre el mismo
+#: estado da el mismo resultado determinista — reintentar solo tiene sentido cuando algo pudo
+#: cambiar (una nueva verificación real de VISUAL_QA que sí pudo decidir).
+RETRYABLE_EVIDENCE_CLASSES: Final[frozenset[str]] = frozenset({EvidenceClass.INCONCLUSIVE.value})
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticClaim:
     """Afirmación factual/semántica de la solicitud, con la evidencia que exige.
@@ -866,6 +1032,9 @@ class ClaimRecord:
     capability_detail: str = ""
     #: Qué corresponde hacer para obtener la evidencia que falta.
     remedy: str = ""
+    #: Clasificación explícita del intento (:class:`EvidenceClass`). Fijada donde se produce el
+    #: registro; el resto del motor decide sobre este campo, nunca reinterpretando el texto.
+    evidence_class: str = ""
 
     @property
     def satisfied(self) -> bool:
@@ -895,6 +1064,7 @@ class ClaimRecord:
             "capability_available": self.capability_available,
             "capability_detail": self.capability_detail,
             "remedy": self.remedy,
+            "evidence_class": self.evidence_class,
         }
 
 
@@ -992,9 +1162,7 @@ class VisualVerdict:
     screenshots: tuple[str, ...] = ()
 
 
-def extract_claims(
-    objective: str, criteria: Iterable[str] = ()
-) -> tuple[SemanticClaim, ...]:
+def extract_claims(objective: str, criteria: Iterable[str] = ()) -> tuple[SemanticClaim, ...]:
     """Extrae las afirmaciones factuales/semánticas de la solicitud.
 
     Solo se consideran afirmaciones que **hablan de corrección** sobre un sujeto geográfico o
@@ -1090,6 +1258,7 @@ def _cartographic_record(
                 "en el repositorio: la geometría propia no es evidencia cartográfica"
             ),
             evidence_required=claim.evidence_required,
+            evidence_class=EvidenceClass.FAILED.value,
         )
     dataset = validos[0]
     if not rendered[0]:
@@ -1101,6 +1270,7 @@ def _cartographic_record(
                 f"existe un dataset válido ({dataset.path}) pero el cambio no lo usa: {rendered[1]}"
             ),
             evidence_required=claim.evidence_required,
+            evidence_class=EvidenceClass.FAILED.value,
         )
     return ClaimRecord(
         sentence=claim.sentence,
@@ -1112,6 +1282,7 @@ def _cartographic_record(
             f"{rendered[1]}"
         ),
         evidence_required=claim.evidence_required,
+        evidence_class=EvidenceClass.SATISFIED.value,
     )
 
 
@@ -1138,6 +1309,7 @@ def _visual_record(
             capability=CAPABILITY_VISION,
             capability_available=capability.available,
             capability_detail=capability.detail,
+            evidence_class=EvidenceClass.SATISFIED.value,
         )
     if verdict is not None and not verdict.provider:
         # Sin revisor: la interacción no se pudo demostrar (elemento no localizado, hover no
@@ -1155,6 +1327,7 @@ def _visual_record(
                 "declara la interacción del destino (visual.interactions) con un selector que "
                 "localice el elemento, o aporta una atestación humana explícita"
             ),
+            evidence_class=EvidenceClass.EVIDENCE_TECHNICAL_FAILURE.value,
         )
     if verdict is not None and capability.available:
         via = (
@@ -1171,6 +1344,7 @@ def _visual_record(
                 capability=CAPABILITY_VISION,
                 capability_available=True,
                 capability_detail=capability.detail,
+                evidence_class=EvidenceClass.SATISFIED.value,
             )
         if verdict.verdict == "FAIL":
             return ClaimRecord(
@@ -1182,6 +1356,7 @@ def _visual_record(
                 capability=CAPABILITY_VISION,
                 capability_available=True,
                 capability_detail=capability.detail,
+                evidence_class=EvidenceClass.FAILED.value,
             )
         return ClaimRecord(
             sentence=claim.sentence,
@@ -1196,6 +1371,7 @@ def _visual_record(
                 "el criterio no es demostrable con una captura estática: aporta evidencia de la "
                 "interacción o una atestación humana explícita"
             ),
+            evidence_class=EvidenceClass.INCONCLUSIVE.value,
         )
     if not capability.available:
         return ClaimRecord(
@@ -1212,6 +1388,7 @@ def _visual_record(
             capability_detail=capability.detail,
             remedy=capability.remedy
             or "aporta una atestación humana explícita o habilita una ruta con imágenes",
+            evidence_class=EvidenceClass.CAPABILITY_UNAVAILABLE.value,
         )
     return ClaimRecord(
         sentence=claim.sentence,
@@ -1225,6 +1402,7 @@ def _visual_record(
         capability_available=True,
         capability_detail=capability.detail,
         remedy="aporta una imagen renderizada del cambio para que el QA visual la evalúe",
+        evidence_class=EvidenceClass.EVIDENCE_TECHNICAL_FAILURE.value,
     )
 
 
@@ -1264,7 +1442,6 @@ def capability_requirements(
             )
         )
     return tuple(requisitos)
-
 
 
 def claims_result(records: Sequence[ClaimRecord]) -> str:

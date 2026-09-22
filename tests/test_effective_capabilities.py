@@ -380,7 +380,7 @@ class _CicloConEvidencia:
         return DevelopmentResult(
             request_id=request.request_id,
             status=DevelopmentStatus.BLOCKED,
-            target_id="punto-inmobiliario-hn",
+            target_id="fixture-target",
             plan_status=PlanStatus.REJECTED,
             error_kind="EVIDENCE_REQUIRED",
             error=(
@@ -433,7 +433,7 @@ def _consola() -> tuple[TestClient, AuditLogger, _CicloConEvidencia, ConsoleDepe
     audit = AuditLogger()
     ciclo = _CicloConEvidencia()
     destino = DevelopmentTarget(
-        target_id="punto-inmobiliario-hn",
+        target_id="fixture-target",
         repository=Path.cwd(),
         baseline_sha="0" * 40,
         scope_roots=("src",),
@@ -444,7 +444,7 @@ def _consola() -> tuple[TestClient, AuditLogger, _CicloConEvidencia, ConsoleDepe
         gates=HumanGate(),
         audit=audit,
         policy=PolicyEngine.from_config(),
-        targets={"punto-inmobiliario-hn": destino},
+        targets={"fixture-target": destino},
         run_inline=True,
         environ={},
     )
@@ -460,7 +460,7 @@ def _crear_tarea(client: TestClient) -> dict[str, Any]:
         "/console/tasks",
         json={
             "objective": "el mapa se integra visualmente con el diseno actual",
-            "target_id": "punto-inmobiliario-hn",
+            "target_id": "fixture-target",
             "scope_paths": ["src"],
         },
     ).json()
@@ -666,7 +666,7 @@ def _resultado_pendiente(claim: ClaimEvidence) -> DevelopmentResult:
     return DevelopmentResult(
         request_id=uuid4(),
         status=DevelopmentStatus.BLOCKED,
-        target_id="punto-inmobiliario-hn",
+        target_id="fixture-target",
         plan_status=PlanStatus.REJECTED,
         error_kind="EVIDENCE_REQUIRED",
         error="hay un criterio factual/semántico requerido que no se puede demostrar",

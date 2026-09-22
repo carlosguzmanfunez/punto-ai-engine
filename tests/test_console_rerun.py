@@ -208,7 +208,9 @@ def test_sin_relectura_el_reintento_reevalua_el_baseline_viejo(tmp_path: Path) -
     # Después: el mismo escenario con la configuración vigente aplicada al segundo intento.
     configuracion = _Configuracion({TARGET_ID: destino_viejo})
     otro, _audit2, _deps2 = _consola(destino_viejo, configuracion, [_plan(), _cambio()])
-    bloqueada = otro.post("/console/tasks", json=SOLICITUD).json()
+    # Otro trabajo distinto (el mismo objetivo se absorbería en la Task ya persistida).
+    distinta = {**SOLICITUD, "objective": "unificar los tipos de propiedad en una fuente única"}
+    bloqueada = otro.post("/console/tasks", json=distinta).json()
     configuracion.destinos = {
         TARGET_ID: replace(destino_viejo, baseline_sha=_head(repo)),
     }

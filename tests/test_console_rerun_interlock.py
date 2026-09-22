@@ -107,9 +107,10 @@ def _consola(
     return TestClient(application, raise_server_exceptions=False), dependencies
 
 
-def _crear(client: TestClient) -> str:
-    """Task nueva sin ejecutar (etapa ``QUEUED``)."""
-    respuesta = client.post("/console/tasks", json=SOLICITUD)
+def _crear(client: TestClient, objetivo: str = "") -> str:
+    """Task nueva sin ejecutar (etapa ``QUEUED``). Otro ``objetivo`` = otro trabajo."""
+    cuerpo = {**SOLICITUD, "objective": objetivo} if objetivo else SOLICITUD
+    respuesta = client.post("/console/tasks", json=cuerpo)
     assert respuesta.status_code == 201, respuesta.text
     return str(respuesta.json()["task_id"])
 
@@ -216,7 +217,8 @@ def test_3_tasks_distintas_se_ejecutan_a_la_vez(tmp_path: Path) -> None:
     """El interlock es por Task: dos Tasks distintas corren de forma concurrente y normal."""
     ciclo = _CicloControlable()
     client, _ = _consola(tmp_path, ciclo)
-    primera, segunda = _crear(client), _crear(client)
+    primera = _crear(client)
+    segunda = _crear(client, "migrar el formulario de contacto a la nueva API de correo")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         a = _en_hilo(pool, client, primera)

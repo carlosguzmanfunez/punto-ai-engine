@@ -578,6 +578,8 @@ def _sembrar_estado_de_la_task(repo: Path) -> dict[str, Any]:
     documento: dict[str, Any] = json.loads(FIXTURE_TASK_2E7822A0.read_text(encoding="utf-8"))
     (tarea,) = documento["tasks"]
     tarea["result"]["no_op_evidence"]["baseline_sha"] = _head(repo)
+    tarea["target_id"] = TARGET_ID
+    tarea["result"]["target_id"] = TARGET_ID
     tarea["result"]["branch"] = "ai/console-fixture"  # la rama de trabajo del destino de la prueba
     default_console_state_path().write_text(json.dumps(documento), encoding="utf-8")
     return documento

@@ -364,6 +364,8 @@ class AuditEventType(StrEnum):
     DEV_VISUAL_ASSESSED = "DEV_VISUAL_ASSESSED"
     #: CONSOLA HUMANA: una persona creó una tarea desde el dashboard local.
     CONSOLE_TASK_CREATED = "CONSOLE_TASK_CREATED"
+    CONSOLE_TASK_SUPERSEDED = "CONSOLE_TASK_SUPERSEDED"
+    CONSOLE_TASK_DEDUPLICATED = "CONSOLE_TASK_DEDUPLICATED"
     #: CONSOLA HUMANA: la tarea cambió de etapa (desarrollo o publicación).
     CONSOLE_TASK_STAGE_CHANGED = "CONSOLE_TASK_STAGE_CHANGED"
     #: AP000-OBS-01: la consola recuperó el estado gobernado persistido al arrancar de nuevo.

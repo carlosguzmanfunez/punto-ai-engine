@@ -280,7 +280,12 @@ def test_un_estado_corrupto_no_inventa_ninguna_tarea(tmp_path: Path) -> None:
 
     otro, audit = _reiniciar(target)
 
-    assert otro.get("/console/tasks").json() == {"total": 0, "items": []}
+    assert otro.get("/console/tasks").json() == {
+        "total": 0,
+        "items": [],
+        "operational": [],
+        "history": [],
+    }
     assert otro.get("/console/human-gates").json()["total"] == 0
     assert "no valida" in _detalle_rechazo(audit)
     # La evidencia del rechazo no se borra: el documento ilegible queda en un expediente aparte.

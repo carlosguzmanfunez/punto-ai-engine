@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -30,7 +31,7 @@ from threading import Lock, RLock
 from typing import Any, Final
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -44,9 +45,22 @@ from punto.api.console_state import (
     StageRules,
     TaskAttempt,
     TaskRecord,
+    TaskRelation,
     publication_of,
 )
 from punto.api.gate_reconciliation import assess_task_gates
+from punto.api.task_graph import build_task_graph
+from punto.api.task_identity import (
+    ACTIVE_LINEAGE,
+    CAUSE_DUPLICATE,
+    CAUSE_IDENTITY,
+    CONTINUABLE_STAGES,
+    SUPERSEDED_LINEAGE,
+    find_equivalents,
+    identity_conflict,
+    pick_canonical,
+    signature_equivalent,
+)
 from punto.api.task_progress import TaskSignals, build_progress
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
@@ -171,6 +185,17 @@ LIVE_PUBLICATION_STAGES: Final[frozenset[str]] = frozenset(
 #: Motivos con los que se rechaza volver a ejecutar una tarea. Son texto estable: la interfaz los
 #: muestra tal cual, sin inventar el suyo.
 RERUN_REJECTED_REASON: Final[str] = "la tarea fue rechazada por una persona: no se reanuda"
+RERUN_SUPERSEDED_REASON: Final[str] = (
+    "la tarea fue superada (historial): no se ejecuta; la operativa es la canónica"
+)
+
+#: Etapas de una Task canónica que una solicitud equivalente **continúa** (mismo rerun).
+CONTINUATION_STAGES: Final[frozenset[str]] = frozenset(
+    {"QUEUED", "DEVELOPMENT_FAILED", "HUMAN_APPROVED"}
+)
+
+#: Etapas que sacan a la Task del flujo operativo (terminó o una persona la cerró).
+NON_OPERATIONAL_STAGES: Final[frozenset[str]] = frozenset({"PRODUCTION_VALIDATED", "REJECTED"})
 RERUN_EXECUTING_REASON: Final[str] = (
     "la tarea ya tiene una ejecución en curso: espera a que termine antes de volver a ejecutarla"
 )
@@ -282,6 +307,18 @@ class ConsoleTask:
         #: Interlock de publicación, también solo en memoria: una publicación viva es un hecho de
         #: este proceso (no de la etapa persistida, que tras un reinicio puede ser obsoleta).
         self._publishing = False
+        #: Identidad canónica del destino con la que nació (huella y ramas; sin rutas).
+        self.target_identity: str = ""
+        self.target_work_branch: str = ""
+        self.target_production_branch: str = ""
+        #: Linaje: ``ACTIVE`` o ``SUPERSEDED`` (historial), con su relación explícita.
+        self.lineage_status: str = ACTIVE_LINEAGE
+        self.superseded_by: UUID | None = None
+        self.supersession_cause: str = ""
+        self.superseded_at: datetime | None = None
+        self.relations: list[TaskRelation] = []
+        #: Origen del intento en curso (``initial`` / ``retry`` / ``continuation``).
+        self.attempt_origin: str = ""
 
     @property
     def request_id(self) -> UUID:
@@ -331,6 +368,8 @@ class ConsoleTask:
         Es la única fuente de esa decisión: la usa el endpoint para rechazar y la vista para que la
         interfaz sepa si ofrecer la acción. La interfaz no decide nada por su cuenta.
         """
+        if self.lineage_status == SUPERSEDED_LINEAGE:
+            return RERUN_SUPERSEDED_REASON
         if self.stage == ConsoleStage.REJECTED.value:
             return RERUN_REJECTED_REASON
         if self.executing:
@@ -485,6 +524,32 @@ class ConsoleTask:
             # (no se persiste) y ``rerun`` dice si se puede volver a ejecutar y, si no, por qué.
             "executing": self.executing,
             "rerun": self._rerun_view(),
+            "lineage": self.lineage_view(),
+            "operational": self.operational,
+        }
+
+    @property
+    def operational(self) -> bool:
+        """True si la Task está en el flujo operativo (activa y no terminada)."""
+        return self.lineage_status == ACTIVE_LINEAGE and self.stage not in NON_OPERATIONAL_STAGES
+
+    def lineage_view(self) -> dict[str, Any]:
+        """Linaje explícito: estado, sustituta, causa y relaciones con otras Tasks."""
+        return {
+            "status": self.lineage_status,
+            "superseded_by": str(self.superseded_by) if self.superseded_by else "",
+            "supersession_cause": self.supersession_cause,
+            "superseded_at": self.superseded_at.isoformat() if self.superseded_at else "",
+            "relations": [
+                {
+                    "kind": item.kind,
+                    "task_id": str(item.task_id),
+                    "cause": item.cause,
+                    "at": item.at.isoformat(),
+                }
+                for item in self.relations
+            ],
+            "target_identity": self.target_identity[:16],
         }
 
     def _rerun_view(self) -> dict[str, Any]:
@@ -594,6 +659,13 @@ def register_human_console(
                 metadata={"kind": "STATE_UNSERIALIZABLE"},
             )
 
+    def consolidate_recovered_tasks() -> None:
+        """Consolida lo recuperado (identidad y duplicados) y persiste si algo cambió."""
+        if _consolidate_tasks(tasks, dependencies):
+            persist()
+
+    consolidate_recovered_tasks()
+
     def reconcile_recovered_gates() -> None:
         """Proyecta el estado operativo de lo recuperado: los gates obsoletos pasan a historial.
 
@@ -645,8 +717,15 @@ def register_human_console(
         status_code=status.HTTP_201_CREATED,
         summary="Crear una tarea gobernada",
     )
-    def create_console_task(body: TaskCreateBody) -> dict[str, Any]:
-        """Crea la tarea y lanza el ciclo de desarrollo: una persona escribe, PUNTO ejecuta."""
+    def create_console_task(body: TaskCreateBody, response: Response) -> dict[str, Any]:
+        """Crea la tarea y lanza el ciclo de desarrollo: una persona escribe, PUNTO ejecuta.
+
+        Antes de crear, detecta si ya existe una Task activa **equivalente** (mismo destino,
+        objetivo normalizado, alcance y criterios compatibles). Si la hay, no crea otra: la
+        solicitud se absorbe en la canónica y, si procede, la continúa con el mismo mecanismo de
+        reintento. La comprobación y el registro son atómicos: dos solicitudes equivalentes
+        simultáneas producen una sola Task.
+        """
         target = _refresh_target(dependencies, body.target_id)
         request = BuildRequest(
             objective=body.objective,
@@ -664,7 +743,19 @@ def register_human_console(
             scope_paths=tuple(body.scope_paths),
             context=body.context,
         )
-        tasks[str(task.task_id)] = task
+        identity = target.identity
+        task.target_identity = identity.fingerprint
+        task.target_work_branch = identity.work_branch
+        task.target_production_branch = identity.production_branch
+        with _TASKS_LOCK:
+            canonical = _canonical_equivalent(task, tasks, dependencies)
+            if canonical is None:
+                tasks[str(task.task_id)] = task
+        if canonical is not None:
+            response.status_code = status.HTTP_200_OK
+            return _absorb_into_canonical(
+                canonical, body.run, dependencies, executor, persist, _run_development
+            )
         # La primera ejecución toma el mismo interlock: un /run mientras corre se rechaza.
         started = body.run and task.begin_execution()
         dependencies.audit.log_dev_event(
@@ -691,7 +782,30 @@ def register_human_console(
     def list_console_tasks() -> dict[str, Any]:
         """Tareas de la consola, de la más nueva a la más antigua."""
         items = sorted(tasks.values(), key=lambda item: item.created_at, reverse=True)
-        return {"total": len(items), "items": [_task_view(item, dependencies) for item in items]}
+        views = [_task_view(item, dependencies) for item in items]
+        return {
+            "total": len(items),
+            "items": views,
+            # Flujo operativo (activas, con su próxima acción) frente al historial (superadas y
+            # terminadas): el historial se conserva íntegro y accesible, pero aparte.
+            "operational": [view for view in views if view["operational"]],
+            "history": [view for view in views if not view["operational"]],
+        }
+
+    @application.get("/console/graph", tags=["console"], summary="Grafo estructural (proyección)")
+    def console_graph(target_id: str = "", task_id: str = "") -> dict[str, Any]:
+        """Proyección del grafo (target → task → attempt → artefacto → publicación…).
+
+        No es un almacén aparte: se **deriva** del estado durable (tareas, intentos, gates y
+        publicaciones) y de la identidad canónica de los destinos.
+        """
+        return build_task_graph(
+            tasks.values(),
+            dependencies.gates.list_all(),
+            dependencies.targets,
+            target_id=target_id,
+            task_id=task_id,
+        )
 
     @application.get("/console/tasks/{task_id}", tags=["console"], summary="Detalle de una tarea")
     def get_console_task(task_id: UUID) -> dict[str, Any]:
@@ -725,6 +839,9 @@ def register_human_console(
         if rejected:
             raise HTTPException(status.HTTP_409_CONFLICT, detail=rejected)
         target = _refresh_target(dependencies, task.target_id)
+        mismatch = _identity_block(task, target)
+        if mismatch:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=mismatch)
         request = BuildRequest(
             request_id=task.task_id,
             objective=task.objective,
@@ -741,6 +858,7 @@ def register_human_console(
             raise HTTPException(status.HTTP_409_CONFLICT, detail=RERUN_EXECUTING_REASON)
         try:
             tasks[str(task.task_id)] = task
+            task.attempt_origin = "retry"
             _run_development(task, request, dependencies, executor)
         except BaseException:
             task.end_execution()
@@ -898,6 +1016,8 @@ def register_human_console(
         """
         task = _task_or_404(tasks, task_id)
         target = _target_or_400(dependencies, task.target_id)
+        if task.lineage_status == SUPERSEDED_LINEAGE:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=RERUN_SUPERSEDED_REASON)
         decision = _evaluate_and_log(task, target, dependencies)
         if decision is None:
             raise HTTPException(
@@ -1425,8 +1545,10 @@ def _close_attempt(task: ConsoleTask, *, result: DevelopmentResult | None, error
             failover=_failover_summary(result),
             visual=_visual_summary(result),
             resolution=result.resolution if result is not None else "",
+            origin=task.attempt_origin or ("initial" if task.runs <= 1 else "retry"),
         ),
     ]
+    task.attempt_origin = ""
     task.attempt_started_at = None
 
 
@@ -1474,6 +1596,14 @@ def _task_record(task: ConsoleTask) -> TaskRecord:
         gate_ids=tuple(task.gates),
         result=task.result,
         publication=task.publication.as_dict() if task.publication is not None else None,
+        target_identity=task.target_identity,
+        target_work_branch=task.target_work_branch,
+        target_production_branch=task.target_production_branch,
+        lineage_status=task.lineage_status,
+        superseded_by=task.superseded_by,
+        supersession_cause=task.supersession_cause,
+        superseded_at=task.superseded_at,
+        relations=tuple(task.relations),
     )
 
 
@@ -1502,6 +1632,14 @@ def _task_from_record(record: TaskRecord, recovered_at: datetime) -> ConsoleTask
     task.result = record.result
     task.publication = publication_of(record)
     task.recovered_at = recovered_at
+    task.target_identity = record.target_identity
+    task.target_work_branch = record.target_work_branch
+    task.target_production_branch = record.target_production_branch
+    task.lineage_status = record.lineage_status
+    task.superseded_by = record.superseded_by
+    task.supersession_cause = record.supersession_cause
+    task.superseded_at = record.superseded_at
+    task.relations = list(record.relations)
     return task
 
 
@@ -1593,6 +1731,254 @@ def _gate_or_404(dependencies: ConsoleDependencies, approval_id: UUID) -> Any:
     return approval
 
 
+# ------------------------------------------- identidad, equivalencia y linaje de las Tasks
+#: Cerrojo de «comprobar equivalencia → registrar la Task»: dos solicitudes simultáneas no pueden
+#: crear dos Tasks para el mismo trabajo.
+_TASKS_LOCK: Final[RLock] = RLock()
+
+
+def _identity_block(task: ConsoleTask, target: DevelopmentTarget) -> str:
+    """Motivo por el que la Task no pertenece a la identidad vigente del destino, o ``""``."""
+    return identity_conflict(
+        fingerprint=task.target_identity,
+        work_branch=task.target_work_branch,
+        production_branch=task.target_production_branch,
+        result_branch=task.result.branch if task.result is not None else "",
+        target=target,
+    )
+
+
+def _supersede_task(
+    task: ConsoleTask,
+    *,
+    by: ConsoleTask | None,
+    cause: str,
+    detail: str,
+    deps: ConsoleDependencies,
+) -> bool:
+    """Saca una Task del flujo operativo **sin perder nada**: pasa a ``SUPERSEDED``.
+
+    Conserva íntegros su historial, sus intentos, su resultado y sus gates; solo añade la
+    constancia (quién la sustituye, por qué y cuándo) y las relaciones explícitas. Idempotente.
+    """
+    with _TASKS_LOCK:
+        if task.lineage_status == SUPERSEDED_LINEAGE:
+            return False
+        now = utc_now()
+        task.lineage_status = SUPERSEDED_LINEAGE
+        task.superseded_at = now
+        task.supersession_cause = cause
+        task.notes = [*task.notes[-4:], f"superada ({cause}): {detail}"[:300]]
+        if by is not None:
+            task.superseded_by = by.task_id
+            task.relations.append(
+                TaskRelation(kind="superseded_by", task_id=by.task_id, cause=cause, at=now)
+            )
+            if cause == CAUSE_DUPLICATE:
+                task.relations.append(
+                    TaskRelation(kind="duplicate_of", task_id=by.task_id, cause=cause, at=now)
+                )
+            by.relations.append(
+                TaskRelation(kind="supersedes", task_id=task.task_id, cause=cause, at=now)
+            )
+        task.updated_at = now
+    with suppress(Exception):  # la traza no puede tumbar la operación
+        deps.audit.log_dev_event(
+            AuditEventType.CONSOLE_TASK_SUPERSEDED,
+            "console_task_superseded",
+            request_id=str(task.task_id),
+            metadata={
+                "target_id": task.target_id,
+                "cause": cause,
+                "superseded_by": str(by.task_id) if by is not None else "",
+                "detail": detail[:300],
+            },
+        )
+    return True
+
+
+def _canonical_equivalent(
+    candidate: ConsoleTask, tasks: Mapping[str, ConsoleTask], deps: ConsoleDependencies
+) -> ConsoleTask | None:
+    """Task canónica equivalente a la solicitud (activa, del mismo destino e identidad válida)."""
+    target = deps.targets.get(candidate.target_id)
+    equivalents = [
+        item
+        for item in find_equivalents(candidate, tasks.values())
+        if target is None or not _identity_block(item, target)
+    ]
+    return pick_canonical(equivalents) if equivalents else None
+
+
+def _absorb_into_canonical(
+    canonical: ConsoleTask,
+    run: bool,
+    deps: ConsoleDependencies,
+    pool: ThreadPoolExecutor | None,
+    persist: Callable[[], None],
+    runner: Callable[
+        [ConsoleTask, BuildRequest, ConsoleDependencies, ThreadPoolExecutor | None], None
+    ],
+) -> dict[str, Any]:
+    """Una solicitud equivalente se absorbe en la Task canónica: no se crea otra.
+
+    Si la canónica es continuable (falló, sigue en cola o una persona ya aprobó su gate), se
+    **continúa** con el mismo mecanismo de reintento y el intento queda marcado ``continuation``.
+    Si está ejecutándose, esperando a una persona o ya completada, no se ejecuta nada nuevo.
+    """
+    started = False
+    reason = ""
+    if run and canonical.stage in CONTINUATION_STAGES:
+        blocked = canonical.rerun_block()
+        target = deps.targets.get(canonical.target_id)
+        if blocked:
+            reason = blocked
+        elif target is None:
+            reason = "el destino ya no está registrado"
+        elif canonical.begin_execution():
+            request = BuildRequest(
+                request_id=canonical.task_id,
+                objective=canonical.objective,
+                target_repository=target.target_id,
+                requested_role=ProviderRole.BUILDER,
+                acceptance_criteria=canonical.acceptance_criteria,
+                scope_paths=canonical.scope_paths,
+                context=canonical.context,
+            )
+            try:
+                canonical.attempt_origin = "continuation"
+                runner(canonical, request, deps, pool)
+                started = True
+            except BaseException:
+                canonical.end_execution()
+                raise
+        else:
+            reason = RERUN_EXECUTING_REASON
+    elif run:
+        reason = f"la tarea canónica está en {canonical.stage}: no hay nada que ejecutar"
+    canonical.notes = [
+        *canonical.notes[-4:],
+        "solicitud equivalente absorbida: no se creó otra tarea"
+        + (" y se continuó el trabajo" if started else ""),
+    ]
+    with suppress(Exception):  # la traza no puede tumbar la operación
+        deps.audit.log_dev_event(
+            AuditEventType.CONSOLE_TASK_DEDUPLICATED,
+            "console_task_deduplicated",
+            request_id=str(canonical.task_id),
+            metadata={
+                "target_id": canonical.target_id,
+                "stage": canonical.stage,
+                "continuation_started": started,
+                "reason": reason[:200],
+            },
+        )
+    persist()
+    return {
+        **_task_view(canonical, deps),
+        "deduplicated": True,
+        "duplicate_of": str(canonical.task_id),
+        "continuation_started": started,
+        "continuation_note": reason,
+    }
+
+
+def _relate_quarantined_duplicates(tasks: Mapping[str, ConsoleTask]) -> int:
+    """Deja explícito ``duplicate_of`` entre Tasks equivalentes ya fuera del flujo operativo.
+
+    No cambia su estado (siguen ``SUPERSEDED`` por su causa) ni las saca de su historial: solo
+    conserva la relación de equivalencia, para que el grafo pueda decir qué duplicaba a qué.
+    """
+    quarantined = [
+        item
+        for item in sorted(tasks.values(), key=lambda item: item.created_at)
+        if item.lineage_status == SUPERSEDED_LINEAGE and item.superseded_by is None
+    ]
+    seen: list[list[ConsoleTask]] = []
+    for item in quarantined:
+        for cluster in seen:
+            if signature_equivalent(item, cluster[0]):
+                cluster.append(item)
+                break
+        else:
+            seen.append([item])
+    added = 0
+    for cluster in seen:
+        if len(cluster) < 2:
+            continue
+        canonical = pick_canonical(cluster)
+        for duplicate in cluster:
+            already = any(
+                rel.kind == "duplicate_of" and rel.task_id == canonical.task_id
+                for rel in duplicate.relations
+            )
+            if duplicate is not canonical and not already:
+                duplicate.relations.append(
+                    TaskRelation(
+                        kind="duplicate_of",
+                        task_id=canonical.task_id,
+                        cause=CAUSE_DUPLICATE,
+                        at=utc_now(),
+                    )
+                )
+                added += 1
+    return added
+
+
+def _consolidate_tasks(tasks: Mapping[str, ConsoleTask], deps: ConsoleDependencies) -> int:
+    """Consolidación general del registro (al recuperar): identidad y duplicados.
+
+    1. Toda Task cuya identidad no es la del destino vigente (fixture, otro repositorio, rama
+       distinta) deja de ser operativa: ``SUPERSEDED`` por ``identity_mismatch``.
+    2. Las Tasks activas equivalentes de un mismo destino se agrupan y solo la canónica sigue
+       operativa; el resto queda ``SUPERSEDED`` por ``duplicate_objective`` apuntando a ella.
+
+    Idempotente y sin borrar nada. Devuelve cuántas Tasks cambiaron de linaje.
+    """
+    changed = 0
+    for task in sorted(tasks.values(), key=lambda item: item.created_at):
+        target = deps.targets.get(task.target_id)
+        if task.lineage_status != ACTIVE_LINEAGE or target is None:
+            continue
+        conflict = _identity_block(task, target)
+        if conflict:
+            changed += int(
+                _supersede_task(task, by=None, cause=CAUSE_IDENTITY, detail=conflict, deps=deps)
+            )
+    changed += _relate_quarantined_duplicates(tasks)
+    active = [
+        item
+        for item in sorted(tasks.values(), key=lambda item: item.created_at)
+        if item.lineage_status == ACTIVE_LINEAGE and item.stage in CONTINUABLE_STAGES
+    ]
+    clusters: list[list[ConsoleTask]] = []
+    for item in active:
+        for cluster in clusters:
+            if any(signature_equivalent(item, other) for other in cluster):
+                cluster.append(item)
+                break
+        else:
+            clusters.append([item])
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        canonical = pick_canonical(cluster)
+        for duplicate in cluster:
+            if duplicate is not canonical:
+                changed += int(
+                    _supersede_task(
+                        duplicate,
+                        by=canonical,
+                        cause=CAUSE_DUPLICATE,
+                        detail=(
+                            f"mismo trabajo que la tarea canónica {str(canonical.task_id)[:8]}"
+                        ),
+                        deps=deps,
+                    )
+                )
+    return changed
+
+
 # ------------------------------------------------- release: artefacto verificado y Human Gates
 #: Cerrojo de las secuencias «leer gates → crear/superar gate → ligar publicación». El ``HumanGate``
 #: del motor no es seguro entre hilos y una petición concurrente no puede duplicar un gate.
@@ -1611,6 +1997,8 @@ def _publication_block(task: ConsoleTask, target: DevelopmentTarget) -> str:
     inequívoco no hay nada que publicar y se dice por qué.
     """
     result = task.result
+    if task.lineage_status == SUPERSEDED_LINEAGE:
+        return RERUN_SUPERSEDED_REASON
     if result is None or result.status.value != "DEVELOPMENT_COMPLETED":
         return "la tarea no tiene un desarrollo completado y verificado que publicar"
     if not result.publishable_sha:

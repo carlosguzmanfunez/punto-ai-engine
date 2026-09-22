@@ -22,6 +22,7 @@ navegador.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -118,6 +119,42 @@ class VisualInteraction:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetIdentity:
+    """Identidad **canónica** de un destino: quién es, dónde vive y en qué ramas trabaja.
+
+    Es la única fuente de ``target → repositorio → rama de trabajo → rama de producción``: la
+    declara la configuración confiable, y todo lo que se registre sobre el destino (una tarea, un
+    resultado, una publicación) se compara con ella. El ``fingerprint`` deja constancia de esa
+    identidad sin arrastrar rutas ni credenciales. El remoto se conserva (sin credenciales) como
+    dato informativo pero no entra en la huella: cambiar de remoto no cambia de proyecto.
+    """
+
+    target_id: str
+    repository: str
+    work_branch: str
+    production_branch: str
+    publish_remote: str
+
+    @property
+    def fingerprint(self) -> str:
+        """Huella estable de la identidad (SHA-256 de su forma canónica)."""
+        canonical = json.dumps(
+            [
+                self.target_id,
+                self.repository,
+                self.work_branch,
+                self.production_branch,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_USERINFO: Final[re.Pattern[str]] = re.compile(r"(?<=//)[^/@\s]+@")
+
+
+@dataclass(frozen=True, slots=True)
 class DevelopmentTarget:
     """Destino de desarrollo: dónde se trabaja, qué se puede hacer y cómo se verifica."""
 
@@ -160,6 +197,18 @@ class DevelopmentTarget:
     #: Autoridad persistente del destino (AP000-R01): qué operaciones están previamente
     #: autorizadas. Sin sobre explícito no hay autonomía (todo ``False``): fail closed.
     authority: TargetAuthority = field(default_factory=TargetAuthority)
+
+    @property
+    def identity(self) -> TargetIdentity:
+        """Identidad canónica del destino (sin credenciales: el remoto va sin ``usuario@``)."""
+        return TargetIdentity(
+            target_id=self.target_id,
+            # El nombre del repositorio, no su ruta: mover la carpeta no cambia de proyecto.
+            repository=Path(self.repository).resolve().name.casefold(),
+            work_branch=self.work_branch,
+            production_branch=self.production_branch,
+            publish_remote=_USERINFO.sub("", self.publish_remote),
+        )
 
     @property
     def publishable(self) -> bool:
@@ -751,6 +800,7 @@ __all__ = [
     "DevelopmentTarget",
     "DevelopmentTargetError",
     "DevelopmentTargetRegistry",
+    "TargetIdentity",
     "VerificationCommand",
     "VisualInteraction",
     "load_development_targets",

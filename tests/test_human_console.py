@@ -59,7 +59,8 @@ from punto.workspace.target import (
     load_development_targets,
 )
 
-TARGET_ID = "punto-inmobiliario-hn"
+#: Destino sintético de las pruebas: NUNCA el id de un proyecto real (aislamiento fixture ↔ real).
+TARGET_ID = "fixture-target"
 WORK_BRANCH = "ai/console-fixture"
 
 FOCUSED = (
@@ -1182,9 +1183,15 @@ def _cambio_con_css() -> dict[str, Any]:
 
 
 def _tarea_con_plan_que_exige_persona(
-    tmp_path: Path,
+    tmp_path: Path, *, objective: str = "poner el mapa real de Honduras"
 ) -> tuple[TestClient, Path, Path, Any, dict[str, Any]]:
-    """Tarea real detenida en ``PLAN_REQUIRES_HUMAN`` con su gate pendiente."""
+    """Tarea real detenida en ``PLAN_REQUIRES_HUMAN`` con su gate pendiente.
+
+    ``objective`` distingue escenarios que comparten el mismo estado durable (mismo destino): dos
+    llamadas con el objetivo por defecto son, a propósito, la misma Task para PUNTO (deduplicación
+    general); para una segunda Task realmente distinta en la misma prueba, se pasa un objetivo
+    distinto.
+    """
     repo, remoto = _repo_con_recurso_desconocido(tmp_path)
     target = _target(repo, remoto=remoto)
     client, _audit, _target_obj, deps = _app(
@@ -1198,7 +1205,7 @@ def _tarea_con_plan_que_exige_persona(
     tarea = client.post(
         "/console/tasks",
         json={
-            "objective": "poner el mapa real de Honduras",
+            "objective": objective,
             "target_id": TARGET_ID,
             "scope_paths": ["src"],
         },
@@ -1284,8 +1291,11 @@ def test_c_aprobar_y_rechazar_siguen_ligados_al_mismo_gate(tmp_path: Path) -> No
     )
     assert doble.status_code == 409
 
-    # Y en otra tarea, REJECT deja la tarea rechazada y el gate sin autorización.
-    client2, _repo2, _remoto2, _deps2, tarea2 = _tarea_con_plan_que_exige_persona(tmp_path / "dos")
+    # Y en otra tarea (trabajo distinto: mismo destino no la deduplica con la anterior), REJECT
+    # deja la tarea rechazada y el gate sin autorización.
+    client2, _repo2, _remoto2, _deps2, tarea2 = _tarea_con_plan_que_exige_persona(
+        tmp_path / "dos", objective="retirar el widget de clima del panel lateral"
+    )
     rechazo = client2.post(
         f"/console/human-gates/{tarea2['gates'][0]}/reject",
         json={"resolved_by": "humano-local", "note": "todavía no"},

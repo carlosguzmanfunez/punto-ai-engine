@@ -62,6 +62,17 @@ def assess_gate(task: Any, approval: HumanApprovalRequest) -> GateAssessment:
     ``task`` es la tarea de la consola (``result``, ``attempts``, ``publication``, ``executing``).
     """
     identifier = str(approval.id)
+    if getattr(task, "lineage_status", "ACTIVE") == "SUPERSEDED":
+        # La Task salió del flujo operativo (duplicada o de otra identidad): sus gates pendientes
+        # ya no son acciones humanas vigentes. Quedan en el historial, sin botones.
+        by = getattr(task, "superseded_by", None)
+        return GateAssessment(
+            identifier,
+            False,
+            f"tarea {str(by)[:8]}" if by else "identidad del destino",
+            f"la tarea fue superada ({getattr(task, 'supersession_cause', '') or 'linaje'}): "
+            "esta solicitud ya no es una acción operativa",
+        )
     result: DevelopmentResult | None = getattr(task, "result", None)
     attempts = list(getattr(task, "attempts", ()) or ())
     if result is None or not attempts or getattr(task, "executing", False):

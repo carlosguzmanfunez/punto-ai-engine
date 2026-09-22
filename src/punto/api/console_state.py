@@ -45,6 +45,7 @@ from punto.schemas.enums import ApprovalStatus, RiskLevel
 __all__ = [
     "CONSOLE_STATE_ENV",
     "CONSOLE_STATE_SCHEMA_VERSION",
+    "TASK_RELATION_KINDS",
     "ConsoleStateDocument",
     "ConsoleStateError",
     "ConsoleStateSnapshot",
@@ -54,6 +55,7 @@ __all__ = [
     "StageRules",
     "TaskAttempt",
     "TaskRecord",
+    "TaskRelation",
     "default_console_state_path",
     "publication_of",
 ]
@@ -98,6 +100,13 @@ def default_console_state_path() -> Path:
     override = os.environ.get(CONSOLE_STATE_ENV, "").strip()
     if override:
         return Path(override).expanduser()
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        # Aislamiento fixture ↔ estado operativo: una prueba jamás lee ni escribe el estado
+        # durable real. Sin ruta explícita, falla en voz alta en vez de contaminarlo.
+        raise ConsoleStateError(
+            "STATE_ISOLATION",
+            f"una prueba intentó usar el estado operativo por defecto: fija {CONSOLE_STATE_ENV}",
+        )
     return Path.cwd() / CONSOLE_STATE_DIR_NAME / CONSOLE_STATE_FILE_NAME
 
 
@@ -198,6 +207,27 @@ class TaskAttempt(BaseModel):
     #: ``ALREADY_SATISFIED`` si el intento se completó **sin cambios** porque el estado actual ya
     #: satisfacía la Task (verificado con la cadena completa); vacío si aplicó cambios.
     resolution: str = Field(default="", max_length=40)
+    #: Cómo nació el intento: ``initial`` (primer intento), ``retry`` (reintento explícito) o
+    #: ``continuation`` (una solicitud equivalente se absorbió en esta Task y la continuó).
+    origin: str = Field(default="initial", max_length=20)
+
+
+#: Relaciones estructurales entre Tasks. Son **hechos** que no se pueden derivar de otra cosa, así
+#: que se persisten con la Task; el resto de relaciones del grafo son proyección del estado durable.
+TASK_RELATION_KINDS: Final[frozenset[str]] = frozenset(
+    {"supersedes", "superseded_by", "duplicate_of", "continuation_of", "retries"}
+)
+
+
+class TaskRelation(BaseModel):
+    """Relación explícita de una Task con otra: quién la sustituye, de quién es duplicada, etc."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str = Field(min_length=1, max_length=20)
+    task_id: UUID
+    cause: str = Field(default="", max_length=120)
+    at: datetime
 
 
 class TaskRecord(BaseModel):
@@ -225,6 +255,18 @@ class TaskRecord(BaseModel):
     result: DevelopmentResult | None = None
     #: Expediente de publicación (``PublicationRecord.as_dict``) tal cual se emitió.
     publication: dict[str, Any] | None = None
+    #: Identidad canónica del destino con la que nació la Task (huella + ramas, sin rutas ni
+    #: credenciales). Vacía en Tasks anteriores a la huella.
+    target_identity: str = Field(default="", max_length=64)
+    target_work_branch: str = Field(default="", max_length=120)
+    target_production_branch: str = Field(default="", max_length=120)
+    #: ``ACTIVE`` o ``SUPERSEDED``: separa el flujo operativo del historial. Una Task superada
+    #: conserva íntegros su historial, sus intentos y sus gates; solo deja de ser operativa.
+    lineage_status: str = Field(default="ACTIVE", max_length=20)
+    superseded_by: UUID | None = None
+    supersession_cause: str = Field(default="", max_length=120)
+    superseded_at: datetime | None = None
+    relations: tuple[TaskRelation, ...] = Field(default=(), max_length=MAX_ITEMS)
 
 
 class ConsoleStateDocument(BaseModel):
@@ -314,6 +356,11 @@ def integrity_problems(
 
     for task in document.tasks:
         problems.extend(_task_problems(task, gates, rules))
+        for reference in (task.superseded_by, *(item.task_id for item in task.relations)):
+            if reference is not None and reference not in tasks:
+                problems.append(
+                    f"la tarea {task.task_id} referencia una tarea que no está: {reference}"
+                )
 
     problems.extend(_source_problems(document, source))
     return tuple(problems)
@@ -347,6 +394,15 @@ def _task_problems(
     for gate_id in task.gate_ids:
         if gate_id not in gates:
             problems.append(f"la tarea {task.task_id} cita un gate que no está: {gate_id}")
+    if task.lineage_status not in {"ACTIVE", "SUPERSEDED"}:
+        problems.append(f"la tarea {task.task_id} tiene un estado de linaje desconocido")
+    if task.lineage_status == "SUPERSEDED" and task.superseded_at is None:
+        problems.append(f"la tarea {task.task_id} está superada y no tiene momento de sustitución")
+    if task.superseded_by is not None and task.superseded_by == task.task_id:
+        problems.append(f"la tarea {task.task_id} se declara superada por sí misma")
+    for relation in task.relations:
+        if relation.kind not in TASK_RELATION_KINDS:
+            problems.append(f"la tarea {task.task_id} declara una relación desconocida")
     if task.updated_at < task.created_at:
         problems.append(f"la tarea {task.task_id} se actualizó antes de crearse")
     if task.finished_at is not None and task.finished_at < task.created_at:

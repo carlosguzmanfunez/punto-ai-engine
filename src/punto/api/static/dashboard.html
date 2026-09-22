@@ -231,7 +231,7 @@
           <div class="note">Sin cargar: pulsa Actualizar o abre la sección de Tareas.</div>
         </div>
         <details id="gates-history" data-testid="gates-history" style="margin-top: 12px">
-          <summary data-testid="gates-history-summary">Historial de gates (auditoría, sin acciones)</summary>
+          <summary id="gates-history-summary" data-testid="gates-history-summary">Historial de gates (auditoría, sin acciones)</summary>
           <div id="gates-history-list" class="grid"></div>
         </details>
         <div id="gates-note" class="note">
@@ -653,7 +653,7 @@
       });
 
       // ------------------------------------------------------------------ consola
-      const consoleState = { targets: [], tasks: [], gates: [], timer: null, pendingRuns: new Set() };
+      const consoleState = { targets: [], tasks: [], gates: [], timer: null, pendingRuns: new Set(), pendingReleases: new Set() };
 
       // <rerun-control>
       // Control «Ejecutar de nuevo» (POST /console/tasks/{id}/run). Toda la decisión es del motor:
@@ -797,7 +797,11 @@
           .slice(0, 3)
           .map((reason) => `<div class="note">${reason}</div>`)
           .join("");
-        const canRelease = release.autonomous && dev.status === "DEVELOPMENT_COMPLETED";
+        // El motor decide si hay release disponible (``next_human_action``): tras publicar y validar
+        // no queda ninguno, y mientras una solicitud vuela el botón no admite un segundo clic.
+        const releasing = consoleState.pendingReleases.has(task.task_id);
+        const canRelease = release.autonomous && dev.status === "DEVELOPMENT_COMPLETED"
+          && (nextAction.kind === "release_autonomous" || releasing);
         const rerun = rerunControl(task, consoleState.pendingRuns);
         const notes = (task.notes || []).map((text) => `<div class="note">${text}</div>`).join("");
         return `
@@ -825,7 +829,7 @@
             <div class="actions">
               <button class="secondary" data-ver="${task.task_id}" data-testid="ver-${task.task_id}">Ver</button>
               ${rerun.visible ? `<button class="secondary" data-rerun="${task.task_id}" data-testid="rerun-${task.task_id}" ${rerun.disabled ? "disabled" : ""} title="${esc(rerun.title)}">${rerun.label}</button>` : ""}
-              ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}">Release autónomo</button>` : ""}
+              ${canRelease ? `<button data-release="${task.task_id}" data-testid="release-${task.task_id}" ${releasing ? "disabled" : ""}>${releasing ? "Publicando…" : "Release autónomo"}</button>` : ""}
               ${canPublish ? `<button data-production="${task.task_id}" data-testid="production-${task.task_id}">Pedir gate de publicación</button>` : ""}
               ${publication && publication.approval_id && publication.stage === "WAITING_PRODUCTION_APPROVAL" ? "" : ""}
               ${publication && publication.approval_id && publication.stage !== "PRODUCTION_VALIDATED" && publication.stage !== "WAITING_PRODUCTION_APPROVAL" ? `<button data-publish="${task.task_id}">Publicar</button>` : ""}
@@ -1073,9 +1077,9 @@
 
       function renderTasks() {
         const items = consoleState.tasks;
-        document.getElementById("tasks-list").innerHTML = items.length
+        setHtml("tasks-list", items.length
           ? items.map(taskCard).join("")
-          : `<div class="note">todavía no hay tareas</div>`;
+          : `<div class="note">todavía no hay tareas</div>`);
         document.querySelectorAll("[data-production]").forEach((button) =>
           button.addEventListener("click", () => requestProductionGate(button.dataset.production)));
         document.querySelectorAll("[data-release]").forEach((button) =>
@@ -1095,14 +1099,13 @@
         const operational = payload.operational || payload.items.filter((gate) => gate.is_pending);
         const history = payload.history || payload.items.filter((gate) => !gate.is_pending);
         consoleState.gates = operational;
-        document.getElementById("gates-list").innerHTML = operational.length
+        setHtml("gates-list", operational.length
           ? operational.map(gateCard).join("")
-          : `<div class="note" data-testid="gates-empty">no hay acciones humanas pendientes</div>`;
-        document.getElementById("gates-history-summary").textContent =
-          `Historial de gates (${history.length}, auditoría, sin acciones)`;
-        document.getElementById("gates-history-list").innerHTML = history.length
+          : `<div class="note" data-testid="gates-empty">no hay acciones humanas pendientes</div>`);
+        setText("gates-history-summary", `Historial de gates (${history.length}, auditoría, sin acciones)`);
+        setHtml("gates-history-list", history.length
           ? history.map(historyCard).join("")
-          : `<div class="note">sin historial</div>`;
+          : `<div class="note">sin historial</div>`);
       }
 
       // Tarjeta de historial: conserva la evidencia original y NO ofrece acciones.
@@ -1135,11 +1138,105 @@
         if (reject) resolveGate(reject.dataset.reject, false);
       });
 
+      // Un nodo opcional puede no existir (otra sección, marcado distinto, tarjeta re-renderizada):
+      // ningún manejador puede suponerlo. Devuelven ``false`` en vez de lanzar.
+      function setText(id, text) {
+        const element = document.getElementById(id);
+        if (!element) return false;
+        element.textContent = text;
+        return true;
+      }
+
+      function setHtml(id, html) {
+        const element = document.getElementById(id);
+        if (!element) return false;
+        element.innerHTML = html;
+        return true;
+      }
+
       function consoleNote(text, kind) {
         const element = document.getElementById("tarea-note");
+        if (!element) return false;
         element.className = "note" + (kind ? " " + kind : "");
         element.textContent = text;
+        return true;
       }
+
+      // <release-control>
+      // Release autónomo: la disposición (AUTO / HUMAN_GATE / DENIED) la decide SIEMPRE el motor y
+      // llega en la respuesta; esta capa solo la representa. Un fallo de la propia interfaz (DOM,
+      // red) jamás se reclasifica como una disposición de release.
+      function releaseOutcome(task, failure) {
+        if (!failure) {
+          const stage = (task && task.stage) || "";
+          const estado = task && task.release_outcome === "ALREADY_PUBLISHED"
+            ? "ALREADY_PUBLISHED"
+            : (stage === "PRODUCTION_VALIDATED" ? "PUBLISHED" : "IN_PROGRESS");
+          const texto = {
+            PUBLISHED: `release autónomo · publicado y validado en producción (etapa ${stage})`,
+            ALREADY_PUBLISHED: `release autónomo · ese artefacto ya estaba publicado y validado: no se repitió nada (etapa ${stage})`,
+            IN_PROGRESS: `release autónomo · etapa ${stage || "desconocida"}`,
+          }[estado];
+          return { kind: estado, message: texto, tone: estado === "IN_PROGRESS" ? "warn" : "ok", stage };
+        }
+        const detail = failure.payload && failure.payload.detail;
+        if (failure.status === 409 && detail && typeof detail === "object" && detail.disposition) {
+          const motivos = (detail.reasons || []).join(" · ") || detail.message || "";
+          return {
+            kind: detail.disposition,
+            message: `sin release autónomo (${detail.disposition}): ${motivos}`,
+            tone: "warn",
+          };
+        }
+        if (failure.status === 409) {
+          return { kind: "REFUSED", message: `release rechazado por el motor: ${failure.message}`, tone: "warn" };
+        }
+        return {
+          kind: "ERROR",
+          message: `error al solicitar el release (${failure.status || "sin respuesta"}): ${failure.message || failure}`,
+          tone: "bad",
+        };
+      }
+
+      // ``call`` es ``api``; ``pending`` evita un segundo envío desde esta página (el motor lo
+      // impone igualmente); ``hooks.note`` y ``hooks.refresh`` pintan y refrescan sin poder alterar
+      // el desenlace: si refrescar falla, se dice que la VISTA falló, no que el release lo hiciera.
+      async function releaseRequest(taskId, pending, call, hooks) {
+        if (pending.has(taskId)) return { kind: "IGNORED", message: "", tone: "" };
+        pending.add(taskId);
+        try {
+          if (hooks.started) hooks.started();
+        } catch (error) { /* repintar es opcional */ }
+        try {
+          let task = null;
+          let failure = null;
+          try {
+            task = await call(`/console/tasks/${taskId}/release`, { method: "POST" });
+          } catch (error) {
+            failure = error;
+          } finally {
+            // La solicitud ya no está en vuelo: el refresco que sigue pinta el estado real, no
+            // un botón «Publicando…» atascado.
+            pending.delete(taskId);
+          }
+          const outcome = releaseOutcome(task, failure);
+          try { hooks.note(outcome.message, outcome.tone); } catch (error) { /* la nota es opcional */ }
+          try {
+            await hooks.refresh();
+          } catch (error) {
+            outcome.refreshError = String((error && error.message) || error);
+            try {
+              hooks.note(
+                `${outcome.message} — la vista no se pudo refrescar (${outcome.refreshError}); el estado real es el del motor`,
+                "warn");
+            } catch (inner) { /* nada más que hacer */ }
+          }
+          return outcome;
+        } finally {
+          pending.delete(taskId);
+        }
+      }
+      // </release-control>
 
       async function createTask() {
         const objective = document.getElementById("tarea-objective").value.trim();
@@ -1216,17 +1313,17 @@
       // Release autónomo (AP000-R01): la autoridad la concede la configuración del destino, no este
       // botón. Si el motor decide HUMAN_GATE o DENIED, no se publica nada y se explica por qué.
       async function releaseTask(taskId) {
-        try {
-          const task = await api(`/console/tasks/${taskId}/release`, { method: "POST" });
-          consoleNote(`release autónomo · etapa ${task.stage}`, task.stage === "PRODUCTION_VALIDATED" ? "ok" : "warn");
-          await Promise.all([loadTasks(), loadGates()]);
-          pollWhileRunning();
-        } catch (error) {
-          const detalle = (error.payload && error.payload.detail) || {};
-          const motivos = detalle.reasons ? detalle.reasons.join(" · ") : String(error.message || error);
-          consoleNote(`sin release autónomo (${detalle.disposition || "HUMAN_GATE"}): ${motivos}`, "warn");
-          await Promise.all([loadTasks(), loadGates()]);
-        }
+        const hooks = {
+          note: consoleNote,
+          started: renderTasks,
+          refresh: async () => {
+            await Promise.all([loadTasks(), loadGates()]);
+            pollWhileRunning();
+          },
+        };
+        // El botón queda deshabilitado mientras vuela (también tras re-renderizar la tarjeta).
+        const outcome = await releaseRequest(taskId, consoleState.pendingReleases, api, hooks);
+        return outcome;
       }
 
       async function resolveGate(approvalId, approved) {

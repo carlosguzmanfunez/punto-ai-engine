@@ -1,0 +1,61 @@
+"""Registra en PELL el aprendizaje causal de la cadena de release del dashboard (VERIFIED)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+MEMORIA = Path(__file__).resolve().parent / "pell-ui-release-chain.jsonl"
+
+
+def main() -> int:
+    """Registra el aprendizaje y reporta el resultado."""
+    from punto.memory.experience import ExperienceResult, ExperienceStatus
+    from punto.memory.store import ExperienceStore
+
+    store = ExperienceStore(MEMORIA)
+    a = store.record(
+        problem=(
+            "un error de UI posterior a una operación con efecto real se muestra como si la "
+            "operación hubiera sido denegada (el catch etiqueta HUMAN_GATE por defecto)"
+        ),
+        context=(
+            "Release autónomo: el backend publicó (push + sonda 200) y la respuesta fue 200, pero el "
+            "refresco posterior escribía textContent sobre un id que el marcado no declaraba; la "
+            "excepción cayó en el mismo try/catch que la llamada y se etiquetó HUMAN_GATE."
+        ),
+        attempts=("añadir solo una comprobación de null en esa línea",),
+        failure_reason="dejaba intacta la clase de defecto y el catch que reclasifica",
+        solution=(
+            "separar llamada, desenlace y refresco: la disposición sale solo de la respuesta del "
+            "motor; un fallo de refresco se informa como fallo de la VISTA; helpers null-safe; "
+            "solicitud en vuelo fuera del set antes de refrescar; idempotencia atómica en el "
+            "backend (interlock en memoria + ya-validado) para doble clic"
+        ),
+        procedure=(
+            "antes de tocar nada, reconstruir qué efecto real produjo el clic (auditoría, estado "
+            "durable, remoto) y no repetirlo",
+            "una acción con efecto externo nunca comparte try/catch con el repintado",
+            "ningún catch asigna una disposición por defecto: solo la que trae el motor",
+            "probar con la página real en Node cuyo DOM son los id que el marcado declara",
+            "añadir una prueba estática marcado↔script de getElementById con nombre fijo",
+        ),
+        result=ExperienceResult.SUCCESS,
+        verification=(
+            "tests/test_dashboard_release_chain.py (18 pruebas, respuestas reales del backend)",
+            "mutaciones (bug original, error→HUMAN_GATE, sin guard, sin interlock, sin "
+            "idempotencia, pending tardío) detectadas",
+        ),
+        tags=(
+            "type:ui-error-misclassification",
+            "trigger:null-dom-after-success",
+            "component:api/static/dashboard+console",
+            "provenance:deterministic-test",
+        ),
+        status=ExperienceStatus.VERIFIED,
+    )
+    print(f"[V] {a.id}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

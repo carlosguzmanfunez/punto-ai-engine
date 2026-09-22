@@ -279,6 +279,9 @@ class ConsoleTask:
         #: de este proceso; si el proceso muere, no queda nada corriendo y por tanto ningún bloqueo
         #: huérfano que limpiar (una tarea recuperada arranca siempre libre).
         self._executing = False
+        #: Interlock de publicación, también solo en memoria: una publicación viva es un hecho de
+        #: este proceso (no de la etapa persistida, que tras un reinicio puede ser obsoleta).
+        self._publishing = False
 
     @property
     def request_id(self) -> UUID:
@@ -290,6 +293,19 @@ class ConsoleTask:
         """True si este proceso está ejecutando el desarrollo de la tarea ahora mismo."""
         with self._lock:
             return self._executing
+
+    def begin_publication(self) -> bool:
+        """Toma el interlock de publicación de forma atómica; ``False`` si ya hay una en curso."""
+        with self._lock:
+            if self._publishing:
+                return False
+            self._publishing = True
+            return True
+
+    def end_publication(self) -> None:
+        """Libera el interlock de publicación (idempotente)."""
+        with self._lock:
+            self._publishing = False
 
     def begin_execution(self) -> bool:
         """Toma el interlock de ejecución de forma **atómica** (comprobar y tomar, bajo un lock).
@@ -902,8 +918,10 @@ def register_human_console(
                     "blockers": [item.name for item in decision.blockers],
                 },
             )
-        _run_publication(task, target, dependencies, executor, None, decision)
-        return _task_view(task, dependencies)
+        outcome = _run_publication(task, target, dependencies, executor, None, decision)
+        # La disposición sigue siendo la del motor; esto solo dice si **esta** llamada publicó o si
+        # el artefacto ya estaba validado (un segundo clic no repite ningún efecto).
+        return {**_task_view(task, dependencies), "release_outcome": outcome}
 
     # ------------------------------------------------------------- ejecución
     def _run_development(
@@ -1032,8 +1050,17 @@ def register_human_console(
         pool: ThreadPoolExecutor | None,
         approval_id: UUID | None,
         decision: ReleaseDecision | None = None,
-    ) -> None:
-        """Ejecuta la publicación gobernada del commit, por gate humano o por sobre del destino."""
+    ) -> str:
+        """Ejecuta la publicación gobernada del commit, por gate humano o por sobre del destino.
+
+        Es **idempotente y atómica por tarea**: la comprobación de «ya publicado / ya en curso» y la
+        marca de publicación en curso ocurren bajo el mismo cerrojo, así que un doble clic o dos
+        peticiones concurrentes no duplican el push ni la sonda de producción.
+
+        Returns:
+            ``PUBLISHED`` si esta llamada ejecutó la publicación; ``ALREADY_PUBLISHED`` si ese mismo
+            artefacto ya estaba validado en producción (no se hace nada nuevo).
+        """
         result = task.result
         sha = result.publishable_sha if result is not None else ""
         if result is None or not sha:
@@ -1051,23 +1078,37 @@ def register_human_console(
                     f"{sha[:12]}: no se publica"
                 ),
             )
-        diverged = _verified_state_block(task, target)
-        if diverged:
-            raise HTTPException(status.HTTP_409_CONFLICT, detail=diverged)
-        if task.publication is None:
-            task.publication = PublicationRecord(
-                task_id=str(task.task_id),
-                request_id=str(task.request_id),
-                target_id=target.target_id,
-                commit_sha=sha,
-                approval_id="" if approval_id is None else str(approval_id),
+        with _GATES_LOCK:
+            current = task.publication
+            if (
+                current is not None
+                and current.commit_sha == sha
+                and current.stage is PublicationStage.PRODUCTION_VALIDATED
+            ):
+                return "ALREADY_PUBLISHED"
+            service = (
+                deps.publisher_factory(target)
+                if deps.publisher_factory is not None
+                else _publication_service(target, audit=deps.audit, environ=deps.environ)
             )
-        service = (
-            deps.publisher_factory(target)
-            if deps.publisher_factory is not None
-            else _publication_service(target, audit=deps.audit, environ=deps.environ)
-        )
-        task.set_stage(PublicationStage.PUBLISHING)
+            if not task.begin_publication():
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail="ya hay una publicación de esta tarea en curso: no se duplica",
+                )
+            diverged = _verified_state_block(task, target)
+            if diverged:
+                task.end_publication()
+                raise HTTPException(status.HTTP_409_CONFLICT, detail=diverged)
+            if task.publication is None:
+                task.publication = PublicationRecord(
+                    task_id=str(task.task_id),
+                    request_id=str(task.request_id),
+                    target_id=target.target_id,
+                    commit_sha=sha,
+                    approval_id="" if approval_id is None else str(approval_id),
+                )
+            task.set_stage(PublicationStage.PUBLISHING)
 
         def work() -> None:
             # El expediente de publicación se persiste con su etapa real, incluso si la cadena se
@@ -1091,12 +1132,18 @@ def register_human_console(
                 task.publication = record
                 task.set_stage(record.stage, record.error)
             finally:
+                task.end_publication()
                 persist()
 
         if pool is None:
             work()
         else:
-            pool.submit(work)
+            try:
+                pool.submit(work)
+            except BaseException:
+                task.end_publication()
+                raise
+        return "PUBLISHED"
 
     # ------------------------------------------------------------- auxiliares
     def _gate_view(
@@ -1828,10 +1875,14 @@ def _next_human_action(
             "label": f"Decidir el gate {current.action}",
         }
     result = task.result
+    retryable = task.publication is None or task.publication.stage in {
+        PublicationStage.PUBLICATION_FAILED,
+        PublicationStage.DEPLOYMENT_NOT_VERIFIED,
+    }
     if (
         result is None
         or target is None
-        or task.publication is not None
+        or not retryable
         or result.status.value != "DEVELOPMENT_COMPLETED"
     ):
         return {"kind": "none"}

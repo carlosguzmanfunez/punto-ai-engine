@@ -346,6 +346,125 @@ def test_9_gap_y_accion_quedan_en_la_auditoria_durable_por_intento(tmp_path: Pat
     assert segunda["materiality"][0] == "viewport"
 
 
+def test_7_un_bloqueo_repetido_con_motivo_distinto_reutiliza_el_gate_no_lo_duplica() -> None:
+    """AP000-OBS-03-R2: reutilizar un gate pendiente no depende de la igualdad textual del motivo.
+
+    La recuperación activa de evidencia redacta un motivo distinto por intento (observación,
+    conteo). Dos bloqueos de la MISMA tarea y MISMA acción son una sola decisión humana pendiente,
+    no dos, aunque el texto varíe: lo que identifica la causa es la acción sin resolver, no la
+    redacción concreta del último bloqueo.
+    """
+    from uuid import uuid4
+
+    from punto.api.console import ConsoleTask, _reuse_pending_gate
+    from punto.schemas.enums import RiskLevel, TaskStatus
+
+    gates = HumanGate()
+    audit = AuditLogger()
+    deps = ConsoleDependencies(
+        dev_cycle=None,  # type: ignore[arg-type]
+        gates=gates,
+        audit=audit,
+        policy=PolicyEngine.from_config(),
+        targets={},
+        run_inline=True,
+        environ={},
+    )
+    task = ConsoleTask(
+        task_id=uuid4(),
+        objective="objetivo",
+        target_id=TARGET_ID,
+        acceptance_criteria=(CRITERIO,),
+        scope_paths=(),
+        context="",
+    )
+
+    primero = gates.request(
+        task_id=task.task_id,
+        action="EVIDENCE_REQUIRED",
+        risk=RiskLevel.HIGH,
+        reason="EVIDENCE_REQUIRED: intento 1, observación A",
+        resume_status=TaskStatus.IN_PROGRESS,
+        policy_outcome="REQUIRE_HUMAN",
+    )
+
+    reutilizado = _reuse_pending_gate(
+        deps, task, "EVIDENCE_REQUIRED", "EVIDENCE_REQUIRED: intento 2, observación B (distinta)"
+    )
+
+    assert reutilizado is not None, "misma tarea+acción pendiente: se reutiliza, no se duplica"
+    assert reutilizado.id == primero.id
+    assert reutilizado.reason == "EVIDENCE_REQUIRED: intento 2, observación B (distinta)", (
+        "el motivo mostrado se refresca al del bloqueo más reciente"
+    )
+    assert gates.list_for_task(task.task_id) == (reutilizado,)
+    assert len(gates.list_pending()) == 1
+
+
+def test_8_dos_gates_pendientes_ya_creados_se_colapsan_a_uno_al_reconciliar() -> None:
+    """Sana el rastro que el defecto AP000-OBS-03-R2 ya dejó: dos PENDING → uno solo accionable."""
+    from uuid import uuid4
+
+    from punto.api.console import ConsoleTask, _dedupe_pending_gates
+    from punto.schemas.enums import RiskLevel, TaskStatus
+
+    gates = HumanGate()
+    audit = AuditLogger()
+    deps = ConsoleDependencies(
+        dev_cycle=None,  # type: ignore[arg-type]
+        gates=gates,
+        audit=audit,
+        policy=PolicyEngine.from_config(),
+        targets={},
+        run_inline=True,
+        environ={},
+    )
+    task = ConsoleTask(
+        task_id=uuid4(),
+        objective="objetivo",
+        target_id=TARGET_ID,
+        acceptance_criteria=(CRITERIO,),
+        scope_paths=(),
+        context="",
+    )
+
+    antiguo = gates.request(
+        task_id=task.task_id,
+        action="EVIDENCE_REQUIRED",
+        risk=RiskLevel.HIGH,
+        reason="EVIDENCE_REQUIRED: run 1, observación A",
+        resume_status=TaskStatus.IN_PROGRESS,
+        policy_outcome="REQUIRE_HUMAN",
+    )
+    reciente = gates.request(
+        task_id=task.task_id,
+        action="EVIDENCE_REQUIRED",
+        risk=RiskLevel.HIGH,
+        reason="EVIDENCE_REQUIRED: run 2, observación B",
+        resume_status=TaskStatus.IN_PROGRESS,
+        policy_outcome="REQUIRE_HUMAN",
+    )
+    assert len(gates.list_pending()) == 2, "reproduce el defecto: dos gates operativos equivalentes"
+
+    cambiados = _dedupe_pending_gates(task, deps)
+
+    pendientes = gates.list_pending()
+    assert len(pendientes) == 1, "solo uno queda accionable"
+    assert pendientes[0].id == reciente.id, "se conserva el más reciente: el estado vigente"
+    assert len(cambiados) == 1 and cambiados[0].id == antiguo.id
+    superado = gates.get(antiguo.id)
+    assert superado is not None
+    assert superado.is_superseded
+    assert superado.supersession_cause == "duplicate_pending_gate"
+    assert superado.superseded_by == f"gate {reciente.id}"
+    # Historial íntegro: el gate superado sigue existiendo, con su motivo original intacto.
+    assert superado.reason == "EVIDENCE_REQUIRED: run 1, observación A"
+    todos = gates.list_for_task(task.task_id)
+    assert {item.id for item in todos} == {antiguo.id, reciente.id}
+    # Idempotente: reconciliar de nuevo no cambia nada más.
+    assert _dedupe_pending_gates(task, deps) == ()
+
+
 def test_m2_presupuesto_de_evidencia_es_declarativo_y_configurable() -> None:
     config = DevelopmentConfig()
     assert config.max_evidence_attempts >= 1

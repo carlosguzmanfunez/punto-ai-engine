@@ -2107,8 +2107,8 @@ def _reconcile_task_gates(
     auditoría. Idempotente: un gate ya superado o resuelto no se vuelve a tocar.
     """
     with _GATES_LOCK:
+        changed: list[HumanApprovalRequest] = list(_dedupe_pending_gates(task, deps))
         approvals = deps.gates.list_for_task(task.task_id)
-        changed: list[HumanApprovalRequest] = []
         for verdict in assess_task_gates(task, approvals):
             if verdict.actionable:
                 continue
@@ -2726,17 +2726,64 @@ def _gate_evidence(
 def _reuse_pending_gate(
     deps: ConsoleDependencies, task: ConsoleTask, action: str, reason: str
 ) -> HumanApprovalRequest | None:
-    """Gate **pendiente** de la misma tarea, acción y causa: se reutiliza en vez de duplicarlo.
+    """Gate **pendiente** de la misma tarea y acción: se reutiliza en vez de duplicarlo.
 
-    Dos intentos que se detienen por lo mismo son **una** decisión humana pendiente, no dos: la
-    persona decide una vez y el registro no se llena de solicitudes idénticas. Solo se reutiliza lo
-    que sigue pendiente y coincide en acción y motivo; en cuanto se resuelve, un nuevo bloqueo
-    vuelve a pedirla (AP000-OBS-03-R1).
+    Dos intentos que se detienen por la misma acción bloqueada son **una** decisión humana
+    pendiente, no dos: la persona decide una vez y el registro no se llena de solicitudes
+    equivalentes. La reutilización se decide por tarea+acción, no por igualdad textual del motivo
+    (AP000-OBS-03-R2): un ciclo autónomo (p. ej. recuperación activa de evidencia) legítimamente
+    redacta un motivo distinto en cada intento bloqueado sin que la causa de fondo — la misma
+    acción, de la misma tarea, sigue sin resolverse — cambie. El motivo mostrado se refresca al
+    del bloqueo más reciente para que el gate reutilizado nunca quede con una explicación obsoleta.
+    En cuanto se resuelve, un nuevo bloqueo vuelve a pedirla (AP000-OBS-03-R1).
     """
     for approval in deps.gates.list_for_task(task.task_id):
-        if approval.is_pending and approval.action == action and approval.reason == reason:
+        if approval.is_pending and approval.action == action:
+            if approval.reason != reason:
+                approval.reason = reason
             return approval
     return None
+
+
+def _dedupe_pending_gates(
+    task: ConsoleTask, deps: ConsoleDependencies
+) -> tuple[HumanApprovalRequest, ...]:
+    """Colapsa gates **pendientes** duplicados (misma tarea, misma acción) a uno solo.
+
+    Antes de AP000-OBS-03-R2, cada bloqueo con un motivo distinto creaba un gate nuevo aunque uno
+    equivalente siguiera pendiente. Esta reconciliación sana el rastro ya creado por ese defecto:
+    conserva el gate pendiente más reciente (el que refleja el estado actual) como el único
+    accionable y supera (``SUPERSEDED``, nunca aprueba ni rechaza) los anteriores de la misma
+    acción, dejando constancia de cuál los reemplazó. Idempotente: sin duplicados, no cambia nada.
+    """
+    changed: list[HumanApprovalRequest] = []
+    by_action: dict[str, list[HumanApprovalRequest]] = {}
+    for approval in deps.gates.list_for_task(task.task_id):
+        if approval.is_pending:
+            by_action.setdefault(approval.action, []).append(approval)
+    for pending in by_action.values():
+        if len(pending) < 2:
+            continue
+        pending.sort(key=lambda item: item.requested_at)
+        kept = pending[-1]
+        for stale in pending[:-1]:
+            try:
+                approval = deps.gates.supersede(
+                    stale.id,
+                    superseded_by=f"gate {kept.id}",
+                    cause="duplicate_pending_gate",
+                )
+            except HumanGateError:
+                continue
+            deps.audit.log_human_gate_superseded(
+                approval_id=approval.id,
+                task_id=task.task_id,
+                action=approval.action,
+                superseded_by=f"gate {kept.id}",
+                cause="duplicate_pending_gate",
+            )
+            changed.append(approval)
+    return tuple(changed)
 
 
 def _human_attestation(task: ConsoleTask, deps: ConsoleDependencies) -> str:

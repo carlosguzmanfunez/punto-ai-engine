@@ -445,9 +445,10 @@ def test_refrescar_y_recargar_no_duplica_tareas_ni_gates(tmp_path: Path) -> None
 def test_reanudar_una_tarea_no_duplica_su_entrada_en_el_registro(tmp_path: Path) -> None:
     """7b: re-ejecutar el ciclo continúa la **misma** solicitud gobernada, no crea otra tarea.
 
-    El gate de la primera ejecución sigue siendo el de esa tarea; la segunda ejecución vuelve a
-    pedir persona (el plan sigue exigiendo autoridad) y eso es un gate **nuevo** de la misma tarea,
-    no una tarea nueva.
+    El gate de la primera ejecución sigue siendo el de esa tarea; si la segunda ejecución vuelve a
+    pedir persona por la MISMA causa sin resolver, el gate pendiente se **reutiliza** en vez de
+    duplicarse (AP000-OBS-03-R2): dos bloqueos equivalentes de la misma tarea y la misma acción son
+    una sola decisión humana pendiente, no dos.
     """
     target, client, tarea = _tarea_con_gate_pendiente(tmp_path)
 
@@ -457,15 +458,16 @@ def test_reanudar_una_tarea_no_duplica_su_entrada_en_el_registro(tmp_path: Path)
     assert listado["total"] == 1
     assert listado["items"][0]["task_id"] == tarea["task_id"]
     assert listado["items"][0]["runs"] == 2
-    # El gate pedido en la primera ejecución sigue siendo el gate de esa misma tarea.
-    assert listado["items"][0]["gates"][0] == tarea["gates"][0]
+    # El gate pedido en la primera ejecución sigue siendo el gate de esa misma tarea: la misma
+    # causa sin resolver se reutiliza, no se duplica.
+    assert listado["items"][0]["gates"] == tarea["gates"]
     assert listado["items"][0]["objective"] == tarea["objective"]
 
     otro, _audit = _reiniciar(target)
     assert otro.get("/console/tasks").json()["total"] == 1
     gates = otro.get("/console/human-gates").json()
-    assert gates["total"] == len(tarea["gates"]) + 1 == 2
-    assert gates["pending"] == 2
+    assert gates["total"] == len(tarea["gates"]) == 1
+    assert gates["pending"] == 1
     assert gates["items"][0]["approval_id"] == tarea["gates"][0], "ningún gate cambia de identidad"
     assert {gate["task_id"] for gate in gates["items"]} == {tarea["task_id"]}
 

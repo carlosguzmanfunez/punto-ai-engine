@@ -68,6 +68,10 @@ failover:
   allow_metered: false
   max_substitutes: 2
   roles:
+    # ARCHITECT: primario openai (Codex, cuenta ChatGPT con limite de uso). Si el cliente oficial
+    # declara el limite agotado (LIMIT_REACHED) o no esta operativo, continua con Claude por su
+    # cuenta (suscripcion): Planning solo necesita salida de texto/JSON, no vision.
+    ARCHITECT: [anthropic]
     # BUILDER: primario deepseek (API de pago). Si se queda sin creditos, continua con Claude por su
     # cuenta (suscripcion), en el orden declarado.
     BUILDER: [anthropic]

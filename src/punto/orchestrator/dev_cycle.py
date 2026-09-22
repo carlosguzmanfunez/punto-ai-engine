@@ -71,6 +71,14 @@ from punto.memory.retrieval import (
     render_experience_block,
 )
 from punto.memory.store import ExperienceStore
+from punto.orchestrator.evidence_recovery import (
+    ACTION_EXPAND_FRAMING,
+    ACTION_RUN_INTERACTION,
+    EvidenceAction,
+    EvidenceGap,
+)
+from punto.orchestrator.evidence_recovery import diagnose as diagnose_evidence_gap
+from punto.orchestrator.evidence_recovery import next_action as next_evidence_action
 from punto.orchestrator.focused_resolution import (
     IMPLEMENTATION_PHASE,
     RESOLUTION_PHASE,
@@ -963,29 +971,33 @@ class DevelopmentCycle:
         repository: GovernedRepository,
         plan: DevelopmentPlan,
         state: _StateEvaluation,
-    ) -> tuple[_StateEvaluation, int, tuple[str, ...]]:
-        """AUTONOMOUS EVIDENCE + REPAIR LOOP v0 (sección 3): recupera evidencia antes de escalar.
+    ) -> tuple[_StateEvaluation, int, tuple[str, ...], tuple[EvidenceGap, ...]]:
+        """CAUSAL ACTION LOOP v1 (continuación de AUTONOMOUS EVIDENCE + REPAIR LOOP v0).
 
-        No repite verificación ni construcción: reintenta **solo** la obtención de evidencia
-        (nueva captura real + veredicto real) para los criterios cuya clase lo justifica
-        (``INCONCLUSIVE`` / ``EVIDENCE_TECHNICAL_FAILURE``), con un presupuesto propio
-        (``max_evidence_attempts``) distinto del de reparación. ``CAPABILITY_UNAVAILABLE`` nunca
-        reintenta aquí: ninguna ruta autorizada puede producir la evidencia, y reintentar sin
-        cambiar de ruta no cambia nada (la ruta efectiva ya se resuelve por capacidad y failover en
-        ``_visual_capability``/``resolve_route``, no aquí).
+        No repite la misma observación: para cada criterio ``INCONCLUSIVE`` (la única clase
+        reintentable —``FAILED`` ya alimenta el bucle de reparación existente;
+        ``CAPABILITY_UNAVAILABLE``/``EVIDENCE_TECHNICAL_FAILURE`` no tienen nada que un reintento
+        pueda cambiar) diagnostica un :class:`EvidenceGap` y pide la siguiente
+        :class:`EvidenceAction` **materialmente distinta** de todo lo ya probado
+        (``punto.orchestrator.evidence_recovery.next_action``): encuadre ampliado primero, evidencia
+        de interacción declarada después. Si no queda ninguna acción distinta, deja de reintentar
+        —aunque quede presupuesto— y escala con la causa completa: repetir una observación
+        equivalente no es recuperación.
 
-        La estrategia de reintento se deriva del propio criterio: la observación del intento
-        anterior ("qué no permitió decidir") viaja como guía al siguiente veredicto, en vez de una
-        regla fija por proyecto.
+        No repite verificación ni construcción: cada acción se ejecuta reinvocando **solo**
+        ``_verify_semantic_claims`` con la acción concreta (captura real, veredicto real).
 
         Returns:
-            El estado final (con los últimos ``claim_records`` si hubo reintentos), los intentos de
-            evidencia consumidos (para el presupuesto) y una traza legible de cada intento (la
-            auditoría real, ya durable, es ``DEV_CLAIMS_EVALUATED``: uno por intento).
+            El estado final, los intentos de evidencia consumidos (presupuesto), la traza legible
+            (auditoría real y durable: ``DEV_CLAIMS_EVALUATED``, uno por intento, con la acción
+            usada) y los huecos diagnosticados (para el grafo/reconciliación).
         """
         attempts = 1
         current = state
+        base_viewport = ("viewport", *target.visual_viewport)
+        tried: set[tuple[Any, ...]] = {base_viewport}
         trail = [self._evidence_attempt_note(1, current)]
+        gaps: list[EvidenceGap] = []
         while (
             current.claims_outcome == "EVIDENCE_REQUIRED"
             and attempts < self.config.max_evidence_attempts
@@ -998,46 +1010,85 @@ class DevelopmentCycle:
             classes = {item.evidence_class for item in pending.values()}
             if not classes & RETRYABLE_EVIDENCE_CLASSES:
                 break
-            guidance = {
-                sentence: item.evidence
-                for sentence, item in pending.items()
-                if item.evidence_class == "INCONCLUSIVE"
-            }
+            inconclusive = [
+                item for item in pending.values() if item.evidence_class == "INCONCLUSIVE"
+            ]
+            if not inconclusive:
+                break
+            gap = diagnose_evidence_gap(inconclusive[0])
+            gaps.append(gap)
+            next_step = next_evidence_action(
+                target=target,
+                is_interaction_claim=is_interaction_claim(inconclusive[0].sentence),
+                tried=frozenset(tried),
+            )
+            if next_step is None:
+                trail.append(
+                    f"intento {attempts + 1}: estrategias agotadas ({gap.signal}); no se reintenta"
+                )
+                break
+            tried.add(next_step.materiality)
+            guidance = {item.sentence: item.evidence for item in inconclusive}
+            viewport_override = (
+                (next_step.materiality[1], next_step.materiality[2])
+                if next_step.kind == ACTION_EXPAND_FRAMING
+                else None
+            )
+            force_interaction = (
+                frozenset(item.sentence for item in inconclusive)
+                if next_step.kind == ACTION_RUN_INTERACTION
+                else frozenset()
+            )
             attempts += 1
             claims_outcome, claim_issues, claim_records = self._verify_semantic_claims(
-                request, repository, target, plan, guidance=guidance
+                request,
+                repository,
+                target,
+                plan,
+                guidance=guidance,
+                viewport_override=viewport_override,
+                force_interaction=force_interaction,
+                action=next_step,
             )
             current = current._replace(
                 claims_outcome=claims_outcome,
                 claim_issues=tuple(claim_issues),
                 claim_records=tuple(claim_records),
             )
-            trail.append(self._evidence_attempt_note(attempts, current))
-        return current, attempts, tuple(trail)
+            trail.append(f"{self._evidence_attempt_note(attempts, current)} [{next_step.kind}]")
+        return current, attempts, tuple(trail), tuple(gaps)
 
     @staticmethod
     def _evidence_blocked_evidence(
-        state: _StateEvaluation, attempts: int, trail: tuple[str, ...]
+        state: _StateEvaluation,
+        attempts: int,
+        trail: tuple[str, ...],
+        gaps: tuple[EvidenceGap, ...] = (),
     ) -> BlockedEvidence:
         """Evidencia auditable del bloqueo (sección 6): por qué PUNTO ya no puede seguir solo.
 
-        Incluye el criterio pendiente, su clasificación, los intentos realizados (la traza) y qué
-        capacidad/proveedor intervino en el último; la auditoría completa —un evento por intento—
-        ya vive en ``DEV_CLAIMS_EVALUATED`` (durable, sin segunda fuente).
+        Incluye el criterio pendiente, su clasificación, el hueco diagnosticado y las estrategias
+        ya probadas (la traza, con la acción de cada intento) y qué capacidad/proveedor intervino
+        en el último; la auditoría completa —un evento por intento, con su acción— ya vive en
+        ``DEV_CLAIMS_EVALUATED`` (durable, sin segunda fuente).
         """
         pending = [item for item in state.claim_records if item.required and item.not_verified]
         primary = pending[0] if pending else None
         classes = sorted({item.evidence_class or "NOT_VERIFIED" for item in pending})
+        gap_note = f" | hueco: {gaps[-1].signal}" if gaps else ""
+        exhausted = bool(trail) and "estrategias agotadas" in trail[-1]
         return BlockedEvidence(
             code="EVIDENCE_REQUIRED",
             detail=(
                 f"criterio pendiente: {primary.sentence[:200] if primary else '(desconocido)'} | "
-                f"clasificación: {', '.join(classes)} | "
+                f"clasificación: {', '.join(classes)}{gap_note} | "
                 f"intentos: {' / '.join(trail)}"
             )[:1_000],
             rule=(
                 "capability-unavailable"
                 if classes == ["CAPABILITY_UNAVAILABLE"]
+                else "evidence-strategies-exhausted"
+                if exhausted
                 else "evidence-budget-exhausted"
             ),
             resource=primary.sentence[:300] if primary else "",
@@ -1294,6 +1345,9 @@ class DevelopmentCycle:
         plan: DevelopmentPlan | None = None,
         *,
         guidance: Mapping[str, str] | None = None,
+        viewport_override: tuple[int, int] | None = None,
+        force_interaction: frozenset[str] = frozenset(),
+        action: EvidenceAction | None = None,
     ) -> tuple[str, tuple[BuildValidationIssue, ...], tuple[ClaimRecord, ...]]:
         """Mide las afirmaciones factuales/semánticas con la evidencia disponible.
 
@@ -1312,7 +1366,15 @@ class DevelopmentCycle:
                 datasets[0].path,
             )
         visual = self._visual_capability()
-        verdicts = self._visual_verdicts(request, repository, target, visual, guidance=guidance)
+        verdicts = self._visual_verdicts(
+            request,
+            repository,
+            target,
+            visual,
+            guidance=guidance,
+            viewport_override=viewport_override,
+            force_interaction=force_interaction,
+        )
         registros = verify_claims(
             self._claims,
             datasets=datasets,
@@ -1333,6 +1395,7 @@ class DevelopmentCycle:
                 "evidence": [item.evidence[:200] for item in registros],
                 "datasets": [item.as_dict() for item in datasets[:2]],
                 "visual_capability": visual.as_dict(),
+                "evidence_action": action.as_dict() if action is not None else None,
             },
             AuditResult.SUCCESS if resultado in {"SATISFIED", "NONE"} else AuditResult.FAILURE,
         )
@@ -1354,6 +1417,8 @@ class DevelopmentCycle:
         visual: VisualCapability,
         *,
         guidance: Mapping[str, str] | None = None,
+        viewport_override: tuple[int, int] | None = None,
+        force_interaction: frozenset[str] = frozenset(),
     ) -> dict[str, VisualVerdict]:
         """Produce evidencia visual real (capturas y/o interacciones) evaluada por VISUAL_QA.
 
@@ -1362,17 +1427,25 @@ class DevelopmentCycle:
         para los de interacción. En cualquier otro caso el criterio sigue exigiendo evidencia
         (nunca se simula). Un fallo de captura, de interacción o de evaluación tampoco es un PASS.
         La evidencia queda ligada a la Task (``request_id``) y al cambio aplicado.
+
+        ``viewport_override``/``force_interaction`` son la acción concreta de una recuperación
+        activa de evidencia (CAUSAL ACTION LOOP): encuadre distinto o evidencia de interacción para
+        un criterio que normalmente se mediría con una captura estática, respectivamente.
         """
         claims = [claim.sentence for claim in self._claims if claim.capability == "VISION"]
         if not claims or not visual.available:
             return {}
-        interactive = [text for text in claims if is_interaction_claim(text)]
+        interactive = [
+            text for text in claims if is_interaction_claim(text) or text in force_interaction
+        ]
         static = [text for text in claims if text not in interactive]
         digest = self._applied_digest(repository)
         verdicts: dict[str, VisualVerdict] = {}
         if static:
             verdicts.update(
-                self._static_verdicts(request, target, static, digest, guidance=guidance)
+                self._static_verdicts(
+                    request, target, static, digest, guidance=guidance, viewport=viewport_override
+                )
             )
         if interactive:
             verdicts.update(self._interaction_verdicts(request, target, interactive, digest))
@@ -1396,12 +1469,20 @@ class DevelopmentCycle:
         digest: str,
         *,
         guidance: Mapping[str, str] | None = None,
+        viewport: tuple[int, int] | None = None,
     ) -> dict[str, VisualVerdict]:
-        """Criterios de apariencia estática: captura real de la app renderizada + VISUAL_QA."""
+        """Criterios de apariencia estática: captura real de la app renderizada + VISUAL_QA.
+
+        ``viewport``, si se declara, sustituye al del destino **solo para esta captura**: es la
+        acción "ampliar encuadre" de la recuperación activa de evidencia (más contenido visible en
+        una sola imagen), nunca una configuración nueva.
+        """
         if self.visual_capture is None or not target.visual_routes:
             return {}
         try:
-            shots = self.visual_capture.capture(target.visual_routes, target.visual_viewport)
+            shots = self.visual_capture.capture(
+                target.visual_routes, viewport or target.visual_viewport
+            )
         except CaptureError as error:
             self._log(
                 AuditEventType.DEV_VISUAL_CAPTURED,
@@ -2689,9 +2770,10 @@ class DevelopmentCycle:
                     state = self._evaluate_state(request, target, repository, plan)
                     evidence_attempts = 1
                     evidence_trail: tuple[str, ...] = ()
+                    evidence_gaps: tuple[EvidenceGap, ...] = ()
                     if state.claims_outcome == "EVIDENCE_REQUIRED":
-                        state, evidence_attempts, evidence_trail = self._evidence_recovery(
-                            request, target, repository, plan, state
+                        state, evidence_attempts, evidence_trail, evidence_gaps = (
+                            self._evidence_recovery(request, target, repository, plan, state)
                         )
                     verification = list(state.verification)
                     acceptance_issues = state.acceptance_issues
@@ -2753,7 +2835,7 @@ class DevelopmentCycle:
                             claims=claim_evidence,
                             claims_result=state.claims_outcome,
                             blocked=self._evidence_blocked_evidence(
-                                state, evidence_attempts, evidence_trail
+                                state, evidence_attempts, evidence_trail, evidence_gaps
                             ),
                             evidence_attempts=evidence_attempts,
                         )
@@ -2943,9 +3025,10 @@ class DevelopmentCycle:
             round_state = self._evaluate_state(request, target, repository, plan)
             evidence_attempts = 1
             evidence_trail = ()
+            evidence_gaps = ()
             if round_state.claims_outcome == "EVIDENCE_REQUIRED":
-                round_state, evidence_attempts, evidence_trail = self._evidence_recovery(
-                    request, target, repository, plan, round_state
+                round_state, evidence_attempts, evidence_trail, evidence_gaps = (
+                    self._evidence_recovery(request, target, repository, plan, round_state)
                 )
             (
                 measured,
@@ -2989,7 +3072,7 @@ class DevelopmentCycle:
                     claims=claim_evidence,
                     claims_result=claims_outcome,
                     blocked=self._evidence_blocked_evidence(
-                        round_state, evidence_attempts, evidence_trail
+                        round_state, evidence_attempts, evidence_trail, evidence_gaps
                     ),
                     evidence_attempts=evidence_attempts,
                 )

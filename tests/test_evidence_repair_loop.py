@@ -103,6 +103,34 @@ def _ciclo_evidencia(
     respuesta_builder: Any = None,
 ) -> tuple[TestClient, AuditLogger, list[int]]:
     """Consola real; VISUAL_QA devuelve un veredicto distinto en cada llamada sucesiva."""
+    client, audit, llamadas, _captura = _ciclo_evidencia_completo(
+        tmp_path,
+        veredictos=veredictos,
+        max_evidence_attempts=max_evidence_attempts,
+        max_repair_rounds=max_repair_rounds,
+        respuesta_builder=respuesta_builder,
+    )
+    return client, audit, llamadas
+
+
+def _ciclo_evidencia_con_captura(
+    tmp_path: Path, *, veredictos: list[str], max_evidence_attempts: int = 2
+) -> tuple[TestClient, AuditLogger, _CapturaFalsa]:
+    """Como ``_ciclo_evidencia``, pero devuelve el doble de captura (ver la materialidad)."""
+    client, audit, _llamadas, captura = _ciclo_evidencia_completo(
+        tmp_path, veredictos=veredictos, max_evidence_attempts=max_evidence_attempts
+    )
+    return client, audit, captura
+
+
+def _ciclo_evidencia_completo(
+    tmp_path: Path,
+    *,
+    veredictos: list[str],
+    max_evidence_attempts: int = 2,
+    max_repair_rounds: int = 2,
+    respuesta_builder: Any = None,
+) -> tuple[TestClient, AuditLogger, list[int], _CapturaFalsa]:
     repo, remoto = _repo_ya_satisfecho(tmp_path)
     target = replace(
         _target(repo, remoto=remoto), visual_routes=("http://localhost:3000/propiedades",)
@@ -167,7 +195,7 @@ def _ciclo_evidencia(
     aplicacion = FastAPI()
     register_dashboard(aplicacion)
     register_human_console(aplicacion, dependencias)
-    return TestClient(aplicacion), audit, llamadas
+    return TestClient(aplicacion), audit, llamadas, captura
 
 
 def _solicitud_visual() -> dict[str, Any]:
@@ -268,6 +296,54 @@ def test_m_mutacion_sin_clasificacion_retryable_pierde_la_recuperacion(tmp_path:
     assert "EVIDENCE_TECHNICAL_FAILURE" not in RETRYABLE_EVIDENCE_CLASSES, (
         "un fallo técnico determinista (sin proveedor) repite el mismo resultado: no reintentar"
     )
+
+
+def test_5_el_segundo_intento_usa_un_encuadre_materialmente_distinto(tmp_path: Path) -> None:
+    """La segunda estrategia (INCONCLUSIVE→INCONCLUSIVE) no repite el mismo encuadre."""
+    client, _audit, captura = _ciclo_evidencia_con_captura(
+        tmp_path, veredictos=["UNCLEAR", "UNCLEAR"], max_evidence_attempts=2
+    )
+
+    client.post("/console/tasks", json=_solicitud_visual())
+
+    viewports = [viewport for _urls, viewport in captura.llamadas]
+    assert len(viewports) == 2
+    assert viewports[0] != viewports[1], "el segundo intento amplía el encuadre, no lo repite"
+    assert viewports[1][1] > viewports[0][1], "más alto: más contenido visible en una captura"
+
+
+def test_6_una_repeticion_equivalente_no_consume_todo_el_presupuesto_en_silencio(
+    tmp_path: Path,
+) -> None:
+    """Presupuesto amplio, sin interacción declarada: se agota la ESCALERA, no el budget."""
+    client, _audit, llamadas = _ciclo_evidencia(
+        tmp_path, veredictos=["UNCLEAR"] * 6, max_evidence_attempts=6
+    )
+
+    tarea = client.post("/console/tasks", json=_solicitud_visual()).json()
+
+    assert tarea["development"]["evidence_attempts"] == 2, (
+        "una sola acción distinta disponible (encuadre): no hay una tercera estrategia real, "
+        "así que no se gastan los 6 intentos posibles en observaciones equivalentes"
+    )
+    assert len(llamadas) == 2
+    blocked = client.get(f"/console/tasks/{tarea['task_id']}").json()["blocked"]
+    assert blocked["rule"] == "evidence-strategies-exhausted"
+    assert "estrategias agotadas" in blocked["detail"]
+
+
+def test_9_gap_y_accion_quedan_en_la_auditoria_durable_por_intento(tmp_path: Path) -> None:
+    """Sección 8 (durabilidad/grafo): cada intento queda en DEV_CLAIMS_EVALUATED con su acción."""
+    client, audit, _llamadas = _ciclo_evidencia(tmp_path, veredictos=["UNCLEAR", "PASS"])
+
+    client.post("/console/tasks", json=_solicitud_visual())
+
+    eventos = audit.by_type(AuditEventType.DEV_CLAIMS_EVALUATED)
+    acciones = [dict(e.metadata).get("evidence_action") for e in eventos]
+    assert acciones[0] is None, "el primer intento es la línea base, sin acción de recuperación"
+    segunda = dict(acciones[1])
+    assert segunda["kind"] == "EXPAND_FRAMING"
+    assert segunda["materiality"][0] == "viewport"
 
 
 def test_m2_presupuesto_de_evidencia_es_declarativo_y_configurable() -> None:

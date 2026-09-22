@@ -317,10 +317,10 @@ def _cycle(
 def _request(**overrides: Any) -> BuildRequest:
     """Solicitud de desarrollo válida."""
     payload: dict[str, Any] = {
-        "objective": "unificar la lista de tipos de propiedad en una sola fuente",
+        "objective": "ajustar el catálogo de tipos de propiedad para el buscador",
         "target_repository": TARGET_ID,
         "requested_role": ProviderRole.BUILDER,
-        "acceptance_criteria": ("una sola fuente de tipos",),
+        "acceptance_criteria": ("el catálogo de tipos queda consistente",),
         "constraints": ("no tocar el esquema de base de datos",),
         "scope_paths": ("src/lib",),
         "context": "El buscador ofrece tipos que no existen en el catálogo.",

@@ -46,6 +46,7 @@ from typing import Any, Final, NamedTuple
 from punto.acceptance import (
     RETRYABLE_EVIDENCE_CLASSES,
     CapabilityRequirement,
+    ClaimKind,
     ClaimRecord,
     RequestReference,
     SemanticClaim,
@@ -155,6 +156,7 @@ from punto.schemas.execution import CommandResult
 from punto.schemas.repair import RepairSnapshot
 from punto.security.deterministic import SECRET_PATTERNS
 from punto.skills import SkillActivation
+from punto.structure import StructuralEvidence, analyze_structural_consistency
 from punto.tools.errors import WorkspaceNotResolvedError, WorkspaceViolationError
 from punto.visualqa.dev_evidence import (
     CaptureError,
@@ -1313,6 +1315,59 @@ class DevelopmentCycle:
                 encontrados.append(relative)
         return tuple(dict.fromkeys((*repository.changed_paths(), *encontrados)))
 
+    def _structural_candidates(
+        self, repository: GovernedRepository, target: DevelopmentTarget
+    ) -> tuple[str, ...]:
+        """Ficheros de código donde puede vivir una fuente canónica: alcance completo del destino.
+
+        Igual que ``_dataset_candidates`` para lo cartográfico: la fuente canónica puede estar
+        fuera de lo que este intento cambió, así que se recorre el árbol del destino (acotado),
+        no solo ``changed_paths()``.
+        """
+        encontrados: list[str] = []
+        for candidate in sorted(target.repository.rglob("*")):
+            if len(encontrados) >= MAX_DISCOVERY_FILES:
+                break
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(target.repository).as_posix()
+            if relative.split("/", maxsplit=1)[0] in {
+                ".git",
+                ".next",
+                "node_modules",
+                ".vercel",
+                ".punto-repair-snapshots",
+            }:
+                continue
+            if candidate.suffix.lower() in {".ts", ".tsx", ".js", ".jsx", ".mjs"}:
+                encontrados.append(relative)
+        return tuple(dict.fromkeys((*repository.changed_paths(), *encontrados)))
+
+    def _structural_evidence(
+        self, repository: GovernedRepository, target: DevelopmentTarget
+    ) -> dict[str, StructuralEvidence]:
+        """Analiza cada criterio de consistencia estructural declarado por la solicitud.
+
+        Determinista y sin capacidad de modelo (EVIDENCE MODALITY ROUTING): nunca pasa por
+        VISUAL_QA ni por el bucle de recuperación de evidencia visual — un criterio estructural se
+        demuestra o no con lo que el repositorio ya declara, no con una captura.
+        """
+        structural_claims = [
+            claim for claim in self._claims if claim.kind == ClaimKind.STRUCTURAL_CONSISTENCY.value
+        ]
+        if not structural_claims:
+            return {}
+        candidatos = self._structural_candidates(repository, target)
+        return {
+            claim.sentence: analyze_structural_consistency(
+                claim.sentence,
+                files=candidatos,
+                read_text=repository.read_text,
+                exists=repository.exists,
+            )
+            for claim in structural_claims
+        }
+
     def _rendering_surface(
         self, repository: GovernedRepository, plan: DevelopmentPlan | None
     ) -> tuple[str, ...]:
@@ -1375,6 +1430,7 @@ class DevelopmentCycle:
             viewport_override=viewport_override,
             force_interaction=force_interaction,
         )
+        structural = self._structural_evidence(repository, target)
         registros = verify_claims(
             self._claims,
             datasets=datasets,
@@ -1382,6 +1438,7 @@ class DevelopmentCycle:
             visual=visual,
             attestation=self._attestation,
             visual_verdicts=verdicts,
+            structural=structural,
         )
         resultado = claims_result(registros)
         self._log(
@@ -1395,6 +1452,7 @@ class DevelopmentCycle:
                 "evidence": [item.evidence[:200] for item in registros],
                 "datasets": [item.as_dict() for item in datasets[:2]],
                 "visual_capability": visual.as_dict(),
+                "structural": [item.as_dict() for item in structural.values()],
                 "evidence_action": action.as_dict() if action is not None else None,
             },
             AuditResult.SUCCESS if resultado in {"SATISFIED", "NONE"} else AuditResult.FAILURE,

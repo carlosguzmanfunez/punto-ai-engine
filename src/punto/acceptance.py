@@ -30,14 +30,17 @@ from typing import Any, Final
 
 __all__ = [
     "CAPABILITY_VISION",
+    "CLAIM_MODALITY",
     "EVIDENCE_CLASSES",
     "INTERACTION_MARKERS",
+    "STRUCTURAL_MARKERS",
     "AcceptanceRecord",
     "CapabilityRequirement",
     "ClaimKind",
     "ClaimRecord",
     "ElementKind",
     "EvidenceClass",
+    "EvidenceModality",
     "LocatedSurface",
     "RequestIntent",
     "RequestReference",
@@ -50,6 +53,7 @@ __all__ = [
     "ground_request",
     "is_interaction_claim",
     "measurable",
+    "modality_of",
     "tokens",
     "verify_acceptance",
     "verify_claims",
@@ -895,6 +899,61 @@ class ClaimKind(StrEnum):
 
     CARTOGRAPHIC_CORRECTNESS = "CARTOGRAPHIC_CORRECTNESS"
     VISUAL_APPEARANCE = "VISUAL_APPEARANCE"
+    #: «Unificar X en una sola fuente...»: una fuente canónica única, con sus consumidores
+    #: declarados usándola y sin definiciones paralelas duplicadas — nunca demostrable con una
+    #: captura (EVIDENCE MODALITY ROUTING).
+    STRUCTURAL_CONSISTENCY = "STRUCTURAL_CONSISTENCY"
+
+
+class EvidenceModality(StrEnum):
+    """Qué CLASE de evidencia puede demostrar un criterio — la modalidad, no el resultado.
+
+    Un ``ClaimKind`` fija la modalidad en el momento en que se extrae el criterio (nunca se
+    reinterpreta después por texto libre): determina qué verificador puede producir evidencia
+    real y evita que un criterio se mida con la modalidad equivocada (un criterio ESTRUCTURAL no
+    se demuestra con una captura, por mucho que la frase mencione una palabra visual de pasada).
+    """
+
+    STRUCTURAL = "STRUCTURAL"
+    FUNCTIONAL = "FUNCTIONAL"
+    VISUAL = "VISUAL"
+    DOM_STATE = "DOM_STATE"
+    TEXTUAL = "TEXTUAL"
+    COMBINED = "COMBINED"
+
+
+#: La modalidad que demuestra cada tipo de afirmación. ``CARTOGRAPHIC_CORRECTNESS`` es estructural
+#: (un dataset real, no un mapa dibujado a mano); ``STRUCTURAL_CONSISTENCY`` también; solo
+#: ``VISUAL_APPEARANCE`` exige mirar el resultado renderizado.
+CLAIM_MODALITY: Final[dict[str, str]] = {
+    ClaimKind.CARTOGRAPHIC_CORRECTNESS.value: EvidenceModality.STRUCTURAL.value,
+    ClaimKind.STRUCTURAL_CONSISTENCY.value: EvidenceModality.STRUCTURAL.value,
+    ClaimKind.VISUAL_APPEARANCE.value: EvidenceModality.VISUAL.value,
+}
+
+
+def modality_of(kind: str) -> str:
+    """Modalidad de evidencia de un tipo de criterio (``COMBINED`` si no se reconoce)."""
+    return CLAIM_MODALITY.get(kind, EvidenceModality.COMBINED.value)
+
+
+#: Marcas de que la frase pide una fuente canónica única (no un aspecto visual, aunque mencione de
+#: pasada una palabra visual: «visualizaciones» es un consumidor, no un juicio estético). Se
+#: comprueban ANTES que las marcas visuales — la precedencia es la corrección de causa raíz del
+#: enrutamiento de modalidad.
+STRUCTURAL_MARKERS: Final[tuple[str, ...]] = (
+    "una sola fuente",
+    "sola fuente de verdad",
+    "fuente de verdad",
+    "fuente unica",
+    "unica fuente",
+    "fuente canonica",
+    "single source of truth",
+    "unificar",
+    "unify",
+    "consolidar",
+    "consolidate",
+)
 
 
 #: Marcas de corrección (frente a mera presencia) en una frase.
@@ -1145,6 +1204,21 @@ def is_interaction_claim(sentence: str) -> bool:
     return any(marker in plain for marker in INTERACTION_MARKERS)
 
 
+#: «visual» es, a la vez, un adjetivo («diseño visual», «aspectos visuales», «cambia
+#: visualmente») y la raíz de un sustantivo NO estético («visualización», «visualizaciones»: una
+#: vista/consumidor de datos, no un juicio sobre el aspecto). Una coincidencia de subcadena
+#: confunde ambos (la causa real de AP000-OBS-03-R3): esta marca acepta las formas adjetivas
+#: declaradas, nunca la familia nominal «visualizaci-».
+_VISUAL_WORD: Final[re.Pattern[str]] = re.compile(r"\bvisual(?:es|mente)?\b")
+
+
+def _marker_present(plain: str, marker: str) -> bool:
+    """Coincidencia de una marca: palabra completa para «visual», subcadena para el resto."""
+    if marker == "visual":
+        return bool(_VISUAL_WORD.search(plain))
+    return marker in plain
+
+
 @dataclass(frozen=True, slots=True)
 class VisualVerdict:
     """Veredicto de VISUAL_QA sobre un criterio, con quién lo emitió y sobre qué capturas.
@@ -1174,13 +1248,13 @@ def extract_claims(objective: str, criteria: Iterable[str] = ()) -> tuple[Semant
     for text in (objective, *criteria):
         for sentence in _sentences(text):
             plain = normalize(sentence)
-            aspecto = any(subject in plain for subject in VISUAL_SUBJECTS) and any(
-                marker in plain for marker in VISUAL_MARKERS
-            )
-            if not aspecto and not any(marker in plain for marker in CORRECTNESS_MARKERS):
-                continue
             # El aspecto manda sobre el sujeto: «el mapa se integra visualmente» es una afirmación
-            # de apariencia, no de datos, aunque la frase mencione el mapa.
+            # de apariencia, no de datos, aunque la frase mencione el mapa. «visual» exige palabra
+            # completa (``_marker_present``): «visualizaciones» (un consumidor, no un juicio
+            # estético) ya no cuenta como aspecto — es la causa real de AP000-OBS-03-R3.
+            aspecto = any(_marker_present(plain, subject) for subject in VISUAL_SUBJECTS) and any(
+                _marker_present(plain, marker) for marker in VISUAL_MARKERS
+            )
             if aspecto:
                 claims.append(
                     SemanticClaim(
@@ -1193,6 +1267,26 @@ def extract_claims(objective: str, criteria: Iterable[str] = ()) -> tuple[Semant
                         capability=CAPABILITY_VISION,
                     )
                 )
+                if len(claims) >= MAX_REFERENCES:
+                    return tuple(claims)
+                continue
+            # Sin aspecto genuino, «unificar X en una sola fuente...» es una afirmación
+            # ESTRUCTURAL (EVIDENCE MODALITY ROUTING): una fuente canónica, no un juicio visual.
+            if any(marker in plain for marker in STRUCTURAL_MARKERS):
+                claims.append(
+                    SemanticClaim(
+                        sentence=sentence[:300],
+                        kind=ClaimKind.STRUCTURAL_CONSISTENCY.value,
+                        evidence_required=(
+                            "una fuente canónica única, usada por los consumidores declarados, "
+                            "sin definiciones paralelas duplicadas en el alcance"
+                        ),
+                    )
+                )
+                if len(claims) >= MAX_REFERENCES:
+                    return tuple(claims)
+                continue
+            if not any(marker in plain for marker in CORRECTNESS_MARKERS):
                 continue
             if any(subject in plain for subject in GEO_SUBJECTS):
                 claims.append(
@@ -1218,6 +1312,7 @@ def verify_claims(
     visual: VisualCapability | None = None,
     attestation: str = "",
     visual_verdicts: Mapping[str, VisualVerdict] | None = None,
+    structural: Mapping[str, Any] | None = None,
 ) -> tuple[ClaimRecord, ...]:
     """Mide cada afirmación con la evidencia disponible, sin inventar PASS.
 
@@ -1228,6 +1323,8 @@ def verify_claims(
         visual: Capacidad real del transporte de VISUAL_QA (imágenes).
         attestation: Atestación humana explícita de la apariencia visual, si existe.
         visual_verdicts: Veredictos de VISUAL_QA por frase del criterio, si se evaluaron capturas.
+        structural: Análisis de consistencia estructural por frase del criterio (duck-typed, como
+            ``datasets``: solo se leen sus atributos, sin importar el tipo que los produjo).
 
     Returns:
         Un registro por afirmación con ``SATISFIED``, ``UNSATISFIED`` (reparable) o
@@ -1239,9 +1336,86 @@ def verify_claims(
         if claim.kind == ClaimKind.CARTOGRAPHIC_CORRECTNESS.value:
             records.append(_cartographic_record(claim, validos, rendered))
             continue
+        if claim.kind == ClaimKind.STRUCTURAL_CONSISTENCY.value:
+            records.append(_structural_record(claim, (structural or {}).get(claim.sentence)))
+            continue
         verdict = (visual_verdicts or {}).get(claim.sentence)
         records.append(_visual_record(claim, visual, attestation, verdict))
     return tuple(records)
+
+
+def _structural_record(claim: SemanticClaim, evidence: Any | None) -> ClaimRecord:
+    """La consistencia estructural se demuestra con una fuente canónica única y sus consumidores.
+
+    Determinista, como la cartográfica: ``SATISFIED``/``UNSATISFIED``, nunca ``INCONCLUSIVE`` — no
+    hay juicio subjetivo de un revisor aquí, solo hechos medidos sobre el repositorio.
+    """
+    if evidence is None:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence="no se analizó el alcance del repositorio para este criterio estructural",
+            evidence_required=claim.evidence_required,
+            evidence_class=EvidenceClass.FAILED.value,
+        )
+    canonical: tuple[str, ...] = tuple(getattr(evidence, "canonical", ()))
+    missing: tuple[str, ...] = tuple(getattr(evidence, "consumers_missing", ()))
+    confirmed: tuple[str, ...] = tuple(getattr(evidence, "consumers_confirmed", ()))
+    topic: tuple[str, ...] = tuple(getattr(evidence, "topic", ()))
+    tema = ", ".join(topic) or claim.sentence[:60]
+    if not canonical:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence=f"no existe ninguna fuente canónica para «{tema}» en el alcance evaluado",
+            evidence_required=claim.evidence_required,
+            remedy=(
+                "declara una única fuente exportada para este dominio y haz que la usen "
+                "los consumidores"
+            ),
+            evidence_class=EvidenceClass.FAILED.value,
+        )
+    if len(canonical) > 1:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence=(
+                f"existen {len(canonical)} definiciones paralelas para «{tema}»: "
+                + ", ".join(canonical)
+            ),
+            evidence_required=claim.evidence_required,
+            remedy="consolida las definiciones paralelas en una única fuente canónica",
+            evidence_class=EvidenceClass.FAILED.value,
+        )
+    if missing:
+        return ClaimRecord(
+            sentence=claim.sentence,
+            kind=claim.kind,
+            result="UNSATISFIED",
+            evidence=(
+                f"fuente canónica {canonical[0]}, pero {', '.join(missing)} no la importa(n)"
+            ),
+            evidence_required=claim.evidence_required,
+            remedy=(
+                f"haz que {', '.join(missing)} importe(n) {canonical[0]} en vez de definir "
+                "su propia versión"
+            ),
+            evidence_class=EvidenceClass.FAILED.value,
+        )
+    detalle_consumidores = (
+        f"; consumidores confirmados: {', '.join(confirmed)}" if confirmed else ""
+    )
+    return ClaimRecord(
+        sentence=claim.sentence,
+        kind=claim.kind,
+        result="SATISFIED",
+        evidence=f"fuente canónica única en {canonical[0]}" + detalle_consumidores,
+        evidence_required=claim.evidence_required,
+        evidence_class=EvidenceClass.SATISFIED.value,
+    )
 
 
 def _cartographic_record(

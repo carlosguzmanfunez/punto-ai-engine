@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
+from punto.acceptance import modality_of
+
 if TYPE_CHECKING:
     from punto.acceptance import ClaimRecord
     from punto.workspace.target import DevelopmentTarget
@@ -50,6 +52,10 @@ class EvidenceGap:
     #: Etiqueta determinista y corta del hueco (no texto libre): identifica la CAUSA, no la repite.
     signal: str
     detail: str = ""
+    #: Modalidad de evidencia que le corresponde a este criterio (EVIDENCE MODALITY ROUTING): la
+    #: fija ``ClaimKind`` en la extracción, nunca este módulo — aquí solo se propaga para que la
+    #: auditoría/grafo puedan reconstruir Criterion -> Modality -> Evidence sin adivinarla.
+    modality: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """Vista serializable (auditoría/grafo)."""
@@ -58,6 +64,7 @@ class EvidenceGap:
             "evidence_class": self.evidence_class,
             "signal": self.signal,
             "detail": self.detail,
+            "modality": self.modality,
         }
 
 
@@ -83,6 +90,7 @@ def diagnose(record: ClaimRecord) -> EvidenceGap:
         evidence_class=record.evidence_class,
         signal="unclear-evidence",
         detail=record.evidence[:300],
+        modality=modality_of(record.kind),
     )
 
 

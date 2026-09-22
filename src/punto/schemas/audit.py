@@ -310,6 +310,9 @@ class AuditEventType(StrEnum):
     DEV_REPAIR_COMPLETED = "DEV_REPAIR_COMPLETED"
     #: PILOT-04: se agotaron las rondas de reparación sin resolver el fallo.
     DEV_REPAIR_EXHAUSTED = "DEV_REPAIR_EXHAUSTED"
+    #: BUILDER TAKEOVER: un proveedor respondió con éxito pero sin producir un cambio material
+    #: ante evidencia accionable; se prueba con el siguiente candidato autorizado y capaz.
+    DEV_BUILDER_TAKEOVER = "DEV_BUILDER_TAKEOVER"
     #: PILOT-04: se creó el checkpoint reversible antes de la primera escritura.
     DEV_CHECKPOINT_CREATED = "DEV_CHECKPOINT_CREATED"
     #: PILOT-04: el rollback devolvió el árbol al estado capturado.

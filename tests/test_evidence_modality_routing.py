@@ -39,6 +39,7 @@ from punto.orchestrator.dev_cycle import DevelopmentConfig, DevelopmentCycle
 from punto.policy.human_gate import HumanGate
 from punto.policy.policy_engine import PolicyEngine
 from punto.providers.contract import ProviderRole
+from punto.providers.failover import FailoverPolicy
 from punto.providers.router import ProviderRouter
 from punto.schemas.audit import AuditEventType
 from punto.schemas.decision import ApprovalStatus, HumanApprovalRequest, RiskLevel
@@ -48,6 +49,7 @@ from punto.structure import analyze_structural_consistency
 from punto.workspace.target import DevelopmentTargetRegistry
 from test_human_console import TARGET_ID, _git, _plan, _target
 from test_noop_reconciliation import _repo_ya_satisfecho
+from test_provider_failover import _conectados
 from test_visual_qa_effective import _Multimodal
 
 #: El criterio real de la Task 0983a418 que disparó el defecto (contiene «visualizaciones»).
@@ -138,9 +140,14 @@ def _consola_estructural(
     architect_plan: dict[str, Any],
     builder_script: list[Any],
     extra_setup: Any = None,
+    builder_alt_script: list[Any] | None = None,
 ) -> tuple[TestClient, AuditLogger, Path, Any]:
     """Consola real con ``DevelopmentCycle`` real. ``extra_setup(repo)`` corre y se comitea ANTES
     de fijar ``baseline_sha``: el ciclo tiene que empezar sobre el árbol final, no uno anterior.
+
+    ``builder_alt_script``, si se da, registra un SEGUNDO proveedor BUILDER («deepseek») como
+    sustituto autorizado (BUILDER TAKEOVER): si el primario responde ``CHANGES_EMPTY`` ante un
+    criterio FAILED accionable, la ronda siguiente la toma este sustituto, no el mismo primario.
     """
     repo, remoto = _repo_ya_satisfecho(tmp_path)
     if extra_setup is not None:
@@ -171,6 +178,20 @@ def _consola_estructural(
         router.register_provider(cliente.provider, lambda _m, c=cliente: c, model=cliente.model)
     router.assign_role(ProviderRole.ARCHITECT, "architect")
     router.assign_role(ProviderRole.BUILDER, "anthropic")
+    if builder_alt_script is not None:
+        cola_alt = list(builder_alt_script)
+
+        def builder_alt_responde(n: int) -> str:
+            paso = cola_alt.pop(0) if cola_alt else builder_alt_script[-1]
+            return json.dumps(paso)
+
+        sustituto = _Multimodal("deepseek", "deepseek-v4-pro", builder_alt_responde)
+        router.register_provider(
+            sustituto.provider, lambda _m, c=sustituto: c, model=sustituto.model
+        )
+        router.configure_failover(
+            FailoverPolicy(roles={ProviderRole.BUILDER: ("deepseek",)}), _conectados("deepseek")
+        )
     ciclo = DevelopmentCycle(
         router=router,
         targets=DevelopmentTargetRegistry({TARGET_ID: target}),
@@ -286,7 +307,8 @@ def test_d_duplicacion_real_repara_y_reevalua_hasta_satisfied(tmp_path: Path) ->
     client, audit, repo, _target_obj = _consola_estructural(
         tmp_path,
         architect_plan=plan,
-        builder_script=[{"changes": []}, reparacion],
+        builder_script=[{"changes": []}],
+        builder_alt_script=[reparacion],
         extra_setup=_con_duplicado,
     )
 

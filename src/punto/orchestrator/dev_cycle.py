@@ -35,6 +35,7 @@ confirmar cambios que no sean suyos.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -318,6 +319,13 @@ class DevelopmentConfig:
     #: con la misma cadena de verificación y solo se completa si todo pasa. ``False`` conserva el
     #: comportamiento anterior (``CHANGES_EMPTY`` reintenta y acaba en fallo).
     reconcile_noop: bool = True
+    #: BUILDER TAKEOVER. Presupuesto de sustituciones de BUILDER **dentro del mismo ciclo**:
+    #: cuántas veces PUNTO puede probar con el siguiente candidato autorizado y capaz cuando el
+    #: asignado respondió con éxito pero sin cambio material (``CHANGES_EMPTY``) ante un criterio
+    #: FAILED con remedio accionable. Distinto de ``max_repair_rounds`` (rondas de reparación) y
+    #: del failover operativo del router (indisponibilidad demostrable del primario): aquí el
+    #: primario respondió, solo que no actuó.
+    max_builder_takeovers: int = 1
     #: Techo acumulado de recursos distintos para toda la sesión (anti-fragmentación).
     session_ceiling: int = AUTONOMOUS_MAX_FILES * 3
     #: Permitir que el BUILDER pida ampliar alcance con evidencia causal.
@@ -2613,6 +2621,11 @@ class DevelopmentCycle:
         last_noop_gap = ""
         last_noop_claims: tuple[ClaimEvidence, ...] = ()
         last_noop_claims_result = "NONE"
+        # BUILDER TAKEOVER: quién ya respondió en este ciclo (nunca se gasta dos veces para la
+        # misma causa), si la próxima invocación debe pedir un sustituto, y cuántas ya se usaron.
+        builder_tried: set[str] = set()
+        takeover_pending = False
+        takeovers_used = 0
         for _ in range(max_iterations):
             # La skill de resolución solo actúa sobre un **fallo real ya medido**: sin verificación
             # fallida no hay nada que resolver, y la implementación inicial no la recibe.
@@ -2665,13 +2678,18 @@ class DevelopmentCycle:
                 resolution=block,
                 proposal_feedback=proposal_feedback,
             )
+            was_takeover_round = takeover_pending
             result = self._invoke(
                 ProviderRole.BUILDER,
                 request,
                 prompt,
                 BUILD_SCHEMA,
                 phase=RESOLUTION_PHASE if resolution_phase else IMPLEMENTATION_PHASE,
+                takeover_exclude=frozenset(builder_tried) if takeover_pending else frozenset(),
             )
+            takeover_pending = False
+            if result.provider:
+                builder_tried.add(result.provider)
             provider = result.provider or provider
             model = result.model or model
             if result.status is not ProviderStatus.SUCCESS:
@@ -2933,6 +2951,35 @@ class DevelopmentCycle:
                         + self._failure_evidence(state.verification)
                         + "".join(f"\n- {issue.detail}" for issue in state.claim_issues)
                     )
+                    # BUILDER TAKEOVER: el asignado respondió con éxito (CHANGES_EMPTY) pero el
+                    # criterio sigue FAILED con un remedio accionable ya calculado — una llamada
+                    # más al MISMO proveedor con la MISMA causa no cambiaría el resultado. Se pide
+                    # un sustituto autorizado/capaz para la ronda siguiente, dentro del presupuesto
+                    # declarativo, en vez de reintentar ciegamente.
+                    accionable = any(
+                        item.unsatisfied and item.remedy for item in state.claim_records
+                    )
+                    if accionable and takeovers_used < self.config.max_builder_takeovers:
+                        takeovers_used += 1
+                        takeover_pending = True
+                        self._log(
+                            AuditEventType.DEV_BUILDER_TAKEOVER,
+                            "dev_builder_takeover",
+                            request,
+                            {
+                                "round": rounds,
+                                "excluded": sorted(builder_tried),
+                                "takeover_number": takeovers_used,
+                                "max_builder_takeovers": self.config.max_builder_takeovers,
+                                "reason": "CHANGES_EMPTY ante criterio FAILED con remedio",
+                                "claims_failed": [
+                                    item.kind
+                                    for item in state.claim_records
+                                    if item.unsatisfied and item.remedy
+                                ],
+                            },
+                            AuditResult.FAILURE,
+                        )
                 continue
 
             # Preflight determinista de la propuesta: los hechos del workspace que PUNTO puede
@@ -3041,6 +3088,9 @@ class DevelopmentCycle:
                     influence=influence,
                 )
 
+            takeover_before = (
+                self._takeover_snapshot(repository, validated) if was_takeover_round else {}
+            )
             try:
                 round_applied = self._apply(repository, validated, round_index=rounds)
             except _ApplyAborted as aborted:
@@ -3082,6 +3132,20 @@ class DevelopmentCycle:
                     "dev_repair_completed",
                     request,
                     {"round": rounds, "changes": len(validated)},
+                )
+            if was_takeover_round and round_applied:
+                self._log(
+                    AuditEventType.DEV_BUILDER_TAKEOVER,
+                    "dev_builder_takeover_result",
+                    request,
+                    {
+                        "round": rounds,
+                        "provider": provider,
+                        "outcome": self._takeover_classify(
+                            takeover_before, round_applied, repository
+                        ),
+                        "changed": [item.path for item in round_applied],
+                    },
                 )
             round_state = self._evaluate_state(request, target, repository, plan)
             evidence_attempts = 1
@@ -3635,6 +3699,51 @@ class DevelopmentCycle:
         self._checkpoint = snapshot
         return snapshot
 
+    @staticmethod
+    def _takeover_snapshot(
+        repository: GovernedRepository, validated: Sequence[FileChangeProposal]
+    ) -> dict[str, str]:
+        """Contenido ANTERIOR de los ficheros que un sustituto de TAKEOVER va a modificar.
+
+        Se captura antes de aplicar nada, solo para MODIFY (CREATE/DELETE/RENAME/MOVE no tienen un
+        «antes» comparable): es lo que permite distinguir después si el sustituto conservó una
+        parte sustancial de lo anterior (SALVAGE) o lo reemplazó (REWRITE).
+        """
+        snapshot: dict[str, str] = {}
+        for proposal in validated:
+            if proposal.operation is not ChangeOperation.MODIFY:
+                continue
+            try:
+                snapshot[proposal.path.replace("\\", "/")] = repository.read_text(proposal.path)
+            except Exception:
+                continue
+        return snapshot
+
+    @staticmethod
+    def _takeover_classify(
+        before: Mapping[str, str],
+        applied: Sequence[AppliedChange],
+        repository: GovernedRepository,
+    ) -> str:
+        """``SALVAGE`` si el sustituto conservó una parte sustancial de lo anterior, si no
+        ``REWRITE``.
+
+        Determinista, por similitud de texto real (no por intuición): un ``DELETE``/``CREATE``/
+        ``RENAME``/``MOVE``, o un ``MODIFY`` sin «antes» capturado, cuenta como ``REWRITE`` — el
+        sustituto reemplazó la superficie, no la corrigió sobre lo mismo.
+        """
+        for item in applied:
+            anterior = before.get(item.path)
+            if item.operation is not ChangeOperation.MODIFY or anterior is None:
+                return "REWRITE"
+            try:
+                nuevo = repository.read_text(item.path)
+            except Exception:
+                return "REWRITE"
+            if difflib.SequenceMatcher(None, anterior, nuevo).ratio() < 0.5:
+                return "REWRITE"
+        return "SALVAGE"
+
     def _apply(
         self,
         repository: GovernedRepository,
@@ -4025,12 +4134,18 @@ class DevelopmentCycle:
         schema: Mapping[str, Any],
         *,
         phase: str = IMPLEMENTATION_PHASE,
+        takeover_exclude: frozenset[str] = frozenset(),
     ) -> ProviderResult:
         """Invoca a un rol por el router, con el JSON Schema declarado.
 
         Antes de invocar se registra **qué proveedor** atiende el rol según la configuración: es
         evidencia de la decisión, no autoridad, y deja el ciclo auditable por rol. La fase decide
         qué skill recibe el rol: la de resolución solo existe cuando hay un fallo que resolver.
+
+        ``takeover_exclude``, si no está vacío, pide el TAKEOVER de reparación
+        (``ProviderRouter.execute_alternative``): el o los proveedores en el conjunto ya
+        respondieron con éxito para esta misma causa sin producir un cambio material, así que se
+        prueba con el siguiente candidato autorizado y capaz en vez de gastarlos de nuevo.
         """
         try:
             selected = self.router.get_provider_for_role(role)
@@ -4040,7 +4155,13 @@ class DevelopmentCycle:
             AuditEventType.BUILD_PROVIDER_SELECTED,
             "dev_provider_selected",
             request,
-            {"role": role.value, "provider": selected, "fallback": False, "phase": phase},
+            {
+                "role": role.value,
+                "provider": selected,
+                "fallback": False,
+                "phase": phase,
+                "takeover": bool(takeover_exclude),
+            },
         )
         provider_request = ProviderRequest(
             role=role,
@@ -4049,12 +4170,21 @@ class DevelopmentCycle:
             context=prompt,
             metadata={"target_id": request.target_repository, "phase": "PILOT-04"},
         )
-        result = self.router.execute(
-            role,
-            provider_request,
-            json_schema=schema,
-            max_output_tokens=self.config.max_output_tokens,
-        )
+        if takeover_exclude:
+            result = self.router.execute_alternative(
+                role,
+                provider_request,
+                exclude=takeover_exclude,
+                json_schema=schema,
+                max_output_tokens=self.config.max_output_tokens,
+            )
+        else:
+            result = self.router.execute(
+                role,
+                provider_request,
+                json_schema=schema,
+                max_output_tokens=self.config.max_output_tokens,
+            )
         self._last_provider = result.provider or self._last_provider
         self._last_model = result.model or self._last_model
         self._note_failover(role, request, result, phase=phase)

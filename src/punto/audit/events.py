@@ -220,6 +220,7 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.DEV_REPAIR_STARTED: "dev_repair",
     AuditEventType.DEV_REPAIR_COMPLETED: "dev_repair",
     AuditEventType.DEV_REPAIR_EXHAUSTED: "dev_repair",
+    AuditEventType.DEV_BUILDER_TAKEOVER: "dev_repair",
     AuditEventType.DEV_CHECKPOINT_CREATED: "dev_checkpoint",
     AuditEventType.DEV_ROLLBACK_COMPLETED: "dev_checkpoint",
     AuditEventType.DEV_PELL_RETRIEVED: "dev_pell",

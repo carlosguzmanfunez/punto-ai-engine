@@ -356,6 +356,85 @@ class ProviderRouter:
             cause=cause,
         )
 
+    def execute_alternative(
+        self,
+        role: ProviderRole,
+        request: ProviderRequest,
+        *,
+        exclude: frozenset[str],
+        json_schema: Mapping[str, object] | None = None,
+        max_output_tokens: int | None = None,
+    ) -> ProviderResult:
+        """Ejecuta el rol con el primer candidato EFECTIVO (conectado, capaz, autorizado por la
+        política de failover) que no esté en ``exclude`` — sin gastar de nuevo a quien ya haya
+        respondido para la misma causa.
+
+        No es el failover operativo de :meth:`execute` (ese existe solo para indisponibilidad
+        **demostrable** del primario: cuota, límite de tasa, desconexión). Este método es para un
+        TAKEOVER: el asignado respondió con éxito pero **no produjo** el cambio material que la
+        evidencia ya entregada pedía — una llamada más al mismo proveedor con la misma causa no
+        cambiaría el resultado. Reutiliza exactamente los mismos candidatos declarados
+        (``FailoverPolicy.preferred``) y el mismo evaluador de capacidad/conexión que el failover
+        operativo: ninguna ruta ni autoridad nuevas, solo un turno distinto dentro de lo ya
+        autorizado.
+
+        Sin política de failover para el rol, o si todos los candidatos declarados están en
+        ``exclude`` o no son elegibles, devuelve un resultado ``UNAVAILABLE`` explícito: no hay
+        bucle de sustitutos infinito.
+        """
+        request_id = request.request_id or f"{role.value.lower()}-sin-id"
+        try:
+            assigned = self.get_provider_for_role(role)
+        except ProviderRouteError as error:
+            return ProviderResult(
+                request_id=request_id,
+                provider="",
+                model="",
+                status=ProviderStatus.UNAVAILABLE,
+                role=role,
+                error=str(error),
+                error_kind=ProviderErrorKind.CONFIG,
+            )
+        policy = self._failover_policy
+        declared = policy.preferred(role) if policy is not None and policy.covers(role) else ()
+        ordered = dict.fromkeys((assigned, *declared))
+        rejections: list[str] = []
+        for name in ordered:
+            if name in exclude:
+                rejections.append(f"{name}: ya respondió para esta misma causa")
+                continue
+            entry = self._entries.get(name)
+            if entry is None:
+                rejections.append(f"{name}: no está registrado en el router")
+                continue
+            verdict = self._judge_substitute(role, name, request.has_attachments)
+            if not verdict.eligible:
+                rejections.append(f"{name}: {verdict.reason or 'no elegible'}")
+                continue
+            if verdict.metered and (policy is None or not policy.allow_metered):
+                rejections.append(f"{name}: transporte de pago por uso (allow_metered=false)")
+                continue
+            return self._run_entry(
+                role,
+                request,
+                entry,
+                request_id=request_id,
+                json_schema=json_schema,
+                max_output_tokens=max_output_tokens,
+            )
+        return ProviderResult(
+            request_id=request_id,
+            provider="",
+            model="",
+            status=ProviderStatus.UNAVAILABLE,
+            role=role,
+            error=(
+                f"ningún proveedor autorizado y capaz sigue disponible para {role.value} "
+                f"tras excluir a quien ya respondió: {'; '.join(rejections) or 'sin candidatos'}"
+            ),
+            error_kind=ProviderErrorKind.UNAVAILABLE,
+        )
+
     def _capability_gap(
         self, role: ProviderRole, request: ProviderRequest, entry: ProviderEntry
     ) -> str:
@@ -731,9 +810,7 @@ class ProviderRouter:
         # Doble saneado: el adaptador conoce su credencial y el entorno declara las conocidas. La
         # garantía de que una clave no acaba en un resultado no puede depender de que el adaptador
         # sea educado.
-        detail = _redact_without_client(
-            client.redact(detail) if client is not None else detail
-        )
+        detail = _redact_without_client(client.redact(detail) if client is not None else detail)
         resolved = kind if kind is not None else classify_provider_error(error)
         status = (
             ProviderStatus.UNAVAILABLE

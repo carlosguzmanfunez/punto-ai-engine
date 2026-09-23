@@ -28,6 +28,8 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Final
 
+from punto.structure import structural_domain
+
 __all__ = [
     "CAPABILITY_VISION",
     "CLAIM_MODALITY",
@@ -1273,16 +1275,35 @@ def extract_claims(objective: str, criteria: Iterable[str] = ()) -> tuple[Semant
             # Sin aspecto genuino, «unificar X en una sola fuente...» es una afirmación
             # ESTRUCTURAL (EVIDENCE MODALITY ROUTING): una fuente canónica, no un juicio visual.
             if any(marker in plain for marker in STRUCTURAL_MARKERS):
-                claims.append(
-                    SemanticClaim(
-                        sentence=sentence[:300],
-                        kind=ClaimKind.STRUCTURAL_CONSISTENCY.value,
-                        evidence_required=(
-                            "una fuente canónica única, usada por los consumidores declarados, "
-                            "sin definiciones paralelas duplicadas en el alcance"
-                        ),
-                    )
+                candidate = SemanticClaim(
+                    sentence=sentence[:300],
+                    kind=ClaimKind.STRUCTURAL_CONSISTENCY.value,
+                    evidence_required=(
+                        "una fuente canónica única, usada por los consumidores declarados, "
+                        "sin definiciones paralelas duplicadas en el alcance"
+                    ),
                 )
+                candidate_domain = set(structural_domain(candidate.sentence))
+                duplicate_index: int | None = None
+                for index, existing in enumerate(claims):
+                    if existing.kind != candidate.kind:
+                        continue
+                    existing_domain = set(structural_domain(existing.sentence))
+                    if candidate_domain and existing_domain and (
+                        candidate_domain <= existing_domain or existing_domain <= candidate_domain
+                    ):
+                        duplicate_index = index
+                        break
+                if duplicate_index is None:
+                    claims.append(candidate)
+                else:
+                    existing = claims[duplicate_index]
+                    existing_domain = set(structural_domain(existing.sentence))
+                    if len(candidate_domain) > len(existing_domain) or (
+                        candidate_domain == existing_domain
+                        and len(candidate.sentence) > len(existing.sentence)
+                    ):
+                        claims[duplicate_index] = candidate
                 if len(claims) >= MAX_REFERENCES:
                     return tuple(claims)
                 continue

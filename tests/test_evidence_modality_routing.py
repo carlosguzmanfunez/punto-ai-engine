@@ -45,7 +45,7 @@ from punto.schemas.audit import AuditEventType
 from punto.schemas.decision import ApprovalStatus, HumanApprovalRequest, RiskLevel
 from punto.schemas.dev import DevelopmentResult, DevelopmentStatus
 from punto.schemas.enums import TaskStatus
-from punto.structure import analyze_structural_consistency
+from punto.structure import analyze_structural_consistency, structural_domain
 from punto.workspace.target import DevelopmentTargetRegistry
 from test_human_console import TARGET_ID, _git, _plan, _target
 from test_noop_reconciliation import _repo_ya_satisfecho
@@ -88,6 +88,92 @@ def test_a2_satisfied_sin_ninguna_captura(tmp_path: Path) -> None:
 
     assert registro.satisfied
     assert registro.evidence_class == "SATISFIED"
+
+
+def test_a3_criterio_abreviado_no_fragmenta_el_dominio_estructural() -> None:
+    """Objetivo natural + criterio taquigráfico describen un hecho, no dos claims artificiales."""
+    claims = extract_claims(CRITERIO_REAL, ("Una sola fuente canónica de tipos",))
+
+    assert len(claims) == 1
+    assert structural_domain(claims[0].sentence) == ("tipo", "propiedad")
+    assert structural_domain("Una sola fuente canónica de tipos") == ("tipo",)
+    assert not {"sola", "fuente", "canonica"} & set(
+        structural_domain("Una sola fuente canónica de tipos")
+    )
+
+
+def test_a4_nombres_tecnicos_bilingues_y_roles_reales_quedan_satisfied() -> None:
+    """El análisis entiende PropertyTypes y roles por código, no solo nombres de fixtures."""
+    files = {
+        "src/lib/property-types.ts": (
+            "export const propertyTypes = [{ type: 'Casa' }] as const;\n"
+            "export function isPropertyTypeName(value: string) { return Boolean(value); }\n"
+        ),
+        "src/db/schema.ts": "export const propertyTypes = pgTable('property_types', {});\n",
+        "src/components/HeroSearch.tsx": (
+            "import { propertyTypes } from '@/lib/property-types';\n"
+            "export function HeroSearch() { return <form>{propertyTypes.length}</form>; }\n"
+        ),
+        "src/app/properties/page.tsx": (
+            "import { propertyTypes, isPropertyTypeName } from '@/lib/property-types';\n"
+            "const filtered = isPropertyTypeName('Casa') ? propertyTypes : [];\n"
+        ),
+        "src/components/CategoryGrid.tsx": (
+            "import { propertyTypes } from '@/lib/property-types';\n"
+            "export function CategoryGrid() { return propertyTypes.map(String); }\n"
+        ),
+    }
+
+    evidencia = analyze_structural_consistency(
+        CRITERIO_REAL,
+        files=list(files),
+        read_text=lambda path: files[path],
+        exists=lambda path: path in files,
+    )
+
+    assert evidencia.canonical == ("src/lib/property-types.ts",)
+    assert evidencia.consumers_missing == ()
+    assert set(evidencia.consumers_confirmed) == {
+        "filtros",
+        "formularios",
+        "validaciones",
+        "visualizaciones de propiedades",
+    }
+
+
+def test_a5_una_definicion_literal_duplicada_sigue_siendo_failed() -> None:
+    """Excluir bindings de esquema no oculta una segunda fuente de catálogo real."""
+    files = {
+        "src/lib/property-types.ts": "export const propertyTypes = [{ type: 'Casa' }];\n",
+        "src/legacy/property-types.ts": "export const propertyTypes = [{ type: 'Legacy' }];\n",
+    }
+    evidencia = analyze_structural_consistency(
+        CRITERIO_SIMPLE,
+        files=list(files),
+        read_text=lambda path: files[path],
+        exists=lambda path: path in files,
+    )
+
+    assert evidencia.has_single_canonical is False
+    assert len(evidencia.canonical) == 2
+
+
+def test_a6_snapshots_de_reparacion_no_son_fuentes_productivas() -> None:
+    """Una copia de rollback de PUNTO no puede inventar una duplicación estructural."""
+    files = {
+        "src/lib/property-types.ts": "export const propertyTypes = [{ type: 'Casa' }];\n",
+        ".punto-repair-snapshots/checkpoint/src/lib/property-types.ts": (
+            "export const propertyTypes = [{ type: 'Casa' }];\n"
+        ),
+    }
+    evidencia = analyze_structural_consistency(
+        CRITERIO_SIMPLE,
+        files=list(files),
+        read_text=lambda path: files[path],
+        exists=lambda path: path in files,
+    )
+
+    assert evidencia.canonical == ("src/lib/property-types.ts",)
 
 
 # ==================================== E · un criterio realmente visual sigue siendo visual

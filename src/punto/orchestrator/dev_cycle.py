@@ -2428,13 +2428,28 @@ class DevelopmentCycle:
         passed = {item.name for item in verification if item.passed}
         pending = [step for step in plan.functional_chain if step.verification not in passed]
         if pending:
+            evidence_by_name = {item.name: item for item in verification}
+
+            def _detail(step: Any) -> str:
+                base = (
+                    f"el eslabón {step.step!r} depende de la verificación "
+                    f"{step.verification!r}, que no pasó"
+                )
+                evidence = evidence_by_name.get(step.verification)
+                if evidence is None:
+                    return base
+                cause = next(
+                    (line.strip() for line in evidence.output_excerpt.splitlines() if line.strip()),
+                    "",
+                )
+                if not cause:
+                    cause = f"exit_code={evidence.exit_code}"
+                return f"{base}: {cause}"[:300]
+
             issues = tuple(
                 BuildValidationIssue(
                     code="FUNCTIONAL_CHAIN_STEP_UNVERIFIED",
-                    detail=(
-                        f"el eslabón {step.step!r} depende de la verificación "
-                        f"{step.verification!r}, que no pasó"
-                    ),
+                    detail=_detail(step),
                 )
                 for step in pending
             )

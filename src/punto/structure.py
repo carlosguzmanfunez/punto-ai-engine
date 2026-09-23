@@ -22,14 +22,23 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
-__all__ = ["StructuralEvidence", "analyze_structural_consistency"]
+__all__ = ["StructuralEvidence", "analyze_structural_consistency", "structural_domain"]
 
 _CODE_SUFFIXES: Final[tuple[str, ...]] = (".ts", ".tsx", ".js", ".jsx", ".mjs")
 _TEST_MARKERS: Final[tuple[str, ...]] = ("/test/", "/tests/", ".test.", ".spec.", "/__tests__/")
+_NON_SOURCE_MARKERS: Final[tuple[str, ...]] = (
+    "/.git/",
+    "/.next/",
+    "/.punto-memory/",
+    "/.punto-repair-snapshots/",
+    "/.venv/",
+    "/coverage/",
+    "/node_modules/",
+)
 
 #: Nombre exportado que declara una definición «canónica»: una constante, un tipo o un esquema.
 _EXPORT_NAME: Final[re.Pattern[str]] = re.compile(
-    r"export\s+(?:const|type|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"export\s+(const|type|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 _IMPORT_SPECIFIER: Final[re.Pattern[str]] = re.compile(
     r"""from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)"""
@@ -50,6 +59,12 @@ _TOPIC_CLAUSE: Final[re.Pattern[str]] = re.compile(
     r"(?:unificar|unify|consolidar|consolidate)\s+(.+?)\s+en\s+una",
     re.IGNORECASE,
 )
+_SOURCE_OF_CLAUSE: Final[re.Pattern[str]] = re.compile(
+    r"(?:una?\s+)?(?:sola|single|unica|unique)?\s*"
+    r"(?:fuente(?:\s+canonica|\s+de\s+verdad)?|source(?:\s+of\s+truth)?)\s+"
+    r"(?:de|of|para|for)\s+(.+?)(?:\s+(?:para|for|entre|among|across)\s+|[.;]|$)",
+    re.IGNORECASE,
+)
 #: La cláusula que nombra los consumidores: «...entre A, B y C».
 _CONSUMERS_CLAUSE: Final[re.Pattern[str]] = re.compile(
     r"(?:entre|among|across)\s+(.+?)(?:[.;]|$)", re.IGNORECASE
@@ -58,8 +73,29 @@ _SPLIT_CONSUMERS: Final[re.Pattern[str]] = re.compile(r",|\by\b|\band\b", re.IGN
 
 #: Palabras vacías (mínimo, solo para no tratarlas como tema/consumidor).
 _STOPWORDS: Final[frozenset[str]] = frozenset(
-    {"el", "la", "los", "las", "de", "del", "un", "una", "unos", "unas", "en", "para", "the", "of"}
+    {
+        "el", "la", "los", "las", "de", "del", "un", "una", "unos", "unas", "en",
+        "para", "the", "of", "sola", "solo", "single", "unica", "unico", "unique",
+        "fuente", "source", "canonica", "canonico", "canonical", "verdad", "truth",
+    }
 )
+
+_CONCEPTS: Final[dict[str, str]] = {
+    "type": "tipo", "types": "tipo", "tipo": "tipo", "tipos": "tipo",
+    "property": "propiedad", "properties": "propiedad", "propiedad": "propiedad",
+    "propiedades": "propiedad",
+    "filter": "filtro", "filters": "filtro", "filtro": "filtro", "filtros": "filtro",
+    "form": "formulario", "forms": "formulario", "formulario": "formulario",
+    "formularios": "formulario",
+    "validation": "validacion", "validations": "validacion", "validate": "validacion",
+    "validator": "validacion", "guard": "validacion", "validacion": "validacion",
+    "validaciones": "validacion",
+    "visualization": "visualizacion", "visualizations": "visualizacion",
+    "visualizacion": "visualizacion", "visualizaciones": "visualizacion",
+    "view": "visualizacion", "views": "visualizacion", "grid": "visualizacion",
+    "display": "visualizacion", "category": "visualizacion", "card": "visualizacion",
+    "render": "visualizacion",
+}
 
 
 def _normalize(text: str) -> str:
@@ -75,6 +111,28 @@ def _tokens(text: str) -> tuple[str, ...]:
             continue
         found.append(raw)
     return tuple(found)
+
+
+def _concept_tokens(text: str) -> tuple[str, ...]:
+    """Normaliza conceptos técnicos bilingües sin depender de nombres de proyecto."""
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text).replace("_", " ")
+    concepts: list[str] = []
+    for token in _tokens(expanded):
+        concept = _CONCEPTS.get(token)
+        if concept is None:
+            concept = next(
+                (
+                    normalized
+                    for alias, normalized in _CONCEPTS.items()
+                    if _stem_match(token, alias)
+                ),
+                token,
+            )
+        if concept not in concepts:
+            concepts.append(concept)
+    if re.search(r"\bis[A-Z][A-Za-z0-9]*", text) and "validacion" not in concepts:
+        concepts.append("validacion")
+    return tuple(concepts)
 
 
 def _stem_match(a: str, b: str) -> bool:
@@ -96,12 +154,17 @@ def _identifier_tokens(name: str) -> tuple[str, ...]:
         token = word.casefold()
         if len(token) >= 3 and token not in found:
             found.append(token)
-    return tuple(found)
+    return tuple(dict.fromkeys(_CONCEPTS.get(token, token) for token in found))
 
 
 def _is_test_path(path: str) -> bool:
     lowered = "/" + path.replace("\\", "/").casefold().lstrip("/")
     return any(marker in lowered for marker in _TEST_MARKERS)
+
+
+def _is_non_source_path(path: str) -> bool:
+    lowered = "/" + path.replace("\\", "/").casefold().lstrip("/")
+    return any(marker in lowered for marker in _NON_SOURCE_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,14 +200,37 @@ class StructuralEvidence:
 
 def _topic_and_consumers(sentence: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Deriva el tema y los consumidores de la frase — genérico, no depende de un dominio."""
-    topic_match = _TOPIC_CLAUSE.search(sentence)
-    topic = _tokens(topic_match.group(1) if topic_match else sentence)
+    topic_match = _TOPIC_CLAUSE.search(sentence) or _SOURCE_OF_CLAUSE.search(sentence)
+    topic = _concept_tokens(topic_match.group(1) if topic_match else sentence)
     consumers_match = _CONSUMERS_CLAUSE.search(sentence)
     domains: tuple[str, ...] = ()
     if consumers_match:
         raw = _SPLIT_CONSUMERS.split(consumers_match.group(1))
         domains = tuple(dict.fromkeys(item.strip() for item in raw if item.strip()))
     return topic, domains
+
+
+def structural_domain(sentence: str) -> tuple[str, ...]:
+    """Dominio semántico estable de un criterio estructural (sin gramática incidental)."""
+    topic, _ = _topic_and_consumers(sentence)
+    return topic
+
+
+def _is_canonical_declaration(match: re.Match[str], content: str) -> bool:
+    """Distingue un catálogo/tipo declarado de un binding exportado a una llamada.
+
+    Por ejemplo, ``pgTable(...)`` crea el binding de un esquema, no otro catálogo de dominio.
+    """
+    kind = match.group(1)
+    if kind != "const":
+        return True
+    tail = content[match.end() : match.end() + 240]
+    initializer = re.search(r"=\s*([^\s])", tail)
+    return initializer is not None and initializer.group(1) in "[{\"'`"
+
+
+def _covers_domain(candidate: Sequence[str], domain: Sequence[str]) -> bool:
+    return bool(domain) and all(_any_stem_match((term,), candidate) for term in domain)
 
 
 def _resolve_specifier(spec: str, base: str) -> str:
@@ -195,7 +281,9 @@ def analyze_structural_consistency(
     code_files = tuple(
         path.replace("\\", "/")
         for path in files
-        if path.casefold().endswith(_CODE_SUFFIXES) and not _is_test_path(path)
+        if path.casefold().endswith(_CODE_SUFFIXES)
+        and not _is_test_path(path)
+        and not _is_non_source_path(path)
     )
     contents: dict[str, str] = {}
     canonical: list[str] = []
@@ -208,7 +296,9 @@ def analyze_structural_consistency(
         if not topic:
             continue
         for match in _EXPORT_NAME.finditer(content):
-            if _any_stem_match(topic, _identifier_tokens(match.group(1))):
+            if _is_canonical_declaration(match, content) and _covers_domain(
+                _identifier_tokens(match.group(2)), topic[:1]
+            ):
                 canonical.append(path)
                 break
     canonical_tuple = tuple(dict.fromkeys(canonical))
@@ -220,12 +310,13 @@ def analyze_structural_consistency(
     confirmed: list[str] = []
     missing: list[str] = []
     for domain in domains:
-        domain_tokens = _tokens(domain)
+        domain_tokens = tuple(token for token in _concept_tokens(domain) if token not in topic)
         found = False
         for path, content in contents.items():
             if path in canonical_set:
                 continue
-            if domain_tokens and not _any_stem_match(domain_tokens, _tokens(path)):
+            surface_tokens = _concept_tokens(path + " " + content)
+            if domain_tokens and not _covers_domain(surface_tokens, domain_tokens):
                 continue
             if any(_resolves_to_canonical(target) for target in _imported_targets(content, path)):
                 confirmed.append(domain)

@@ -37,6 +37,8 @@ from punto.providers.router import ProviderRouter
 from punto.schemas.build import BuildRequest
 from punto.schemas.dev import (
     ChangeOperation,
+    CommandEvidence,
+    DevelopmentPlan,
     DevelopmentStatus,
     RepositoryOperation,
 )
@@ -364,6 +366,42 @@ def test_ciclo_completo_aplica_verifica_y_confirma(tmp_path: Path) -> None:
     assert ".env.local" in (root / ".gitignore").read_text(encoding="utf-8")
     assert "M .gitignore" in _git(root, "status", "--porcelain")
     assert _git(root, "rev-parse", "HEAD") != target.baseline_sha
+
+
+def test_cadena_funcional_expone_el_error_concreto_de_typecheck(tmp_path: Path) -> None:
+    """Una dependencia roja conserva archivo/línea/causa; no queda en el mensaje genérico."""
+    root = _repo(tmp_path)
+    cycle, _, _, _ = _cycle(root, responses=[])
+    plan = DevelopmentPlan.model_validate(
+        _plan(
+            verification_commands=["typecheck"],
+            functional_chain=[
+                {
+                    "step": "consumers",
+                    "description": "los consumidores compilan",
+                    "verification": "typecheck",
+                }
+            ],
+        )
+    )
+    evidence = CommandEvidence(
+        name="typecheck",
+        argv=("tsc", "--noEmit"),
+        exit_code=2,
+        duration_ms=5,
+        output_excerpt=(
+            "src/db/schema.ts(3,10): error TS2724: module has no exported member "
+            "'propertyTypeNames'"
+        ),
+        passed=False,
+    )
+
+    ok, issues = cycle._verify_functional_chain(plan, (evidence,), _request())
+
+    assert ok is False
+    assert issues[0].code == "FUNCTIONAL_CHAIN_STEP_UNVERIFIED"
+    assert "src/db/schema.ts(3,10)" in issues[0].detail
+    assert "TS2724" in issues[0].detail
 
 
 def test_la_auditoria_reconstruye_el_ciclo_por_request_id(tmp_path: Path) -> None:

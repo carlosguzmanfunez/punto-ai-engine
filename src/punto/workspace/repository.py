@@ -236,6 +236,8 @@ class GovernedRepository:
     actor: str = "punto-dev-cycle"
     #: Hook de fencing opcional. ``None`` conserva exactamente el runtime single-task actual.
     fence: Callable[[], None] | None = None
+    #: Base durable fijada por un TaskWorkspace. Vacía conserva el baseline legacy (HEAD al abrir).
+    declared_base_sha: str = ""
     context: ExecutionContext = field(init=False)
     snapshot_root: Path | None = None
     _filesystem: FilesystemTool = field(init=False, repr=False)
@@ -266,7 +268,8 @@ class GovernedRepository:
         self._shell = ShellRunner(self.context)
         self._git = GitWorkspace(self.context, self._shell)
         self._validator = Validator(self.context, self._shell)
-        self._baseline_sha = self._git.head_sha()
+        current_head = self._git.head_sha()
+        self._baseline_sha = self.declared_base_sha.strip().lower() or current_head
 
     # ------------------------------------------------------------------ estado
     @property

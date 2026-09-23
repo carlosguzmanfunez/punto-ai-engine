@@ -129,11 +129,22 @@ class FileRepairSnapshots:
     archivos en disco que se pueden volver a leer en otro proceso.
     """
 
-    __slots__ = ("_fence", "_root")
+    __slots__ = ("_fence", "_root", "_task_id", "_workspace_id")
 
-    def __init__(self, root: Path, *, fence: Callable[[], None] | None = None) -> None:
-        self._root = Path(root)
+    def __init__(
+        self,
+        root: Path,
+        *,
+        fence: Callable[[], None] | None = None,
+        task_id: UUID | None = None,
+        workspace_id: UUID | None = None,
+    ) -> None:
+        self._root = Path(root).resolve()
         self._fence = fence
+        if (task_id is None) is not (workspace_id is None):
+            raise ValueError("task_id y workspace_id deben declararse juntos")
+        self._task_id = task_id
+        self._workspace_id = workspace_id
 
     @property
     def root(self) -> Path:
@@ -181,6 +192,9 @@ class FileRepairSnapshots:
                 f"el snapshot pide {len(targets)} archivos y el contrato admite "
                 f"{MAX_REPAIR_SNAPSHOT_ENTRIES}: un registro mayor no se podría volver a validar"
             )
+        workspace_label = _workspace_label(workspace_path, self._root)
+        if self._workspace_id is not None and Path(workspace_label).resolve() != self._root:
+            raise ValueError("un snapshot con ownership no puede declarar otro workspace_path")
         if self._fence is not None:
             self._fence()
         snapshot_id = uuid4()
@@ -206,12 +220,12 @@ class FileRepairSnapshots:
             snapshot_id=snapshot_id,
             repair_id=repair_id,
             cycle=cycle,
-            workspace_path=_workspace_label(workspace_path, self._root),
+            workspace_path=workspace_label,
+            task_id=self._task_id,
+            workspace_id=self._workspace_id,
             entries=tuple(entries),
         )
-        return snapshot.model_copy(
-            update={"workspace_fingerprint": self.fingerprint(snapshot)}
-        )
+        return snapshot.model_copy(update={"workspace_fingerprint": self.fingerprint(snapshot)})
 
     def digest(self, path: str) -> str:
         """sha256 hex del archivo, o ``""`` si no existe.
@@ -239,6 +253,9 @@ class FileRepairSnapshots:
         snapshot.
         """
         hasher = hashlib.sha256()
+        hasher.update(
+            f"workspace\0{snapshot.task_id or ''}\0{snapshot.workspace_id or ''}\n".encode()
+        )
         for entry in sorted(snapshot.entries, key=lambda item: normalize_path(item.path)):
             line = (
                 f"{normalize_path(entry.path)}\0{entry.sha256}\0{entry.bytes}\0"
@@ -256,6 +273,8 @@ class FileRepairSnapshots:
         excepción sino como un «no» verificado: la pregunta es si las entradas describen el estado
         actual, y con una entrada que no se puede leer la respuesta es que no se puede afirmar.
         """
+        if not self._same_workspace(snapshot):
+            return False
         for entry in snapshot.entries:
             try:
                 current = self.digest(entry.path)
@@ -300,6 +319,12 @@ class FileRepairSnapshots:
             ``RollbackVerdict`` con ``rolled_back=True`` y las rutas devueltas a su estado previo
             —incluidas las que se borraron porque no existían— o el rechazo con su motivo.
         """
+        if not self._same_workspace(snapshot):
+            return RollbackVerdict(
+                rolled_back=False,
+                code=WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
+                detail="el snapshot pertenece a otra Task o workspace; no se restauró nada",
+            )
         if external_side_effects:
             return RollbackVerdict(
                 rolled_back=False,
@@ -320,6 +345,19 @@ class FileRepairSnapshots:
         if self._fence is not None:
             self._fence()
         return self._apply_rollback(steps)
+
+    def _same_workspace(self, snapshot: RepairSnapshot) -> bool:
+        """Exige ownership fuerte cuando cualquiera de las dos partes es de Fase 3."""
+        snapshot_owned = snapshot.task_id is not None or snapshot.workspace_id is not None
+        local_owned = self._task_id is not None or self._workspace_id is not None
+        if not snapshot_owned and not local_owned:
+            return True
+        if snapshot.task_id != self._task_id or snapshot.workspace_id != self._workspace_id:
+            return False
+        try:
+            return Path(snapshot.workspace_path).resolve() == self._root
+        except OSError:
+            return False
 
     def _resolve(self, path: str) -> Path:
         """Traduce una ruta relativa a una ruta **dentro** de la raíz, o lanza ``ValueError``.

@@ -12,6 +12,14 @@ from punto.scheduling.leases import (
     ProviderLease,
     TaskWriterLease,
 )
+from punto.scheduling.workspaces import (
+    TaskWorkspace,
+    TaskWorkspaceCollisionError,
+    TaskWorkspaceError,
+    TaskWorkspaceManager,
+    TaskWorkspaceStaleError,
+    TaskWorkspaceState,
+)
 
 __all__ = [
     "FencingToken",
@@ -23,5 +31,11 @@ __all__ = [
     "LeaseResult",
     "LeaseState",
     "ProviderLease",
+    "TaskWorkspace",
+    "TaskWorkspaceCollisionError",
+    "TaskWorkspaceError",
+    "TaskWorkspaceManager",
+    "TaskWorkspaceStaleError",
+    "TaskWorkspaceState",
     "TaskWriterLease",
 ]

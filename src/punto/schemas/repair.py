@@ -311,6 +311,9 @@ class RepairSnapshot(BaseModel):
     repair_id: UUID = Field(...)
     cycle: int = Field(..., ge=1)
     workspace_path: str = Field(..., min_length=1, max_length=400)
+    #: Ownership fuerte de Fase 3. ``None`` conserva snapshots legacy anteriores a workspaces.
+    task_id: UUID | None = Field(default=None)
+    workspace_id: UUID | None = Field(default=None)
     entries: tuple[RepairSnapshotEntry, ...] = Field(
         default=(), max_length=MAX_REPAIR_SNAPSHOT_ENTRIES
     )

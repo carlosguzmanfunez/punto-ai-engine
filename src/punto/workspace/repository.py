@@ -30,7 +30,7 @@ almacenes de secretos, y la auditoría de cada operación.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -234,6 +234,8 @@ class GovernedRepository:
     audit: AuditLogger | None = None
     policy_engine: PolicyEngine | None = None
     actor: str = "punto-dev-cycle"
+    #: Hook de fencing opcional. ``None`` conserva exactamente el runtime single-task actual.
+    fence: Callable[[], None] | None = None
     context: ExecutionContext = field(init=False)
     snapshot_root: Path | None = None
     _filesystem: FilesystemTool = field(init=False, repr=False)
@@ -585,6 +587,8 @@ class GovernedRepository:
             else RepositoryOperation.WRITE
         )
         self.authorize(repository_operation, paths=(relative,))
+        if self.fence is not None:
+            self.fence()
         change = self._filesystem.write_text(relative, content)
         self._log_file_changed(change)
         return change
@@ -610,6 +614,8 @@ class GovernedRepository:
         if expected_sha256 is not None and expected_sha256 != current:
             raise StaleWriteError(f"{relative}: huella distinta de la declarada")
         self.authorize(RepositoryOperation.DELETE, paths=(relative,), reversible=reversible)
+        if self.fence is not None:
+            self.fence()
         change = self._filesystem.delete_file(relative)
         self._log_file_changed(change)
         return change
@@ -637,6 +643,8 @@ class GovernedRepository:
             args=tuple(argv[1:]),
             timeout_seconds=timeout_seconds or self.policy.command_timeout_seconds,
         )
+        if self.fence is not None:
+            self.fence()
         result = ShellRunner(self.context, backend=TrustedLocalBackend()).run(request, name=name)
         if self.audit is not None:
             self.audit.log_command_executed(task_id=self.task_id, result=result, actor=self.actor)
@@ -662,6 +670,8 @@ class GovernedRepository:
                 "el commit no puede incluir cambios preexistentes del usuario: "
                 + ", ".join(intruders)
             )
+        if self.fence is not None:
+            self.fence()
         self._git.add(tuple(paths))
         sha = self._git.commit(message)
         if self.audit is not None:

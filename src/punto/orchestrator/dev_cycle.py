@@ -40,7 +40,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
@@ -402,6 +402,8 @@ class DevelopmentCycle:
     visual_capture: ScreenshotCapture | None = None
     #: Ejecutor de interacciones reales (hover) para criterios que una captura no demuestra.
     visual_interaction: InteractionRunner | None = None
+    #: Hook compuesto TaskWriter+Provider. ``None`` mantiene Fase 2A inactiva por defecto.
+    fence: Callable[[], None] | None = None
     _snapshots: FileRepairSnapshots | None = field(default=None, init=False, repr=False)
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
     _last_provider: str = field(default="", init=False, repr=False)
@@ -768,6 +770,7 @@ class DevelopmentCycle:
             audit=self.audit,
             policy_engine=self.policy_engine,
             actor=self.actor,
+            fence=self.fence,
         )
         repository.verify_work_branch()
         if repository.baseline_sha != target.baseline_sha:
@@ -3845,7 +3848,7 @@ class DevelopmentCycle:
         así que no entra en el commit ni puede leerse ni escribirse desde el ciclo.
         """
         if self._snapshots is None:
-            self._snapshots = FileRepairSnapshots(target.repository)
+            self._snapshots = FileRepairSnapshots(target.repository, fence=self.fence)
         # El checkpoint cubre **todo** lo que el ciclo puede cambiar, incluido el origen de un
         # RENAME/MOVE: si no, revertir un movimiento dejaría el fichero borrado.
         paths: list[str] = []
@@ -4332,6 +4335,8 @@ class DevelopmentCycle:
         respondieron con éxito para esta misma causa sin producir un cambio material, así que se
         prueba con el siguiente candidato autorizado y capaz en vez de gastarlos de nuevo.
         """
+        if self.fence is not None:
+            self.fence()
         try:
             selected = self.router.get_provider_for_role(role)
         except Exception:  # la ausencia de asignación la reporta el router al invocar
@@ -4370,6 +4375,8 @@ class DevelopmentCycle:
                 json_schema=schema,
                 max_output_tokens=self.config.max_output_tokens,
             )
+        if self.fence is not None:
+            self.fence()
         self._last_provider = result.provider or self._last_provider
         self._last_model = result.model or self._last_model
         self._note_failover(role, request, result, phase=phase)
@@ -4621,6 +4628,8 @@ class DevelopmentCycle:
         resultado funcional. No se guarda «cambié el archivo X», y no se guarda nada de lo que el
         proveedor afirmó sin evidencia del entorno.
         """
+        if self.fence is not None:
+            self.fence()
         if self.store is None or not applied:
             return None
         rounds = sum(1 for item in applied if item.round_index > 0)

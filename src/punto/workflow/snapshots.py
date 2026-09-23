@@ -48,7 +48,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -129,10 +129,11 @@ class FileRepairSnapshots:
     archivos en disco que se pueden volver a leer en otro proceso.
     """
 
-    __slots__ = ("_root",)
+    __slots__ = ("_fence", "_root")
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, fence: Callable[[], None] | None = None) -> None:
         self._root = Path(root)
+        self._fence = fence
 
     @property
     def root(self) -> Path:
@@ -180,6 +181,8 @@ class FileRepairSnapshots:
                 f"el snapshot pide {len(targets)} archivos y el contrato admite "
                 f"{MAX_REPAIR_SNAPSHOT_ENTRIES}: un registro mayor no se podría volver a validar"
             )
+        if self._fence is not None:
+            self._fence()
         snapshot_id = uuid4()
         backup_root = self._snapshot_dir(snapshot_id)
         backup_root.mkdir(parents=True, exist_ok=True)
@@ -314,6 +317,8 @@ class FileRepairSnapshots:
                 code=WorkflowFailureCode.WORKFLOW_REPAIR_RECONCILIATION_REQUIRED,
                 detail=f"no se restauró nada: {exc}",
             )
+        if self._fence is not None:
+            self._fence()
         return self._apply_rollback(steps)
 
     def _resolve(self, path: str) -> Path:

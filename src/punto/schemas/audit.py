@@ -243,6 +243,15 @@ class AuditEventType(StrEnum):
     PELL_RETRIEVAL_FAILED = "PELL_RETRIEVAL_FAILED"
     #: PELL-1: el resultado de un nodo se registró como experiencia nueva.
     PELL_EXPERIENCE_RECORDED = "PELL_EXPERIENCE_RECORDED"
+    #: MULTI-TASK 2A: observabilidad del ledger. Estos eventos no conceden autoridad; el JSON
+    #: durable y su epoch siguen siendo la única verdad del lease.
+    LEASE_ACQUIRED = "LEASE_ACQUIRED"
+    LEASE_BUSY = "LEASE_BUSY"
+    LEASE_RENEWED = "LEASE_RENEWED"
+    LEASE_RELEASED = "LEASE_RELEASED"
+    LEASE_EXPIRED = "LEASE_EXPIRED"
+    LEASE_FENCED = "LEASE_FENCED"
+    LEASE_LEDGER_CORRUPT = "LEASE_LEDGER_CORRUPT"
     #: MULTI-PROVIDER v0: se envió una petición normalizada a un proveedor.
     PROVIDER_REQUEST_STARTED = "PROVIDER_REQUEST_STARTED"
     #: MULTI-PROVIDER v0: el proveedor respondió con éxito.

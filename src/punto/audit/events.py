@@ -131,6 +131,13 @@ RESOURCE_BY_EVENT: Final[dict[AuditEventType, str]] = {
     AuditEventType.VISUAL_QA_BLOCKED: "visual_qa_report",
     # --- Multi-provider orchestration (MULTI-PROVIDER v0) ---------------------
     AuditEventType.PROVIDER_REQUEST_STARTED: "provider_request",
+    AuditEventType.LEASE_ACQUIRED: "lease",
+    AuditEventType.LEASE_BUSY: "lease",
+    AuditEventType.LEASE_RENEWED: "lease",
+    AuditEventType.LEASE_RELEASED: "lease",
+    AuditEventType.LEASE_EXPIRED: "lease",
+    AuditEventType.LEASE_FENCED: "lease",
+    AuditEventType.LEASE_LEDGER_CORRUPT: "lease",
     AuditEventType.PROVIDER_REQUEST_COMPLETED: "provider_request",
     AuditEventType.PROVIDER_REQUEST_FAILED: "provider_request",
     AuditEventType.PROVIDER_FAILOVER: "provider_failover",

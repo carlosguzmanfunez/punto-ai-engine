@@ -64,6 +64,37 @@ class AuditLogger:
         self._events.append(event)
         return event
 
+    def log_lease_event(
+        self,
+        *,
+        event_type: AuditEventType,
+        kind: str,
+        key: str,
+        epoch: int,
+        seq: int,
+        state: str,
+        holder_id: UUID,
+        task_id: UUID | None,
+        result: AuditResult = AuditResult.SUCCESS,
+        actor: str | None = None,
+    ) -> AuditEvent:
+        """Observa una transición del ledger sin convertirse en su fuente de verdad."""
+        return self.record(
+            event_type,
+            action=event_type.value.casefold(),
+            resource_id=task_id or key,
+            result=result,
+            actor=actor,
+            metadata={
+                "kind": kind,
+                "key": key,
+                "epoch": epoch,
+                "seq": seq,
+                "state": state,
+                "holder_id": str(holder_id),
+            },
+        )
+
     def log_task_created(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la creación de una tarea."""
         return self.record(

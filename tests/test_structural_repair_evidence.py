@@ -119,7 +119,7 @@ def _consola_con_takeover(
     architect_plan: dict[str, Any],
     primary_script: list[Any],
     substitute_script: list[Any] | None = None,
-    max_builder_takeovers: int = 1,
+    max_builder_takeovers: int = 2,
     with_duplicate: bool = True,
     extra_setup: Any = None,
 ) -> tuple[TestClient, AuditLogger, Path, _Espia, _Espia | None, ProviderRouter]:

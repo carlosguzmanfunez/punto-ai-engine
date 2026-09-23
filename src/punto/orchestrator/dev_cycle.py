@@ -328,8 +328,11 @@ class DevelopmentConfig:
     #: asignado respondió con éxito pero sin cambio material (``CHANGES_EMPTY``) ante un criterio
     #: FAILED con remedio accionable. Distinto de ``max_repair_rounds`` (rondas de reparación) y
     #: del failover operativo del router (indisponibilidad demostrable del primario): aquí el
-    #: primario respondió, solo que no actuó.
-    max_builder_takeovers: int = 1
+    #: primario respondió, solo que no actuó. ``2`` (no ``1``): un ciclo real puede legítimamente
+    #: producir más de un CHANGES_EMPTY distinto (el candidato que ya reparó una vez con un
+    #: cambio material sigue siendo un candidato válido para OTRO CHANGES_EMPTY posterior — solo
+    #: se excluye a quien respondió vacío, nunca a quien intentó de verdad).
+    max_builder_takeovers: int = 2
     #: Techo acumulado de recursos distintos para toda la sesión (anti-fragmentación).
     session_ceiling: int = AUTONOMOUS_MAX_FILES * 3
     #: Permitir que el BUILDER pida ampliar alcance con evidencia causal.
@@ -2700,8 +2703,6 @@ class DevelopmentCycle:
                 takeover_exclude=frozenset(builder_tried) if takeover_pending else frozenset(),
             )
             takeover_pending = False
-            if result.provider:
-                builder_tried.add(result.provider)
             provider = result.provider or provider
             model = result.model or model
             if result.status is not ProviderStatus.SUCCESS:
@@ -2767,8 +2768,14 @@ class DevelopmentCycle:
                 )
             # Causa raíz: en una reparación, sin hipótesis no se toca nada. Es la regla que impide
             # el «patch until green»: cada ronda explica qué falló, por qué y qué espera conseguir.
+            # No aplica a una respuesta sin cambios (CHANGES_EMPTY, misma condición que usa
+            # ``_proposals``): no hay ninguna reparación que justificar, y esa respuesta tiene su
+            # propio camino (reconciliación / TAKEOVER) más abajo — exigirle una causa raíz aquí
+            # la interceptaría antes de llegar a ese camino y quemaría una ronda por nada.
+            raw_changes = payload.get("changes")
+            changes_empty = not isinstance(raw_changes, list) or not raw_changes
             root_cause, root_evidence, expected_effect = _root_cause(payload)
-            if rounds > 0:
+            if rounds > 0 and not changes_empty:
                 if not root_cause:
                     change_issues = (
                         BuildValidationIssue(
@@ -2861,6 +2868,17 @@ class DevelopmentCycle:
                     continue
 
             proposals, proposal_issue = self._proposals(payload)
+            # Solo CHANGES_EMPTY excluye de un futuro TAKEOVER: respondió con éxito y no produjo
+            # nada. Un proveedor que sí propuso un cambio real (aunque PUNTO lo rechace o no
+            # baste para pasar la verificación) sigue siendo un candidato legítimo — repetirle
+            # una ronda de reparación normal es iteración esperada, no la misma observación
+            # vacía repetida.
+            if (
+                proposal_issue is not None
+                and proposal_issue.code == "CHANGES_EMPTY"
+                and result.provider
+            ):
+                builder_tried.add(result.provider)
             if proposal_issue is not None:
                 change_issues = (proposal_issue,)
                 failure_evidence = (
@@ -3036,13 +3054,20 @@ class DevelopmentCycle:
                         + "".join(f"\n- {issue.detail}" for issue in state.claim_issues)
                     )
                     # BUILDER TAKEOVER: el asignado respondió con éxito (CHANGES_EMPTY) pero el
-                    # criterio sigue FAILED con un remedio accionable ya calculado — una llamada
-                    # más al MISMO proveedor con la MISMA causa no cambiaría el resultado. Se pide
-                    # un sustituto autorizado/capaz para la ronda siguiente, dentro del presupuesto
-                    # declarativo, en vez de reintentar ciegamente.
-                    accionable = any(
-                        item.unsatisfied and item.remedy for item in state.claim_records
-                    )
+                    # estado sigue sin satisfacer la tarea — con una causa concreta y describible
+                    # ya calculada (``gap``, la misma que ``_noop_gap`` usa arriba para negar el
+                    # cierre en no-op: verificaciones fallidas como typecheck/property-types,
+                    # cadena funcional, aceptación, o un criterio semántico con remedio). Una
+                    # llamada más al MISMO proveedor con la MISMA causa no cambiaría el resultado.
+                    # Se pide un sustituto autorizado/capaz para la ronda siguiente, dentro del
+                    # presupuesto declarativo, en vez de cerrar en VERIFICATION_FAILED genérico o
+                    # reintentar ciegamente. No se restringe a ``state.claim_records``: un
+                    # criterio semántico ya SATISFIED con una verificación de comando (typecheck,
+                    # property-types) todavía fallida es, igualmente, una causa accionable — llegar
+                    # aquí ya implica ``gap`` no vacío (la rama ``if not gap`` arriba ya cerró en
+                    # COMPLETED), así que ``gap`` en sí es la prueba de que existe algo concreto que
+                    # reparar.
+                    accionable = bool(gap)
                     if accionable and takeovers_used < self.config.max_builder_takeovers:
                         takeovers_used += 1
                         takeover_pending = True
@@ -3055,11 +3080,14 @@ class DevelopmentCycle:
                                 "excluded": sorted(builder_tried),
                                 "takeover_number": takeovers_used,
                                 "max_builder_takeovers": self.config.max_builder_takeovers,
-                                "reason": "CHANGES_EMPTY ante criterio FAILED con remedio",
+                                "reason": f"CHANGES_EMPTY ante estado sin satisfacer ({gap})",
                                 "claims_failed": [
                                     item.kind
                                     for item in state.claim_records
                                     if item.unsatisfied and item.remedy
+                                ],
+                                "verification_failed": [
+                                    item.name for item in state.verification if not item.passed
                                 ],
                             },
                             AuditResult.FAILURE,
@@ -3578,11 +3606,16 @@ class DevelopmentCycle:
                         "origen real, PUNTO no inventará una ruta"
                     ),
                 )
-            if operation in {
-                ChangeOperation.CREATE.value,
-                ChangeOperation.MODIFY.value,
-                ChangeOperation.DELETE.value,
-            } and isinstance(source, str) and source.strip():
+            if (
+                operation
+                in {
+                    ChangeOperation.CREATE.value,
+                    ChangeOperation.MODIFY.value,
+                    ChangeOperation.DELETE.value,
+                }
+                and isinstance(source, str)
+                and source.strip()
+            ):
                 return (), BuildValidationIssue(
                     code="CHANGE_SOURCE_PATH_FORBIDDEN",
                     detail=(

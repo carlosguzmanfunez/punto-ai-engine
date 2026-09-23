@@ -100,8 +100,9 @@ def _repo(tmp_path: Path) -> Path:
             f"export const RELLENO_{index} = {index};\n", encoding="utf-8"
         )
     (root / ".gitignore").write_text("node_modules\n", encoding="utf-8")
-    (root / ".env.local").write_text("DATABASE_URL=postgresql://canary:canary@host/db\n",
-                                     encoding="utf-8")
+    (root / ".env.local").write_text(
+        "DATABASE_URL=postgresql://canary:canary@host/db\n", encoding="utf-8"
+    )
     # Un almacén de credenciales **dentro** del alcance: la denegación tiene que ser por secreto.
     (root / "src" / ".env.local").write_text(f"API_KEY={CANARY_API_KEY}\n", encoding="utf-8")
     _git(root, "init", "-b", "main")
@@ -269,6 +270,7 @@ def _change(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
 
 def _cycle(
     root: Path,
@@ -658,9 +660,7 @@ def test_una_propuesta_duplicada_se_rechaza(tmp_path: Path) -> None:
 def test_un_plan_sin_verificacion_no_se_aplica(tmp_path: Path) -> None:
     """Un plan que no declara cómo se verifica no se acepta."""
     root = _repo(tmp_path)
-    cycle, _, _, _ = _cycle(
-        root, responses=[_plan(verification_commands=[])]
-    )
+    cycle, _, _, _ = _cycle(root, responses=[_plan(verification_commands=[])])
 
     result = cycle.run(_request())
 
@@ -751,9 +751,7 @@ def test_un_borrado_no_autorizado_se_rechaza(tmp_path: Path) -> None:
         root,
         responses=[
             _plan(files_to_modify=["src/lib/opciones.ts"]),
-            _change(
-                changes=[{"path": "src/lib/opciones.ts", "operation": "DELETE"}]
-            ),
+            _change(changes=[{"path": "src/lib/opciones.ts", "operation": "DELETE"}]),
         ],
     )
 
@@ -802,9 +800,7 @@ def test_una_peticion_de_contexto_dentro_de_autoridad_se_concede(tmp_path: Path)
         root,
         responses=[
             _plan(),
-            _change(
-                context_requests=[{"path": "src/lib/relleno-01.ts", "reason": "ver el resto"}]
-            ),
+            _change(context_requests=[{"path": "src/lib/relleno-01.ts", "reason": "ver el resto"}]),
             _change(),
         ],
         max_context_files=2,
@@ -955,10 +951,16 @@ def test_un_fallo_del_proveedor_queda_contenido(tmp_path: Path) -> None:
 
     result = cycle.run(_request())
 
+    # PROVIDER_FAILED se une al conjunto esperado tras la corrección de TAKEOVER REAL DEL
+    # INTENTO 10: con ``accionable`` basado en ``gap`` (no solo en ClaimRecords), un CHANGES_EMPTY
+    # persistente ahora sí dispara una petición de sustituto; sin uno configurado en este
+    # escenario, ``_invoke`` no encuentra candidato y falla explícito (PROVIDER_FAILED) en vez de
+    # agotar rondas en silencio — sigue siendo un cierre contenido, no una reparación a medias.
     assert result.status in {
         DevelopmentStatus.CHANGE_REJECTED,
         DevelopmentStatus.VERIFICATION_FAILED,
         DevelopmentStatus.BLOCKED,
+        DevelopmentStatus.PROVIDER_FAILED,
     }
     assert result.applied == () or result.rolled_back
 
@@ -1033,9 +1035,11 @@ def test_el_proveedor_no_puede_ampliar_el_alcance(tmp_path: Path) -> None:
         repository.read_text("tests/otro.txt")
     with pytest.raises(ScopeViolation):
         repository.write_text(
-            "../fuera.txt", "contenido", operation=__import__(
+            "../fuera.txt",
+            "contenido",
+            operation=__import__(
                 "punto.schemas.dev", fromlist=["ChangeOperation"]
-            ).ChangeOperation.MODIFY
+            ).ChangeOperation.MODIFY,
         )
 
 

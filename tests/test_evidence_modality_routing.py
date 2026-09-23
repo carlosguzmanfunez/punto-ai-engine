@@ -102,6 +102,35 @@ def test_a3_criterio_abreviado_no_fragmenta_el_dominio_estructural() -> None:
     )
 
 
+def test_a3b_un_contenedor_gramatical_no_se_convierte_en_dominio() -> None:
+    """«Lista de tipos» describe el contenedor; el dominio estructural sigue siendo ``tipo``."""
+    claims = extract_claims(
+        "Unificar la lista de tipos en una sola fuente",
+        ("Una sola fuente de tipos",),
+    )
+
+    assert len(claims) == 1
+    assert structural_domain(claims[0].sentence) == ("tipo",)
+
+
+def test_a3c_la_clausula_de_consumo_no_contamina_el_dominio() -> None:
+    """«y que los filtros usen...» describe el efecto; no forma parte del tema unificado."""
+    claims = extract_claims(
+        "Unificar los tipos de propiedad y que los filtros usen la fuente canónica",
+        ("Una sola fuente de tipos",),
+    )
+
+    assert len(claims) == 1
+    assert structural_domain(claims[0].sentence) == ("tipo", "propiedad")
+
+
+def test_a3d_fuente_canonica_con_acento_y_cadena_posterior_conserva_el_tema() -> None:
+    """Los acentos y una cláusula causal posterior no convierten verbos en dominio."""
+    criterio = "Diseñar la fuente canónica de tipos y su cadena funcional completa"
+
+    assert structural_domain(criterio) == ("tipo",)
+
+
 def test_a4_nombres_tecnicos_bilingues_y_roles_reales_quedan_satisfied() -> None:
     """El análisis entiende PropertyTypes y roles por código, no solo nombres de fixtures."""
     files = {

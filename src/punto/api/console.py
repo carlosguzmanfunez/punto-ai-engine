@@ -87,6 +87,7 @@ from punto.schemas.build import BuildRequest
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.dev import BlockedEvidence, DevelopmentResult, DevelopmentStatus
 from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
+from punto.schemas.scheduling import TaskSchedulingRecord
 from punto.workspace.target import (
     DevelopmentTarget,
     DevelopmentTargetError,
@@ -317,6 +318,8 @@ class ConsoleTask:
         self.supersession_cause: str = ""
         self.superseded_at: datetime | None = None
         self.relations: list[TaskRelation] = []
+        #: Contrato durable preparado para Multi-Task. Fase 1 no lo activa ni adquiere leases.
+        self.scheduling = TaskSchedulingRecord()
         #: Origen del intento en curso (``initial`` / ``retry`` / ``continuation``).
         self.attempt_origin: str = ""
 
@@ -626,7 +629,7 @@ def register_human_console(
     #: Almacén durable del estado gobernado (tareas y Human Gates) y cerrojo de escritura.
     store = ConsoleStateStore()
     state_lock = Lock()
-    _restore_console_state(store, dependencies, tasks)
+    restored_state = _restore_console_state(store, dependencies, tasks)
 
     def persist() -> None:
         """Persiste el estado gobernado de la consola para que sobreviva al proceso.
@@ -659,6 +662,12 @@ def register_human_console(
                 f"el estado en memoria no se puede serializar: {type(exc).__name__}",
                 metadata={"kind": "STATE_UNSERIALIZABLE"},
             )
+
+    # La migración se vuelve durable en el mismo arranque, mediante el único writer atómico de
+    # la consola. Si el write falla, ``persist`` lo audita y el v1 original sigue siendo legible;
+    # nunca se pierde el estado recuperado ni se finge que la migración quedó escrita.
+    if restored_state.migrated_from is not None:
+        persist()
 
     def consolidate_recovered_tasks() -> None:
         """Consolida lo recuperado (identidad y duplicados) y persiste si algo cambió."""
@@ -1605,6 +1614,7 @@ def _task_record(task: ConsoleTask) -> TaskRecord:
         supersession_cause=task.supersession_cause,
         superseded_at=task.superseded_at,
         relations=tuple(task.relations),
+        scheduling=task.scheduling,
     )
 
 
@@ -1641,6 +1651,7 @@ def _task_from_record(record: TaskRecord, recovered_at: datetime) -> ConsoleTask
     task.supersession_cause = record.supersession_cause
     task.superseded_at = record.superseded_at
     task.relations = list(record.relations)
+    task.scheduling = record.scheduling
     return task
 
 

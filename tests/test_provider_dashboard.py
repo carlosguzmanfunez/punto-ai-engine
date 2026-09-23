@@ -58,6 +58,8 @@ def dashboard(
     """
     monkeypatch.setenv(SECRETS_FILE_ENV, str(tmp_path / "secrets.json"))
     monkeypatch.setenv(LOCAL_CONFIG_ENV, str(tmp_path / "providers.local.yaml"))
+    for variable in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
     application = create_app(environment="test")
     registry: ProviderRegistry = application.state.provider_registry
     return TestClient(application), registry

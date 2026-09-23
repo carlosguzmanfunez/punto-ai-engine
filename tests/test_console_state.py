@@ -41,6 +41,7 @@ from punto.common import utc_now
 from punto.publish.production import PublicationRecord, PublicationRefused, PublicationStage
 from punto.schemas.audit import AuditEventType
 from punto.schemas.enums import ApprovalStatus
+from punto.schemas.scheduling import TaskSchedulingRecord
 from punto.workspace.target import DevelopmentTarget
 from test_human_console import (
     TARGET_ID,
@@ -164,6 +165,27 @@ def test_una_tarea_creada_sobrevive_al_reinicio_con_su_evidencia(tmp_path: Path)
     assert audit.by_type(AuditEventType.CONSOLE_STATE_RECOVERED)
     assert not audit.by_type(AuditEventType.CONSOLE_TASK_CREATED)
     assert otro.get("/console/tasks").json()["total"] == 1
+
+
+def test_el_reinicio_migra_v1_a_v2_y_conserva_la_task_completa(tmp_path: Path) -> None:
+    """La compatibilidad v1 no es lectura eterna: el mismo arranque deja el v2 durable."""
+    target, _client, tarea = _tarea_completada(tmp_path)
+    legacy = json.loads(_estado().read_text(encoding="utf-8"))
+    legacy["schema_version"] = 1
+    for item in legacy["tasks"]:
+        item.pop("scheduling")
+    _escribir(legacy)
+
+    otro, audit = _reiniciar(target)
+
+    recuperada = otro.get(f"/console/tasks/{tarea['task_id']}").json()
+    assert recuperada["objective"] == tarea["objective"]
+    assert recuperada["development"] == tarea["development"]
+    durable = json.loads(_estado().read_text(encoding="utf-8"))
+    assert durable["schema_version"] == CONSOLE_STATE_SCHEMA_VERSION == 2
+    assert durable["tasks"][0]["scheduling"]["managed"] is False
+    metadata = dict(audit.by_type(AuditEventType.CONSOLE_STATE_RECOVERED)[0].metadata)
+    assert metadata["migrated_from"] == 1
 
 
 def test_la_tarea_en_curso_conserva_su_etapa_sin_inventar_un_fallo(tmp_path: Path) -> None:
@@ -378,6 +400,7 @@ def test_el_almacen_rechaza_un_documento_con_credenciales(tmp_path: Path) -> Non
         stage="QUEUED",
         created_at=momento,
         updated_at=momento,
+        scheduling=TaskSchedulingRecord(),
     )
 
     with pytest.raises(ConsoleStateError) as excinfo:

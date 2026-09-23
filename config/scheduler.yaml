@@ -1,0 +1,5 @@
+# Multi-Task v0: contrato declarativo. Fase 1 no activa todavía el scheduler ni adquiere leases.
+schema_version: 1
+max_active_tasks: 2
+max_writers_per_task: 1
+provider_concurrency: 1

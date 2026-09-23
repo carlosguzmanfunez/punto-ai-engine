@@ -24,6 +24,7 @@ Tres reglas gobiernan este módulo:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from collections.abc import Iterable, Mapping
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -41,6 +42,7 @@ from punto.providers.secrets import redact_secret_text
 from punto.publish.production import PublicationRecord, PublicationRefused
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.enums import ApprovalStatus, RiskLevel
+from punto.schemas.scheduling import TaskSchedulingRecord
 
 __all__ = [
     "CONSOLE_STATE_ENV",
@@ -57,12 +59,13 @@ __all__ = [
     "TaskRecord",
     "TaskRelation",
     "default_console_state_path",
+    "migrate_console_state_v1",
     "publication_of",
 ]
 
-#: Versión del documento persistido. Un documento de otra versión **no** se interpreta: se rechaza
-#: entero (fail closed) en vez de adivinar cómo leerlo.
-CONSOLE_STATE_SCHEMA_VERSION: Final[int] = 1
+#: Versión actual del documento persistido. Solo v1 tiene una migración explícita a este contrato;
+#: cualquier otra versión se rechaza entera en vez de adivinar cómo leerla.
+CONSOLE_STATE_SCHEMA_VERSION: Final[Literal[2]] = 2
 
 #: Variable de entorno con la que se fija la ruta del estado (pruebas y despliegues locales).
 CONSOLE_STATE_ENV: Final[str] = "PUNTO_CONSOLE_STATE_PATH"
@@ -267,6 +270,9 @@ class TaskRecord(BaseModel):
     supersession_cause: str = Field(default="", max_length=120)
     superseded_at: datetime | None = None
     relations: tuple[TaskRelation, ...] = Field(default=(), max_length=MAX_ITEMS)
+    #: Overlay durable de scheduling. En Fase 1 queda ``managed=False``: persistir el contrato no
+    #: afirma que ya exista un scheduler, un lease o un executor vivo.
+    scheduling: TaskSchedulingRecord
 
 
 class ConsoleStateDocument(BaseModel):
@@ -274,7 +280,7 @@ class ConsoleStateDocument(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int
+    schema_version: Literal[2]
     written_at: datetime
     source: str = Field(default="punto-console", max_length=80)
     tasks: tuple[TaskRecord, ...] = ()
@@ -289,6 +295,7 @@ class ConsoleStateSnapshot:
     detail: str
     tasks: tuple[TaskRecord, ...] = ()
     gates: tuple[GateRecord, ...] = ()
+    migrated_from: int | None = None
 
     @property
     def recovered(self) -> bool:
@@ -304,8 +311,38 @@ class ConsoleStateSnapshot:
             "pending_gates": sum(
                 1 for gate in self.gates if gate.status is ApprovalStatus.PENDING
             ),
+            "migrated_from": self.migrated_from,
             "detail": self.detail[:300],
         }
+
+
+def migrate_console_state_v1(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Migra exactamente v1 → v2 sin inferir ejecución, ownership ni leases.
+
+    Cada Task anterior recibe el overlay neutral ``managed=False``. Una sección ``scheduling`` en
+    un documento que todavía se declara v1 es ambigua/fabricada y se rechaza: no se mezclan
+    contratos de versiones distintas.
+    """
+    migrated = dict(payload)
+    tasks = migrated.get("tasks")
+    if isinstance(tasks, list):
+        migrated_tasks: list[Any] = []
+        neutral = TaskSchedulingRecord().model_dump(mode="json")
+        for item in tasks:
+            if not isinstance(item, Mapping):
+                migrated_tasks.append(item)
+                continue
+            if "scheduling" in item:
+                raise ConsoleStateError(
+                    "STATE_MIGRATION",
+                    "un documento v1 no puede declarar la sección scheduling de v2",
+                )
+            migrated_task = dict(item)
+            migrated_task["scheduling"] = neutral.copy()
+            migrated_tasks.append(migrated_task)
+        migrated["tasks"] = migrated_tasks
+    migrated["schema_version"] = CONSOLE_STATE_SCHEMA_VERSION
+    return migrated
 
 
 def publication_of(task: TaskRecord) -> PublicationRecord | None:
@@ -485,14 +522,30 @@ class ConsoleStateStore:
         if len(raw.encode("utf-8")) > MAX_CONSOLE_STATE_BYTES:
             return self._rejected("el estado persistido supera el tope de lectura")
         try:
-            document = ConsoleStateDocument.model_validate_json(raw)
-        except ValidationError as exc:
-            return self._rejected(f"el estado persistido no valida: {_first_error(exc)}")
-        if document.schema_version != CONSOLE_STATE_SCHEMA_VERSION:
+            decoded: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return self._rejected(f"el estado persistido no valida como JSON: {exc.msg}")
+        if not isinstance(decoded, Mapping):
+            return self._rejected("el estado persistido no es un documento JSON")
+        version = decoded.get("schema_version")
+        if type(version) is not int:
+            return self._rejected("la versión del estado persistido no es un entero")
+        migrated_from: int | None = None
+        if version == 1:
+            try:
+                decoded = migrate_console_state_v1(decoded)
+            except ConsoleStateError as exc:
+                return self._rejected(f"la migración del estado falló: {exc.detail}")
+            migrated_from = 1
+        elif version != CONSOLE_STATE_SCHEMA_VERSION:
             return self._rejected(
                 "la versión del estado persistido no es compatible: "
-                f"{document.schema_version} != {CONSOLE_STATE_SCHEMA_VERSION}"
+                f"{version} != {CONSOLE_STATE_SCHEMA_VERSION}"
             )
+        try:
+            document = ConsoleStateDocument.model_validate(decoded)
+        except ValidationError as exc:
+            return self._rejected(f"el estado persistido no valida: {_first_error(exc)}")
         problems = integrity_problems(document, effective, source=source)
         if problems:
             return self._rejected("el estado persistido es incoherente: " + "; ".join(problems[:5]))
@@ -501,6 +554,7 @@ class ConsoleStateStore:
             f"estado recuperado de {self._path.name}",
             tasks=document.tasks,
             gates=document.gates,
+            migrated_from=migrated_from,
         )
 
     def _rejected(self, detail: str) -> ConsoleStateSnapshot:

@@ -56,13 +56,15 @@ _RESOLVE_SUFFIXES: Final[tuple[str, ...]] = (
 
 #: La cláusula que nombra qué se unifica: «unificar X en una sola fuente...».
 _TOPIC_CLAUSE: Final[re.Pattern[str]] = re.compile(
-    r"(?:unificar|unify|consolidar|consolidate)\s+(.+?)\s+en\s+una",
+    r"(?:unificar|unify|consolidar|consolidate)\s+(.+?)"
+    r"(?:\s+en\s+una\b|\s+y\s+que\b|\s+so\s+that\b|[.;]|$)",
     re.IGNORECASE,
 )
 _SOURCE_OF_CLAUSE: Final[re.Pattern[str]] = re.compile(
     r"(?:una?\s+)?(?:sola|single|unica|unique)?\s*"
     r"(?:fuente(?:\s+canonica|\s+de\s+verdad)?|source(?:\s+of\s+truth)?)\s+"
-    r"(?:de|of|para|for)\s+(.+?)(?:\s+(?:para|for|entre|among|across)\s+|[.;]|$)",
+    r"(?:de|of|para|for)\s+(.+?)"
+    r"(?:\s+(?:para|for|entre|among|across)\s+|\s+y\s+su\s+|\s+and\s+its\s+|[.;]|$)",
     re.IGNORECASE,
 )
 #: La cláusula que nombra los consumidores: «...entre A, B y C».
@@ -77,6 +79,10 @@ _STOPWORDS: Final[frozenset[str]] = frozenset(
         "el", "la", "los", "las", "de", "del", "un", "una", "unos", "unas", "en",
         "para", "the", "of", "sola", "solo", "single", "unica", "unico", "unique",
         "fuente", "source", "canonica", "canonico", "canonical", "verdad", "truth",
+        # Contenedores gramaticales: «lista/catálogo/conjunto de tipos» sigue nombrando el
+        # dominio ``tipo``. Exigir que el identificador exportado también contenga «lista» crea
+        # un falso negativo (``TIPOS`` es una fuente perfectamente válida).
+        "lista", "listado", "list", "catalogo", "catalog", "conjunto", "set",
     }
 )
 
@@ -200,9 +206,10 @@ class StructuralEvidence:
 
 def _topic_and_consumers(sentence: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Deriva el tema y los consumidores de la frase — genérico, no depende de un dominio."""
-    topic_match = _TOPIC_CLAUSE.search(sentence) or _SOURCE_OF_CLAUSE.search(sentence)
-    topic = _concept_tokens(topic_match.group(1) if topic_match else sentence)
-    consumers_match = _CONSUMERS_CLAUSE.search(sentence)
+    normalized = _normalize(sentence)
+    topic_match = _TOPIC_CLAUSE.search(normalized) or _SOURCE_OF_CLAUSE.search(normalized)
+    topic = _concept_tokens(topic_match.group(1) if topic_match else normalized)
+    consumers_match = _CONSUMERS_CLAUSE.search(normalized)
     domains: tuple[str, ...] = ()
     if consumers_match:
         raw = _SPLIT_CONSUMERS.split(consumers_match.group(1))

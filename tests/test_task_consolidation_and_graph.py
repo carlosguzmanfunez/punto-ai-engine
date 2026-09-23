@@ -97,6 +97,7 @@ def _inyectar_task_historica(
     """
     from punto.api.console_state import ConsoleStateStore, TaskRecord, default_console_state_path
     from punto.schemas.dev import DevelopmentResult, DevelopmentStatus
+    from punto.schemas.scheduling import TaskSchedulingRecord
 
     store = ConsoleStateStore(default_console_state_path())
     existing = store.load().tasks if default_console_state_path().is_file() else ()
@@ -117,6 +118,7 @@ def _inyectar_task_historica(
         created_at=now,
         updated_at=now,
         result=result,
+        scheduling=TaskSchedulingRecord(),
     )
     store.save(tasks=(*existing, record), gates=())
     return task_id

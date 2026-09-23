@@ -2721,12 +2721,17 @@ class DevelopmentCycle:
             provider = result.provider or provider
             model = result.model or model
             if result.status is not ProviderStatus.SUCCESS:
+                provider_error = result.error or result.status.value
+                if last_noop_gap:
+                    provider_error += (
+                        " (último estado sin cambios medido: " + last_noop_gap[:200] + ")"
+                    )
                 return self._outcome(
                     status=DevelopmentStatus.PROVIDER_FAILED,
                     error_kind=(
                         result.error_kind.value if result.error_kind else "PROVIDER_FAILED"
                     ),
-                    error=result.error or result.status.value,
+                    error=provider_error,
                     provider=provider,
                     model=model,
                     applied=applied,
@@ -2736,6 +2741,10 @@ class DevelopmentCycle:
                     denied=denied,
                     checkpoint=checkpoint,
                     influence=influence,
+                    acceptance=acceptance_evidence,
+                    acceptance_result=self._acceptance_result(acceptance_evidence),
+                    claims=last_noop_claims,
+                    claims_result=last_noop_claims_result,
                 )
             payload = _json_object(result.content)
             if payload is None:

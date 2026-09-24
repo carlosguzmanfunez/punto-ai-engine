@@ -20,6 +20,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -62,6 +63,7 @@ from test_two_task_scheduler import (
     CATALOG,
     PROPERTY,
     WAIT,
+    Clock,
     Harness,
     ProcessDeath,
     build_scheduler,
@@ -209,11 +211,15 @@ class CycleRunner:
 
 
 def _pilot(
-    tmp_path: Path, *, repo_factory: Callable[[Path], tuple[Path, Path]] = _repos
+    tmp_path: Path,
+    *,
+    repo_factory: Callable[[Path], tuple[Path, Path]] = _repos,
+    clock: Clock | None = None,
+    options: dict[str, Any] | None = None,
 ) -> tuple[Harness, CycleRunner]:
     """Scheduler real sobre un repo destino real, con ``CycleRunner`` como TaskRunner."""
     repo, remoto = repo_factory(tmp_path / "fixture")
-    harness = make_harness(tmp_path)
+    harness = make_harness(tmp_path, clock=clock, options=options)
     harness.scheduler.shutdown()
     harness.target = repo
     harness.base = _git(repo, "rev-parse", "HEAD")
@@ -603,3 +609,67 @@ def test_o_real_quality_takeover_de_a_y_b_continua(tmp_path: Path, cleanup: list
     assert "export const TIPOS = ['Duplicado']" in (ws_b / "src/lib/tipos_legacy.ts").read_text(
         encoding="utf-8"
     )  # la reparación de A jamás tocó el workspace de B
+
+
+# ================================================= Fase 11R · ciclos reales más largos que el TTL
+class WallClock(Clock):
+    """Reloj real: la expiración ocurre de verdad, no porque la prueba avance un contador."""
+
+    def __call__(self) -> datetime:
+        return datetime.now(UTC)
+
+
+def test_fase_11r_dos_ciclos_reales_mas_largos_que_el_ttl_completan_con_renovacion(
+    tmp_path: Path, cleanup: list[Harness]
+) -> None:
+    ttl = 5  # mínimo que admite el ledger (SAFETY_MARGIN_SECONDS)
+    harness, runner = _pilot(tmp_path, clock=WallClock(), options={"ttl_seconds": ttl})
+    cleanup.append(harness)
+    born = datetime.now(UTC) - timedelta(minutes=1)
+    a = make_task("A", provider="deepseek", resource=AUTH).model_copy(
+        update={"created_at": born, "updated_at": born}
+    )
+    b = make_task("B", provider="openai", resource=CATALOG).model_copy(
+        update={"created_at": born + timedelta(seconds=1), "updated_at": born}
+    )
+    hold = ttl + 3.0  # > TTL + gracia de takeover: sin renovación la authority se perdería
+    renewals: dict[UUID, int] = {}
+
+    def slow(task_id: UUID, payload: dict[str, Any]) -> Callable[[], dict[str, Any]]:
+        def step() -> dict[str, Any]:
+            threading.Event().wait(hold)
+            renewer = harness.scheduler.renewers()[task_id]
+            renewals[task_id] = renewer.renewals
+            return payload
+
+        return step
+
+    path_a, path_b = "src/lib/tipos.ts", "src/components/Rejilla.tsx"
+    runner.scripts[a.task_id] = TaskScript(
+        path=path_a,
+        marker="LONG-A",
+        provider="deepseek",
+        builder_steps=[_plan(path_a), slow(a.task_id, _change(path_a, "LONG-A"))],
+    )
+    runner.scripts[b.task_id] = TaskScript(
+        path=path_b,
+        marker="LONG-B",
+        provider="openai",
+        builder_steps=[_plan(path_b), slow(b.task_id, _change(path_b, "LONG-B"))],
+    )
+    harness.scheduler.submit(a)
+    harness.scheduler.submit(b)
+    harness.scheduler.wake()
+    assert harness.scheduler.wait_idle(WAIT * 2)
+
+    for task in (a, b):
+        record = finished(harness, task)
+        assert record.result is not None and record.result.completed, record.attempts
+        assert [item.status for item in record.attempts] == ["COMPLETED"]  # sin perder authority
+        assert renewals[task.task_id] >= 1
+    # Ambos ciclos convivieron más allá del TTL: los intervalos se solapan y superan ttl+gracia.
+    (a0, a1), (b0, b1) = runner.intervals[a.task_id], runner.intervals[b.task_id]
+    assert max(a0, b0) < min(a1, b1)
+    assert min(a1 - a0, b1 - b0) > ttl + 2
+    assert harness.scheduler.renewers() == {}
+    _no_human_gate(runner)

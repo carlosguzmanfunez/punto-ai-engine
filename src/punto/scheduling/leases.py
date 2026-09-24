@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import stat
 import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -526,7 +527,13 @@ class LeaseLedger:
         entries: list[tuple[int, Path]] = []
         for path in directory.iterdir():
             if path.name.startswith(".lease-") and path.name.endswith(".tmp"):
-                if not path.is_file() or path.is_symlink():
+                try:
+                    status = path.lstat()
+                except FileNotFoundError:
+                    # Temporal de un append concurrente que ya se publicó o descartó entre el
+                    # listado y esta lectura: es un write legítimo en vuelo, no corrupción.
+                    continue
+                if not stat.S_ISREG(status.st_mode):
                     self._corrupt(f"temporal ambiguo en ledger: {path}")
                 continue
             match = _RECORD_RE.fullmatch(path.name)

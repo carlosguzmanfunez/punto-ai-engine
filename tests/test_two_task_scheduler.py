@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -221,6 +222,8 @@ class Harness:
     runner: Runner
     scheduler: TwoTaskScheduler
     recovery: RecoveryWaitCoordinator | None = None
+    #: Parámetros extra del scheduler (p. ej. ``ttl_seconds``/``renew_check_seconds``, Fase 11R).
+    options: dict[str, Any] = field(default_factory=dict)
 
     def restart(self, runner: Runner | None = None) -> TwoTaskScheduler:
         """Proceso nuevo: mismo disco, holders nuevos, ninguna authority en memoria."""
@@ -242,11 +245,16 @@ def build_scheduler(harness: Harness, runner: Runner) -> TwoTaskScheduler:
         workspace_target=lambda _task: (harness.target, harness.base),
         clock=harness.clock,
         recovery=harness.recovery,
+        **harness.options,
     )
 
 
 def make_harness(
-    tmp_path: Path, *, recovery: RecoveryWaitCoordinator | None = None, clock: Clock | None = None
+    tmp_path: Path,
+    *,
+    recovery: RecoveryWaitCoordinator | None = None,
+    clock: Clock | None = None,
+    options: dict[str, Any] | None = None,
 ) -> Harness:
     target, base = make_target(tmp_path)
     clock = clock or Clock()
@@ -265,6 +273,7 @@ def make_harness(
         runner=runner,
         scheduler=None,  # type: ignore[arg-type]
         recovery=recovery,
+        options=dict(options or {}),
     )
     harness.scheduler = build_scheduler(harness, runner)
     return harness

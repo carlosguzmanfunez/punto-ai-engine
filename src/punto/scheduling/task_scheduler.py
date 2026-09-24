@@ -15,6 +15,10 @@ recursos ni grafos propios: compone lo que ya existe.
 - **Duplicados/restart**: antes de despachar se apunta la intención en el ``EffectLedger`` sobre un
   ``WorkflowRun`` durable por Task. Un intento ``IN_FLIGHT`` heredado de un proceso muerto no se
   repite: la Task queda ``WAITING_RECOVERY`` hasta ``reconcile_dispatch``.
+- **Renovación** (Fase 11R): mientras una ejecución está RUNNING, un ``LeaseRenewer`` propio renueva
+  writer y provider (misma holder/task/epoch, vía ``LeaseLedger.renew``) antes de expirar. Si una
+  renovación falla, la ejecución se revoca: se sueltan sus leases y el fence falla antes del
+  siguiente efecto. El renewer muere con la ejecución; las esperas y las huérfanas no tienen.
 - **Orden**: ``ready_since`` (``waiting_since`` o ``created_at``) y ``task_id`` como desempate;
   nunca el orden de llegada de hilos.
 
@@ -43,7 +47,7 @@ from punto.api.console_state import (
 )
 from punto.scheduler.settings import SchedulerLimits
 from punto.scheduling.adapters import holder_from_executor_ref
-from punto.scheduling.fencing import LeaseFence
+from punto.scheduling.fencing import FenceHook, LeaseFence
 from punto.scheduling.leases import (
     TAKEOVER_GRACE_SECONDS,
     FencingToken,
@@ -51,6 +55,7 @@ from punto.scheduling.leases import (
     LeaseHolder,
     LeaseKind,
     LeaseLedger,
+    LeaseOutcome,
     LeaseState,
 )
 from punto.scheduling.provider_waits import (
@@ -123,7 +128,8 @@ class ExecutionContext:
     workspace: TaskWorkspace
     workspaces: TaskWorkspaceManager
     ledger: LeaseLedger
-    fence: LeaseFence
+    #: Fence compuesto: renovación viva (Fase 11R) + TaskWriterLease + ProviderLease en el ledger.
+    fence: FenceHook
     dispatch_key: str
 
 
@@ -135,6 +141,112 @@ class ExecutionResult:
     result: DevelopmentResult | None = None
     recovery_task: TaskRecord | None = None
     detail: str = ""
+
+
+class LeaseRenewer:
+    """Renueva writer y provider de UNA ejecución viva; nunca hereda ni resucita authority.
+
+    Un único hilo acotado por ejecución que despierta cada ``check_seconds`` (sin polling agresivo)
+    y renueva solo si la vida restante es <= ``ttl/2``. Cualquier renovación fallida revoca: marca
+    la ejecución y suelta sus propios leases, de modo que todo fence basado en el ledger falla antes
+    del siguiente efecto. ``stop`` lo detiene y lo espera: nunca queda un hilo huérfano.
+    """
+
+    def __init__(
+        self,
+        *,
+        ledger: LeaseLedger,
+        task_token: FencingToken,
+        provider_token: FencingToken,
+        ttl_seconds: int,
+        clock: Callable[[], datetime],
+        check_seconds: float,
+    ) -> None:
+        if task_token.kind is not LeaseKind.TASK_WRITER or provider_token.kind is not (
+            LeaseKind.PROVIDER
+        ):
+            raise SchedulerError("RENEWAL", "el renewer exige TaskWriter + Provider en ese orden")
+        if provider_token.task_id is None or str(provider_token.task_id) != task_token.key:
+            raise SchedulerError("RENEWAL", "el ProviderLease no pertenece a la Task del writer")
+        self._ledger = ledger
+        self._tokens = (task_token, provider_token)
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._check_seconds = check_seconds
+        self._threshold = timedelta(seconds=ttl_seconds / 2)
+        self._stop = threading.Event()
+        self._revoked = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"punto-renew-{task_token.key}", daemon=True
+        )
+        self.renewals = 0
+        self.failure = ""
+
+    @property
+    def task_id(self) -> str:
+        return self._tokens[0].key
+
+    @property
+    def revoked(self) -> bool:
+        return self._revoked.is_set()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Cesa de inmediato (fin, cancelación o fence) y espera al hilo."""
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join()
+
+    def assert_live(self) -> None:
+        """Parte del fence de la ejecución: una renovación fallida bloquea el siguiente efecto."""
+        if self._revoked.is_set():
+            raise LeaseFencedError(f"renovación de leases fallida: {self.failure}")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._check_seconds):
+            try:
+                if not self._due():
+                    continue
+                for token in self._tokens:  # writer antes que provider (subordinado)
+                    if self._stop.is_set():
+                        return
+                    result = self._ledger.renew(token, ttl_seconds=self._ttl_seconds)
+                    if result.outcome is not LeaseOutcome.PASS:
+                        self._revoke(f"{token.kind.value}: {result.outcome.value} {result.detail}")
+                        return
+                self.renewals += 1
+            except Exception as error:  # cualquier incertidumbre revoca, nunca se ignora
+                self._revoke(f"{type(error).__name__}: {error}")
+                return
+
+    def _due(self) -> bool:
+        # ``assert_fenced`` relee la cabeza: un token ya obsoleto no llega a pedir renovación.
+        head = self._ledger.assert_fenced(self._tokens[0])
+        self._ledger.assert_fenced(self._tokens[1])
+        return head.expires_at - self._clock().astimezone(UTC) <= self._threshold
+
+    def _revoke(self, detail: str) -> None:
+        self.failure = detail[:300]
+        self._revoked.set()
+        # Soltar SOLO lo propio: un token obsoleto produce STALE_RELEASE y no toca al holder nuevo.
+        for token in reversed(self._tokens):
+            with suppress(Exception):
+                self._ledger.release(token)
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionFence:
+    renewer: LeaseRenewer
+    leases: LeaseFence
+
+    def __call__(self) -> None:
+        self.renewer.assert_live()
+        self.leases()
 
 
 TaskRunner = Callable[[ExecutionContext], ExecutionResult]
@@ -225,6 +337,7 @@ class TwoTaskScheduler:
         recovery: RecoveryWaitCoordinator | None = None,
         eligibility: Callable[[TaskRecord], ProviderEligibility] | None = None,
         ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+        renew_check_seconds: float | None = None,
         scheduler_id: str = "",
     ) -> None:
         if limits.max_writers_per_task != 1 or limits.provider_concurrency != 1:
@@ -240,6 +353,9 @@ class TwoTaskScheduler:
         self._recovery = recovery
         self._eligibility = eligibility
         self._ttl_seconds = ttl_seconds
+        self._renew_check_seconds = (
+            renew_check_seconds if renew_check_seconds is not None else ttl_seconds / 4
+        )
         self._scheduler_id = scheduler_id or uuid4().hex[:12]
         self._providers = ProviderWaitCoordinator(
             ledger=ledger, clock=clock, ttl_seconds=ttl_seconds
@@ -250,6 +366,7 @@ class TwoTaskScheduler:
         self._tasks: dict[UUID, TaskRecord] = {}
         self._gates: tuple[GateRecord, ...] = ()
         self._active: dict[UUID, _ActiveExecution] = {}
+        self._renewers: dict[UUID, LeaseRenewer] = {}
         self._pool = ThreadPoolExecutor(
             max_workers=limits.max_active_tasks, thread_name_prefix="punto-task"
         )
@@ -278,6 +395,11 @@ class TwoTaskScheduler:
                 for task in self._tasks.values()
                 if task.scheduling.state is SchedulingState.RUNNING and not _is_terminal(task)
             )
+
+    def renewers(self) -> dict[UUID, LeaseRenewer]:
+        """Renewers vivos de ESTE proceso: uno por ejecución RUNNING propia, nunca por espera."""
+        with self._lock:
+            return {key: item for key, item in self._renewers.items() if item.is_alive()}
 
     def submit(self, task: TaskRecord) -> TaskRecord:
         """Registra una Task gestionada nueva; nunca duplica una ``task_id`` existente."""
@@ -311,6 +433,9 @@ class TwoTaskScheduler:
         """Deja de admitir; ``wait=False`` simula la muerte del proceso (no se persiste nada)."""
         with self._lock:
             self._closed = True
+            abandoned = () if wait else tuple(self._renewers.values())
+        for renewer in abandoned:  # un proceso que muere no deja renovación viva detrás
+            renewer.stop()
         self._pool.shutdown(wait=wait, cancel_futures=not wait)
 
     def reconcile_dispatch(self, task_id: UUID, *, status: EffectStatus, detail: str) -> TaskRecord:
@@ -512,10 +637,12 @@ class TwoTaskScheduler:
             active = self._active[task_id]
             task = self._tasks[task_id]
         ran = False
+        renewer: LeaseRenewer | None = None
         try:
             # Un writer o provider obsoleto no ejecuta: se relee el ledger antes del ciclo.
             self._ledger.assert_fenced(active.task_token)
             self._ledger.assert_fenced(active.provider_token)
+            renewer = self._start_renewer(task_id, active)
             context = ExecutionContext(
                 task=task,
                 attempt=active.attempt,
@@ -525,7 +652,9 @@ class TwoTaskScheduler:
                 workspace=active.workspace,
                 workspaces=self._workspaces,
                 ledger=self._ledger,
-                fence=LeaseFence(self._ledger, (active.task_token, active.provider_token)),
+                fence=_ExecutionFence(
+                    renewer, LeaseFence(self._ledger, (active.task_token, active.provider_token))
+                ),
                 dispatch_key=active.dispatch_key,
             )
             ran = True
@@ -536,7 +665,34 @@ class TwoTaskScheduler:
             result = ExecutionResult(
                 ExecutionOutcome.FAILED, detail=f"{type(error).__name__}: {error}"[:300]
             )
+        finally:
+            # La renovación cesa con la ejecución, termine como termine (incluida la muerte).
+            if renewer is not None:
+                renewer.stop()
+                with self._lock:
+                    self._renewers.pop(task_id, None)
+        if renewer is not None and renewer.revoked:
+            # Sin authority renovada no se confía en nada producido después: se descarta.
+            result = ExecutionResult(
+                ExecutionOutcome.FENCED, detail=f"renovación fallida: {renewer.failure}"[:300]
+            )
         self._finish(task_id, active, result, ran=ran)
+
+    def _start_renewer(self, task_id: UUID, active: _ActiveExecution) -> LeaseRenewer:
+        renewer = LeaseRenewer(
+            ledger=self._ledger,
+            task_token=active.task_token,
+            provider_token=active.provider_token,
+            ttl_seconds=self._ttl_seconds,
+            clock=self._clock,
+            check_seconds=self._renew_check_seconds,
+        )
+        with self._lock:
+            if self._closed:
+                raise LeaseFencedError("scheduler cerrado: no se inicia renovación")
+            self._renewers[task_id] = renewer
+        renewer.start()
+        return renewer
 
     def _finish(
         self, task_id: UUID, active: _ActiveExecution, result: ExecutionResult, *, ran: bool
@@ -743,6 +899,7 @@ __all__ = [
     "ExecutionContext",
     "ExecutionOutcome",
     "ExecutionResult",
+    "LeaseRenewer",
     "SchedulerError",
     "TaskRunner",
     "TwoTaskScheduler",

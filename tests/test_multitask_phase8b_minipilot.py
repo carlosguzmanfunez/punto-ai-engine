@@ -32,7 +32,7 @@ from punto.providers.router import ProviderRouter
 from punto.scheduling.adapters import holder_from_executor_ref
 from punto.scheduling.leases import FencingToken, LeaseHolder, LeaseKind, LeaseLedger, LeaseOutcome
 from punto.scheduling.recovery_waits import RecoveryWaitCoordinator
-from punto.scheduling.recovery_wiring import RecoveryExecutor
+from punto.scheduling.recovery_wiring import RecoveryExecutor, RecoveryInvocationGuard
 from punto.schemas.build import BuildRequest
 from punto.schemas.dev import DevelopmentStatus
 from punto.schemas.scheduling import (
@@ -42,6 +42,8 @@ from punto.schemas.scheduling import (
     SchedulingState,
     TaskSchedulingRecord,
 )
+from punto.schemas.workflow import WorkflowRequest, WorkflowRun
+from punto.workflow.checkpoints import FileCheckpointStore
 from punto.workspace.target import DevelopmentTargetRegistry
 from test_human_console import TARGET_ID, _cambio, _plan, _repos, _target
 from test_provider_failover import Fake, _conectados, _registrar
@@ -141,6 +143,19 @@ def _ciclo_con_recovery(
     coordinator = RecoveryWaitCoordinator(router=router, ledger=ledger, audit=audit)
     task = _task()
     holder, token = _writer_authority(ledger, TASK_ID)
+    workflow_request = WorkflowRequest(
+        task_id=TASK_ID,
+        project_id=uuid4(),
+        objective="mini-piloto recovery 8B",
+        action="development.recovery",
+        idempotency_key=f"phase8b-{uuid4()}",
+    )
+    workflow_run = WorkflowRun(workflow_id=uuid4(), request=workflow_request)
+    invocation_guard = RecoveryInvocationGuard(
+        run=workflow_run,
+        checkpoints=FileCheckpointStore(tmp_path / "recovery-checkpoints"),
+        step_index=0,
+    )
     executor = RecoveryExecutor(
         router=router,
         ledger=ledger,
@@ -148,6 +163,7 @@ def _ciclo_con_recovery(
         task=task,
         holder=holder,
         task_token=token,
+        invocation_guard=invocation_guard,
     )
     ciclo = DevelopmentCycle(
         router=router,

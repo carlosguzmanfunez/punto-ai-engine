@@ -46,9 +46,16 @@ from punto.scheduling.leases import (
 )
 from punto.scheduling.provider_waits import ProviderWaitCoordinator, ProviderWaitOutcome
 from punto.scheduling.recovery_waits import RecoveryWaitCoordinator
-from punto.scheduling.recovery_wiring import DEFAULT_MAX_RECOVERY_ATTEMPTS, RecoveryExecutor
+from punto.scheduling.recovery_wiring import (
+    DEFAULT_MAX_RECOVERY_ATTEMPTS,
+    RecoveryExecutor,
+    RecoveryInvocationGuard,
+)
 from punto.schemas.build import BuildRequest
 from punto.schemas.scheduling import ExecutorReference, SchedulingState
+from punto.schemas.workflow import WorkflowRequest, WorkflowRun
+from punto.workflow.checkpoints import FileCheckpointStore
+from punto.workflow.errors import WorkflowEffectReconciliationError
 from punto.workspace.target import DevelopmentTargetRegistry
 from test_human_console import TARGET_ID
 from test_provider_failover import Fake, _conectados, _registrar
@@ -88,9 +95,11 @@ def _executor(
     holder: LeaseHolder,
     token: FencingToken,
     *,
+    invocation_guard: RecoveryInvocationGuard | None = None,
     on_state_change: Callable[[TaskRecord], None] | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
 ) -> RecoveryExecutor:
+    guard = invocation_guard or _invocation_guard(ledger, task.task_id)
     return RecoveryExecutor(
         router=router,
         ledger=ledger,
@@ -98,9 +107,30 @@ def _executor(
         task=task,
         holder=holder,
         task_token=token,
+        invocation_guard=guard,
         max_attempts=max_attempts,
         on_state_change=on_state_change,
     )
+
+
+def _invocation_guard(
+    ledger: LeaseLedger,
+    task_id: UUID,
+    *,
+    run: WorkflowRun | None = None,
+) -> RecoveryInvocationGuard:
+    checkpoints = FileCheckpointStore(ledger.root.parent / "recovery-checkpoints")
+    current = run
+    if current is None:
+        request = WorkflowRequest(
+            task_id=task_id,
+            project_id=uuid4(),
+            objective="recovery wiring discriminant",
+            action="development.recovery",
+            idempotency_key=f"recovery-{uuid4()}",
+        )
+        current = WorkflowRun(workflow_id=uuid4(), request=request)
+    return RecoveryInvocationGuard(run=current, checkpoints=checkpoints, step_index=0)
 
 
 def _failed(
@@ -171,12 +201,18 @@ class _RaceOnceLedger(LeaseLedger):
         )
 
 
+class SimulatedCrash(BaseException):
+    """Caída que no es un fallo operacional capturable por ``except Exception``."""
+
+
 class _RaisingRouter(ProviderRouter):
-    """Router real cuyo ``execute_recovery`` lanza en vez de devolver -- simula un crash del
-    proceso durante la llamada al proveedor (discriminante Q: el ``finally`` libera igual)."""
+    """Router que cae después de cruzar la frontera de invocación externa."""
+
+    recovery_invocations: int = 0
 
     def execute_recovery(self, *args: Any, **kwargs: Any) -> ProviderResult:
-        raise RuntimeError("crash simulado durante la invocación de recovery")
+        self.recovery_invocations += 1
+        raise SimulatedCrash("proceso caído tras invocar al provider de recovery")
 
 
 # =================================================================== A/B/C · selección real
@@ -604,8 +640,8 @@ def test_p_un_ejecutor_reconstruido_tras_reinicio_invoca_limpio_sin_estado_previ
     assert result.ok and result.provider == "openai" and len(openai.calls) == 1
 
 
-# ============================================= Q · el lease se libera incluso si el router revienta
-def test_q_el_providerlease_se_libera_incluso_si_la_invocacion_revienta(tmp_path: Path) -> None:
+# ==================== Q · crash tras invocar: restart exige reconciliación y no duplica
+def test_q_crash_durante_recovery_no_reinvoca_tras_restart(tmp_path: Path) -> None:
     _router, openai, _deepseek, _anthropic = _base_router(
         connected=("openai", "anthropic", "deepseek")
     )
@@ -619,7 +655,16 @@ def test_q_el_providerlease_se_libera_incluso_si_la_invocacion_revienta(tmp_path
     coordinator = _base_coordinator(raising, ledger)
     task = _base_task(TASK_ID, provider="deepseek")
     holder, token = _writer_authority(ledger, TASK_ID)
-    executor = _executor(raising, ledger, coordinator, task, holder, token)
+    guard = _invocation_guard(ledger, TASK_ID)
+    executor = _executor(
+        raising,
+        ledger,
+        coordinator,
+        task,
+        holder,
+        token,
+        invocation_guard=guard,
+    )
 
     try:
         executor(
@@ -629,12 +674,56 @@ def test_q_el_providerlease_se_libera_incluso_si_la_invocacion_revienta(tmp_path
             max_output_tokens=None,
             failed=_failed("deepseek", ProviderErrorKind.QUOTA_EXHAUSTED),
         )
-        raise AssertionError("se esperaba que el router simulado reventara")
-    except RuntimeError:
+        raise AssertionError("se esperaba la caída simulada")
+    except SimulatedCrash:
         pass
 
+    assert raising.recovery_invocations == 1
+    persisted = guard.checkpoints.load(guard.run.workflow_id)
+    assert len(persisted.effects) == 1
+    assert persisted.effects[0].status.value == "IN_FLIGHT"
     head = ledger.head(kind=LeaseKind.PROVIDER, key="openai:0", provider_id="openai", slot=0)
     assert head is not None and head.state.value == "RELEASED"
+
+    # Proceso nuevo, holder/epoch nuevo y solo el checkpoint como memoria del anterior. Liberar
+    # aquí el writer representa el punto posterior a TTL/reconcile en el que el scheduling vuelve
+    # a conceder authority; la deduplicación no depende de conservar el lease viejo.
+    ledger.release(token)
+    restarted_holder = holder_from_executor_ref(
+        ExecutorReference(executor_id=f"executor-{TASK_ID}-restart", role="BUILDER"),
+        executor_id=uuid4(),
+    )
+    reacquired = ledger.acquire(
+        kind=LeaseKind.TASK_WRITER,
+        key=str(TASK_ID),
+        holder=restarted_holder,
+        ttl_seconds=60,
+    )
+    assert reacquired.outcome is LeaseOutcome.PASS and reacquired.token is not None
+    restarted_guard = _invocation_guard(ledger, TASK_ID, run=persisted)
+    restarted = _executor(
+        raising,
+        ledger,
+        coordinator,
+        task,
+        restarted_holder,
+        reacquired.token,
+        invocation_guard=restarted_guard,
+    )
+
+    try:
+        restarted(
+            role=ProviderRole.BUILDER,
+            request=_request(),
+            json_schema={},
+            max_output_tokens=None,
+            failed=_failed("deepseek", ProviderErrorKind.QUOTA_EXHAUSTED),
+        )
+        raise AssertionError("se esperaba reconciliación antes de repetir la invocación")
+    except WorkflowEffectReconciliationError as exc:
+        assert exc.code.value == "WORKFLOW_EFFECT_RECONCILIATION_REQUIRED"
+
+    assert raising.recovery_invocations == 1, "el restart no puede volver a invocar openai"
 
 
 # ================================================ T · un candidato sin capacidad nunca se invoca
@@ -735,8 +824,11 @@ def test_u_el_primario_asignado_del_router_no_cambia_tras_una_cadena_de_recovery
     assert router.get_provider_for_role(ProviderRole.BUILDER) == "deepseek"
 
 
-# ========================================== V · sin referencia a workspace/checkpoint
-def test_v_el_ejecutor_no_referencia_workspace_ni_checkpoint(tmp_path: Path) -> None:
+# ================================ V · checkpoint durable obligatorio, sin segundo ledger
+def test_v_el_ejecutor_exige_guard_durable_sobre_effectledger_existente(tmp_path: Path) -> None:
     campos = set(RecoveryExecutor.__dataclass_fields__)
-    prohibido = {"workspace", "checkpoint", "snapshot", "repository"}
+    assert "invocation_guard" in campos
+    guard_fields = set(RecoveryInvocationGuard.__dataclass_fields__)
+    assert {"run", "checkpoints", "effects"} <= guard_fields
+    prohibido = {"workspace", "snapshot", "repository", "recovery_ledger"}
     assert not (campos & prohibido), campos

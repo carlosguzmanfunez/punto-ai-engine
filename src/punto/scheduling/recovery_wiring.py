@@ -1,24 +1,27 @@
 """Fase 8B: implementación real de ``OperationalRecoveryHook`` -- decidir, adquirir, revalidar,
-invocar, encadenar con exclusión creciente, o persistir ``WAITING_RECOVERY``.
+apuntar la invocación durablemente, invocar, encadenar con exclusión creciente, o persistir
+``WAITING_RECOVERY``.
 
 ``RecoveryExecutor`` es lo único que ``DevelopmentCycle`` invoca (vía el protocolo, nunca importa
 este módulo): conecta la decisión pura de Fase 8A (``RecoveryWaitCoordinator``) con la invocación
 real de un candidato (``ProviderRouter.execute_recovery``), sin tocar Quality Takeover
 (``execute_alternative``/``TakeoverPolicy``) ni el failover operativo del propio ``execute()``.
 
-La cadena vive dentro de UNA sola llamada: no persiste ``chain_excluded`` entre invocaciones de
-``__call__`` distintas. Lo que sí sobrevive a un reinicio es exactamente lo que Fase 8A ya
-persiste (``RecoveryWaitReason``, con ``failed_provider``/``also_excluded`` completos) cuando la
-cadena se agota en ``WAITING_RECOVERY`` -- eso es lo único que ``DevelopmentCycle`` (síncrono, sin
-puntos de control a la granularidad de una sola invocación de proveedor) puede, honestamente,
-garantizar que sobreviva.
+La exclusión creciente vive dentro de UNA sola llamada. La frontera de crash no depende de esa
+memoria: antes de cada invocación se registra una intención en el ``EffectLedger`` del
+``WorkflowRun`` y se persiste con el ``CheckpointStore`` existente. Si el proceso cae después de
+invocar y antes de que el resultado sea utilizable, un proceso nuevo encuentra esa misma clave en
+``IN_FLIGHT`` (o ya resuelta) y entra en ``WORKFLOW_EFFECT_RECONCILIATION_REQUIRED``; nunca repite
+el efecto a ciegas. No existe un segundo ledger ni un estado paralelo de recovery.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
+from uuid import UUID
 
 from punto.api.console_state import TaskRecord
 from punto.providers.contract import ProviderRequest, ProviderResult, ProviderRole
@@ -27,10 +30,93 @@ from punto.providers.failover import failover_cause_of
 from punto.providers.router import ProviderRouter
 from punto.scheduling.leases import FencingToken, LeaseHolder, LeaseKind, LeaseLedger, LeaseOutcome
 from punto.scheduling.recovery_waits import RecoveryDecisionKind, RecoveryWaitCoordinator
+from punto.schemas.workflow import EffectStatus, WorkflowRun
+from punto.workflow.checkpoints import CheckpointStore
+from punto.workflow.effects import EffectLedger, effect_key
+from punto.workflow.errors import WorkflowEffectReconciliationError
+from punto.workflow.providers import workflow_role_of
 
 #: Tope duro de candidatos intentados dentro de UNA cadena de recovery: protección contra loops
 #: (§13) independiente de que la exclusión estructural ya lo impida por construcción.
 DEFAULT_MAX_RECOVERY_ATTEMPTS: Final[int] = 3
+
+
+@dataclass(slots=True)
+class RecoveryInvocationGuard:
+    """Frontera durable y deduplicada de una invocación de recovery.
+
+    El guard no guarda un libro propio: opera sobre ``WorkflowRun.effects`` mediante el
+    ``EffectLedger`` existente y persiste ese mismo run en el ``CheckpointStore`` existente.
+    ``workflow_id`` identifica el ciclo lógico; ``task_id`` y ``request_id`` forman parte de la
+    acción estable, de modo que reconstruir el guard desde el último checkpoint produce la misma
+    clave y no una nueva autoridad para repetir el provider.
+    """
+
+    run: WorkflowRun
+    checkpoints: CheckpointStore
+    step_index: int
+    effects: EffectLedger = field(default_factory=EffectLedger)
+
+    def begin(
+        self,
+        *,
+        task_id: UUID,
+        role: ProviderRole,
+        request_id: str,
+        provider: str,
+    ) -> str:
+        """Persiste ``IN_FLIGHT`` antes del efecto o exige reconciliación.
+
+        ``task_id`` se compara con el del run antes de construir la clave: una recuperación no
+        puede cambiar de Task y seguir usando la autoridad durable del ciclo anterior.
+        """
+        if task_id != self.run.task_id:
+            raise WorkflowEffectReconciliationError(
+                "la Task del recovery no coincide con la Task del WorkflowRun durable: "
+                f"recovery={task_id}, workflow={self.run.task_id}"
+            )
+        workflow_role = workflow_role_of(role)
+        if workflow_role is None:
+            raise WorkflowEffectReconciliationError(
+                f"el rol {role.value} no tiene traducción durable para registrar recovery"
+            )
+        identity = f"{self.run.task_id}:{request_id}:{provider}"
+        action = f"recovery-provider-invocation:{hashlib.sha256(identity.encode()).hexdigest()}"
+        key = effect_key(self.run.workflow_id, self.step_index, workflow_role, action)
+        updated, decision = self.effects.begin_intent(
+            self.run,
+            key=key,
+            action=action,
+            role=workflow_role,
+            step_index=self.step_index,
+            reversible=False,
+        )
+        if not decision.allowed:
+            raise WorkflowEffectReconciliationError(
+                decision.detail or f"la invocación de recovery {key!r} ya tiene evidencia durable"
+            )
+        # Orden causal obligatorio: publicar el intent antes de tocar el provider.
+        self.run = updated
+        self.checkpoints.save(self.run)
+        return key
+
+    def resolve(self, *, key: str, result: ProviderResult) -> None:
+        """Sella que la invocación terminó y persiste antes de exponer el resultado.
+
+        ``APPLIED`` significa que el efecto externo (la llamada) ocurrió, no que la respuesta
+        del provider haya sido exitosa. Tanto una respuesta OK como un fallo operacional son una
+        invocación consumida que no se puede repetir por accidente tras un crash.
+        """
+        outcome = result.status.value
+        if result.error_kind is not None:
+            outcome = f"{outcome}/{result.error_kind.value}"
+        self.run = self.effects.resolve(
+            self.run,
+            key=key,
+            status=EffectStatus.APPLIED,
+            detail=f"provider={result.provider or 'unknown'}; outcome={outcome}",
+        )
+        self.checkpoints.save(self.run)
 
 
 @dataclass(slots=True)
@@ -51,6 +137,9 @@ class RecoveryExecutor:
     #: TaskWriterLease YA vigente del ciclo en curso (Fase 2A/7) -- este ejecutor NUNCA lo
     #: readquiere, solo lo usa como fencing del ProviderLease propio que sí adquiere.
     task_token: FencingToken
+    #: Frontera durable obligatoria. Sin ella una caída después de invocar y antes de devolver
+    #: el resultado haría ambiguo si el provider puede volver a llamarse.
+    invocation_guard: RecoveryInvocationGuard
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS
     ttl_seconds: int = 60
     #: Se invoca con el ``TaskRecord`` actualizado cada vez que cambia (entra/sale/actualiza
@@ -147,6 +236,12 @@ class RecoveryExecutor:
                 (chain_excluded | set(evaluation.decision.ordered_candidates)) - {selected}
             )
             try:
+                invocation_key = self.invocation_guard.begin(
+                    task_id=self.task.task_id,
+                    role=role,
+                    request_id=request.request_id,
+                    provider=selected,
+                )
                 result = self.router.execute_recovery(
                     role,
                     request,
@@ -154,6 +249,10 @@ class RecoveryExecutor:
                     json_schema=json_schema,
                     max_output_tokens=max_output_tokens,
                 )
+                # El resultado solo cruza esta frontera después de sellar durablemente que la
+                # invocación ocurrió. Si el save falla, el checkpoint anterior conserva
+                # IN_FLIGHT y un restart exige reconciliación en vez de repetir.
+                self.invocation_guard.resolve(key=invocation_key, result=result)
             finally:
                 # El ProviderLease de recovery nunca se conserva más allá de esta invocación: no
                 # es autoridad permanente, es un turno propio para este candidato.
@@ -177,4 +276,8 @@ class RecoveryExecutor:
         return current_failed
 
 
-__all__ = ["DEFAULT_MAX_RECOVERY_ATTEMPTS", "RecoveryExecutor"]
+__all__ = [
+    "DEFAULT_MAX_RECOVERY_ATTEMPTS",
+    "RecoveryExecutor",
+    "RecoveryInvocationGuard",
+]

@@ -190,6 +190,39 @@ class AuditLogger:
             },
         )
 
+    def log_recovery_wait(
+        self,
+        *,
+        event_type: AuditEventType,
+        task_id: UUID,
+        fingerprint: str,
+        failed_provider: str,
+        failure_kind: str,
+        candidates: Sequence[str],
+        generation: int,
+    ) -> AuditEvent:
+        """Observa una transición durable de recovery wait sin reportar un fallo."""
+        allowed = {
+            AuditEventType.RECOVERY_WAIT_ENTERED,
+            AuditEventType.RECOVERY_WAIT_UPDATED,
+            AuditEventType.RECOVERY_WAIT_RESOLVED,
+            AuditEventType.RECOVERY_WAIT_REEVALUATED,
+        }
+        if event_type not in allowed:
+            raise ValueError("event_type no corresponde a una transición de recovery wait")
+        return self.record(
+            event_type,
+            action=event_type.value.casefold(),
+            resource_id=task_id,
+            metadata={
+                "fingerprint": fingerprint,
+                "failed_provider": failed_provider,
+                "failure_kind": failure_kind,
+                "candidates": list(candidates),
+                "generation": generation,
+            },
+        )
+
     def log_task_created(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la creación de una tarea."""
         return self.record(

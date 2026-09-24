@@ -21,6 +21,7 @@ from typing import Final
 from punto.policy.config_loader import ConfigError, find_config_dir, load_yaml_file
 from punto.providers.contract import ProviderRole
 from punto.providers.failover import DEFAULT_MAX_SUBSTITUTES, FailoverPolicy
+from punto.providers.recovery_policy import DEFAULT_MAX_RECOVERY_SUBSTITUTES, RecoveryPolicy
 from punto.providers.router import (
     DEFAULT_PROVIDER_MODELS,
     DEFAULT_ROLE_ASSIGNMENT,
@@ -79,6 +80,9 @@ class ProviderSettings:
     #: Política de TAKEOVER de calidad (``providers.yaml``, sección ``takeover:``) —
     #: independiente de ``failover``: ``None`` = sin takeover (por defecto).
     takeover: TakeoverPolicy | None = None
+    #: Política de RECOVERY operacional (``providers.yaml``, sección ``recovery:``) —
+    #: independiente de ``failover`` y de ``takeover``: ``None`` = sin recovery (por defecto).
+    recovery: RecoveryPolicy | None = None
 
     def model_of(self, provider: str) -> str:
         """Modelo configurado de un proveedor, o el conocido por el motor."""
@@ -126,6 +130,15 @@ class ProviderSettings:
                     "roles": {role.value: list(subs) for role, subs in self.takeover.roles.items()},
                     "max_substitutes": self.takeover.max_substitutes,
                     "allow_metered": self.takeover.allow_metered,
+                }
+            ),
+            "recovery": (
+                None
+                if self.recovery is None
+                else {
+                    "roles": {role.value: list(subs) for role, subs in self.recovery.roles.items()},
+                    "max_substitutes": self.recovery.max_substitutes,
+                    "allow_metered": self.recovery.allow_metered,
                 }
             ),
         }
@@ -244,6 +257,7 @@ def load_provider_settings(
     auth_modes = dict(base.auth_modes)
     failover: FailoverPolicy | None = base.failover
     takeover: TakeoverPolicy | None = base.takeover
+    recovery: RecoveryPolicy | None = base.recovery
 
     if path is not None and path.is_file():
         raw = load_yaml_file(path)
@@ -253,6 +267,7 @@ def load_provider_settings(
         assignment = _read_roles(raw, assignment)
         failover = _read_failover(raw)
         takeover = _read_takeover(raw)
+        recovery = _read_recovery(raw)
 
     for name in KNOWN_PROVIDERS:
         override = env.get(f"PUNTO_{name.upper()}{PROVIDER_MODEL_ENV_SUFFIX}", "").strip()
@@ -285,6 +300,7 @@ def load_provider_settings(
         auth_modes=auth_modes,
         failover=failover,
         takeover=takeover,
+        recovery=recovery,
     )
 
 
@@ -460,6 +476,66 @@ def _read_takeover(raw: Mapping[str, object]) -> TakeoverPolicy | None:
     if not roles:
         return None
     return TakeoverPolicy(roles=roles, max_substitutes=maximum, allow_metered=allow_metered)
+
+
+def _read_recovery(raw: Mapping[str, object]) -> RecoveryPolicy | None:
+    """Lee la sección ``recovery`` del fichero: orden GENERAL de rotación operacional, por rol.
+
+    Forma (independiente de ``failover:``/``takeover:`` — misma forma, sección distinta)::
+
+        recovery:
+          allow_metered: false
+          max_substitutes: 2
+          roles:
+            BUILDER: [openai, anthropic, deepseek]   # orden general; quién se excluye por ser
+                                                        # el causante de hoy lo decide cada llamada
+
+    La sección es **opcional**: sin ella no hay recovery. Es configuración de confianza: solo
+    este fichero la declara, ni una petición ni un proveedor ni una Task pueden ampliarla.
+
+    Raises:
+        ProviderRouteError: si la forma es inválida, el rol o el proveedor no existen o el tope
+            no es un entero positivo. Una política mal escrita no se ignora en silencio.
+    """
+    section = raw.get("recovery")
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise ProviderRouteError("la sección 'recovery' debe ser un mapa")
+    unknown = sorted(set(section) - {"roles", "max_substitutes", "allow_metered"})
+    if unknown:
+        raise ProviderRouteError(f"claves desconocidas en 'recovery': {', '.join(unknown)}")
+    allow_metered = section.get("allow_metered", False)
+    if not isinstance(allow_metered, bool):
+        raise ProviderRouteError("recovery.allow_metered debe ser booleano")
+    maximum = section.get("max_substitutes", DEFAULT_MAX_RECOVERY_SUBSTITUTES)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ProviderRouteError("recovery.max_substitutes debe ser un entero positivo")
+    roles_section = section.get("roles", {})
+    if roles_section is None:
+        roles_section = {}
+    if not isinstance(roles_section, Mapping):
+        raise ProviderRouteError("recovery.roles debe ser un mapa rol -> lista de proveedores")
+    roles: dict[ProviderRole, tuple[str, ...]] = {}
+    for role_name, substitutes in roles_section.items():
+        try:
+            role = ProviderRole(str(role_name))
+        except ValueError as exc:
+            known = ", ".join(item.value for item in ProviderRole)
+            raise ProviderRouteError(
+                f"rol desconocido en recovery.roles: {role_name!r}. Conocidos: {known}"
+            ) from exc
+        if substitutes is None:
+            substitutes = []
+        if not isinstance(substitutes, (list, tuple)):
+            raise ProviderRouteError(f"recovery.roles.{role.value} debe ser una lista")
+        roles[role] = tuple(
+            _validate_provider(str(name), source=f"recovery.roles.{role.value}")
+            for name in substitutes
+        )
+    if not roles:
+        return None
+    return RecoveryPolicy(roles=roles, max_substitutes=maximum, allow_metered=allow_metered)
 
 
 def _validate_transport(name: str, *, key: str) -> str:

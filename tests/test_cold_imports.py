@@ -141,6 +141,9 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.workflow.state_machine",
     # --- MULTI-TASK FASE 7: arbitraje ProviderLease / WAITING_PROVIDER --------
     "punto.scheduling.provider_waits",
+    # --- MULTI-TASK FASE 8A: RECOVERY POLICY / WAITING_RECOVERY ---------------
+    "punto.providers.recovery_policy",
+    "punto.scheduling.recovery_waits",
     # --- SKILL-LAYER-0: telemetría pasiva de eficiencia ------------------------
     "punto.telemetry",
     "punto.telemetry.efficiency",
@@ -176,18 +179,14 @@ def test_module_imports_in_a_fresh_interpreter(module: str) -> None:
 
 def test_tasks_then_camus_in_a_fresh_interpreter() -> None:
     """Orden ``tasks.manager`` -> ``orchestrator.camus`` en un proceso nuevo."""
-    result = run_in_fresh_interpreter(
-        "import punto.tasks.manager\nimport punto.orchestrator.camus"
-    )
+    result = run_in_fresh_interpreter("import punto.tasks.manager\nimport punto.orchestrator.camus")
 
     assert result.returncode == 0, result.stderr
 
 
 def test_camus_then_tasks_in_a_fresh_interpreter() -> None:
     """Orden inverso ``orchestrator.camus`` -> ``tasks.manager`` en un proceso nuevo."""
-    result = run_in_fresh_interpreter(
-        "import punto.orchestrator.camus\nimport punto.tasks.manager"
-    )
+    result = run_in_fresh_interpreter("import punto.orchestrator.camus\nimport punto.tasks.manager")
 
     assert result.returncode == 0, result.stderr
 

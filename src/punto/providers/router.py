@@ -70,6 +70,7 @@ from punto.providers.failover import (
     failover_cause_of,
 )
 from punto.providers.openai import OpenAIError
+from punto.providers.recovery_policy import RecoveryCandidateJudgment, RecoveryPolicy
 from punto.providers.takeover import TakeoverPolicy
 from punto.providers.transport import TransportError, provider_error_kind_of
 from punto.tools.errors import ProviderRouteError
@@ -153,6 +154,10 @@ class ProviderRouter:
         #: QUALITY TAKEOVER (independiente del failover operativo): ver ``configure_takeover``.
         self._takeover_policy: TakeoverPolicy | None = None
         self._takeover_evaluator: SubstituteEvaluator | None = None
+        #: OPERATIONAL RECOVERY (Fase 8A, independiente de failover y de takeover): ver
+        #: ``configure_recovery``.
+        self._recovery_policy: RecoveryPolicy | None = None
+        self._recovery_evaluator: SubstituteEvaluator | None = None
 
     # ------------------------------------------------------------------ registro
     def register_provider(
@@ -281,6 +286,81 @@ class ProviderRouter:
     def takeover_policy(self) -> TakeoverPolicy | None:
         """Política de TAKEOVER vigente, o ``None`` si está desactivada."""
         return self._takeover_policy
+
+    # ----------------------------------------------------------------- recovery
+    def configure_recovery(
+        self, policy: RecoveryPolicy | None, evaluator: SubstituteEvaluator | None = None
+    ) -> None:
+        """Declara la política de RECOVERY operacional — independiente de failover y takeover.
+
+        Mismo contrato de seguridad que las otras dos (sin ``evaluator`` no hay recuperación
+        aunque haya política; ``None`` la desactiva; la asignación de roles no se toca). El orden
+        declarado es GENERAL (todos los providers capaces del rol): quién se excluye por ser el
+        causante del fallo de hoy lo decide cada llamada a :meth:`recovery_candidates`, nunca la
+        política en sí.
+        """
+        self._recovery_policy = policy
+        self._recovery_evaluator = evaluator
+
+    def recovery_policy(self) -> RecoveryPolicy | None:
+        """Política de RECOVERY vigente, o ``None`` si está desactivada."""
+        return self._recovery_policy
+
+    def recovery_candidates(
+        self, role: ProviderRole, *, exclude: str, needs_vision: bool = False
+    ) -> tuple[RecoveryCandidateJudgment, ...]:
+        """Candidatos de recuperación para ``role``, en el orden general declarado, sin invocar.
+
+        ``exclude`` (normalizado a minúsculas) nunca aparece en el resultado: el provider
+        causalmente fallido no es un candidato rechazado más, es estructuralmente inelegible y ni
+        siquiera se juzga. Sin política para el rol, o sin evaluador, devuelve ``()`` -- el
+        llamante falla cerrado si lo necesita, igual que ``resolve_route`` sin evaluador.
+
+        No comprueba BUSY de ningún ``ProviderLease``: este router no conoce leases. Un candidato
+        aquí ``eligible=True`` sigue necesitando esa comprobación en la capa de scheduling.
+        """
+        policy = self._recovery_policy
+        if policy is None or not policy.covers(role) or self._recovery_evaluator is None:
+            return ()
+        excluded = exclude.strip().lower()
+        declared = policy.preferred(role)
+        names = declared if declared else tuple(self._entries)
+        seen: set[str] = {excluded}
+        judgments: list[RecoveryCandidateJudgment] = []
+        for raw in names:
+            name = raw.strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name not in self._entries:
+                judgments.append(
+                    RecoveryCandidateJudgment(
+                        provider=name, eligible=False, reason="no está registrado en el router"
+                    )
+                )
+                continue
+            verdict = self._judge_with(self._recovery_evaluator, role, name, needs_vision)
+            if verdict.eligible and verdict.metered and not policy.allow_metered:
+                judgments.append(
+                    RecoveryCandidateJudgment(
+                        provider=name,
+                        eligible=False,
+                        reason="transporte de pago por uso (allow_metered=false)",
+                        metered=True,
+                        transport=verdict.transport,
+                    )
+                )
+                continue
+            judgments.append(
+                RecoveryCandidateJudgment(
+                    provider=name,
+                    eligible=verdict.eligible,
+                    reason=verdict.reason,
+                    metered=verdict.metered,
+                    transport=verdict.transport,
+                )
+            )
+        return tuple(judgments)
 
     # ---------------------------------------------------------------- ejecución
     def execute(

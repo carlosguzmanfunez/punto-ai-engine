@@ -326,6 +326,64 @@ class ProviderWaitReason(WaitingReason):
         return self
 
 
+class RecoveryWaitReason(WaitingReason):
+    """Evidencia durable de una RECOVERY operacional sin candidato elegible (Fase 8A).
+
+    ``provider_ids`` (heredado) son los candidatos CONSIDERADOS, en el orden general evaluado
+    (nunca incluye a ``failed_provider``: ese ni se juzga). ``exclusion_reasons`` empareja cada
+    uno con su motivo, como ``"anthropic: no conectado"`` — mismo formato compacto que ya usa
+    ``RouteChoice.reason`` en ``punto.providers.failover``.
+    """
+
+    kind: Literal[WaitingKind.RECOVERY] = WaitingKind.RECOVERY
+    code: Literal["RECOVERY_EXHAUSTED"] = "RECOVERY_EXHAUSTED"
+    task_id: UUID
+    #: Valor de ``ProviderRole`` (``ARCHITECT``/``BUILDER``/``VISUAL_QA``): necesario para poder
+    #: reevaluar tras un reinicio sin pedirle al llamante que recuerde el rol de cada Task.
+    role: str = Field(min_length=1, max_length=40)
+    failed_provider: str = Field(min_length=1, max_length=40)
+    failure_kind: str = Field(min_length=1, max_length=40)
+    required_capabilities: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
+    exclusion_reasons: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
+    waiting_since: datetime
+    last_evaluated_at: datetime
+    recovery_fingerprint: str = Field(min_length=64, max_length=64)
+    wakeup_generation: int = Field(default=1, ge=1)
+
+    @field_validator("failed_provider")
+    @classmethod
+    def _failed_provider_normalized(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("failed_provider no puede estar vacío")
+        return normalized
+
+    @field_validator("waiting_since", "last_evaluated_at")
+    @classmethod
+    def _timezone_required(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("los tiempos de recovery wait deben incluir zona horaria")
+        return value.astimezone(UTC)
+
+    @field_validator("recovery_fingerprint")
+    @classmethod
+    def _fingerprint_is_sha256(cls, value: str) -> str:
+        normalized = value.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("recovery_fingerprint debe ser sha256 hexadecimal")
+        return normalized
+
+    @model_validator(mode="after")
+    def _recovery_wait_is_coherent(self) -> Self:
+        if self.failed_provider in self.provider_ids:
+            raise ValueError("el provider causalmente fallido no puede ser un candidato")
+        if len(self.exclusion_reasons) != len(self.provider_ids):
+            raise ValueError("exclusion_reasons debe tener un motivo por cada candidato")
+        if self.last_evaluated_at < self.waiting_since:
+            raise ValueError("last_evaluated_at no puede preceder waiting_since")
+        return self
+
+
 _WAIT_KIND_BY_STATE: dict[SchedulingState, WaitingKind] = {
     SchedulingState.WAITING_RESOURCE: WaitingKind.RESOURCE,
     SchedulingState.WAITING_DEPENDENCY: WaitingKind.DEPENDENCY,
@@ -346,7 +404,12 @@ class TaskSchedulingRecord(BaseModel):
     managed: bool = False
     state: SchedulingState = SchedulingState.QUEUED
     waiting: (
-        ProviderWaitReason | ResourceWaitReason | DependencyWaitReason | WaitingReason | None
+        RecoveryWaitReason
+        | ProviderWaitReason
+        | ResourceWaitReason
+        | DependencyWaitReason
+        | WaitingReason
+        | None
     ) = None
     executor: ExecutorReference | None = None
     provider: ProviderReference | None = None
@@ -394,6 +457,13 @@ class TaskSchedulingRecord(BaseModel):
             raise ValueError("PROVIDER_LEASE_BUSY exige ProviderWaitReason completo")
         if isinstance(self.waiting, ProviderWaitReason) and self.provider != self.waiting.provider:
             raise ValueError("ProviderWaitReason debe coincidir con el provider de la Task")
+        if (
+            self.state is SchedulingState.WAITING_RECOVERY
+            and self.waiting is not None
+            and self.waiting.code == "RECOVERY_EXHAUSTED"
+            and not isinstance(self.waiting, RecoveryWaitReason)
+        ):
+            raise ValueError("RECOVERY_EXHAUSTED exige RecoveryWaitReason completo")
         identities = tuple((item.kind, item.key) for item in self.resources)
         if len(set(identities)) != len(identities):
             raise ValueError("las referencias de recursos no pueden repetirse")
@@ -419,6 +489,7 @@ __all__ = [
     "ExecutorReference",
     "ProviderReference",
     "ProviderWaitReason",
+    "RecoveryWaitReason",
     "ResourceAccess",
     "ResourceReference",
     "ResourceWaitReason",

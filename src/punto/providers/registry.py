@@ -374,6 +374,9 @@ class ProviderRegistry:
         # TAKEOVER de calidad (providers.yaml, sección `takeover:`): política INDEPENDIENTE del
         # failover operativo (mismo evaluador de capacidad/conexión, candidatos distintos).
         router.configure_takeover(self.settings().takeover, self._judge_substitute)
+        # RECOVERY operacional (providers.yaml, sección `recovery:`): política INDEPENDIENTE de
+        # failover y de takeover (mismo evaluador, orden general de rotación propio).
+        router.configure_recovery(self.settings().recovery, self._judge_substitute)
         self.router = router
 
     def router_instance(self) -> ProviderRouter:

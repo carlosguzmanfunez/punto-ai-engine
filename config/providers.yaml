@@ -95,3 +95,18 @@ takeover:
     # BUILDER cuando el primario respondio sin resolver la causa. Si Codex no esta disponible,
     # continua con el siguiente candidato autorizado y capaz (Claude).
     BUILDER: [openai, anthropic]
+
+# RECOVERY operacional (Fase 8A): independiente de `failover` y de `takeover`. `failover` y
+# `takeover` dan por hecho que DeepSeek sigue siendo el primario de BUILDER y listan solo su(s)
+# sustituto(s); `recovery` en cambio es el orden general de rotacion cuando CUALQUIERA de los
+# tres providers de BUILDER (incluido el propio primario) sufre un fallo OPERACIONAL real
+# (auth/cuota/rate-limit/transporte/no-disponible) a mitad de un ciclo ya en marcha -- el
+# provider que causo el fallo se excluye SIEMPRE, sea cual sea; el resto de este orden general
+# se evalua tal cual. No es sustituto de `failover` (que sigue gobernando el primer intento) ni
+# de `takeover` (calidad, no disponibilidad): es la tercera causa, ver
+# punto.providers.recovery_policy.
+recovery:
+  allow_metered: false
+  max_substitutes: 2
+  roles:
+    BUILDER: [openai, anthropic, deepseek]

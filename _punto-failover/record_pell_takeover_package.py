@@ -1,0 +1,67 @@
+"""Registra el aprendizaje reutilizable y verificado de Fase 9."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+MEMORY = Path(__file__).resolve().parent / "pell-takeover-package.jsonl"
+
+
+def main() -> int:
+    from punto.memory.experience import ExperienceResult, ExperienceStatus
+    from punto.memory.store import ExperienceStore
+
+    store = ExperienceStore(MEMORY)
+    record = store.record(
+        problem=(
+            "un cambio de executor/provider no tenía un handoff canónico que preservara, tras "
+            "restart, la identidad Task/workflow, los actores, la causa y el estado exacto de "
+            "cada evidencia"
+        ),
+        context=(
+            "el handoff de proyecto, los checkpoints, workspaces, ResourceClaims y leases ya "
+            "eran durables por separado; faltaba unir sus referencias sin duplicar blobs ni "
+            "convertir operational recovery y quality takeover en la misma causa"
+        ),
+        attempts=(),
+        failure_reason=(
+            "estado correcto pero disperso no es un contrato de takeover: un proceso nuevo no "
+            "puede saber qué snapshot es canónico ni distinguir ausencia, fallo, parcialidad y "
+            "falta de verificación"
+        ),
+        solution=(
+            "un TakeoverPackage append-only usa referencias existentes, estados de evidencia "
+            "explícitos, fingerprint canónico e idempotente y el TaskWriterLease existente como "
+            "única autoridad; nueva información crea otra versión y nunca sobrescribe historia"
+        ),
+        procedure=(
+            "clasificar cada evidencia como VERIFIED, UNVERIFIED, FAILED, PARTIAL o PENDING sin "
+            "promociones implícitas",
+            "calcular identidad y fingerprint solo desde contenido material normalizado; excluir "
+            "timestamps, versión y epoch para que una reevaluación idéntica sea idempotente",
+            "revalidar TaskWriterLease inmediatamente antes de publicar y conservar versiones "
+            "previas como archivos append-only",
+            "compartir el transporte durable entre recovery operacional y takeover de calidad, "
+            "pero exigir una causa estructurada distinta en cada boundary",
+        ),
+        result=ExperienceResult.SUCCESS,
+        verification=(
+            "tests/test_takeover_package.py: 15 PASS, incluidos 12 escenarios de mutación",
+            "tests/test_multitask_phase9_minipilot.py: 2 PASS",
+            "regresión causal handoff/workspace/checkpoint/fencing/recovery/takeover: 129 PASS",
+            "cold imports: 110 PASS; ruff y mypy --strict PASS",
+        ),
+        tags=(
+            "type:durable-takeover-package-phase9",
+            "trigger:executor-provider-handoff-must-survive-restart",
+            "component:project/handoff+leases+workflow-checkpoints",
+            "provenance:discriminant-tests+minipilot+causal-regression",
+        ),
+        status=ExperienceStatus.VERIFIED,
+    )
+    print(f"[V] {record.id}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

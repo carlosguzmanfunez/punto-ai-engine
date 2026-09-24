@@ -801,16 +801,44 @@ def _bounded(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[:max_chars]
 
 
+# Fase 9 extiende el handoff durable existente con un package de takeover. La implementación
+# vive separada para que este módulo de nodos no mezcle su serialización con el store versionado,
+# pero se reexporta aquí: sigue habiendo una sola frontera pública de handoff de proyecto.
+from punto.project.takeover_package import (  # noqa: E402
+    TAKEOVER_PACKAGE_SCHEMA_VERSION,
+    TakeoverCause,
+    TakeoverEvidence,
+    TakeoverEvidenceStatus,
+    TakeoverPackage,
+    TakeoverPackageDraft,
+    TakeoverPackageError,
+    TakeoverPackageStore,
+    TakeoverWorkspaceReference,
+    publish_operational_takeover,
+    publish_quality_takeover,
+    takeover_fingerprint,
+    takeover_package_id,
+)
+
 __all__ = [
     "NODE_PLAN_LABEL",
     "NODE_TASK_NAMESPACE",
     "PROJECT_GRAPH_KIND",
     "PROJECT_GRAPH_LABEL",
     "PROJECT_NODE_HANDOFF_KIND",
+    "TAKEOVER_PACKAGE_SCHEMA_VERSION",
     "FrozenGraph",
     "ProjectDependencyEvidenceError",
     "ProjectGraphBundle",
     "ProjectHandoffError",
+    "TakeoverCause",
+    "TakeoverEvidence",
+    "TakeoverEvidenceStatus",
+    "TakeoverPackage",
+    "TakeoverPackageDraft",
+    "TakeoverPackageError",
+    "TakeoverPackageStore",
+    "TakeoverWorkspaceReference",
     "dependency_references",
     "node_idempotency_key",
     "node_request",
@@ -820,6 +848,10 @@ __all__ = [
     "publish_graph_bundle",
     "publish_node_handoff",
     "publish_node_plan",
+    "publish_operational_takeover",
+    "publish_quality_takeover",
     "resolve_graph_bundle",
     "resolve_node_handoff",
+    "takeover_fingerprint",
+    "takeover_package_id",
 ]

@@ -86,12 +86,45 @@ def test_paths_are_relative_and_contained(ai_context: ExecutionContext) -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "candidate",
-    ["../outside.txt", "..\\outside.txt", "sub/../../outside.txt", "./../escape.py"],
+    ["../outside.txt", "sub/../../outside.txt", "./../escape.py"],
 )
 def test_relative_traversal_is_blocked(ai_context: ExecutionContext, candidate: str) -> None:
     """Una ruta con ``..`` que sale del workspace se bloquea."""
     with pytest.raises(WorkspaceViolationError):
         ai_context.resolve_path(candidate)
+
+
+# ``resolve_path`` resuelve con la semántica de rutas **nativa** del sistema: ``\`` es
+# separador en Windows y un carácter más del nombre en POSIX. Cada caso se prueba donde aplica.
+BACKSLASH_CANDIDATES = ["..\\outside.txt", "sub\\..\\..\\outside.txt"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="'\\' solo es separador de ruta en Windows")
+@pytest.mark.parametrize("candidate", BACKSLASH_CANDIDATES)
+def test_windows_backslash_traversal_is_blocked(
+    ai_context: ExecutionContext, candidate: str
+) -> None:
+    """En Windows, ``..\\`` es traversal nativo y se bloquea."""
+    with pytest.raises(WorkspaceViolationError):
+        ai_context.resolve_path(candidate)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="en Windows '\\' es separador, no un carácter literal")
+@pytest.mark.parametrize("candidate", BACKSLASH_CANDIDATES)
+def test_posix_backslash_is_a_literal_name_inside_workspace(
+    ai_context: ExecutionContext, tmp_path: Path, candidate: str
+) -> None:
+    """En POSIX, ``\\`` es parte del nombre: el archivo queda dentro y nada sale del workspace."""
+    filesystem = FilesystemTool(ai_context)
+
+    resolved = ai_context.resolve_path(candidate)
+    change = filesystem.write_text(candidate, "contenido")
+
+    assert resolved == ai_context.workspace_root / candidate
+    assert resolved.parent == ai_context.workspace_root
+    assert change.path == candidate
+    assert resolved.read_text() == "contenido"
+    assert not (tmp_path / "outside.txt").exists()
 
 
 def test_traversal_write_is_blocked(ai_context: ExecutionContext, tmp_path: Path) -> None:

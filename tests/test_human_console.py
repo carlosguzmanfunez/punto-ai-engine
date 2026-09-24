@@ -10,6 +10,7 @@ es una ``PolicyDecision`` real sobre ``deploy_production`` y la publicación lla
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -1111,9 +1112,12 @@ def test_un_destino_no_registrado_no_concede_acceso_a_otro_directorio(tmp_path: 
         assert respuesta.status_code == 400, intento
         assert str(repo) not in respuesta.text, "el rechazo no revela el repositorio registrado"
         assert str(ajeno) not in respuesta.text, "ni la ruta del repositorio ajeno"
-    # Una ruta arbitrariamente larga ni siquiera entra: el campo del selector está acotado.
-    larga = str(ajeno)
-    assert len(larga) > 80
+    # Una ruta arbitrariamente larga ni siquiera entra: el campo del selector está acotado (80).
+    # La longitud se construye aquí (``/.`` repetido sigue designando el repositorio ajeno) y no
+    # depende de dónde viva ``tmp_path`` en el runner.
+    larga = str(ajeno) + (os.sep + os.curdir) * 41
+    assert Path(larga).resolve() == ajeno.resolve()
+    assert len(larga) - len(str(ajeno)) > 80
     acotado = client.post(
         "/console/tasks", json={"objective": "tocar otro repositorio", "target_id": larga}
     )

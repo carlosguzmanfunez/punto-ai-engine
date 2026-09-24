@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
+    from punto.project.resource_claims import ResourceClaim
     from punto.schemas.replan import ProjectContract
 
 #: Máximo de tokens que un conjunto de recursos enumera (cota de serialización y de informe).
@@ -50,6 +51,13 @@ class ResourceDimension(StrEnum):
     DEPLOYMENT = "deployment"
     TECHNOLOGY = "technology"
     PACKAGE = "package"
+    FILE = "file"
+    PATH = "path"
+    CONTRACT = "contract"
+    SCHEMA = "schema"
+    API = "api"
+    DATABASE_TABLE = "database_table"
+    CHAIN = "chain"
 
 
 #: Dimensiones que un manifiesto de dependencias puede introducir.
@@ -151,6 +159,11 @@ class ResourceSet:
             ``(recursos observados, razones sin resolver)``; lo ilegible no se supone vacío.
         """
         return resources_from_diff(paths, read)
+
+    @classmethod
+    def from_claims(cls, claims: Iterable[ResourceClaim]) -> ResourceSet:
+        """Recursos explícitos reclamados por Tasks, sin crear otro concepto de conjunto."""
+        return cls.of(claim.token for claim in claims)
 
     def union(self, other: ResourceSet) -> ResourceSet:
         """Unión de dos conjuntos."""

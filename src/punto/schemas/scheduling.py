@@ -33,6 +33,18 @@ class SchedulingState(StrEnum):
     INTEGRATING = "INTEGRATING"
 
 
+class TaskKind(StrEnum):
+    """Clase de trabajo de una Task (Fase 12); la identidad y el ciclo de vida son los mismos.
+
+    ``INTEGRATION`` no ejecuta un DevelopmentCycle: consume los outputs durables de sus Tasks
+    fuente (sus dependencias) y los integra en un workspace propio. Sigue siendo una Task real:
+    mismo scheduler, mismas esperas, mismos leases.
+    """
+
+    DEVELOPMENT = "DEVELOPMENT"
+    INTEGRATION = "INTEGRATION"
+
+
 class WaitingKind(StrEnum):
     """Causa estable de espera; BUSY es scheduling, no fallo de proveedor."""
 
@@ -505,6 +517,7 @@ __all__ = [
     "ResourceReference",
     "ResourceWaitReason",
     "SchedulingState",
+    "TaskKind",
     "TaskSchedulingRecord",
     "WaitingKind",
     "WaitingReason",

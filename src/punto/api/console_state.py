@@ -35,14 +35,23 @@ from pathlib import Path
 from typing import Any, Final, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 
 from punto.common import utc_now
 from punto.providers.secrets import redact_secret_text
 from punto.publish.production import PublicationRecord, PublicationRefused
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.enums import ApprovalStatus, RiskLevel
-from punto.schemas.scheduling import TaskSchedulingRecord
+from punto.schemas.scheduling import TaskKind, TaskSchedulingRecord
 
 __all__ = [
     "CONSOLE_STATE_ENV",
@@ -273,6 +282,27 @@ class TaskRecord(BaseModel):
     #: Overlay durable de scheduling. En Fase 1 queda ``managed=False``: persistir el contrato no
     #: afirma que ya exista un scheduler, un lease o un executor vivo.
     scheduling: TaskSchedulingRecord
+    #: Clase de trabajo (Fase 12). Vive en la Task y no en el overlay: los coordinadores de espera
+    #: reconstruyen ``scheduling`` campo a campo, pero siempre copian la Task entera. El valor por
+    #: defecto no se serializa, así que los documentos existentes quedan idénticos byte a byte.
+    kind: TaskKind = TaskKind.DEVELOPMENT
+
+    @model_validator(mode="after")
+    def _integration_is_governed(self) -> TaskRecord:
+        if self.kind is TaskKind.INTEGRATION and (
+            not self.scheduling.managed or not self.scheduling.dependencies
+        ):
+            raise ValueError("una Integration Task exige scheduling gestionado y Tasks fuente")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_default_kind(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and self.kind is TaskKind.DEVELOPMENT:
+            data.pop("kind", None)
+        return data
 
 
 class ConsoleStateDocument(BaseModel):

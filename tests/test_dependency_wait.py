@@ -399,6 +399,36 @@ def test_v_dependency_change_reevaluates_against_current_dag() -> None:
     assert evaluation.task.scheduling.dependencies == (_dependency(TASK_C),)
 
 
+# ============= V2 · DAG mutado y TODAVÍA esperando: el unmet debe ser el nuevo, no el viejo
+def test_v2_dependency_change_while_still_waiting_reports_the_new_unmet_set() -> None:
+    """V no discrimina esto: allí el cambio de DAG terminaba SATISFIED (no pasa por
+    _wait_dependency). Aquí B sigue esperando, pero sobre un prerequisito DISTINTO -- el reason
+    persistido debe reflejar C (el nuevo unmet), nunca A (el viejo, ya no declarado).
+    """
+    coordinator = ResourceWaitCoordinator(clock=_clock)
+    dependent = _dependent(TASK_B, TASK_A, resources=(_resource(),))
+    waiting = _wait_dep(coordinator, dependent, _pending(TASK_A))
+    # B se reescribe para depender de C en vez de A; C tampoco está satisfecho todavía.
+    changed_dependencies = waiting.model_copy(
+        update={
+            "scheduling": TaskSchedulingRecord(
+                managed=True,
+                state=SchedulingState.WAITING_DEPENDENCY,
+                waiting=_dep_reason(waiting),
+                resources=(_resource(),),
+                dependencies=(_dependency(TASK_C),),
+            )
+        }
+    )
+
+    evaluation = coordinator.evaluate(changed_dependencies, (_completed(TASK_A), _pending(TASK_C)))
+
+    assert evaluation.outcome is ResourceWaitOutcome.WAITING_DEPENDENCY
+    reason = _dep_reason(evaluation.task)
+    assert reason.related_task_ids == (TASK_C,), "el unmet debe ser el DAG actual, no el viejo"
+    assert TASK_A not in reason.related_task_ids
+
+
 # =========================================== W · orden estable de dependientes
 def test_w_multiple_dependents_are_reevaluated_in_stable_order(tmp_path: Path) -> None:
     store = ConsoleStateStore(tmp_path / "console-state.json")

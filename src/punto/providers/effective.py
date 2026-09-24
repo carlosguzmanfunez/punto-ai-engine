@@ -37,6 +37,7 @@ __all__ = [
     "CAPABILITY_TEXT",
     "CAPABILITY_VISION",
     "EffectiveCapability",
+    "capability_limitations",
     "capability_routes",
     "configured_capabilities",
     "effective_capabilities_table",
@@ -451,3 +452,58 @@ def _required_capability(role: str) -> str:
         return str(ROLE_REQUIRED_CAPABILITY.get(ProviderRole(role), "") or "")
     except ValueError:
         return ""
+
+
+def _plural_limited(count: int) -> str:
+    if count <= 0:
+        return ""
+    return f"⚠ {count} capacidad limitada" if count == 1 else f"⚠ {count} capacidades limitadas"
+
+
+def capability_limitations(
+    effective_rows: Iterable[Mapping[str, Any]],
+    provider_rows: Iterable[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Resumen compacto de capacidades CONFIGURADAS que NO son EFECTIVAS en el transporte actual.
+
+    Una limitación de capacidad no es desconexión ni fallo: ``provider_status`` se copia tal cual
+    del estado real del catálogo, nunca se deriva de aquí. Solo cuentan los proveedores
+    ``CONNECTED`` (o de estado desconocido): en uno no configurado el problema es su estado, no una
+    capacidad limitada, y se reporta aparte en ``not_connected``.
+    """
+    status_of = {str(row.get("provider", "")): str(row.get("status", "")) for row in provider_rows}
+    items: list[dict[str, Any]] = []
+    not_connected: set[str] = set()
+    for row in sorted(effective_rows, key=lambda item: str(item.get("provider", ""))):
+        provider = str(row.get("provider", ""))
+        status = status_of.get(provider, "")
+        effective = {str(item) for item in row.get("effective", ())}
+        reasons = [str(item) for item in row.get("reasons", ())]
+        limited = [
+            str(cap) for cap in dict.fromkeys(row.get("configured", ())) if cap not in effective
+        ]
+        if not limited:
+            continue
+        if status and status != "CONNECTED":
+            not_connected.add(provider)
+            continue
+        for capability in limited:
+            items.append(
+                {
+                    "provider": provider,
+                    "capability": capability,
+                    "configured": True,
+                    "effective": False,
+                    "transport": str(row.get("transport", "")),
+                    "model": str(row.get("model", "")),
+                    "reason": next((item for item in reasons if capability in item), ""),
+                    "provider_status": status,
+                }
+            )
+    return {
+        "count": len(items),
+        "label": _plural_limited(len(items)),
+        "providers": sorted({item["provider"] for item in items}),
+        "items": items,
+        "not_connected": sorted(not_connected),
+    }

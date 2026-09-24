@@ -49,6 +49,7 @@ from punto.api.console_state import (
     publication_of,
 )
 from punto.api.gate_reconciliation import assess_task_gates
+from punto.api.operational_projection import project_operations
 from punto.api.task_graph import build_task_graph
 from punto.api.task_identity import (
     ACTIVE_LINEAGE,
@@ -65,6 +66,7 @@ from punto.api.task_progress import TaskSignals, build_progress
 from punto.audit.logger import AuditLogger
 from punto.common import utc_now
 from punto.orchestrator.dev_cycle import DevelopmentCycle
+from punto.policy.config_loader import ConfigError
 from punto.policy.human_gate import HumanGate, HumanGateError
 from punto.policy.policy_engine import PolicyEngine
 from punto.policy.target_authority import (
@@ -82,12 +84,13 @@ from punto.publish.production import (
     PublicationService,
     PublicationStage,
 )
+from punto.scheduler.settings import SchedulerLimits, load_scheduler_limits
 from punto.schemas.audit import AuditEventType
 from punto.schemas.build import BuildRequest
 from punto.schemas.decision import ActionRequest, HumanApprovalRequest
 from punto.schemas.dev import BlockedEvidence, DevelopmentResult, DevelopmentStatus
 from punto.schemas.enums import ApprovalStatus, AuditResult, RiskLevel, TaskStatus
-from punto.schemas.scheduling import TaskSchedulingRecord
+from punto.schemas.scheduling import TaskKind, TaskSchedulingRecord
 from punto.workspace.target import (
     DevelopmentTarget,
     DevelopmentTargetError,
@@ -320,6 +323,9 @@ class ConsoleTask:
         self.relations: list[TaskRelation] = []
         #: Contrato durable preparado para Multi-Task. Fase 1 no lo activa ni adquiere leases.
         self.scheduling = TaskSchedulingRecord()
+        #: Clase de trabajo (Fase 12). Se conserva tal cual en el round-trip durable: sin ella, una
+        #: Integration Task recuperada se volvería a persistir como DEVELOPMENT.
+        self.kind: TaskKind = TaskKind.DEVELOPMENT
         #: Origen del intento en curso (``initial`` / ``retry`` / ``continuation``).
         self.attempt_origin: str = ""
 
@@ -530,6 +536,7 @@ class ConsoleTask:
             "rerun": self._rerun_view(),
             "lineage": self.lineage_view(),
             "operational": self.operational,
+            "kind": self.kind.value,
         }
 
     @property
@@ -816,6 +823,30 @@ def register_human_console(
             target_id=target_id,
             task_id=task_id,
         )
+
+    #: Límites declarados del scheduler (``scheduler.yaml``): el máximo activo que se muestra es el
+    #: mismo que aplica el scheduler, no un número de la interfaz.
+    scheduler_limits = _scheduler_limits()
+
+    @application.get(
+        "/console/operations", tags=["console"], summary="Proyección operacional Multi-Task"
+    )
+    def console_operations() -> dict[str, Any]:
+        """Estado operacional real (Fase 13): Tasks activas/en espera, causas, bloqueos y grafo.
+
+        Se reconstruye en cada consulta desde el documento **durable** (el mismo que escribe el
+        scheduler), sin memoria del proceso y sin escribir nada: ni la Task, ni su scheduling, ni
+        siquiera la cuarentena de un documento ilegible. No decide scheduling.
+        """
+        snapshot = store.load(rules=RESTORE_RULES, quarantine=False)
+        records = snapshot.tasks if snapshot.recovered else ()
+        return {
+            "source": {"status": snapshot.status.value, "detail": snapshot.detail[:300]},
+            "limits": (
+                scheduler_limits.model_dump(mode="json") if scheduler_limits is not None else None
+            ),
+            **project_operations(records, limits=scheduler_limits),
+        }
 
     @application.get("/console/tasks/{task_id}", tags=["console"], summary="Detalle de una tarea")
     def get_console_task(task_id: UUID) -> dict[str, Any]:
@@ -1587,6 +1618,14 @@ def _visual_summary(result: DevelopmentResult | None) -> str:
     return _redacted(f"{first.provider}/{first.transport}: {verdicts}{kind}", 120)
 
 
+def _scheduler_limits() -> SchedulerLimits | None:
+    """``SchedulerLimits`` declarados, o ``None`` si no se pueden leer (no se inventa un máximo)."""
+    try:
+        return load_scheduler_limits()
+    except (ConfigError, OSError):
+        return None
+
+
 def _task_record(task: ConsoleTask) -> TaskRecord:
     """Vista persistible de una tarea: estado gobernado y evidencia, sin contenido de ficheros."""
     return TaskRecord(
@@ -1615,6 +1654,7 @@ def _task_record(task: ConsoleTask) -> TaskRecord:
         superseded_at=task.superseded_at,
         relations=tuple(task.relations),
         scheduling=task.scheduling,
+        kind=task.kind,
     )
 
 
@@ -1652,6 +1692,7 @@ def _task_from_record(record: TaskRecord, recovered_at: datetime) -> ConsoleTask
     task.superseded_at = record.superseded_at
     task.relations = list(record.relations)
     task.scheduling = record.scheduling
+    task.kind = record.kind
     return task
 
 

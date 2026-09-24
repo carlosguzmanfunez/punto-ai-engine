@@ -531,9 +531,16 @@ class ConsoleStateStore:
 
     # ------------------------------------------------------------------ lectura
     def load(
-        self, *, rules: StageRules | None = None, source: str = "punto-console"
+        self,
+        *,
+        rules: StageRules | None = None,
+        source: str = "punto-console",
+        quarantine: bool = True,
     ) -> ConsoleStateSnapshot:
         """Lee y valida el estado persistido.
+
+        ``quarantine=False`` es la lectura estrictamente read-only de una proyección (Fase 13):
+        mismo veredicto, pero un rechazo no escribe el expediente de cuarentena.
 
         Returns:
             La instantánea: vacía si no había nada, recuperable si el documento es coherente y
@@ -542,6 +549,12 @@ class ConsoleStateStore:
         Un rechazo nunca deja el estado a medias: la consola arranca con el registro vacío y el
         hecho queda auditado. La evidencia del rechazo se conserva en un expediente aparte.
         """
+        snapshot = self._read(rules, source)
+        if quarantine and snapshot.status is ConsoleStateStatus.REJECTED:
+            self._quarantine()
+        return snapshot
+
+    def _read(self, rules: StageRules | None, source: str) -> ConsoleStateSnapshot:
         effective = rules if rules is not None else StageRules()
         if not self._path.is_file():
             return ConsoleStateSnapshot(ConsoleStateStatus.EMPTY, "no había estado persistido")
@@ -588,8 +601,7 @@ class ConsoleStateStore:
         )
 
     def _rejected(self, detail: str) -> ConsoleStateSnapshot:
-        """Falla cerrado: conserva la evidencia y devuelve una instantánea sin estado."""
-        self._quarantine()
+        """Falla cerrado: instantánea sin estado (``load`` conserva la evidencia en cuarentena)."""
         return ConsoleStateSnapshot(ConsoleStateStatus.REJECTED, detail[:500])
 
     def _quarantine(self) -> None:

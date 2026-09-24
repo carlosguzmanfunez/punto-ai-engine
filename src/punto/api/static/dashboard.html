@@ -105,6 +105,14 @@
          pinta como utilizable; se muestra con su motivo (AP000-OBS-03-R1). */
       .cap.declared-only { color: var(--warn); border-color: var(--warn); border-style: dashed; }
       .capability-warning { color: var(--warn); font-size: 12px; margin-top: 6px; }
+      .capability-warning summary { cursor: pointer; }
+      /* Fase 13: proyección operacional read-only (sin botones: no concede autoridad). */
+      .op-card { border-left: 3px solid var(--line); }
+      .op-card.ACTIVE { border-left-color: var(--ok); }
+      .op-card.WAITING { border-left-color: var(--warn); }
+      .op-card .op-wait { color: var(--warn); font-size: 12px; margin-top: 4px; }
+      .op-card .op-meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+      .op-kind { font-size: 11px; border: 1px solid var(--accent); border-radius: 20px; padding: 2px 8px; }
       .tabs { display: flex; gap: 12px; margin-left: auto; }
       .tabs a { color: var(--muted); text-decoration: none; font-size: 13px; }
       .tabs a:hover { color: var(--text); }
@@ -184,6 +192,7 @@
       <span class="crumb">Consola humana · Tareas, Human Gates y Configuración de proveedores</span>
       <nav class="tabs">
         <a href="#tasks" data-console="tasks">Tareas</a>
+        <a href="#operations" data-console="tasks">Operación</a>
         <a href="#gates" data-console="gates">Human Gates</a>
         <a href="#providers-section">Proveedores</a>
       </nav>
@@ -229,6 +238,22 @@
         </details>
       </section>
 
+      <section id="operations" data-testid="operations">
+        <h2>Operación Multi-Task</h2>
+        <div id="operations-summary" class="note" data-testid="operations-summary">
+          Sin cargar: pulsa Actualizar o abre la sección de Tareas.
+        </div>
+        <div id="operations-list" class="grid" data-testid="operations-list"></div>
+        <details id="operations-graph" data-testid="operations-graph" style="margin-top: 12px">
+          <summary id="operations-graph-summary">Relaciones entre Tasks</summary>
+          <div id="operations-edges"></div>
+        </details>
+        <div class="note">
+          Vista de solo lectura derivada del estado durable del scheduler: no adquiere leases, no
+          cambia el scheduling, no dispara recovery ni takeover y no ejecuta Tasks.
+        </div>
+      </section>
+
       <section id="gates">
         <h2>Human Gates</h2>
         <div id="gates-list" data-testid="gates-list" class="grid">
@@ -245,6 +270,7 @@
       </section>
       <section id="providers-section">
         <h2>Proveedores</h2>
+        <div id="capability-summary" class="capability-warning" data-testid="capability-summary"></div>
         <div id="providers" class="grid" data-testid="providers"></div>
       </section>
 
@@ -400,15 +426,32 @@
       // Capacidades de una ruta: verde solo lo que el **transporte activo** ejecuta de verdad. Lo
       // declarado que el transporte no ejecuta se muestra aparte, con su motivo, para no ofrecer
       // como utilizable algo que no lo es (AP000-OBS-03-R1).
+      // Fase 13: compacto. La tarjeta dice «⚠ N capacidad(es) limitada(s)» y el detalle
+      // (capacidad, configurada, efectiva, transporte, motivo) queda plegado. Una capacidad
+      // limitada NO cambia el estado de conexión: ese viene del backend tal cual.
+      function limitedLabel(count) {
+        if (!count) return "";
+        return count === 1 ? "⚠ 1 capacidad limitada" : `⚠ ${count} capacidades limitadas`;
+      }
+
       function effectiveRow(provider) {
-        const fila = (state.effective || []).find((item) => item.provider === provider.provider);
-        if (!fila) return "";
-        const motivos = (fila.reasons || []).filter(Boolean);
-        if (!motivos.length) return "";
-        return `<div class="capability-warning" data-testid="capacidad-no-efectiva-${provider.provider}">
-            configurada y no efectiva en la ruta activa${fila.transport ? ` (${fila.transport})` : ""}:
-            ${motivos.join("; ")}
-          </div>`;
+        const items = ((state.limitations || {}).items || [])
+          .filter((item) => item.provider === provider.provider);
+        if (!items.length) return "";
+        const detalle = items
+          .map((item) => `<div>· ${esc(item.capability)}: configurada, no efectiva${
+            item.transport ? ` en ${esc(item.transport)}` : ""}${item.reason ? ` — ${esc(item.reason)}` : ""}</div>`)
+          .join("");
+        return `<details class="capability-warning" data-testid="capacidad-no-efectiva-${provider.provider}">
+            <summary>${limitedLabel(items.length)}</summary>${detalle}
+          </details>`;
+      }
+
+      function renderCapabilitySummary() {
+        const resumen = state.limitations || {};
+        setHtml("capability-summary", resumen.count
+          ? `${esc(resumen.label || limitedLabel(resumen.count))} · ${esc((resumen.providers || []).join(", "))}`
+          : "");
       }
 
       function capabilitiesRow(provider) {
@@ -458,6 +501,7 @@
 
       function render() {
         document.getElementById("providers").innerHTML = state.providers.map(card).join("");
+        renderCapabilitySummary();
         renderRoles();
         document.querySelectorAll("[data-save]").forEach((button) =>
           button.addEventListener("click", () => save(button.dataset.save)));
@@ -520,6 +564,7 @@
         // Capacidad efectiva por proveedor y por rol: es lo que la interfaz usa para no presentar
         // como utilizable una capacidad que el transporte activo no ejecuta (AP000-OBS-03-R1).
         state.effective = providers.effective_capabilities || [];
+        state.limitations = providers.capability_limitations || { count: 0, items: [] };
         state.roleCapabilities = roles.role_capabilities || {};
         document.getElementById("custom-adapter").innerHTML = state.adapterTypes
           .map((item) => `<option value="${item}">${item}</option>`)
@@ -1105,6 +1150,73 @@
         consoleState.tasks = operational;
         consoleState.tasksHistory = history;
         renderTasks();
+        await loadOperations();
+      }
+
+      // Fase 13: proyección operacional (GET /console/operations), reconstruida por el backend
+      // desde el estado durable en cada consulta. La página no guarda ni deduce estado: si la
+      // proyección no llega, lo dice en vez de mostrar una Task RUNNING que no puede demostrar.
+      async function loadOperations() {
+        try {
+          consoleState.operations = await api("/console/operations");
+        } catch (error) {
+          consoleState.operations = null;
+        }
+        renderOperations();
+      }
+
+      function operationTitle(operations, taskId) {
+        const found = (operations.tasks || []).find((item) => item.task_id === taskId);
+        return found ? found.title : String(taskId).slice(0, 8);
+      }
+
+      function operationCard(task, operations) {
+        const provider = task.provider
+          ? `Provider: ${esc(task.provider.provider)}${task.provider.role === "expected" ? " (esperado)" : ""}`
+          : "";
+        const kind = task.kind === "INTEGRATION"
+          ? `<span class="op-kind" data-testid="op-integration-${task.task_id}">Integration Task</span> `
+          : "";
+        const blockers = (task.blocking_task_ids || [])
+          .map((id) => esc(operationTitle(operations, id))).join(", ");
+        const sources = (task.integration_source_ids || [])
+          .map((id) => esc(operationTitle(operations, id))).join(" + ");
+        const recursos = task.waiting_detail && task.waiting_detail.resource_keys
+          ? task.waiting_detail.resource_keys.map(esc).join(", ") : "";
+        return `<article class="card op-card ${esc(task.phase)}" data-testid="op-${task.task_id}">
+            <h3>${kind}${esc(task.title)}</h3>
+            <span class="stage ${esc(task.operational_display_state)}">${esc(task.operational_display_state)}</span>
+            ${provider ? `<div class="op-meta">${provider}</div>` : ""}
+            ${task.waiting_summary ? `<div class="op-wait">${esc(task.waiting_summary)}</div>` : ""}
+            ${blockers ? `<div class="op-meta">Blocked by: ${blockers}</div>` : ""}
+            ${recursos ? `<div class="op-meta">Resource: ${recursos}</div>` : ""}
+            ${sources ? `<div class="op-meta">Sources: ${sources}</div>` : ""}
+          </article>`;
+      }
+
+      function renderOperations() {
+        const operations = consoleState.operations;
+        if (!operations || !operations.summary) {
+          setText("operations-summary", "proyección operacional no disponible");
+          setHtml("operations-list", "");
+          setHtml("operations-edges", "");
+          return;
+        }
+        const summary = operations.summary;
+        const partes = [summary.capacity_label];
+        if (summary.waiting) partes.push(`${summary.waiting} en espera`);
+        if (summary.queued) partes.push(`${summary.queued} en cola`);
+        if (summary.integration) partes.push(`${summary.integration} Integration`);
+        setText("operations-summary", partes.join(" · "));
+        const vivas = (operations.tasks || []).filter((task) => !task.terminal);
+        setHtml("operations-list", vivas.length
+          ? vivas.map((task) => operationCard(task, operations)).join("")
+          : `<div class="note">sin Tasks gestionadas activas</div>`);
+        const edges = operations.edges || [];
+        setText("operations-graph-summary", `Relaciones entre Tasks (${edges.length})`);
+        setHtml("operations-edges", edges
+          .map((edge) => `<div>${esc(operationTitle(operations, edge.source))} ─${esc(edge.relation)}→ ${esc(operationTitle(operations, edge.target))}</div>`)
+          .join(""));
       }
 
       function renderTasks() {

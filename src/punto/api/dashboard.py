@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from punto.providers.contract import ProviderRole
-from punto.providers.effective import effective_capabilities_table
+from punto.providers.effective import capability_limitations, effective_capabilities_table
 from punto.providers.registry import (
     CAPABILITIES,
     InvalidProviderError,
@@ -110,13 +110,16 @@ def register_dashboard(application: FastAPI, registry: ProviderRegistry | None =
         configuración declara —por ejemplo, imágenes por Claude Code—, la interfaz puede decirlo en
         vez de ofrecerlo como utilizable.
         """
+        providers = list(catalog.status_table())
+        efectivas = [dict(item) for item in effective_capabilities_table(catalog=catalog)]
         return {
-            "providers": list(catalog.status_table()),
+            "providers": providers,
             "capabilities": list(CAPABILITIES),
             "roles": catalog.roles(),
-            "effective_capabilities": [
-                dict(item) for item in effective_capabilities_table(catalog=catalog)
-            ],
+            "effective_capabilities": efectivas,
+            # Fase 13: resumen compacto «⚠ N capacidades limitadas». Una capacidad configurada y
+            # no efectiva en el transporte actual NO es desconexión: el estado sigue siendo el real.
+            "capability_limitations": capability_limitations(efectivas, providers),
         }
 
     @application.get("/providers/{provider}", tags=["dashboard"], summary="Ficha de un proveedor")

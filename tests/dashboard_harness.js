@@ -102,7 +102,8 @@ function boot({ html, routes, dropIds = [] }) {
   // Se registra cada nota de la consola y se exponen los símbolos de la página bajo prueba.
   const wrapped = `${source}
 ;globalThis.__page = { releaseTask, releaseRequest, releaseOutcome, renderTasks, loadTasks,
-  loadGates, consoleState, setText, setHtml, consoleNote, taskCard };`;
+  loadGates, consoleState, setText, setHtml, consoleNote, taskCard, loadOperations,
+  renderOperations, state, effectiveRow, renderCapabilitySummary, limitedLabel };`;
   process.on("unhandledRejection", () => {});
   vm.runInContext(wrapped, sandbox);
 

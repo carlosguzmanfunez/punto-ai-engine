@@ -134,6 +134,7 @@ def _is_relevant_blocker(task: TaskRecord) -> bool:
     if task.scheduling.state in (
         SchedulingState.WAITING_RESOURCE,
         SchedulingState.WAITING_DEPENDENCY,
+        SchedulingState.WAITING_PROVIDER,
     ):
         return False
     return (
@@ -365,6 +366,7 @@ class ResourceWaitCoordinator:
             managed=True,
             state=SchedulingState.WAITING_RESOURCE,
             waiting=reason,
+            provider=task.scheduling.provider,
             resources=task.scheduling.resources,
             dependencies=task.scheduling.dependencies,
         )
@@ -398,6 +400,7 @@ class ResourceWaitCoordinator:
         scheduling = TaskSchedulingRecord(
             managed=True,
             state=SchedulingState.QUEUED,
+            provider=task.scheduling.provider,
             resources=task.scheduling.resources,
             dependencies=task.scheduling.dependencies,
         )
@@ -452,6 +455,7 @@ class ResourceWaitCoordinator:
             managed=True,
             state=SchedulingState.WAITING_DEPENDENCY,
             waiting=reason,
+            provider=task.scheduling.provider,
             resources=task.scheduling.resources,
             dependencies=task.scheduling.dependencies,
         )

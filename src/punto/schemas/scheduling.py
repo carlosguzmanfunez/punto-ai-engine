@@ -282,6 +282,50 @@ class DependencyWaitReason(WaitingReason):
         return self
 
 
+class ProviderWaitReason(WaitingReason):
+    """Evidencia durable de un slot de provider ocupado por otro holder vigente."""
+
+    kind: Literal[WaitingKind.PROVIDER] = WaitingKind.PROVIDER
+    code: Literal["PROVIDER_LEASE_BUSY"] = "PROVIDER_LEASE_BUSY"
+    task_id: UUID
+    provider: ProviderReference
+    slot: Literal[0] = 0
+    waiting_since: datetime
+    last_evaluated_at: datetime
+    provider_fingerprint: str = Field(min_length=64, max_length=64)
+    blocker_executor_id: UUID
+    blocker_task_id: UUID
+    blocker_task_epoch: int = Field(ge=1)
+    wakeup_generation: int = Field(default=1, ge=1)
+
+    @field_validator("waiting_since", "last_evaluated_at")
+    @classmethod
+    def _timezone_required(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("los tiempos de provider wait deben incluir zona horaria")
+        return value.astimezone(UTC)
+
+    @field_validator("provider_fingerprint")
+    @classmethod
+    def _fingerprint_is_sha256(cls, value: str) -> str:
+        normalized = value.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("provider_fingerprint debe ser sha256 hexadecimal")
+        return normalized
+
+    @model_validator(mode="after")
+    def _provider_wait_is_coherent(self) -> Self:
+        if self.provider_ids != (self.provider.provider,):
+            raise ValueError("provider_ids debe identificar exactamente al provider esperado")
+        if self.related_task_ids != (self.blocker_task_id,):
+            raise ValueError("related_task_ids debe identificar exactamente a la Task holder")
+        if self.task_id == self.blocker_task_id:
+            raise ValueError("una Task no puede esperar su propio ProviderLease")
+        if self.last_evaluated_at < self.waiting_since:
+            raise ValueError("last_evaluated_at no puede preceder waiting_since")
+        return self
+
+
 _WAIT_KIND_BY_STATE: dict[SchedulingState, WaitingKind] = {
     SchedulingState.WAITING_RESOURCE: WaitingKind.RESOURCE,
     SchedulingState.WAITING_DEPENDENCY: WaitingKind.DEPENDENCY,
@@ -301,7 +345,9 @@ class TaskSchedulingRecord(BaseModel):
 
     managed: bool = False
     state: SchedulingState = SchedulingState.QUEUED
-    waiting: ResourceWaitReason | DependencyWaitReason | WaitingReason | None = None
+    waiting: (
+        ProviderWaitReason | ResourceWaitReason | DependencyWaitReason | WaitingReason | None
+    ) = None
     executor: ExecutorReference | None = None
     provider: ProviderReference | None = None
     resources: tuple[ResourceReference, ...] = Field(
@@ -339,6 +385,15 @@ class TaskSchedulingRecord(BaseModel):
             and not isinstance(self.waiting, DependencyWaitReason)
         ):
             raise ValueError("DEPENDENCY_UNSATISFIED exige DependencyWaitReason completo")
+        if (
+            self.state is SchedulingState.WAITING_PROVIDER
+            and self.waiting is not None
+            and self.waiting.code == "PROVIDER_LEASE_BUSY"
+            and not isinstance(self.waiting, ProviderWaitReason)
+        ):
+            raise ValueError("PROVIDER_LEASE_BUSY exige ProviderWaitReason completo")
+        if isinstance(self.waiting, ProviderWaitReason) and self.provider != self.waiting.provider:
+            raise ValueError("ProviderWaitReason debe coincidir con el provider de la Task")
         identities = tuple((item.kind, item.key) for item in self.resources)
         if len(set(identities)) != len(identities):
             raise ValueError("las referencias de recursos no pueden repetirse")
@@ -363,6 +418,7 @@ __all__ = [
     "DependencyWaitReason",
     "ExecutorReference",
     "ProviderReference",
+    "ProviderWaitReason",
     "ResourceAccess",
     "ResourceReference",
     "ResourceWaitReason",

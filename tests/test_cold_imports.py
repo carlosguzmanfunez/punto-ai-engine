@@ -139,6 +139,8 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.workflow.providers",
     "punto.workflow.roles",
     "punto.workflow.state_machine",
+    # --- MULTI-TASK FASE 7: arbitraje ProviderLease / WAITING_PROVIDER --------
+    "punto.scheduling.provider_waits",
     # --- SKILL-LAYER-0: telemetría pasiva de eficiencia ------------------------
     "punto.telemetry",
     "punto.telemetry.efficiency",

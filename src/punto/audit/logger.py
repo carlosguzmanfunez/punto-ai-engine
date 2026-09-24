@@ -157,6 +157,39 @@ class AuditLogger:
             },
         )
 
+    def log_provider_wait(
+        self,
+        *,
+        event_type: AuditEventType,
+        task_id: UUID,
+        fingerprint: str,
+        provider_id: str,
+        slot: int,
+        blocker_task_id: UUID,
+        generation: int,
+    ) -> AuditEvent:
+        """Observa una transición durable de provider wait sin reportar un fallo."""
+        allowed = {
+            AuditEventType.PROVIDER_WAIT_ENTERED,
+            AuditEventType.PROVIDER_WAIT_UPDATED,
+            AuditEventType.PROVIDER_WAIT_RESOLVED,
+            AuditEventType.PROVIDER_WAIT_REEVALUATED,
+        }
+        if event_type not in allowed:
+            raise ValueError("event_type no corresponde a una transición de provider wait")
+        return self.record(
+            event_type,
+            action=event_type.value.casefold(),
+            resource_id=task_id,
+            metadata={
+                "fingerprint": fingerprint,
+                "provider_id": provider_id,
+                "slot": slot,
+                "blocker_task_id": str(blocker_task_id),
+                "generation": generation,
+            },
+        )
+
     def log_task_created(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la creación de una tarea."""
         return self.record(

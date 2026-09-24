@@ -95,6 +95,37 @@ class AuditLogger:
             },
         )
 
+    def log_resource_wait(
+        self,
+        *,
+        event_type: AuditEventType,
+        task_id: UUID,
+        fingerprint: str,
+        blockers: Sequence[UUID],
+        resource_keys: Sequence[str],
+        generation: int,
+    ) -> AuditEvent:
+        """Observa una transición durable de resource wait sin gobernarla."""
+        allowed = {
+            AuditEventType.RESOURCE_WAIT_ENTERED,
+            AuditEventType.RESOURCE_WAIT_UPDATED,
+            AuditEventType.RESOURCE_WAIT_RESOLVED,
+            AuditEventType.RESOURCE_WAIT_REEVALUATED,
+        }
+        if event_type not in allowed:
+            raise ValueError("event_type no corresponde a una transición de resource wait")
+        return self.record(
+            event_type,
+            action=event_type.value.casefold(),
+            resource_id=task_id,
+            metadata={
+                "fingerprint": fingerprint,
+                "blockers": [str(blocker) for blocker in blockers],
+                "resource_keys": list(resource_keys),
+                "generation": generation,
+            },
+        )
+
     def log_task_created(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la creación de una tarea."""
         return self.record(

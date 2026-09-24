@@ -126,6 +126,37 @@ class AuditLogger:
             },
         )
 
+    def log_dependency_wait(
+        self,
+        *,
+        event_type: AuditEventType,
+        task_id: UUID,
+        fingerprint: str,
+        unmet: Sequence[UUID],
+        blocked: Sequence[UUID],
+        generation: int,
+    ) -> AuditEvent:
+        """Observa una transición durable de dependency wait sin gobernarla."""
+        allowed = {
+            AuditEventType.DEPENDENCY_WAIT_ENTERED,
+            AuditEventType.DEPENDENCY_WAIT_UPDATED,
+            AuditEventType.DEPENDENCY_WAIT_RESOLVED,
+            AuditEventType.DEPENDENCY_WAIT_REEVALUATED,
+        }
+        if event_type not in allowed:
+            raise ValueError("event_type no corresponde a una transición de dependency wait")
+        return self.record(
+            event_type,
+            action=event_type.value.casefold(),
+            resource_id=task_id,
+            metadata={
+                "fingerprint": fingerprint,
+                "unmet": [str(item) for item in unmet],
+                "blocked": [str(item) for item in blocked],
+                "generation": generation,
+            },
+        )
+
     def log_task_created(self, task: Task, *, actor: str | None = None) -> AuditEvent:
         """Registra la creación de una tarea."""
         return self.record(

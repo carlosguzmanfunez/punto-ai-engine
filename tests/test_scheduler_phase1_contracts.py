@@ -50,9 +50,7 @@ def _task_record(*, scheduling: TaskSchedulingRecord | None = None) -> TaskRecor
     )
 
 
-def _document(
-    task: TaskRecord, *, version: int = CONSOLE_STATE_SCHEMA_VERSION
-) -> dict[str, Any]:
+def _document(task: TaskRecord, *, version: int = CONSOLE_STATE_SCHEMA_VERSION) -> dict[str, Any]:
     return {
         "schema_version": version,
         "written_at": utc_now().isoformat(),
@@ -156,9 +154,7 @@ def test_referencias_hacen_round_trip_sin_convertirse_en_leases() -> None:
         executor=ExecutorReference(executor_id="executor-01", role="BUILDER"),
         provider=ProviderReference(provider="OpenAI", model="codex", transport="codex"),
         resources=(
-            ResourceReference(
-                kind="contract", key="property-types", access=ResourceAccess.WRITE
-            ),
+            ResourceReference(kind="contract", key="property-types", access=ResourceAccess.WRITE),
         ),
     )
 
@@ -197,6 +193,7 @@ def test_documento_v1_migra_sin_perder_task_y_se_reescribe_como_v2(tmp_path: Pat
         "executor": None,
         "provider": None,
         "resources": [],
+        "dependencies": [],
     }
     assert store.load().migrated_from is None
 

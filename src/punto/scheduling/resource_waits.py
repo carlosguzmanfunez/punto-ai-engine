@@ -34,8 +34,17 @@ from punto.project.resource_claims import (
     detect_conflicts,
 )
 from punto.scheduling.leases import FencingToken, LeaseLedger, LeaseOutcome
+from punto.scheduling.task_dependencies import (
+    DependencyCycleError,
+    DependencyEvaluation,
+    DependencyStatus,
+    MissingDependencyError,
+    SelfDependencyError,
+    evaluate_dependencies,
+)
 from punto.schemas.audit import AuditEventType
 from punto.schemas.scheduling import (
+    DependencyWaitReason,
     ResourceWaitReason,
     SchedulingState,
     TaskSchedulingRecord,
@@ -59,11 +68,17 @@ class ResourceWaitOutcome(StrEnum):
     """Resultado de una reevaluación, separado de fallos de DevelopmentCycle."""
 
     WAITING_RESOURCE = "WAITING_RESOURCE"
+    WAITING_DEPENDENCY = "WAITING_DEPENDENCY"
     READY = "READY"
     UNCHANGED = "UNCHANGED"
     TERMINAL = "TERMINAL"
     INSUFFICIENT_CLAIMS = "INSUFFICIENT_CLAIMS"
     INVALID_RESOURCE_CLAIM = "INVALID_RESOURCE_CLAIM"
+    #: Fase 6: la propia declaración de dependencias de la Task es inválida (auto-dependencia o
+    #: prerequisito inexistente) — no es que falte satisfacerla, es que no se puede evaluar.
+    INVALID_TASK_DEPENDENCY = "INVALID_TASK_DEPENDENCY"
+    #: Fase 6: ciclo de dependencias alcanzable desde la Task evaluada.
+    DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"
 
 
 class ResourceWaitError(RuntimeError):
@@ -116,7 +131,10 @@ def _is_terminal(task: TaskRecord) -> bool:
 def _is_relevant_blocker(task: TaskRecord) -> bool:
     if _is_terminal(task) or not task.scheduling.managed:
         return False
-    if task.scheduling.state is SchedulingState.WAITING_RESOURCE:
+    if task.scheduling.state in (
+        SchedulingState.WAITING_RESOURCE,
+        SchedulingState.WAITING_DEPENDENCY,
+    ):
         return False
     return (
         task.scheduling.state in _BLOCKING_STATES
@@ -132,6 +150,21 @@ def _resource_reason(task: TaskRecord) -> ResourceWaitReason | None:
     return None
 
 
+def _dependency_reason(task: TaskRecord) -> DependencyWaitReason | None:
+    waiting = task.scheduling.waiting
+    if isinstance(waiting, DependencyWaitReason):
+        return waiting
+    return None
+
+
+def _wait_reason(task: TaskRecord) -> ResourceWaitReason | DependencyWaitReason | None:
+    """Cualquiera de las dos causas de espera que este coordinador gobierna, la que aplique."""
+    waiting = task.scheduling.waiting
+    if isinstance(waiting, (ResourceWaitReason, DependencyWaitReason)):
+        return waiting
+    return None
+
+
 def _conflict_payload(
     blocker_reports: Sequence[tuple[UUID, ConflictReport]],
 ) -> tuple[tuple[UUID, ...], tuple[str, ...], tuple[str, ...], str]:
@@ -140,9 +173,7 @@ def _conflict_payload(
         conflict for _, report in blocker_reports for conflict in report.conflicts
     ]
     resource_keys = tuple(sorted({conflict.resource_key for conflict in conflicts}))
-    conflict_classes = tuple(
-        sorted({conflict.conflict_class.value for conflict in conflicts})
-    )
+    conflict_classes = tuple(sorted({conflict.conflict_class.value for conflict in conflicts}))
     canonical = [
         {
             "blocker": str(blocker),
@@ -166,6 +197,16 @@ def _conflict_payload(
     ]
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return blockers, resource_keys, conflict_classes, hashlib.sha256(encoded).hexdigest()
+
+
+def _dependency_payload(evaluation: DependencyEvaluation) -> str:
+    """Huella estable del conjunto (unmet, blocked); mismo patrón que ``_conflict_payload``."""
+    canonical = {
+        "unmet": [str(item) for item in evaluation.unmet],
+        "blocked": [str(item) for item in evaluation.blocked],
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ResourceWaitCoordinator:
@@ -218,6 +259,34 @@ class ResourceWaitCoordinator:
                 ResourceWaitOutcome.INSUFFICIENT_CLAIMS,
                 detail="la Task no está gestionada por scheduling",
             )
+
+        # DEPENDENCY antes que RESOURCE (Fase 6, §19): una Task que todavía no puede ejecutar por
+        # un prerequisito no satisfecho no debe parecer bloqueada por un recurso que ni siquiera
+        # ha llegado a reclamar de verdad. Solo si las dependencias ya están satisfechas (o la
+        # Task no declara ninguna: el camino existente de Fase 4/5 queda intacto) se sigue a la
+        # evaluación de recursos, en la MISMA llamada -- sin READY fugaz entre medias.
+        if task.scheduling.dependencies:
+            universe = {candidate.task_id: candidate for candidate in candidates}
+            try:
+                dependency_evaluation = evaluate_dependencies(
+                    task.task_id, task.scheduling.dependencies, universe
+                )
+            except (SelfDependencyError, MissingDependencyError) as error:
+                return ResourceWaitEvaluation(
+                    task, ResourceWaitOutcome.INVALID_TASK_DEPENDENCY, detail=error.detail
+                )
+            except DependencyCycleError as error:
+                return ResourceWaitEvaluation(
+                    task, ResourceWaitOutcome.DEPENDENCY_CYCLE, detail=error.detail
+                )
+            if dependency_evaluation.status is not DependencyStatus.SATISFIED:
+                return self._wait_dependency(
+                    task,
+                    dependency_evaluation,
+                    task_token=task_token,
+                    provider_token=provider_token,
+                )
+
         try:
             own_claims = claims_from_scheduling(task.task_id, task.scheduling)
         except InvalidResourceClaimError as error:
@@ -297,6 +366,7 @@ class ResourceWaitCoordinator:
             state=SchedulingState.WAITING_RESOURCE,
             waiting=reason,
             resources=task.scheduling.resources,
+            dependencies=task.scheduling.dependencies,
         )
         updated = task.model_copy(update={"scheduling": scheduling, "updated_at": now})
         event_type = (
@@ -315,7 +385,11 @@ class ResourceWaitCoordinator:
         )
 
     def _ready(self, task: TaskRecord) -> ResourceWaitEvaluation:
-        previous = _resource_reason(task)
+        # Cualquiera de las dos causas de espera que este coordinador gobierna cuenta como "había
+        # algo que limpiar": una Task que sale de WAITING_DEPENDENCY directa a READY (Fase 6, sin
+        # haber pasado nunca por WAITING_RESOURCE) también debe transicionar a QUEUED aquí, no
+        # solo la que venía de un conflicto de recursos.
+        previous = _wait_reason(task)
         if previous is None:
             return ResourceWaitEvaluation(
                 task, ResourceWaitOutcome.READY, detail="sin conflictos activos"
@@ -325,15 +399,76 @@ class ResourceWaitCoordinator:
             managed=True,
             state=SchedulingState.QUEUED,
             resources=task.scheduling.resources,
+            dependencies=task.scheduling.dependencies,
         )
         updated = task.model_copy(update={"scheduling": scheduling, "updated_at": now})
-        self._audit_wait(AuditEventType.RESOURCE_WAIT_REEVALUATED, updated, previous)
-        self._audit_wait(AuditEventType.RESOURCE_WAIT_RESOLVED, updated, previous)
+        if isinstance(previous, ResourceWaitReason):
+            self._audit_wait(AuditEventType.RESOURCE_WAIT_REEVALUATED, updated, previous)
+            self._audit_wait(AuditEventType.RESOURCE_WAIT_RESOLVED, updated, previous)
+        else:
+            self._audit_dependency_wait(
+                AuditEventType.DEPENDENCY_WAIT_REEVALUATED, updated, previous
+            )
+            self._audit_dependency_wait(AuditEventType.DEPENDENCY_WAIT_RESOLVED, updated, previous)
         return ResourceWaitEvaluation(
             updated,
             ResourceWaitOutcome.READY,
             changed=True,
             detail="todos los conflictos dejaron de aplicar",
+        )
+
+    def _wait_dependency(
+        self,
+        task: TaskRecord,
+        evaluation: DependencyEvaluation,
+        *,
+        task_token: FencingToken | None,
+        provider_token: FencingToken | None,
+    ) -> ResourceWaitEvaluation:
+        fingerprint = _dependency_payload(evaluation)
+        previous = _dependency_reason(task)
+        if previous is not None and previous.dependency_fingerprint == fingerprint:
+            return ResourceWaitEvaluation(
+                task,
+                ResourceWaitOutcome.UNCHANGED,
+                detail="el conjunto de dependencias no satisfechas no cambió",
+            )
+
+        now = self._clock().astimezone(UTC)
+        self._release_authority(task_token=task_token, provider_token=provider_token)
+        waiting_since = previous.waiting_since if previous is not None else now
+        generation = previous.wakeup_generation + 1 if previous is not None else 1
+        reason = DependencyWaitReason(
+            task_id=task.task_id,
+            detail=f"{len(evaluation.unmet)} prerequisito(s) sin satisfacer",
+            related_task_ids=evaluation.unmet,
+            blocked_prerequisite_ids=evaluation.blocked,
+            waiting_since=waiting_since,
+            last_evaluated_at=now,
+            dependency_fingerprint=fingerprint,
+            wakeup_generation=generation,
+        )
+        scheduling = TaskSchedulingRecord(
+            managed=True,
+            state=SchedulingState.WAITING_DEPENDENCY,
+            waiting=reason,
+            resources=task.scheduling.resources,
+            dependencies=task.scheduling.dependencies,
+        )
+        updated = task.model_copy(update={"scheduling": scheduling, "updated_at": now})
+        event_type = (
+            AuditEventType.DEPENDENCY_WAIT_UPDATED
+            if previous is not None
+            else AuditEventType.DEPENDENCY_WAIT_ENTERED
+        )
+        if previous is not None:
+            self._audit_dependency_wait(AuditEventType.DEPENDENCY_WAIT_REEVALUATED, updated, reason)
+        self._audit_dependency_wait(event_type, updated, reason)
+        return ResourceWaitEvaluation(
+            updated,
+            ResourceWaitOutcome.WAITING_DEPENDENCY,
+            changed=True,
+            detail=reason.detail,
         )
 
     def _release_authority(
@@ -413,11 +548,11 @@ class ResourceWaitCoordinator:
             return False
         if task.scheduling.state is SchedulingState.QUEUED:
             return True
-        return _resource_reason(task) is not None
+        return _wait_reason(task) is not None
 
     @staticmethod
     def _reevaluation_key(task: TaskRecord) -> tuple[datetime, str]:
-        reason = _resource_reason(task)
+        reason = _wait_reason(task)
         return (reason.waiting_since if reason is not None else task.created_at, str(task.task_id))
 
     def _assert_no_cycles(self, tasks: Sequence[TaskRecord]) -> None:
@@ -450,6 +585,20 @@ class ResourceWaitCoordinator:
             fingerprint=reason.conflict_fingerprint,
             blockers=reason.related_task_ids,
             resource_keys=reason.resource_keys,
+            generation=reason.wakeup_generation,
+        )
+
+    def _audit_dependency_wait(
+        self, event_type: AuditEventType, task: TaskRecord, reason: DependencyWaitReason
+    ) -> None:
+        if self._audit is None:
+            return
+        self._audit.log_dependency_wait(
+            event_type=event_type,
+            task_id=task.task_id,
+            fingerprint=reason.dependency_fingerprint,
+            unmet=reason.related_task_ids,
+            blocked=reason.blocked_prerequisite_ids,
             generation=reason.wakeup_generation,
         )
 

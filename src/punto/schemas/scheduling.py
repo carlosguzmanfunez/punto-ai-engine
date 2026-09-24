@@ -49,6 +49,17 @@ class ResourceAccess(StrEnum):
     WRITE = "WRITE"
 
 
+class DependencyCondition(StrEnum):
+    """Condición mínima y determinista para considerar satisfecho un prerequisito (Fase 6).
+
+    Solo ``COMPLETED``: el desarrollo del prerequisito terminó realmente completado. Nada de
+    porcentajes, puntuaciones ni juicio de un modelo — ver ``punto.scheduling.task_dependencies``
+    para la lectura exacta de qué hace a una Task ``COMPLETED``.
+    """
+
+    COMPLETED = "COMPLETED"
+
+
 class ExecutorReference(BaseModel):
     """Identidad durable de un executor, sin convertirla todavía en un lease."""
 
@@ -109,6 +120,27 @@ class ResourceReference(BaseModel):
         return normalized
 
 
+class DependencyReference(BaseModel):
+    """Referencia declarativa a un prerequisito operacional.
+
+    Vive dentro del ``TaskSchedulingRecord`` de la Task **dependiente**: no declara su propio
+    ``dependent_task_id`` (sería redundante, igual que ``ResourceReference`` no declara el suyo) ni
+    copia nada del grafo del prerequisito. ``punto.scheduling.task_dependencies`` es quien recorre
+    el universo de Tasks conocidas y decide si la condición se cumple.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    prerequisite_task_id: UUID
+    condition: DependencyCondition = DependencyCondition.COMPLETED
+    origin: str = Field(default="", max_length=40)
+
+    @field_validator("origin")
+    @classmethod
+    def _strip_origin(cls, value: str) -> str:
+        return value.strip()
+
+
 class WaitingReason(BaseModel):
     """Causa estructurada y accionable por la que una Task no puede avanzar."""
 
@@ -117,9 +149,7 @@ class WaitingReason(BaseModel):
     kind: WaitingKind
     code: str = Field(min_length=1, max_length=80)
     detail: str = Field(min_length=1, max_length=MAX_SCHEDULING_TEXT)
-    related_task_ids: tuple[UUID, ...] = Field(
-        default=(), max_length=MAX_SCHEDULING_REFERENCES
-    )
+    related_task_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
     resource_keys: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
     provider_ids: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
 
@@ -157,15 +187,9 @@ class ResourceWaitReason(WaitingReason):
     task_id: UUID
     waiting_since: datetime
     conflict_fingerprint: str = Field(min_length=64, max_length=64)
-    related_task_ids: tuple[UUID, ...] = Field(
-        min_length=1, max_length=MAX_SCHEDULING_REFERENCES
-    )
-    resource_keys: tuple[str, ...] = Field(
-        min_length=1, max_length=MAX_SCHEDULING_REFERENCES
-    )
-    conflict_classes: tuple[str, ...] = Field(
-        min_length=1, max_length=MAX_SCHEDULING_REFERENCES
-    )
+    related_task_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_SCHEDULING_REFERENCES)
+    resource_keys: tuple[str, ...] = Field(min_length=1, max_length=MAX_SCHEDULING_REFERENCES)
+    conflict_classes: tuple[str, ...] = Field(min_length=1, max_length=MAX_SCHEDULING_REFERENCES)
     last_evaluated_at: datetime
     wakeup_generation: int = Field(default=1, ge=1)
 
@@ -207,6 +231,57 @@ class ResourceWaitReason(WaitingReason):
         return self
 
 
+class DependencyWaitReason(WaitingReason):
+    """Evidencia durable mínima de una espera por prerequisitos operacionales no satisfechos."""
+
+    kind: Literal[WaitingKind.DEPENDENCY] = WaitingKind.DEPENDENCY
+    code: Literal["DEPENDENCY_UNSATISFIED"] = "DEPENDENCY_UNSATISFIED"
+    task_id: UUID
+    waiting_since: datetime
+    dependency_fingerprint: str = Field(min_length=64, max_length=64)
+    #: Todos los prerequisitos todavía no satisfechos (pendientes o terminal-unsatisfied).
+    related_task_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_SCHEDULING_REFERENCES)
+    #: Subconjunto de ``related_task_ids`` que terminó en un estado que jamás cumplirá la
+    #: condición (p. ej. FAILED/SUPERSEDED): no son "todavía no", son "ya no puede".
+    blocked_prerequisite_ids: tuple[UUID, ...] = Field(
+        default=(), max_length=MAX_SCHEDULING_REFERENCES
+    )
+    last_evaluated_at: datetime
+    wakeup_generation: int = Field(default=1, ge=1)
+
+    @field_validator("waiting_since", "last_evaluated_at")
+    @classmethod
+    def _timezone_required(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("los tiempos de dependency wait deben incluir zona horaria")
+        return value.astimezone(UTC)
+
+    @field_validator("dependency_fingerprint")
+    @classmethod
+    def _fingerprint_is_sha256(cls, value: str) -> str:
+        normalized = value.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("dependency_fingerprint debe ser sha256 hexadecimal")
+        return normalized
+
+    @model_validator(mode="after")
+    def _dependency_wait_is_coherent(self) -> Self:
+        if self.task_id in self.related_task_ids:
+            raise ValueError("una Task no puede depender de sí misma")
+        if tuple(sorted(set(self.related_task_ids), key=str)) != self.related_task_ids:
+            raise ValueError("prerequisite task ids debe estar ordenado y sin duplicados")
+        if (
+            tuple(sorted(set(self.blocked_prerequisite_ids), key=str))
+            != self.blocked_prerequisite_ids
+        ):
+            raise ValueError("blocked_prerequisite_ids debe estar ordenado y sin duplicados")
+        if not set(self.blocked_prerequisite_ids) <= set(self.related_task_ids):
+            raise ValueError("blocked_prerequisite_ids debe ser subconjunto de related_task_ids")
+        if self.last_evaluated_at < self.waiting_since:
+            raise ValueError("last_evaluated_at no puede preceder waiting_since")
+        return self
+
+
 _WAIT_KIND_BY_STATE: dict[SchedulingState, WaitingKind] = {
     SchedulingState.WAITING_RESOURCE: WaitingKind.RESOURCE,
     SchedulingState.WAITING_DEPENDENCY: WaitingKind.DEPENDENCY,
@@ -226,10 +301,15 @@ class TaskSchedulingRecord(BaseModel):
 
     managed: bool = False
     state: SchedulingState = SchedulingState.QUEUED
-    waiting: ResourceWaitReason | WaitingReason | None = None
+    waiting: ResourceWaitReason | DependencyWaitReason | WaitingReason | None = None
     executor: ExecutorReference | None = None
     provider: ProviderReference | None = None
     resources: tuple[ResourceReference, ...] = Field(
+        default=(), max_length=MAX_SCHEDULING_REFERENCES
+    )
+    #: Prerequisitos operacionales declarados por esta Task (Fase 6). No es el DAG completo: cada
+    #: Task solo referencia sus propios prerequisitos, igual que ``resources`` con ResourceClaims.
+    dependencies: tuple[DependencyReference, ...] = Field(
         default=(), max_length=MAX_SCHEDULING_REFERENCES
     )
 
@@ -252,21 +332,35 @@ class TaskSchedulingRecord(BaseModel):
             and not isinstance(self.waiting, ResourceWaitReason)
         ):
             raise ValueError("RESOURCE_CONFLICT exige ResourceWaitReason completo")
+        if (
+            self.state is SchedulingState.WAITING_DEPENDENCY
+            and self.waiting is not None
+            and self.waiting.code == "DEPENDENCY_UNSATISFIED"
+            and not isinstance(self.waiting, DependencyWaitReason)
+        ):
+            raise ValueError("DEPENDENCY_UNSATISFIED exige DependencyWaitReason completo")
         identities = tuple((item.kind, item.key) for item in self.resources)
         if len(set(identities)) != len(identities):
             raise ValueError("las referencias de recursos no pueden repetirse")
+        prerequisite_ids = tuple(item.prerequisite_task_id for item in self.dependencies)
+        if len(set(prerequisite_ids)) != len(prerequisite_ids):
+            raise ValueError("las dependencias no pueden repetir el mismo prerequisito")
         if not self.managed and (
             self.state is not SchedulingState.QUEUED
             or self.waiting is not None
             or self.executor is not None
             or self.provider is not None
             or self.resources
+            or self.dependencies
         ):
             raise ValueError("una Task no gestionada no puede afirmar actividad de scheduling")
         return self
 
 
 __all__ = [
+    "DependencyCondition",
+    "DependencyReference",
+    "DependencyWaitReason",
     "ExecutorReference",
     "ProviderReference",
     "ResourceAccess",

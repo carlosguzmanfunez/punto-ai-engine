@@ -144,6 +144,8 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     # --- MULTI-TASK FASE 8A: RECOVERY POLICY / WAITING_RECOVERY ---------------
     "punto.providers.recovery_policy",
     "punto.scheduling.recovery_waits",
+    # --- MULTI-TASK FASE 8B: OPERATIONAL RECOVERY WIRING -----------------------
+    "punto.scheduling.recovery_wiring",
     # --- SKILL-LAYER-0: telemetría pasiva de eficiencia ------------------------
     "punto.telemetry",
     "punto.telemetry.efficiency",

@@ -343,6 +343,11 @@ class RecoveryWaitReason(WaitingReason):
     role: str = Field(min_length=1, max_length=40)
     failed_provider: str = Field(min_length=1, max_length=40)
     failure_kind: str = Field(min_length=1, max_length=40)
+    #: Fase 8B: resto de la cadena de recovery ya intentada dentro de esta MISMA recuperación
+    #: causal (p. ej. Codex, si DeepSeek fue el causal y Codex también falló operacionalmente
+    #: antes de esta evaluación) — nunca incluye a ``failed_provider``, que ya está separado.
+    #: Vacío en Fase 8A (una sola exclusión, sin cadena todavía).
+    also_excluded: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
     required_capabilities: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
     exclusion_reasons: tuple[str, ...] = Field(default=(), max_length=MAX_SCHEDULING_REFERENCES)
     waiting_since: datetime
@@ -379,6 +384,12 @@ class RecoveryWaitReason(WaitingReason):
             raise ValueError("el provider causalmente fallido no puede ser un candidato")
         if len(self.exclusion_reasons) != len(self.provider_ids):
             raise ValueError("exclusion_reasons debe tener un motivo por cada candidato")
+        if self.failed_provider in self.also_excluded:
+            raise ValueError("also_excluded no puede repetir al provider causalmente fallido")
+        if len(set(self.also_excluded)) != len(self.also_excluded):
+            raise ValueError("also_excluded no puede repetir un provider")
+        if set(self.also_excluded) & set(self.provider_ids):
+            raise ValueError("also_excluded y provider_ids (candidatos) no pueden solaparse")
         if self.last_evaluated_at < self.waiting_since:
             raise ValueError("last_evaluated_at no puede preceder waiting_since")
         return self

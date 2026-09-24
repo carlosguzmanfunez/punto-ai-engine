@@ -42,7 +42,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Final, NamedTuple
+from typing import Any, Final, NamedTuple, Protocol
 
 from punto.acceptance import (
     RETRYABLE_EVIDENCE_CLASSES,
@@ -125,6 +125,7 @@ from punto.providers.contract import (
     ProviderRole,
     ProviderStatus,
 )
+from punto.providers.failover import failover_cause_of
 from punto.providers.registry import ProviderRegistry
 from punto.providers.router import ProviderRouter
 from punto.schemas.audit import AuditEventType
@@ -385,6 +386,30 @@ class _StateEvaluation(NamedTuple):
     claim_records: tuple[ClaimRecord, ...]
 
 
+class OperationalRecoveryHook(Protocol):
+    """Fase 8B: qué hacer cuando el router agota su propio failover con un fallo operacional.
+
+    ``DevelopmentCycle`` no conoce ``TaskRecord``, ``LeaseLedger`` ni ``RecoveryPolicy`` (esos
+    tipos pertenecen a Multi-Task v0, ajeno a PILOT-04): solo invoca este hook en el punto exacto
+    donde la indisponibilidad operativa ya demostrada por ``ProviderRouter.execute`` sigue sin
+    resolverse, con la misma petición que ya se le hizo al asignado. Devuelve un
+    ``ProviderResult`` nuevo -- éxito si un candidato de recovery respondió, o un fallo (que el
+    ciclo trata exactamente como cualquier otro ``PROVIDER_FAILED``, sin distinguir en ``run()``)
+    si la recuperación quedó en ``WAITING_RECOVERY`` o se agotó. ``None`` (el valor por defecto de
+    ``DevelopmentCycle.recovery``) mantiene la Fase 8B inactiva, igual que ``fence`` para 2A.
+    """
+
+    def __call__(
+        self,
+        *,
+        role: ProviderRole,
+        request: ProviderRequest,
+        json_schema: Mapping[str, Any],
+        max_output_tokens: int | None,
+        failed: ProviderResult,
+    ) -> ProviderResult: ...
+
+
 @dataclass(slots=True)
 class DevelopmentCycle:
     """Ciclo de desarrollo gobernado, con todas sus dependencias inyectadas."""
@@ -404,6 +429,10 @@ class DevelopmentCycle:
     visual_interaction: InteractionRunner | None = None
     #: Hook compuesto TaskWriter+Provider. ``None`` mantiene Fase 2A inactiva por defecto.
     fence: Callable[[], None] | None = None
+    #: RECOVERY operacional (Fase 8B). ``None`` mantiene Multi-Task v0 inactivo por defecto: un
+    #: fallo operativo que el router no pudo resolver con su propio failover sigue terminando en
+    #: ``PROVIDER_FAILED``, exactamente como antes de esta fase.
+    recovery: OperationalRecoveryHook | None = None
     _snapshots: FileRepairSnapshots | None = field(default=None, init=False, repr=False)
     _checkpoint: RepairSnapshot | None = field(default=None, init=False, repr=False)
     _last_provider: str = field(default="", init=False, repr=False)
@@ -4375,6 +4404,41 @@ class DevelopmentCycle:
                 json_schema=schema,
                 max_output_tokens=self.config.max_output_tokens,
             )
+            # RECOVERY operacional (Fase 8B): el router ya agotó su propio failover
+            # (``FailoverPolicy``, estrecho a propósito) y el fallo sigue siendo indisponibilidad
+            # operativa demostrable (nunca una respuesta técnicamente incorrecta: esa no entra
+            # aquí, exactamente igual que en el failover del router). Sin ``self.recovery``
+            # (por defecto) el resultado se devuelve tal cual, como siempre.
+            if (
+                self.recovery is not None
+                and not result.ok
+                and failover_cause_of(result.error_kind) is not None
+            ):
+                failed_provider = result.provider
+                failed_kind = result.error_kind.value if result.error_kind else ""
+                result = self.recovery(
+                    role=role,
+                    request=provider_request,
+                    json_schema=schema,
+                    max_output_tokens=self.config.max_output_tokens,
+                    failed=result,
+                )
+                # Trazabilidad de Fase 8B (§7): proveedor previo -> fallo -> nuevo proveedor,
+                # en el mismo registro auditable que ya usa el failover del router (§12: éxito
+                # o WAITING_RECOVERY son ambos desenlaces legítimos de haber intentado recovery).
+                self._log(
+                    AuditEventType.BUILD_PROVIDER_SELECTED,
+                    "dev_provider_recovery",
+                    request,
+                    {
+                        "role": role.value,
+                        "failed_provider": failed_provider,
+                        "failure_kind": failed_kind,
+                        "provider": result.provider,
+                        "recovered": result.ok,
+                        "phase": phase,
+                    },
+                )
         if self.fence is not None:
             self.fence()
         self._last_provider = result.provider or self._last_provider

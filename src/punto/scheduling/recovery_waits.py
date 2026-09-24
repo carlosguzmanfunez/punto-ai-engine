@@ -59,7 +59,9 @@ class RecoveryDecision:
     failed_provider: str
     failure_kind: str
     required_capabilities: tuple[str, ...]
-    #: Orden general considerado (nunca incluye a ``failed_provider``).
+    #: Fase 8B: resto de la cadena de recovery ya intentada en esta MISMA recuperación causal.
+    also_excluded: tuple[str, ...]
+    #: Orden general considerado (nunca incluye a ``failed_provider`` ni a ``also_excluded``).
     ordered_candidates: tuple[str, ...]
     #: Candidatos descartados, en el mismo orden, con su motivo -- BUSY incluido.
     excluded_candidates: tuple[tuple[str, str], ...]
@@ -122,12 +124,13 @@ def _recovery_reason(task: TaskRecord) -> RecoveryWaitReason | None:
     return reason if isinstance(reason, RecoveryWaitReason) else None
 
 
-def _is_lease_busy(ledger: LeaseLedger, provider: str, now: datetime) -> bool:
+def is_provider_lease_busy(ledger: LeaseLedger, provider: str, now: datetime) -> bool:
     """Lee el ProviderLease sin mutar el ledger: BUSY solo si sigue ACTIVE y no expiró.
 
     Un lease expirado por reloj pero todavía no barrido por ``reconcile``/``acquire`` no cuenta
     como BUSY aquí: es exactamente lo que ``LeaseRecord.expires_at`` existe para decidir sin
-    necesitar el barrido perezoso interno del ledger.
+    necesitar el barrido perezoso interno del ledger. Pública (Fase 8B): la reutiliza también
+    ``punto.scheduling.recovery_wiring`` para revalidar justo antes de invocar.
     """
     head = ledger.head(kind=LeaseKind.PROVIDER, key="", provider_id=provider, slot=0)
     return head is not None and head.state is LeaseState.ACTIVE and head.expires_at > now
@@ -138,6 +141,7 @@ def _recovery_fingerprint(
     failed_provider: str,
     failure_kind: str,
     required_capabilities: tuple[str, ...],
+    also_excluded: tuple[str, ...],
     excluded: tuple[tuple[str, str], ...],
     selected: str | None,
 ) -> str:
@@ -145,6 +149,7 @@ def _recovery_fingerprint(
         "failed_provider": failed_provider,
         "failure_kind": failure_kind,
         "required_capabilities": list(required_capabilities),
+        "also_excluded": list(also_excluded),
         "excluded": [{"provider": provider, "reason": reason} for provider, reason in excluded],
         "selected": selected,
     }
@@ -177,8 +182,13 @@ class RecoveryWaitCoordinator:
         failed_provider: str,
         failure_kind: str,
         required_capabilities: tuple[str, ...] = (),
+        also_exclude: frozenset[str] = frozenset(),
     ) -> RecoveryWaitEvaluation:
-        """Evalúa una vez; el caller decide cuándo persistir el registro devuelto."""
+        """Evalúa una vez; el caller decide cuándo persistir el registro devuelto.
+
+        ``also_exclude`` (Fase 8B) es el resto de una cadena de recovery ya intentada dentro de
+        esta MISMA recuperación causal -- vacío en Fase 8A (una sola exclusión).
+        """
         with self._lock:
             return self._evaluate(
                 task,
@@ -186,6 +196,7 @@ class RecoveryWaitCoordinator:
                 failed_provider=failed_provider,
                 failure_kind=failure_kind,
                 required_capabilities=required_capabilities,
+                also_exclude=also_exclude,
             )
 
     def _evaluate(
@@ -196,6 +207,7 @@ class RecoveryWaitCoordinator:
         failed_provider: str,
         failure_kind: str,
         required_capabilities: tuple[str, ...],
+        also_exclude: frozenset[str] = frozenset(),
     ) -> RecoveryWaitEvaluation:
         if _is_terminal(task):
             return RecoveryWaitEvaluation(
@@ -210,7 +222,7 @@ class RecoveryWaitCoordinator:
             )
         needs_vision = "VISION" in required_capabilities
         judgments = self._router.recovery_candidates(
-            role, exclude=failed_provider, needs_vision=needs_vision
+            role, exclude=failed_provider, also_exclude=also_exclude, needs_vision=needs_vision
         )
         now = self._clock().astimezone(UTC)
         decision = self._decide(
@@ -219,6 +231,7 @@ class RecoveryWaitCoordinator:
             failed_provider=failed_provider,
             failure_kind=failure_kind,
             required_capabilities=required_capabilities,
+            also_excluded=tuple(sorted(also_exclude)),
             judgments=judgments,
             now=now,
         )
@@ -234,6 +247,7 @@ class RecoveryWaitCoordinator:
         failed_provider: str,
         failure_kind: str,
         required_capabilities: tuple[str, ...],
+        also_excluded: tuple[str, ...],
         judgments: tuple[RecoveryCandidateJudgment, ...],
         now: datetime,
     ) -> RecoveryDecision:
@@ -246,7 +260,7 @@ class RecoveryWaitCoordinator:
                 continue
             # BUSY (§7): sano pero con el slot ocupado ahora -- no es failed, se salta y se
             # sigue evaluando al siguiente candidato del orden general.
-            if _is_lease_busy(self._ledger, judgment.provider, now):
+            if is_provider_lease_busy(self._ledger, judgment.provider, now):
                 excluded.append((judgment.provider, "BUSY: ProviderLease vigente"))
                 continue
             selected = judgment.provider
@@ -260,6 +274,7 @@ class RecoveryWaitCoordinator:
             failed_provider=failed_provider,
             failure_kind=failure_kind,
             required_capabilities=required_capabilities,
+            also_excluded=also_excluded,
             excluded=tuple(excluded),
             selected=selected,
         )
@@ -269,6 +284,7 @@ class RecoveryWaitCoordinator:
             failed_provider=failed_provider,
             failure_kind=failure_kind,
             required_capabilities=required_capabilities,
+            also_excluded=also_excluded,
             ordered_candidates=ordered,
             excluded_candidates=tuple(excluded),
             selected_candidate=selected,
@@ -328,6 +344,7 @@ class RecoveryWaitCoordinator:
             failed_provider=decision.failed_provider,
             failure_kind=decision.failure_kind,
             required_capabilities=decision.required_capabilities,
+            also_excluded=decision.also_excluded,
             provider_ids=decision.ordered_candidates,
             exclusion_reasons=tuple(reason for _, reason in decision.excluded_candidates),
             waiting_since=waiting_since,
@@ -386,6 +403,7 @@ class RecoveryWaitCoordinator:
                     failed_provider=reason.failed_provider,
                     failure_kind=reason.failure_kind,
                     required_capabilities=reason.required_capabilities,
+                    also_exclude=frozenset(reason.also_excluded),
                 )
                 current[task.task_id] = evaluation.task
                 evaluations.append(evaluation)
@@ -442,4 +460,5 @@ __all__ = [
     "RecoveryWaitError",
     "RecoveryWaitEvaluation",
     "RecoveryWaitOutcome",
+    "is_provider_lease_busy",
 ]

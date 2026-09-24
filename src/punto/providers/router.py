@@ -307,14 +307,23 @@ class ProviderRouter:
         return self._recovery_policy
 
     def recovery_candidates(
-        self, role: ProviderRole, *, exclude: str, needs_vision: bool = False
+        self,
+        role: ProviderRole,
+        *,
+        exclude: str,
+        also_exclude: frozenset[str] = frozenset(),
+        needs_vision: bool = False,
     ) -> tuple[RecoveryCandidateJudgment, ...]:
         """Candidatos de recuperación para ``role``, en el orden general declarado, sin invocar.
 
         ``exclude`` (normalizado a minúsculas) nunca aparece en el resultado: el provider
         causalmente fallido no es un candidato rechazado más, es estructuralmente inelegible y ni
-        siquiera se juzga. Sin política para el rol, o sin evaluador, devuelve ``()`` -- el
-        llamante falla cerrado si lo necesita, igual que ``resolve_route`` sin evaluador.
+        siquiera se juzga. ``also_exclude`` (Fase 8B) es el resto de una cadena de recovery ya
+        intentada dentro de la MISMA recuperación causal -- tratado exactamente igual: ninguno de
+        sus miembros se juzga ni aparece en el resultado, para que "ya lo intenté y falló" nunca
+        se confunda con "no es elegible por este motivo". Sin política para el rol, o sin
+        evaluador, devuelve ``()`` -- el llamante falla cerrado si lo necesita, igual que
+        ``resolve_route`` sin evaluador.
 
         No comprueba BUSY de ningún ``ProviderLease``: este router no conoce leases. Un candidato
         aquí ``eligible=True`` sigue necesitando esa comprobación en la capa de scheduling.
@@ -325,7 +334,7 @@ class ProviderRouter:
         excluded = exclude.strip().lower()
         declared = policy.preferred(role)
         names = declared if declared else tuple(self._entries)
-        seen: set[str] = {excluded}
+        seen: set[str] = {excluded, *(item.strip().lower() for item in also_exclude)}
         judgments: list[RecoveryCandidateJudgment] = []
         for raw in names:
             name = raw.strip().lower()
@@ -539,6 +548,73 @@ class ProviderRouter:
                 f"ningún proveedor autorizado y capaz sigue disponible para {role.value} "
                 f"tras excluir a quien ya respondió: {'; '.join(rejections) or 'sin candidatos'}"
             ),
+            error_kind=ProviderErrorKind.UNAVAILABLE,
+        )
+
+    def execute_recovery(
+        self,
+        role: ProviderRole,
+        request: ProviderRequest,
+        *,
+        exclude: frozenset[str],
+        json_schema: Mapping[str, object] | None = None,
+        max_output_tokens: int | None = None,
+    ) -> ProviderResult:
+        """Ejecuta el rol con el primer candidato EFECTIVO de RECOVERY que no esté en ``exclude``
+        -- Fase 8B, invocación real de un candidato ya validado por ``recovery_candidates``.
+
+        Mismo propósito que :meth:`execute_alternative`, pero para RECOVERY OPERACIONAL, nunca
+        para TAKEOVER de calidad: usa ``self._recovery_policy``/``self._recovery_evaluator``,
+        jamás ``self._takeover_policy``. ``exclude`` es el conjunto COMPLETO ya intentado en esta
+        cadena causal (el causante original más cualquier candidato que también haya fallado
+        operacionalmente en esta MISMA recuperación) -- a diferencia de
+        :meth:`recovery_candidates` (que solo excluye a uno más ``also_exclude``, pensado para la
+        decisión durable de Fase 8A), aquí el llamante ya sabe la cadena completa y la declara de
+        una vez. El orden general de ``RecoveryPolicy`` ya incluye a los tres providers capaces
+        del rol (a diferencia de failover/takeover, que asumen un primario y listan solo
+        sustitutos): no se antepone ``assigned`` -- sería redundante.
+
+        Sin política de recovery para el rol, o si todos los candidatos declarados están en
+        ``exclude`` o no son elegibles, devuelve un resultado ``UNAVAILABLE`` explícito: no hay
+        bucle de candidatos infinito.
+        """
+        request_id = request.request_id or f"{role.value.lower()}-sin-id"
+        policy = self._recovery_policy
+        evaluator = self._recovery_evaluator
+        declared = policy.preferred(role) if policy is not None and policy.covers(role) else ()
+        rejections: list[str] = []
+        for raw in dict.fromkeys(declared):
+            name = raw.strip().lower()
+            if name in exclude:
+                rejections.append(f"{name}: ya se intentó en esta cadena de recovery")
+                continue
+            entry = self._entries.get(name)
+            if entry is None:
+                rejections.append(f"{name}: no está registrado en el router")
+                continue
+            verdict = self._judge_with(evaluator, role, name, request.has_attachments)
+            if not verdict.eligible:
+                rejections.append(f"{name}: {verdict.reason or 'no elegible'}")
+                continue
+            if verdict.metered and (policy is None or not policy.allow_metered):
+                rejections.append(f"{name}: transporte de pago por uso (allow_metered=false)")
+                continue
+            return self._run_entry(
+                role,
+                request,
+                entry,
+                request_id=request_id,
+                json_schema=json_schema,
+                max_output_tokens=max_output_tokens,
+            )
+        detail = "; ".join(rejections) or "sin política de recovery declarada para este rol"
+        return ProviderResult(
+            request_id=request_id,
+            provider="",
+            model="",
+            status=ProviderStatus.UNAVAILABLE,
+            role=role,
+            error=f"recovery de {role.value}: ningún candidato disponible ({detail})",
             error_kind=ProviderErrorKind.UNAVAILABLE,
         )
 

@@ -203,6 +203,15 @@ NON_OPERATIONAL_STAGES: Final[frozenset[str]] = frozenset({"PRODUCTION_VALIDATED
 RERUN_EXECUTING_REASON: Final[str] = (
     "la tarea ya tiene una ejecución en curso: espera a que termine antes de volver a ejecutarla"
 )
+#: Una Task ``managed=True`` es de la autoridad operacional del scheduler: la consola histórica no
+#: ejecuta su ciclo, ni por /run ni absorbiendo una solicitud equivalente.
+RERUN_MANAGED_REASON: Final[str] = (
+    "la Task pertenece al scheduler (managed): la consola no ejecuta su ciclo"
+)
+SCHEDULER_EQUIVALENT_REASON: Final[str] = (
+    "ya existe una Task equivalente gestionada por el scheduler: la consola no la absorbe ni "
+    "crea un duplicado"
+)
 RERUN_PUBLISHING_REASON: Final[str] = (
     "la tarea está publicándose: no se vuelve a ejecutar el desarrollo durante la publicación"
 )
@@ -377,6 +386,8 @@ class ConsoleTask:
         Es la única fuente de esa decisión: la usa el endpoint para rechazar y la vista para que la
         interfaz sepa si ofrecer la acción. La interfaz no decide nada por su cuenta.
         """
+        if self.scheduling.managed:
+            return RERUN_MANAGED_REASON
         if self.lineage_status == SUPERSEDED_LINEAGE:
             return RERUN_SUPERSEDED_REASON
         if self.stage == ConsoleStage.REJECTED.value:
@@ -648,11 +659,14 @@ def register_human_console(
         operación que la persona está haciendo.
         """
         try:
+            # Instantánea y escritura bajo la MISMA exclusión: las escrituras quedan en el orden de
+            # sus instantáneas, así que una persistencia más vieja (p. ej. la del handler de /run)
+            # nunca termina encima de una más nueva (la del worker que cerró el intento).
             with state_lock:
                 snapshot = tuple(tasks.values())
                 records = [_task_record(task) for task in snapshot]
                 approvals = [_gate_record(item) for item in _console_gates(snapshot, dependencies)]
-            store.save(tasks=records, gates=approvals)
+                store.save(tasks=records, gates=approvals)
         except ConsoleStateError as exc:
             _log_state_event(
                 dependencies,
@@ -765,9 +779,16 @@ def register_human_console(
         task.target_work_branch = identity.work_branch
         task.target_production_branch = identity.production_branch
         with _TASKS_LOCK:
-            canonical = _canonical_equivalent(task, tasks, dependencies)
-            if canonical is None:
+            owned = _scheduler_equivalent(task, tasks)
+            canonical = None if owned else _canonical_equivalent(task, tasks, dependencies)
+            if canonical is None and not owned:
                 tasks[str(task.task_id)] = task
+        if owned:
+            # El mismo trabajo ya es del scheduler: ni se absorbe (ciclo legacy) ni se duplica.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"{SCHEDULER_EQUIVALENT_REASON}: {owned}",
+            )
         if canonical is not None:
             response.status_code = status.HTTP_200_OK
             return _absorb_into_canonical(
@@ -1858,9 +1879,19 @@ def _canonical_equivalent(
     equivalents = [
         item
         for item in find_equivalents(candidate, tasks.values())
-        if target is None or not _identity_block(item, target)
+        if not _scheduler_owned(item) and (target is None or not _identity_block(item, target))
     ]
     return pick_canonical(equivalents) if equivalents else None
+
+
+def _scheduler_equivalent(candidate: ConsoleTask, tasks: Mapping[str, ConsoleTask]) -> str:
+    """Id (el menor, determinista) de una Task del scheduler equivalente, o ``""``."""
+    owned = sorted(
+        str(item.task_id)
+        for item in find_equivalents(candidate, tasks.values())
+        if _scheduler_owned(item)
+    )
+    return owned[0] if owned else ""
 
 
 def _absorb_into_canonical(

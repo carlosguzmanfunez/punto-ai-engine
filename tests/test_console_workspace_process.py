@@ -274,8 +274,9 @@ def test_el_resultado_del_ultimo_intento_sobrevive_al_reinicio(tmp_path: Path) -
     client.post(f"/console/tasks/{tarea['task_id']}/run")
     ultima = _esperar_intento(client, tarea["task_id"], intentos=2)
 
-    documento = json.loads(_estado().read_text(encoding="utf-8"))
-    guardada = documento["tasks"][0]
+    # Lo que se verifica es el hecho DURABLE: el intento cerrado se ve en memoria antes de que el
+    # worker lo persista, así que se espera (acotado) al documento, no a la memoria.
+    guardada = _esperar_intento_durable(tarea["task_id"], intentos=2)
     assert guardada["result"]["error_kind"] == "CYCLE_ERROR"
     assert ultima["development"]["error_kind"] == "CYCLE_ERROR"
     assert len(guardada["attempts"]) == 2
@@ -332,6 +333,17 @@ def _consola_inyectada(
     register_dashboard(application)
     register_human_console(application, dependencies)
     return TestClient(application), audit
+
+
+def _esperar_intento_durable(task_id: str, *, intentos: int) -> dict[str, Any]:
+    """Espera (acotado) a que el estado DURABLE tenga ese numero de intentos cerrados."""
+    limite = time.monotonic() + 30.0
+    while time.monotonic() < limite:
+        for guardada in json.loads(_estado().read_text(encoding="utf-8")).get("tasks", []):
+            if guardada["task_id"] == task_id and len(guardada["attempts"]) >= intentos:
+                return dict(guardada)
+        time.sleep(0.02)
+    raise AssertionError("el intento no llego al estado durable a tiempo (lost update)")
 
 
 def _esperar_intento(client: TestClient, task_id: str, *, intentos: int = 1) -> dict[str, Any]:

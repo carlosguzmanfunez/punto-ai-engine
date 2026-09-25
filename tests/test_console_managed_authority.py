@@ -180,3 +180,142 @@ def test_f_la_proyeccion_sigue_siendo_read_only() -> None:
     for _ in range(3):
         assert client.get("/console/operations").status_code == 200
     assert path.read_bytes() == before and path.stat().st_mtime_ns == mtime
+
+
+# =====================================================================================
+# Fase 13R · GAP B: una solicitud equivalente no absorbe una Task del scheduler (H-L)
+# =====================================================================================
+class _CycleSpy:
+    """Ciclo que registra cualquier intento de ejecución legacy (no debe haber ninguno)."""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def run(self, request: Any) -> Any:
+        self.calls.append(request)
+        raise RuntimeError("el ciclo legacy no debía ejecutarse")
+
+
+def _scheduler_twin(state: str) -> TaskRecord:
+    """Task gestionada del MISMO trabajo que ``SOLICITUD`` (mismo destino y firma)."""
+    from test_console_workspace_process import SOLICITUD
+
+    base = make_task("S", resource=("path", "src/**")).model_copy(
+        update={
+            "objective": SOLICITUD["objective"],
+            "target_id": TARGET_ID,
+            "acceptance_criteria": tuple(SOLICITUD["acceptance_criteria"]),
+            "scope_paths": tuple(SOLICITUD["scope_paths"]),
+        }
+    )
+    if state == "RUNNING":
+        return running(base)
+    other = running(make_task("O", resource=("path", "src/**"), offset=-1))
+    return resource_waiting(base, other)
+
+
+def _console_for_target(tmp_path: Path) -> tuple[TestClient, _CycleSpy, Any]:
+    from test_console_workspace_process import _consola_inyectada
+
+    repo, remoto = _repos(tmp_path)
+    destino = _target(repo, remoto=remoto)
+    client, _audit = _consola_inyectada(destino, run_inline=True)
+    spy = _CycleSpy()
+    client.app.state.human_console.dev_cycle = spy
+    return client, spy, destino
+
+
+def _post_equivalent(client: TestClient) -> Any:
+    from test_console_workspace_process import SOLICITUD
+
+    return client.post("/console/tasks", json=SOLICITUD)
+
+
+def _assert_refused(response: Any, twin: TaskRecord) -> None:
+    assert response.status_code == 409, response.text
+    assert "gestionada por el scheduler" in response.json()["detail"]
+    assert str(twin.task_id) in response.json()["detail"]
+
+
+# ============================================================ H / I
+def test_h_i_post_equivalente_no_reutiliza_la_task_managed_waiting_resource(
+    tmp_path: Path,
+) -> None:
+    twin = _scheduler_twin("WAITING_RESOURCE")
+    persist(twin)
+    client, spy, _destino = _console_for_target(tmp_path)
+    antes = client.get("/console/tasks").json()["total"]
+
+    _assert_refused(_post_equivalent(client), twin)
+
+    assert spy.calls == []  # ningún ciclo legacy
+    assert client.get("/console/tasks").json()["total"] == antes  # ni duplicado ni absorción
+    stored = disk()[str(twin.task_id)]
+    assert stored == dump(twin)  # I · idéntica, incluido WAITING_RESOURCE y su blocker
+
+
+# ============================================================ J
+def test_j_managed_running_permanece_identica_y_su_ciclo_no_se_lanza(tmp_path: Path) -> None:
+    twin = _scheduler_twin("RUNNING")
+    persist(twin)
+    client, spy, _destino = _console_for_target(tmp_path)
+
+    _assert_refused(_post_equivalent(client), twin)
+    rerun = client.post(f"/console/tasks/{twin.task_id}/run")
+    assert rerun.status_code == 409
+    assert "pertenece al scheduler" in rerun.json()["detail"]
+    view = client.get(f"/console/tasks/{twin.task_id}").json()
+    # La interfaz no ofrece la acción: la decisión es la misma que la del endpoint.
+    assert view["rerun"] == {"allowed": False, "reason": rerun.json()["detail"]}
+
+    assert spy.calls == []
+    assert disk()[str(twin.task_id)] == dump(twin)
+
+
+def test_h2_con_una_unmanaged_equivalente_tambien_manda_el_scheduler(tmp_path: Path) -> None:
+    from test_console_workspace_process import SOLICITUD
+
+    twin = _scheduler_twin("RUNNING")
+    legacy = unmanaged(SOLICITUD["objective"], target_id=TARGET_ID).model_copy(
+        update={"acceptance_criteria": tuple(SOLICITUD["acceptance_criteria"])}
+    )
+    persist(twin, legacy)
+    client, spy, _destino = _console_for_target(tmp_path)
+    before = disk()
+
+    _assert_refused(_post_equivalent(client), twin)
+    assert spy.calls == []
+    assert disk() == before  # ni la gestionada ni la legacy se tocan
+
+
+# ============================================================ K
+def test_k_unmanaged_equivalente_conserva_la_absorcion_historica(tmp_path: Path) -> None:
+    from test_console_workspace_process import SOLICITUD
+
+    client, _spy, _destino = _console_for_target(tmp_path)
+    primera = client.post("/console/tasks", json={**SOLICITUD, "run": False})
+    assert primera.status_code == 201, primera.text
+    segunda = client.post("/console/tasks", json={**SOLICITUD, "run": False})
+    assert segunda.status_code == 200
+    body = segunda.json()
+    assert body["deduplicated"] is True
+    assert body["duplicate_of"] == primera.json()["task_id"]
+    assert client.get("/console/tasks").json()["total"] == 1
+
+
+# ============================================================ L
+def test_l_restart_y_mount_repetidos_no_cambian_el_resultado(tmp_path: Path) -> None:
+    twin = _scheduler_twin("WAITING_RESOURCE")
+    persist(twin)
+    client, spy, destino = _console_for_target(tmp_path)
+    _assert_refused(_post_equivalent(client), twin)
+    first = disk()
+
+    from test_console_workspace_process import _consola_inyectada
+
+    for _ in range(3):
+        again, _audit = _consola_inyectada(destino, run_inline=True)
+        again.app.state.human_console.dev_cycle = spy
+        _assert_refused(_post_equivalent(again), twin)
+        assert disk() == first
+    assert spy.calls == []

@@ -1,0 +1,182 @@
+"""Fase 13 · hallazgo #1: el arranque de la consola no consolida Tasks del scheduler (A-F).
+
+Invariante: una Task con ``scheduling.managed=True`` pertenece a la autoridad operacional del
+scheduler. La consolidación histórica de la consola (``_consolidate_tasks``: identidad y
+``duplicate_objective``) y la anotación de «recuperada a mitad de camino» no pueden cambiar su
+identidad, su linaje, su scheduling ni ningún otro campo. Las Tasks no gestionadas conservan el
+comportamiento histórico.
+
+    pytest tests/test_console_managed_authority.py -q
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from punto.api.console import ConsoleDependencies, register_human_console
+from punto.api.console_state import ConsoleStateStore, TaskRecord
+from punto.audit.logger import AuditLogger
+from punto.policy.human_gate import HumanGate
+from punto.policy.policy_engine import PolicyEngine
+from punto.schemas.scheduling import TaskSchedulingRecord
+from punto.workspace.target import DevelopmentTarget
+from test_human_console import TARGET_ID, _repos, _target
+from test_operational_projection import (
+    NOW,
+    by_id,
+    make_task,
+    mount_console,
+    persist,
+    resource_waiting,
+    running,
+)
+
+#: Objetivos que ``signature_equivalent`` considera el mismo trabajo (así colisionaron en F13).
+SIMILAR = ("Fase 11 A", "Fase 11 B")
+
+
+def managed(label: str, objective: str, *, offset: int = 0, **options: Any) -> TaskRecord:
+    return make_task(label, offset=offset, **options).model_copy(update={"objective": objective})
+
+
+def unmanaged(objective: str, *, offset: int = 0, target_id: str = "phase13-target") -> TaskRecord:
+    created = NOW + timedelta(seconds=offset)
+    return TaskRecord(
+        task_id=__import__("uuid").uuid4(),
+        objective=objective,
+        target_id=target_id,
+        scope_paths=("src",),
+        stage="QUEUED",
+        created_at=created,
+        updated_at=created,
+        scheduling=TaskSchedulingRecord(),
+    )
+
+
+def disk() -> dict[str, dict[str, Any]]:
+    snapshot = ConsoleStateStore().load()
+    assert snapshot.recovered, snapshot.detail
+    return {str(task.task_id): task.model_dump(mode="json") for task in snapshot.tasks}
+
+
+def dump(task: TaskRecord) -> dict[str, Any]:
+    return task.model_dump(mode="json")
+
+
+def mount_with_target(target: DevelopmentTarget) -> TestClient:
+    application = FastAPI()
+    register_human_console(
+        application,
+        ConsoleDependencies(
+            dev_cycle=object(),  # type: ignore[arg-type]
+            gates=HumanGate(),
+            audit=AuditLogger(),
+            policy=PolicyEngine.from_config(),
+            targets={TARGET_ID: target},
+            run_inline=True,
+        ),
+    )
+    return TestClient(application)
+
+
+def scheduler_document() -> tuple[TaskRecord, TaskRecord, TaskRecord, TaskRecord]:
+    """A RUNNING + B WAITING_RESOURCE (gestionadas, objetivos equivalentes) y un par legacy
+    equivalente, que obliga a la consola a consolidar y a PERSISTIR en el arranque."""
+    a = running(managed("A", SIMILAR[0]))
+    b = resource_waiting(managed("B", SIMILAR[1], offset=1), a)
+    legacy_old = unmanaged("unificar la lista de tipos en una sola fuente", offset=2)
+    legacy_new = unmanaged("unificar la lista de tipos en una sola fuente", offset=3)
+    persist(a, b, legacy_old, legacy_new)
+    return a, b, legacy_old, legacy_new
+
+
+# ============================================================ A
+def test_a_montar_la_consola_no_cambia_ningun_campo_de_una_task_waiting_resource() -> None:
+    a, b, _old, _new = scheduler_document()
+    mount_console()
+    after = disk()
+    assert after[str(b.task_id)] == dump(b)
+    assert after[str(a.task_id)] == dump(a)
+
+
+# ============================================================ B
+def test_b_managed_running_no_se_supera_por_objetivo_equivalente_ni_por_identidad(
+    tmp_path: Path,
+) -> None:
+    a = running(managed("A", SIMILAR[0]))
+    twin = unmanaged(SIMILAR[1], offset=1)
+    persist(a, twin)
+    mount_console()
+    assert disk()[str(a.task_id)] == dump(a)
+
+    # Identidad: una Task gestionada con otra huella de destino tampoco la supera la consola.
+    repo, remoto = _repos(tmp_path)
+    target = _target(repo, remoto=remoto)
+    foreign = running(managed("F", "Rehacer la ficha del inmueble")).model_copy(
+        update={"target_id": TARGET_ID, "target_identity": "f" * 64}
+    )
+    persist(foreign)
+    mount_with_target(target)
+    stored = disk()[str(foreign.task_id)]
+    assert stored == dump(foreign)
+    assert stored["lineage_status"] == "ACTIVE" and stored["scheduling"]["state"] == "RUNNING"
+
+
+# ============================================================ C
+def test_c_dos_managed_similares_conservan_identidad_y_linaje() -> None:
+    a, b, _old, _new = scheduler_document()
+    client = mount_console()
+    after = disk()
+    for task in (a, b):
+        stored = after[str(task.task_id)]
+        assert stored["task_id"] == str(task.task_id)
+        assert stored["lineage_status"] == "ACTIVE"
+        assert stored["superseded_by"] is None and stored["relations"] == []
+    body = client.get("/console/operations").json()
+    assert by_id(body, b)["operational_display_state"] == "WAITING_RESOURCE"
+    assert by_id(body, b)["blocking_task_ids"] == [str(a.task_id)]
+
+
+# ============================================================ D
+def test_d_la_consolidacion_historica_de_unmanaged_no_cambia() -> None:
+    _a, _b, old, new = scheduler_document()
+    mount_console()
+    after = disk()
+    stored_old, stored_new = after[str(old.task_id)], after[str(new.task_id)]
+    # Mismo desenlace histórico: una canónica ACTIVE y la otra SUPERSEDED por duplicate_objective.
+    lineages = sorted([stored_old["lineage_status"], stored_new["lineage_status"]])
+    assert lineages == ["ACTIVE", "SUPERSEDED"]
+    superseded = stored_old if stored_old["lineage_status"] == "SUPERSEDED" else stored_new
+    canonical = stored_new if superseded is stored_old else stored_old
+    assert superseded["supersession_cause"] == "duplicate_objective"
+    assert superseded["superseded_by"] == canonical["task_id"]
+    assert {"kind": "supersedes", "task_id": superseded["task_id"]}.items() <= next(
+        rel for rel in canonical["relations"] if rel["kind"] == "supersedes"
+    ).items()
+
+
+# ============================================================ E
+def test_e_montar_y_reiniciar_repetidamente_es_idempotente() -> None:
+    a, b, _old, _new = scheduler_document()
+    mount_console()
+    first = disk()
+    for _ in range(3):
+        mount_console()
+        assert disk() == first
+    assert first[str(a.task_id)] == dump(a) and first[str(b.task_id)] == dump(b)
+
+
+# ============================================================ F
+def test_f_la_proyeccion_sigue_siendo_read_only() -> None:
+    scheduler_document()
+    client = mount_console()
+    path = ConsoleStateStore().path
+    before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+    for _ in range(3):
+        assert client.get("/console/operations").status_code == 200
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == mtime

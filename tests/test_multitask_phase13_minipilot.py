@@ -68,14 +68,10 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Harness
     built.scheduler.shutdown(wait=True)
 
 
-#: Objetivos realmente distintos. La consola, al arrancar, consolida como ``duplicate_objective``
-#: Tasks activas con objetivos equivalentes (hallazgo fuera de alcance F13): el piloto modela
-#: trabajos distintos, y ``operations`` exige igualmente que montar + consultar no escriba nada.
-OBJECTIVES = {
-    "A": "Unificar los tipos de propiedad en una fuente canónica",
-    "B": "Rediseñar la rejilla del catálogo de inmuebles",
-    "I": "Integrar outputs verificados de las Tasks fuente",
-}
+#: Objetivos del F11 que ``signature_equivalent`` considera el mismo trabajo: con ellos la consola
+#: superaba al montar una Task gestionada (hallazgo #1). Ahora no la toca, y ``operations`` exige
+#: que montar + consultar no cambie ni un byte del documento del scheduler.
+OBJECTIVES = {"A": "Fase 11 A", "B": "Fase 11 B", "I": "Fase 11 integración A+B"}
 
 
 def task(label: str, **options: Any) -> Any:

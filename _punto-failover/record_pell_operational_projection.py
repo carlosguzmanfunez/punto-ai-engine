@@ -26,7 +26,9 @@ def main() -> int:
         attempts=(),
         failure_reason=(
             "la consola reconstruía ConsoleTask campo a campo y omitía kind: una Integration Task "
-            "recuperada se re-persistía como DEVELOPMENT sin error de validación"
+            "recuperada se re-persistía como DEVELOPMENT sin error de validación; y el arranque de "
+            "la consola (consolidación duplicate_objective/identidad + nota de recuperación) "
+            "superaba y anotaba Tasks managed=True del scheduler por objetivo parecido"
         ),
         solution=(
             "proyección pura sobre los TaskRecord durables (GET /console/operations relee el "
@@ -43,14 +45,19 @@ def main() -> int:
             "el resumen compacto no borra el detalle causal: siempre acompaña el motivo completo",
             "todo round-trip campo a campo de un registro durable debe copiar cada campo de "
             "identidad (kind): probarlo con restore->persist",
+            "una Task managed=True es de la autoridad del scheduler: la consolidación histórica "
+            "de la consola no la supera, no la elige canónica y no le añade notas ni relaciones",
+            "un test que verifica un hecho durable espera al hecho durable, no a su reflejo en "
+            "memoria: la visibilidad en memoria precede a persist por diseño",
         ),
         result=ExperienceResult.SUCCESS,
         verification=(
             "tests/test_operational_projection.py: 21 PASS (A-V + regresión kind + linaje)",
             "tests/test_multitask_phase13_minipilot.py: 4/4 PASS sobre scheduler F11 real, "
             "consola real y página real en Node",
-            "tests/test_multitask_phase13_mutations.py: 12/12 mutaciones CAUGHT, motivo verificado",
-            "cono causal 334 PASS (1 carrera preexistente en base, misma tasa); ruff; mypy strict",
+            "tests/test_console_managed_authority.py: 6 PASS (A-F), 4 rojos antes del fix",
+            "tests/test_multitask_phase13_mutations.py: 13/13 mutaciones CAUGHT, motivo verificado",
+            "cono causal 342 PASS; ruff; mypy strict",
         ),
         tags=(
             "type:operational-projection-phase13",

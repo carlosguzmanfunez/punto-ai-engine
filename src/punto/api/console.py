@@ -1454,7 +1454,7 @@ def _restore_console_state(
         recovered_at = utc_now()
         for record in snapshot.tasks:
             task = _task_from_record(record, recovered_at)
-            if task.stage in IN_FLIGHT_STAGES:
+            if task.stage in IN_FLIGHT_STAGES and not _scheduler_owned(task):
                 # La etapa se conserva tal cual —no se convierte en fallo ni en cierre— y se deja
                 # dicho que ese trabajo ya no está corriendo en este proceso.
                 task.notes = [*task.notes[-4:], INTERRUPTED_NOTE]
@@ -1945,7 +1945,9 @@ def _relate_quarantined_duplicates(tasks: Mapping[str, ConsoleTask]) -> int:
     quarantined = [
         item
         for item in sorted(tasks.values(), key=lambda item: item.created_at)
-        if item.lineage_status == SUPERSEDED_LINEAGE and item.superseded_by is None
+        if item.lineage_status == SUPERSEDED_LINEAGE
+        and item.superseded_by is None
+        and not _scheduler_owned(item)
     ]
     seen: list[list[ConsoleTask]] = []
     for item in quarantined:
@@ -1978,6 +1980,15 @@ def _relate_quarantined_duplicates(tasks: Mapping[str, ConsoleTask]) -> int:
     return added
 
 
+def _scheduler_owned(task: ConsoleTask) -> bool:
+    """True si la Task pertenece a la autoridad operacional del scheduler (``managed=True``).
+
+    La consolidación histórica de la consola no la toca: ni la supera, ni la elige canónica de otra,
+    ni le añade relaciones o notas. Su identidad, linaje y scheduling son del scheduler.
+    """
+    return task.scheduling.managed
+
+
 def _consolidate_tasks(tasks: Mapping[str, ConsoleTask], deps: ConsoleDependencies) -> int:
     """Consolidación general del registro (al recuperar): identidad y duplicados.
 
@@ -1986,12 +1997,13 @@ def _consolidate_tasks(tasks: Mapping[str, ConsoleTask], deps: ConsoleDependenci
     2. Las Tasks activas equivalentes de un mismo destino se agrupan y solo la canónica sigue
        operativa; el resto queda ``SUPERSEDED`` por ``duplicate_objective`` apuntando a ella.
 
-    Idempotente y sin borrar nada. Devuelve cuántas Tasks cambiaron de linaje.
+    Idempotente y sin borrar nada. Devuelve cuántas Tasks cambiaron de linaje. Las Tasks del
+    scheduler (``managed=True``) quedan fuera: su autoridad no es la de la consola.
     """
     changed = 0
     for task in sorted(tasks.values(), key=lambda item: item.created_at):
         target = deps.targets.get(task.target_id)
-        if task.lineage_status != ACTIVE_LINEAGE or target is None:
+        if task.lineage_status != ACTIVE_LINEAGE or target is None or _scheduler_owned(task):
             continue
         conflict = _identity_block(task, target)
         if conflict:
@@ -2002,7 +2014,9 @@ def _consolidate_tasks(tasks: Mapping[str, ConsoleTask], deps: ConsoleDependenci
     active = [
         item
         for item in sorted(tasks.values(), key=lambda item: item.created_at)
-        if item.lineage_status == ACTIVE_LINEAGE and item.stage in CONTINUABLE_STAGES
+        if item.lineage_status == ACTIVE_LINEAGE
+        and item.stage in CONTINUABLE_STAGES
+        and not _scheduler_owned(item)
     ]
     clusters: list[list[ConsoleTask]] = []
     for item in active:

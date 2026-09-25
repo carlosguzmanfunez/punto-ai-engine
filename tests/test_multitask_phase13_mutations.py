@@ -1,4 +1,4 @@
-"""Fase 13 -- 12 mutation scenarios: cada mutante debe quedar CAUGHT por un discriminante real.
+"""Fase 13 -- 12 (+1 del hallazgo #1) mutantes: cada uno debe quedar CAUGHT por un discriminante.
 
 Cada caso ejecuta primero el discriminante sin mutar (tiene que pasar) y después con el mutante
 inyectado en el código de producción (tiene que fallar). Si un mutante sobrevive, F13 no es
@@ -20,6 +20,7 @@ import punto.api.console as console_module
 import punto.api.dashboard as dashboard_module
 import punto.api.operational_projection as projection
 import punto.providers.effective as effective_module
+import test_console_managed_authority as managed_authority
 import test_multitask_phase13_minipilot as pilot
 import test_operational_projection as discriminants
 from punto.api.console_state import CONSOLE_STATE_ENV, ConsoleStateStore
@@ -184,6 +185,10 @@ def m12_projection_writes_state(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_projection(monkeypatch, writing)
 
 
+def m13_console_consolidates_managed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(console_module, "_scheduler_owned", lambda task: False)
+
+
 # --------------------------------------------------------------------------- matriz
 def _run(test: Callable[..., None], monkeypatch: pytest.MonkeyPatch, workdir: Path) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
@@ -254,6 +259,11 @@ MUTATIONS: list[tuple[str, Callable[[pytest.MonkeyPatch], None], Callable[..., N
         m12_projection_writes_state,
         discriminants.test_v_la_proyeccion_via_api_no_escribe_estado_durable,
     ),
+    (
+        "13-arranque-de-consola-supera-task-managed",
+        m13_console_consolidates_managed,
+        managed_authority.test_a_montar_la_consola_no_cambia_ningun_campo_de_una_task_waiting_resource,
+    ),
 ]
 
 
@@ -274,6 +284,7 @@ def test_mutante_caught(
         _run(discriminant, monkeypatch, tmp_path / "mutant")  # mutado: CAUGHT
 
 
-def test_la_matriz_cubre_los_12_mutantes() -> None:
-    assert len(MUTATIONS) == 12
-    assert len({name for name, _mutate, _test in MUTATIONS}) == 12
+def test_la_matriz_cubre_los_mutantes() -> None:
+    # 12 del alcance F13 + 1 del hallazgo #1 (autoridad del scheduler en el arranque).
+    assert len(MUTATIONS) == 13
+    assert len({name for name, _mutate, _test in MUTATIONS}) == 13

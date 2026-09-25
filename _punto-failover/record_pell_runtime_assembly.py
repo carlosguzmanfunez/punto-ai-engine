@@ -1,0 +1,118 @@
+"""Registra el aprendizaje reusable y verificado de F15 (runtime productivo ensamblado)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+MEMORY = Path(__file__).resolve().parent / "pell-runtime-assembly.jsonl"
+
+VERIFICATION = (
+    "tests/test_multitask_phase15_runtime.py: 19/19 PASS (E2E HTTP A+B+Integration+restart)",
+    "tests/test_multitask_phase15_discriminants.py: 15/15 CAUGHT (14 exigidos + consola)",
+    "cono causal F1-F14: 883 PASS + 36 PASS con basetemp corto (35 fallan igual en "
+    "phase-14-verified: MAX_PATH de Windows, ambiente); cold imports 116 PASS",
+    "ruff; mypy strict 238 ficheros",
+)
+
+
+def main() -> int:
+    from punto.memory.experience import ExperienceResult, ExperienceStatus
+    from punto.memory.store import ExperienceStore
+
+    store = ExperienceStore(MEMORY)
+    ownership = store.record(
+        problem=(
+            "las piezas Multi-Task verificadas (scheduler, leases, recovery, integración) solo se "
+            "componían en harnesses de prueba: no había un owner productivo del runtime ni un "
+            "orden de arranque que impidiera admitir trabajo antes de reconciliar lo heredado"
+        ),
+        context=(
+            "TwoTaskScheduler F11 cuyo _schedule reconcilia y admite en la misma pasada; "
+            "FastAPI con app = create_app() a nivel de módulo; uvicorn puede lanzar N workers "
+            "sobre el mismo documento durable"
+        ),
+        attempts=(),
+        failure_reason=(
+            "sin composition root, cada punto de entrada podía construir su propio scheduler: dos "
+            "schedulers sobre un documento se pisan (lost update) aunque los leases impidan el "
+            "doble writer; y sin fase explícita de reconciliación la primera admisión compite "
+            "con la recuperación de huérfanas y APPLIED sin desenlace"
+        ),
+        solution=(
+            "MultiTaskRuntime: UN owner por proceso (guard de proceso) y por raíz durable (lock "
+            "del SO no bloqueante), creado solo por el lifespan de la app; estados CREATED -> "
+            "STARTING (cargar -> scheduler.reconcile() sin admitir) -> READY -> STOPPING -> "
+            "STOPPED; submit fuera de READY falla cerrado; huérfana con authority vigente "
+            "conserva su slot y arma UN wakeup en su expiración+gracia (sin polling); shutdown "
+            "cierra admisiones, drena y, si no alcanza, abandona como muerte del proceso"
+        ),
+        procedure=(
+            "separar reconciliar de admitir: una llamada de reconciliación sin despacho antes de "
+            "abrir la puerta de entrada",
+            "el owner del runtime se reclama en el arranque (proceso Y documento), nunca en un "
+            "handler; los handlers solo leen el runtime del proceso",
+            "discriminar el orden de arranque inyectando trabajo DESDE dentro de la "
+            "reconciliación: debe rechazarse",
+            "importar el runtime de forma perezosa desde la capa HTTP si el paquete API se "
+            "inicializa al importar cualquiera de sus submódulos",
+        ),
+        result=ExperienceResult.SUCCESS,
+        verification=VERIFICATION,
+        tags=(
+            "type:runtime-composition-root-phase15",
+            "trigger:verified-components-only-composed-in-tests",
+            "component:runtime/assembly.MultiTaskRuntime",
+            "component:api/runtime_routes+app.lifespan",
+            "provenance:e2e-http+source-mutations",
+        ),
+        status=ExperienceStatus.VERIFIED,
+    )
+    print(f"[V] {ownership.id}")
+    latent = store.record(
+        problem=(
+            "al ensamblar en UN proceso aparecieron dos defectos latentes: la consola decidía "
+            "'¿es ya del scheduler?' con su copia de arranque (Tasks gestionadas creadas después "
+            "eran invisibles y se podía duplicar su trabajo por el camino legacy), y el orden de "
+            "un plan se fechaba now+δ, dejando updated_at < created_at con reloj congelado o de "
+            "resolución gruesa: el documento durable completo se rechazaba en el siguiente arranque"
+        ),
+        context=(
+            "dos escritores (consola y scheduler) sobre el mismo ConsoleStateStore con save_owned; "
+            "reglas de integridad que rechazan el documento entero ante una Task incoherente"
+        ),
+        attempts=(),
+        failure_reason=(
+            "una frontera de authority evaluada contra una instantánea en memoria en vez de contra "
+            "la verdad durable vigente; y una marca temporal sintética en el futuro, que el "
+            "validador fail-closed convierte en indisponibilidad total"
+        ),
+        solution=(
+            "la comprobación de equivalencia gestionada de la consola incluye las Tasks managed "
+            "leídas del documento durable en el momento de decidir (lectura sin cuarentena); el "
+            "orden del plan se fecha hacia atrás desde now (created_at <= now siempre)"
+        ),
+        procedure=(
+            "toda decisión de frontera entre dos escritores de un documento se toma contra la "
+            "verdad durable del instante, nunca contra la copia de arranque",
+            "nunca fabricar marcas temporales en el futuro para ordenar: ordenar hacia atrás "
+            "desde now o por clave explícita",
+            "probar la durabilidad con un reloj congelado: expone invariantes temporales que el "
+            "reloj real oculta",
+        ),
+        result=ExperienceResult.SUCCESS,
+        verification=VERIFICATION,
+        tags=(
+            "type:assembly-latent-defects-phase15",
+            "trigger:second-writer-created-after-startup+frozen-clock",
+            "component:api/console._scheduler_equivalent",
+            "component:runtime/assembly._plan_records",
+            "provenance:e2e-http+source-mutations",
+        ),
+        status=ExperienceStatus.VERIFIED,
+    )
+    print(f"[V] {latent.id}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

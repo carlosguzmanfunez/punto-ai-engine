@@ -126,7 +126,9 @@ def f9_console_runs_managed(monkeypatch: pytest.MonkeyPatch) -> None:
         return str(ORIGINAL_RERUN_BLOCK(self))
 
     monkeypatch.setattr(console_module.ConsoleTask, "rerun_block", rerun_block)
-    monkeypatch.setattr(console_module, "_scheduler_equivalent", lambda task, tasks: "")
+    monkeypatch.setattr(
+        console_module, "_scheduler_equivalent", lambda task, tasks, durable=(): ""
+    )
     monkeypatch.setattr(console_module, "_scheduler_owned", lambda task: False)
 
 

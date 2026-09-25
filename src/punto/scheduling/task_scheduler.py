@@ -557,6 +557,27 @@ class TwoTaskScheduler:
                 return
             self._schedule()
 
+    def reconcile(self) -> bool:
+        """Reconciliación SIN admisión (F15): el arranque la completa antes de abrir admisiones.
+
+        Mismo orden que el inicio de ``_schedule``: huérfanas RUNNING (IN_FLIGHT y APPLIED sin
+        desenlace pasan a reconciliación explícita; una authority todavía vigente conserva su slot)
+        y esperas de recovery reevaluadas. Persiste solo si algo cambió; no despacha nada.
+        """
+        with self._lock:
+            if self._closed:
+                return False
+            changed = self._reconcile_orphans()
+            changed = self._reconcile_recovery() or changed
+            if changed:
+                self._persist()
+            return changed
+
+    def stop_admissions(self) -> None:
+        """Deja de admitir sin esperar (F15): lo que ya corre termina y persiste su desenlace."""
+        with self._lock:
+            self._closed = True
+
     def wait_idle(self, timeout: float = 30.0) -> bool:
         """Espera a que no quede ejecución viva de este proceso (utilidad de orquestación)."""
         with self._idle:

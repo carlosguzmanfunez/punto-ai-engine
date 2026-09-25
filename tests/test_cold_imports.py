@@ -44,6 +44,11 @@ COLD_IMPORT_MODULES: tuple[str, ...] = (
     "punto.policy.human_gate",
     "punto.policy.policy_engine",
     "punto.api.app",
+    # --- FASE 15: runtime productivo ensamblado ----------------------------------
+    "punto.runtime",
+    "punto.runtime.assembly",
+    "punto.runtime.development",
+    "punto.api.runtime_routes",
     # --- ENGINE-1: capa de ejecución controlada ------------------------------
     "punto.schemas.execution",
     "punto.tools",

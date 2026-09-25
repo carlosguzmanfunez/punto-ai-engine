@@ -5207,18 +5207,31 @@ def default_development_cycle(
     *,
     audit: AuditLogger | None = None,
     environ: Mapping[str, str] | None = None,
+    router: ProviderRouter | None = None,
+    targets: DevelopmentTargetRegistry | None = None,
+    fence: Callable[[], None] | None = None,
+    recovery: OperationalRecoveryHook | None = None,
+    memory_path: str | None = None,
 ) -> DevelopmentCycle:
-    """Compone el ciclo con los componentes que ya existen, sin construir ninguno nuevo."""
-    registry = ProviderRegistry()
+    """Compone el ciclo con los componentes que ya existen, sin construir ninguno nuevo.
+
+    Multi-Task (F15): el runtime ensamblado inyecta, por ejecución, el router de la Task, su
+    destino re-basado en el worktree, el fence de su authority y su recovery operacional. Sin
+    ellos la composición es exactamente la de siempre.
+    """
     return DevelopmentCycle(
-        router=registry.router_instance(),
-        targets=DevelopmentTargetRegistry.from_environment(environ),
-        retriever=MemoryRetriever(ExperienceStore()),
-        store=ExperienceStore(),
+        router=router if router is not None else ProviderRegistry().router_instance(),
+        targets=(
+            targets if targets is not None else DevelopmentTargetRegistry.from_environment(environ)
+        ),
+        retriever=MemoryRetriever(ExperienceStore(memory_path)),
+        store=ExperienceStore(memory_path),
         audit=audit,
         policy_engine=PolicyEngine.from_config(),
         visual_capture=HeadlessBrowserCapture(),
         visual_interaction=BrowserInteraction(),
+        fence=fence,
+        recovery=recovery,
     )
 
 

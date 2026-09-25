@@ -37,6 +37,7 @@ Códigos de error:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
@@ -45,6 +46,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from punto._version import ENGINE_NAME, ENGINE_PHASE, ENGINE_VERSION
+from punto.api.runtime_routes import (
+    RuntimeFactory,
+    register_runtime,
+    runtime_enabled,
+    runtime_lifespan,
+)
 from punto.audit.logger import AuditLogger
 from punto.orchestrator.build_cycle import (
     BuildCycle,
@@ -72,6 +79,8 @@ from punto.tasks.manager import TaskManager, TaskNotFoundError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from punto.runtime.assembly import MultiTaskRuntime
 
 
 # ============================================================================
@@ -248,10 +257,20 @@ class PolicyEvaluateRequest(BaseModel):
 # Aplicación
 # ============================================================================
 def create_app(
-    *, environment: str = "local", build_cycle: BuildCycle | None = None
+    *,
+    environment: str = "local",
+    build_cycle: BuildCycle | None = None,
+    runtime: RuntimeFactory | None = None,
 ) -> FastAPI:
-    """Construye la aplicación FastAPI con el motor ensamblado."""
+    """Construye la aplicación FastAPI con el motor ensamblado.
+
+    Args:
+        runtime: Fábrica del runtime Multi-Task del proceso (Fase 15). Sin ella, la aplicación por
+            defecto lo compone desde la configuración vigente solo si ``PUNTO_MULTITASK_RUNTIME``
+            lo activa. El ``lifespan`` lo arranca (reconciliando antes de admitir) y lo detiene.
+    """
     application = FastAPI(
+        lifespan=runtime_lifespan,
         title=ENGINE_NAME,
         version=ENGINE_VERSION,
         description=(
@@ -295,7 +314,23 @@ def create_app(
     from punto.api.console import register_human_console
 
     register_human_console(application)
+    # RUNTIME MULTI-TASK (Fase 15): UN owner por proceso, arrancado por el lifespan de esta misma
+    # aplicación; la consola y la proyección leen el mismo documento durable que él escribe.
+    register_runtime(application, runtime if runtime is not None else _configured_runtime(engine))
     return application
+
+
+def _configured_runtime(engine: Engine) -> RuntimeFactory | None:
+    """Runtime productivo con la configuración vigente, si el entorno lo activa."""
+    if not runtime_enabled(os.environ):
+        return None
+
+    def factory() -> MultiTaskRuntime:
+        from punto.runtime.assembly import production_runtime
+
+        return production_runtime(audit=engine.audit)
+
+    return factory
 
 
 def get_engine(application: FastAPI) -> Engine:

@@ -19,7 +19,7 @@ estados del motor, no publica sin aprobación humana y no devuelve secretos ni p
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -781,7 +781,7 @@ def register_human_console(
         task.target_work_branch = identity.work_branch
         task.target_production_branch = identity.production_branch
         with _TASKS_LOCK:
-            owned = _scheduler_equivalent(task, tasks)
+            owned = _scheduler_equivalent(task, tasks, _durable_managed(store))
             canonical = None if owned else _canonical_equivalent(task, tasks, dependencies)
             if canonical is None and not owned:
                 tasks[str(task.task_id)] = task
@@ -1891,14 +1891,32 @@ def _console_owned(record: TaskRecord) -> bool:
     return not record.scheduling.managed
 
 
-def _scheduler_equivalent(candidate: ConsoleTask, tasks: Mapping[str, ConsoleTask]) -> str:
-    """Id (el menor, determinista) de una Task del scheduler equivalente, o ``""``."""
+def _scheduler_equivalent(
+    candidate: ConsoleTask,
+    tasks: Mapping[str, ConsoleTask],
+    durable: Sequence[TaskRecord] = (),
+) -> str:
+    """Id (el menor, determinista) de una Task del scheduler equivalente, o ``""``.
+
+    ``durable`` son las Tasks gestionadas tal como están AHORA en disco: el runtime (F15) las crea
+    después del arranque de la consola, así que su copia en memoria no basta para no duplicarlas.
+    """
     owned = sorted(
-        str(item.task_id)
-        for item in find_equivalents(candidate, tasks.values())
-        if _scheduler_owned(item)
+        {
+            str(item.task_id)
+            for item in find_equivalents(candidate, (*tasks.values(), *durable))
+            if _scheduler_owned(item)
+        }
     )
     return owned[0] if owned else ""
+
+
+def _durable_managed(store: ConsoleStateStore) -> tuple[TaskRecord, ...]:
+    """Tasks del scheduler en el documento durable vigente (lectura, sin cuarentena)."""
+    snapshot = store.load(rules=RESTORE_RULES, quarantine=False)
+    if not snapshot.recovered:
+        return ()
+    return tuple(record for record in snapshot.tasks if record.scheduling.managed)
 
 
 def _absorb_into_canonical(

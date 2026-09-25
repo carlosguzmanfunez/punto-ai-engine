@@ -45,6 +45,7 @@ from punto.api.console_state import (
     TaskAttempt,
     TaskRecord,
 )
+from punto.providers.router import ProviderRouter
 from punto.scheduler.settings import SchedulerLimits
 from punto.scheduling.adapters import holder_from_executor_ref
 from punto.scheduling.fencing import FenceHook, LeaseFence
@@ -66,6 +67,7 @@ from punto.scheduling.provider_waits import (
     ProviderWaitOutcome,
 )
 from punto.scheduling.recovery_waits import RecoveryWaitCoordinator
+from punto.scheduling.recovery_wiring import RecoveryExecutor, RecoveryInvocationGuard
 from punto.scheduling.workspaces import TaskWorkspace, TaskWorkspaceError, TaskWorkspaceManager
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.scheduling import (
@@ -167,10 +169,12 @@ class ProviderAuthority:
         token: FencingToken,
         *,
         on_transfer: Callable[[str], None] | None = None,
+        on_released: Callable[[], None] | None = None,
     ) -> None:
         self._ledger = ledger
         self._token: FencingToken | None = token
         self._on_transfer = on_transfer
+        self._on_released = on_released
         self._lock = threading.RLock()
 
     @property
@@ -189,9 +193,14 @@ class ProviderAuthority:
         conserva toda su authority. ``TaskRecord.provider`` expresa el destino durable del
         handoff, mientras el ledger sigue siendo la única verdad de authority.
 
-        Si el candidato no se puede ocupar (p. ej. BUSY por otra Task), la ejecución recupera un
-        lease NUEVO de su provider anterior: nunca queda sin authority a mitad del ciclo (el ciclo
-        termina en WAITING_RECOVERY, no FENCED) y el token viejo sigue fenced.
+        Si el candidato no se puede ocupar (p. ej. BUSY por otra Task), la ejecución intenta
+        recuperar un lease NUEVO de su provider anterior (el token viejo sigue fenced). Si también
+        ese slot lo ocupó otra Task entretanto, la ejecución queda SIN ProviderLease: ``current``
+        es ``None`` y el fence de la ejecución hace fallar cerrado cualquier efecto posterior.
+        Nunca hay dos leases ni un token reutilizado; no se promete más que eso.
+
+        ``on_released`` se llama FUERA de la exclusión y solo después de soltar el lease anterior:
+        es cuando ese slot puede desbloquear de verdad a otra Task (Fase 7).
         """
         if self._on_transfer is not None:
             self._on_transfer(provider)
@@ -207,6 +216,8 @@ class ProviderAuthority:
                 self._token = back.token if back.outcome is LeaseOutcome.PASS else None
             else:
                 self._token = adopted
+        if previous is not None and self._on_released is not None:
+            self._on_released()
         return result
 
 
@@ -341,6 +352,33 @@ class _ExecutionFence:
 
 
 TaskRunner = Callable[[ExecutionContext], ExecutionResult]
+
+
+def recovery_for_execution(
+    context: ExecutionContext,
+    *,
+    router: ProviderRouter,
+    coordinator: RecoveryWaitCoordinator,
+    invocation_guard: RecoveryInvocationGuard,
+) -> RecoveryExecutor:
+    """El ``RecoveryExecutor`` de una ejecución gobernada por el scheduler (F14-G1).
+
+    La authority de provider es SIEMPRE la de la ejecución: el candidato se obtiene transfiriendo
+    el ProviderLease vigente, nunca con un segundo lease. Sin ``provider_authority`` no hay
+    ejecución gobernada y se falla cerrado en vez de construir un ejecutor sin handoff.
+    """
+    if context.provider_authority is None:
+        raise SchedulerError("AUTHORITY", "ejecución sin ProviderAuthority: no hay handoff")
+    return RecoveryExecutor(
+        router=router,
+        ledger=context.ledger,
+        coordinator=coordinator,
+        task=context.task,
+        holder=context.holder,
+        task_token=context.task_token,
+        invocation_guard=invocation_guard,
+        provider_handoff=context.provider_authority,
+    )
 
 
 def outcome_from_development(
@@ -726,6 +764,7 @@ class TwoTaskScheduler:
                 self._ledger,
                 provider_token,
                 on_transfer=partial(self._provider_transferred, task.task_id),
+                on_released=self._provider_released,
             ),
         )
         self._persist()
@@ -965,6 +1004,10 @@ class TwoTaskScheduler:
             )
             self._tasks[task_id] = self._with_scheduling(task, scheduling)
             self._persist()
+
+    def _provider_released(self) -> None:
+        """Tras soltar el ProviderLease anterior del handoff, se reevalúan las esperas (Fase 7)."""
+        with self._lock:
             if not self._closed:
                 self._schedule()
 
@@ -1046,4 +1089,5 @@ __all__ = [
     "eligibility_map",
     "outcome_from_development",
     "ready_key",
+    "recovery_for_execution",
 ]

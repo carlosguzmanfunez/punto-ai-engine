@@ -29,6 +29,7 @@ from punto.providers.contract import (
     ProviderRole,
     ProviderStatus,
 )
+from punto.scheduling import task_scheduler
 from punto.scheduling.leases import LeaseLedger
 from punto.scheduling.provider_waits import (
     ProviderWaitCoordinator,
@@ -37,7 +38,7 @@ from punto.scheduling.provider_waits import (
 )
 from punto.scheduling.recovery_waits import RecoveryWaitCoordinator
 from punto.scheduling.recovery_wiring import RecoveryExecutor
-from punto.scheduling.task_scheduler import ProviderAuthority
+from punto.scheduling.task_scheduler import ProviderAuthority, TwoTaskScheduler
 from punto.schemas.scheduling import RecoveryWaitReason, SchedulingState, TaskSchedulingRecord
 
 ORIGINAL_EVALUATE = RecoveryWaitCoordinator.evaluate_recovery
@@ -207,6 +208,66 @@ def m8_quality_failure_enters_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(DevelopmentCycle, "_invoke", invoke)
 
 
+# ------------------------------------------------------- cierre F14 (B1 · F7 wake · wiring)
+def c1_handoff_not_durable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """El destino del handoff solo cambia en memoria: nunca llega a disco."""
+    mutate_source(
+        monkeypatch,
+        TwoTaskScheduler,
+        "_provider_transferred",
+        [("        self._persist()\n", "")],
+    )
+
+
+def c2_persisted_after_acquire(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Orden de 866036b: se persiste DESPUÉS de adquirir el candidato (ventana B1)."""
+    released = "    if previous is not None and self._on_released is not None:\n"
+    mutate_source(
+        monkeypatch,
+        ProviderAuthority,
+        "transfer",
+        [
+            (
+                "    if self._on_transfer is not None:\n        self._on_transfer(provider)\n",
+                "",
+            ),
+            (
+                released,
+                "    if adopted is not None and self._on_transfer is not None:\n"
+                "        self._on_transfer(provider)\n" + released,
+            ),
+        ],
+    )
+
+
+def c3_handoff_disconnected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """La composición de src deja de pasar la ProviderAuthority de la ejecución."""
+    source = textwrap.dedent(inspect.getsource(task_scheduler.recovery_for_execution))
+    old = "        provider_handoff=context.provider_authority,\n"
+    assert source.count(old) == 1
+    namespace: dict[str, Any] = {}
+    mutant = compile(source.replace(old, ""), "<mutante recovery_for_execution>", "exec")
+    exec(mutant, vars(task_scheduler), namespace)
+    for module in (task_scheduler, pilot):
+        monkeypatch.setattr(module, "recovery_for_execution", namespace["recovery_for_execution"])
+
+
+def c4_waits_not_reevaluated_after_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Las esperas F7 no se reevalúan al soltar el ProviderLease del handoff."""
+    mutate_source(
+        monkeypatch,
+        ProviderAuthority,
+        "transfer",
+        [
+            (
+                "    if previous is not None and self._on_released is not None:\n"
+                "        self._on_released()\n",
+                "",
+            )
+        ],
+    )
+
+
 def _provider_request(cycle: DevelopmentCycle, role: ProviderRole, request: Any, args: Any) -> Any:
 
     return ProviderRequest(
@@ -278,6 +339,26 @@ MUTATIONS: list[tuple[str, Callable[[pytest.MonkeyPatch], None], Callable[..., N
         "8-fallo-de-calidad-entra-en-recovery",
         m8_quality_failure_enters_recovery,
         pilot.test_7_fallo_de_calidad_va_por_quality_takeover_nunca_por_recovery,
+    ),
+    (
+        "c1-handoff-sin-persistencia-durable",
+        c1_handoff_not_durable,
+        g1.test_k_crash_tras_acquire_antes_de_invocar_conserva_el_candidato_durable,
+    ),
+    (
+        "c2-crash-acquire-persist-vuelve-al-causal",
+        c2_persisted_after_acquire,
+        g1.test_k_crash_tras_acquire_antes_de_invocar_conserva_el_candidato_durable,
+    ),
+    (
+        "c3-provider-handoff-desconectado-de-src",
+        c3_handoff_disconnected,
+        g1.test_a_e_f_j_handoff_primario_a_candidato_en_el_mismo_ciclo,
+    ),
+    (
+        "c4-handoff-no-despierta-esperas-f7",
+        c4_waits_not_reevaluated_after_release,
+        g1.test_m_el_handoff_despierta_a_la_task_que_esperaba_al_causante,
     ),
 ]
 

@@ -57,6 +57,7 @@ from punto.scheduling.task_scheduler import (
     ExecutionOutcome,
     ExecutionResult,
     TaskRunner,
+    recovery_for_execution,
 )
 from punto.scheduling.workspaces import TaskWorkspace, TaskWorkspaceManager
 from punto.schemas.audit import AuditEventType
@@ -963,22 +964,19 @@ def recovery_executor(
             idempotency_key=f"phase14-{context.task.task_id}",
         ),
     )
-    return RecoveryExecutor(
+    # La composición de producción (src): el handoff sale de la ejecución, no de este helper.
+    return recovery_for_execution(
+        context,
         router=router,
-        ledger=context.ledger,
         # El mismo reloj que el ledger: BUSY se juzga contra la misma expiración que lo decide.
         coordinator=RecoveryWaitCoordinator(
             router=router, ledger=context.ledger, clock=clock or (lambda: datetime.now(UTC))
         ),
-        task=context.task,
-        holder=context.holder,
-        task_token=context.task_token,
         invocation_guard=RecoveryInvocationGuard(
             run=run,
             checkpoints=FileCheckpointStore(tmp_path / "recovery"),
             step_index=context.attempt,
         ),
-        provider_handoff=context.provider_authority,
     )
 
 

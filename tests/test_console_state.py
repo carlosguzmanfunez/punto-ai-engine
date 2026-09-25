@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from punto.api import console_state
 from punto.api.console import ConsoleDependencies, register_human_console
 from punto.api.console_state import (
     CONSOLE_STATE_SCHEMA_VERSION,
@@ -88,7 +89,11 @@ def _save_owned_process(
     started: Any,
     done: Any,
     block: bool,
+    file_lock: bool = True,
 ) -> None:
+    if not file_lock:  # mutante: solo queda la exclusión entre hilos de ESTE proceso
+        console_state._acquire_file_lock = lambda stream: None
+        console_state._release_file_lock = lambda stream: None
     started.set()
     task = _owned_task(task_id, managed=managed, stage=stage)
     paused = False
@@ -179,9 +184,8 @@ def _detalle_rechazo(audit: AuditLogger) -> str:
     return str(dict(eventos[0].metadata).get("detail", ""))
 
 
-def test_save_owned_serializa_console_y_scheduler_entre_procesos(tmp_path: Path) -> None:
-    """Dos procesos no pueden leer la misma base y sobrescribir después el cambio del otro."""
-    path = tmp_path / "multi-writer.json"
+def _race_between_processes(path: Path, *, file_lock: bool) -> tuple[bool, dict[UUID, str]]:
+    """Scheduler relee y queda dentro de su sección crítica; la consola intenta escribir."""
     managed_id, console_id = uuid4(), uuid4()
     ConsoleStateStore(path).save(
         tasks=(
@@ -196,38 +200,30 @@ def test_save_owned_serializa_console_y_scheduler_entre_procesos(tmp_path: Path)
     first_done, second_done = context.Event(), context.Event()
     first = context.Process(
         target=_save_owned_process,
-        args=(
-            str(path),
-            managed_id,
-            True,
-            "NEW_MANAGED",
-            entered,
-            release,
-            first_started,
-            first_done,
-            True,
-        ),
+        args=(str(path), managed_id, True, "NEW_MANAGED", entered, release),
+        kwargs={
+            "started": first_started,
+            "done": first_done,
+            "block": True,
+            "file_lock": file_lock,
+        },
     )
     second = context.Process(
         target=_save_owned_process,
-        args=(
-            str(path),
-            console_id,
-            False,
-            "NEW_CONSOLE",
-            entered,
-            release,
-            second_started,
-            second_done,
-            False,
-        ),
+        args=(str(path), console_id, False, "NEW_CONSOLE", entered, release),
+        kwargs={
+            "started": second_started,
+            "done": second_done,
+            "block": False,
+            "file_lock": file_lock,
+        },
     )
     try:
         first.start()
         assert entered.wait(10), "el primer writer no alcanzó su sección crítica"
         second.start()
         assert second_started.wait(10), "el segundo proceso no llegó a ejecutar"
-        assert not second_done.wait(1), "el segundo proceso atravesó la sección crítica del primero"
+        crossed = second_done.wait(1)
     finally:
         release.set()
         first.join(10)
@@ -238,9 +234,22 @@ def test_save_owned_serializa_console_y_scheduler_entre_procesos(tmp_path: Path)
             second.terminate()
     assert first.exitcode == 0 and second.exitcode == 0
     assert first_done.is_set() and second_done.is_set()
-    records = {task.task_id: task for task in ConsoleStateStore(path).load().tasks}
-    assert records[managed_id].stage == "NEW_MANAGED"
-    assert records[console_id].stage == "NEW_CONSOLE"
+    records = {task.task_id: task.stage for task in ConsoleStateStore(path).load().tasks}
+    return crossed, {managed_id: records[managed_id], console_id: records[console_id]}
+
+
+def test_save_owned_serializa_console_y_scheduler_entre_procesos(tmp_path: Path) -> None:
+    """Dos procesos no pueden leer la misma base y sobrescribir después el cambio del otro."""
+    crossed, stages = _race_between_processes(tmp_path / "multi-writer.json", file_lock=True)
+    assert not crossed, "el segundo proceso atravesó la sección crítica del primero"
+    assert sorted(stages.values()) == ["NEW_CONSOLE", "NEW_MANAGED"]
+
+
+def test_sin_lock_de_archivo_la_carrera_entre_procesos_pierde_updates(tmp_path: Path) -> None:
+    """Discriminante N1: el lock entre hilos solo NO basta entre procesos (lost update)."""
+    crossed, stages = _race_between_processes(tmp_path / "multi-writer.json", file_lock=False)
+    assert crossed  # la exclusión process-local no detiene al otro proceso
+    assert sorted(stages.values()) == ["NEW_MANAGED", "OLD_CONSOLE"]  # la consola regresó
 
 
 # ------------------------------------------------- 1 · la tarea sobrevive al reinicio

@@ -38,6 +38,7 @@ from punto.scheduling.leases import (
     LeaseState,
 )
 from punto.scheduling.recovery_waits import RecoveryWaitCoordinator
+from punto.scheduling.task_scheduler import TwoTaskScheduler
 from punto.schemas.scheduling import ExecutorReference, RecoveryWaitReason, SchedulingState
 from punto.schemas.workflow import EffectStatus
 from test_multitask_phase11_minipilot import CycleRunner, TaskScript, _plan
@@ -604,3 +605,232 @@ def run_configure(
         )
 
     return configure
+
+
+# ================================= L · matriz de caída del handoff (A y B; C es ``test_k``)
+def _crash_before_handoff(died: threading.Event, task_id: UUID) -> Callable[..., None]:
+    """A: la caída llega tras el fallo operacional y ANTES de persistir/soltar nada."""
+    original = TwoTaskScheduler._provider_transferred
+
+    def transferred(self: TwoTaskScheduler, target: UUID, provider: str) -> None:
+        if target == task_id and not died.is_set():
+            died.set()
+            raise ProcessDeath("SIGKILL antes de persistir el destino del handoff")
+        original(self, target, provider)
+
+    return transferred
+
+
+def _crash_after_release(died: threading.Event, task_id: UUID) -> Callable[..., Any]:
+    """B: el primario ya se soltó (token fenced) y el candidato aún no se adquirió."""
+    original = LeaseLedger.release
+
+    def release(self: LeaseLedger, token: FencingToken) -> Any:
+        result = original(self, token)
+        if not died.is_set() and token.key == "deepseek:0" and token.task_id == task_id:
+            died.set()
+            raise ProcessDeath("SIGKILL entre release del primario y acquire del candidato")
+        return result
+
+    return release
+
+
+@pytest.mark.parametrize(
+    ("point", "durable", "primary_state", "calls"),
+    [
+        # Sin fallo durable no hay causante conocido: solo una reconciliación humana redespacha.
+        pytest.param("A", "deepseek", LeaseState.ACTIVE, {"deepseek": 4, "openai": 0}, id="A"),
+        pytest.param("B", "openai", LeaseState.RELEASED, {"deepseek": 2, "openai": 2}, id="B"),
+    ],
+)
+def test_l_matriz_de_caida_del_handoff_sin_resurreccion_ni_doble_efecto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    point: str,
+    durable: str,
+    primary_state: LeaseState,
+    calls: dict[str, int],
+) -> None:
+    with piloting(tmp_path, monkeypatch) as pilot:
+        died = threading.Event()
+        run = recovering(
+            pilot,
+            tmp_path,
+            policy=("openai",),
+            connected=("openai",),
+            scripts={
+                "deepseek": [
+                    _plan(CATALOG_FILE),
+                    unavailable("deepseek"),
+                    _plan(CATALOG_FILE),
+                    edit(CATALOG_FILE, "CATALOG-A"),
+                ],
+                "openai": [_plan(CATALOG_FILE), edit(CATALOG_FILE, "CATALOG-A")],
+            },
+        )
+        a = run.task
+        with monkeypatch.context() as crash:
+            if point == "A":
+                crash.setattr(
+                    TwoTaskScheduler,
+                    "_provider_transferred",
+                    _crash_before_handoff(died, a.task_id),
+                )
+            else:
+                crash.setattr(LeaseLedger, "release", _crash_after_release(died, a.task_id))
+            pilot.scheduler.submit(a)
+            pilot.scheduler.wake()
+            assert died.wait(WAIT)
+            pilot.harness.scheduler.shutdown(wait=False)
+        primary = context_of(pilot, a).provider_token
+
+        on_disk = pilot.durable()[a.task_id]
+        assert on_disk.scheduling.state is SchedulingState.RUNNING
+        assert on_disk.scheduling.provider is not None
+        assert on_disk.scheduling.provider.provider == durable
+        assert provider_state(pilot, "deepseek") is primary_state
+        assert provider_state(pilot, "openai") is None  # nunca dos ProviderLease
+        assert run.fakes["openai"].calls == []
+
+        pilot.restart(CycleRunner(base_target=pilot.cycles.base_target))
+        pilot.cycles.scripts[a.task_id] = TaskScript(
+            path=CATALOG_FILE,
+            marker="CATALOG-A",
+            configure=run_configure(pilot, a, run.fakes),
+            recovery=lambda context, router: recovery_executor(
+                tmp_path, context, router, pilot.harness.clock
+            ),
+        )
+        pilot.harness.clock.advance(900)
+        pilot.scheduler.wake()
+        assert pilot.scheduler.wait_idle(WAIT)
+        waiting = pilot.scheduler.task(a.task_id).scheduling.waiting
+        assert waiting is not None and waiting.code == "DISPATCH_RECONCILIATION_REQUIRED"
+        assert pilot.observed.calls == [] and run.fakes["openai"].calls == []
+        with pytest.raises(LeaseFencedError):
+            pilot.harness.ledger.assert_fenced(primary)  # el token primario nunca revive
+
+        pilot.scheduler.reconcile_dispatch(
+            a.task_id, status=EffectStatus.FAILED, detail=f"crash {point} en el handoff"
+        )
+        assert pilot.scheduler.wait_idle(WAIT * 2)
+        record = finished(pilot.harness, a)
+        assert completed(record), record.result
+        assert record.runs == 2
+        assert {name: len(fake.calls) for name, fake in run.fakes.items()} == calls
+
+
+# ==================== M · el ProviderLease soltado en el handoff desbloquea a otra Task (F7)
+def test_m_el_handoff_despierta_a_la_task_que_esperaba_al_causante(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watch: Callable[[Pilot], LeaseWatch]
+) -> None:
+    with piloting(tmp_path, monkeypatch) as pilot:
+        leases = watch(pilot)
+        planning, candidate = threading.Event(), threading.Event()
+
+        def plan_a() -> dict[str, Any]:
+            assert planning.wait(WAIT)
+            return _plan(CATALOG_FILE)
+
+        def held_a() -> dict[str, Any]:
+            assert candidate.wait(WAIT)
+            return edit(CATALOG_FILE, "CATALOG-A")
+
+        run = recovering(
+            pilot,
+            tmp_path,
+            policy=("openai",),
+            connected=("openai",),
+            scripts={
+                "deepseek": [plan_a, unavailable("deepseek")],
+                "openai": [held_a],
+            },
+        )
+        a = run.task
+        y = pilot.task(
+            "Y",
+            provider="deepseek",
+            resource=SEARCH,
+            path=SEARCH_FILE,
+            marker="SEARCH-Y",
+            steps=[_plan(SEARCH_FILE), edit(SEARCH_FILE, "SEARCH-Y")],
+        )
+        try:
+            pilot.scheduler.submit(a)
+            pilot.scheduler.wake()
+            eventually(lambda: pilot.observed.count(a.task_id) == 1)
+            pilot.scheduler.submit(y)
+            pilot.scheduler.wake()
+            assert state(pilot.harness, y) is SchedulingState.WAITING_PROVIDER  # A tiene deepseek
+
+            planning.set()  # A cae y transfiere deepseek -> openai; NINGÚN wake externo
+            eventually(lambda: pilot.observed.count(y.task_id) == 1)
+            assert state(pilot.harness, a) is SchedulingState.RUNNING  # A sigue en su candidato
+        finally:
+            planning.set()
+            candidate.set()
+        assert pilot.scheduler.wait_idle(WAIT * 2)
+        assert completed(finished(pilot.harness, a)) and completed(finished(pilot.harness, y))
+        assert len(run.fakes["deepseek"].calls) == 2  # el causante no se redespacha para A
+        assert leases.peak[a.task_id] == 1
+
+
+# ============================ N · candidato Y primario ocupados: sin authority, fail-closed
+def test_n_sin_slot_para_candidato_ni_primario_la_ejecucion_no_actua_sin_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with piloting(tmp_path, monkeypatch) as pilot:
+        with_scheduler_recovery(pilot, policy=("openai",), connected=("openai",))
+        run = recovering(
+            pilot,
+            tmp_path,
+            policy=("openai",),
+            connected=("openai",),
+            scripts={
+                "deepseek": [_plan(CATALOG_FILE), unavailable("deepseek")],
+                "openai": [_plan(CATALOG_FILE), edit(CATALOG_FILE, "CATALOG-A")],
+            },
+        )
+        a = run.task
+        original = LeaseLedger.acquire
+        occupants: list[tuple[FencingToken, FencingToken]] = []
+        seen: list[FencingToken | None] = []
+
+        def race(self: LeaseLedger, **kwargs: Any) -> LeaseResult:
+            if (
+                not occupants
+                and kwargs.get("kind") is LeaseKind.PROVIDER
+                and kwargs.get("provider_id") == "openai"
+                and kwargs.get("task_id") == a.task_id
+            ):
+                # Justo al adquirir el candidato, otras Tasks ocupan openai Y el deepseek soltado.
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(LeaseLedger, "acquire", original)
+                    occupants.append(occupy(self, "openai"))
+                    occupants.append(occupy(self, "deepseek"))
+            result = original(self, **kwargs)
+            if occupants and kwargs.get("task_id") == a.task_id and len(seen) < 2:
+                seen.append(result.token if result.outcome is LeaseOutcome.PASS else None)
+            return result
+
+        monkeypatch.setattr(LeaseLedger, "acquire", race)
+        pilot.scheduler.submit(a)
+        pilot.scheduler.wake()
+        eventually(lambda: pilot.scheduler.task(a.task_id).attempts[-1].status != "RUNNING")
+        assert pilot.scheduler.wait_idle(WAIT)
+
+        assert seen == [None, None]  # candidato BUSY y primario BUSY: ningún lease para A
+        context = context_of(pilot, a)
+        assert context.provider_authority is not None
+        assert context.provider_authority.current() is None
+        with pytest.raises(LeaseFencedError):
+            context.fence()  # cualquier efecto posterior falla cerrado
+        with pytest.raises(LeaseFencedError):
+            pilot.harness.ledger.assert_fenced(context.provider_token)
+        record = pilot.scheduler.task(a.task_id)
+        assert record.finished_at is None and not completed(record)
+        assert record.scheduling.state is not SchedulingState.RUNNING
+        assert run.fakes["openai"].calls == [] and len(run.fakes["deepseek"].calls) == 2
+        reason = record.scheduling.waiting
+        if isinstance(reason, RecoveryWaitReason):
+            assert "openai" not in reason.also_excluded  # BUSY sigue sin ser exclusión

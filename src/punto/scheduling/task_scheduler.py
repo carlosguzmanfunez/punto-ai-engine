@@ -30,10 +30,11 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Final
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -55,6 +56,7 @@ from punto.scheduling.leases import (
     LeaseKind,
     LeaseLedger,
     LeaseOutcome,
+    LeaseResult,
     LeaseState,
 )
 from punto.scheduling.provider_waits import (
@@ -68,6 +70,7 @@ from punto.scheduling.workspaces import TaskWorkspace, TaskWorkspaceError, TaskW
 from punto.schemas.dev import DevelopmentResult
 from punto.schemas.scheduling import (
     ExecutorReference,
+    ProviderReference,
     RecoveryWaitReason,
     SchedulingState,
     TaskSchedulingRecord,
@@ -133,6 +136,9 @@ class ExecutionContext:
     #: Fence compuesto: renovación viva (Fase 11R) + TaskWriterLease + ProviderLease en el ledger.
     fence: FenceHook
     dispatch_key: str
+    #: El ÚNICO ProviderLease vigente de la ejecución (``provider_token`` es el inicial). Recovery
+    #: operacional lo TRANSFIERE a su candidato (F14-G1); nunca se acumula un segundo.
+    provider_authority: ProviderAuthority | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +149,60 @@ class ExecutionResult:
     result: DevelopmentResult | None = None
     recovery_task: TaskRecord | None = None
     detail: str = ""
+
+
+class ProviderAuthority:
+    """El único ProviderLease vigente de UNA ejecución: transferible, nunca acumulable (F14-G1).
+
+    ``transfer`` suelta primero el lease actual (su token queda fenced en el ledger) y solo después
+    adquiere el nuevo, bajo la misma exclusión que usa la renovación: en ningún instante la Task
+    sostiene dos ProviderLease, y la renovación nunca renueva un token ya transferido. Quien lo
+    llama (el ``RecoveryExecutor``) solo lo hace con un fallo operacional ya clasificado y un
+    candidato decidido.
+    """
+
+    def __init__(
+        self,
+        ledger: LeaseLedger,
+        token: FencingToken,
+        *,
+        on_transfer: Callable[[FencingToken], None] | None = None,
+    ) -> None:
+        self._ledger = ledger
+        self._token: FencingToken | None = token
+        self._on_transfer = on_transfer
+        self._lock = threading.RLock()
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    def current(self) -> FencingToken | None:
+        with self._lock:
+            return self._token
+
+    def transfer(self, provider: str, acquire: Callable[[str], LeaseResult]) -> LeaseResult:
+        """Suelta el lease actual (su token queda fenced) y adquiere el de ``provider``.
+
+        Si el candidato no se puede ocupar (p. ej. BUSY por otra Task), la ejecución recupera un
+        lease NUEVO de su provider anterior: nunca queda sin authority a mitad del ciclo (el ciclo
+        termina en WAITING_RECOVERY, no FENCED) y el token viejo sigue fenced.
+        """
+        with self._lock:
+            previous = self._token
+            if previous is not None:
+                self._ledger.release(previous)
+                self._token = None
+            result = acquire(provider)
+            adopted = result.token if result.outcome is LeaseOutcome.PASS else None
+            if adopted is None and previous is not None:
+                back = acquire(previous.key.rsplit(":", maxsplit=1)[0])
+                self._token = back.token if back.outcome is LeaseOutcome.PASS else None
+            else:
+                self._token = adopted
+        if adopted is not None and self._on_transfer is not None:
+            self._on_transfer(adopted)
+        return result
 
 
 class LeaseRenewer:
@@ -163,6 +223,7 @@ class LeaseRenewer:
         ttl_seconds: int,
         clock: Callable[[], datetime],
         check_seconds: float,
+        authority: ProviderAuthority | None = None,
     ) -> None:
         if task_token.kind is not LeaseKind.TASK_WRITER or provider_token.kind is not (
             LeaseKind.PROVIDER
@@ -172,6 +233,7 @@ class LeaseRenewer:
             raise SchedulerError("RENEWAL", "el ProviderLease no pertenece a la Task del writer")
         self._ledger = ledger
         self._tokens = (task_token, provider_token)
+        self._authority = authority
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._check_seconds = check_seconds
@@ -209,34 +271,51 @@ class LeaseRenewer:
         if self._revoked.is_set():
             raise LeaseFencedError(f"renovación de leases fallida: {self.failure}")
 
+    def _current(self) -> tuple[FencingToken, ...]:
+        """Writer y el ProviderLease VIGENTE (tras una transferencia, el nuevo; sin él, ninguno)."""
+        if self._authority is None:
+            return self._tokens
+        provider = self._authority.current()
+        return self._tokens[:1] if provider is None else (self._tokens[0], provider)
+
+    def _exclusive(self) -> AbstractContextManager[object]:
+        return self._authority.lock if self._authority is not None else nullcontext()
+
     def _run(self) -> None:
         while not self._stop.wait(self._check_seconds):
             try:
-                if not self._due():
-                    continue
-                for token in self._tokens:  # writer antes que provider (subordinado)
-                    if self._stop.is_set():
-                        return
-                    result = self._ledger.renew(token, ttl_seconds=self._ttl_seconds)
-                    if result.outcome is not LeaseOutcome.PASS:
-                        self._revoke(f"{token.kind.value}: {result.outcome.value} {result.detail}")
-                        return
+                with self._exclusive():  # una transferencia nunca se cruza con una renovación
+                    tokens = self._current()
+                    if not self._due(tokens):
+                        continue
+                    for token in tokens:  # writer antes que provider (subordinado)
+                        if self._stop.is_set():
+                            return
+                        result = self._ledger.renew(token, ttl_seconds=self._ttl_seconds)
+                        if result.outcome is not LeaseOutcome.PASS:
+                            self._revoke(
+                                f"{token.kind.value}: {result.outcome.value} {result.detail}"
+                            )
+                            return
                 self.renewals += 1
             except Exception as error:  # cualquier incertidumbre revoca, nunca se ignora
                 self._revoke(f"{type(error).__name__}: {error}")
                 return
 
-    def _due(self) -> bool:
+    def _due(self, tokens: tuple[FencingToken, ...]) -> bool:
         # ``assert_fenced`` relee la cabeza: un token ya obsoleto no llega a pedir renovación.
-        head = self._ledger.assert_fenced(self._tokens[0])
-        self._ledger.assert_fenced(self._tokens[1])
-        return head.expires_at - self._clock().astimezone(UTC) <= self._threshold
+        head = self._ledger.assert_fenced(tokens[0])
+        due = head.expires_at - self._clock().astimezone(UTC) <= self._threshold
+        for token in tokens[1:]:
+            provider = self._ledger.assert_fenced(token)
+            due = due or provider.expires_at - self._clock().astimezone(UTC) <= self._threshold
+        return due
 
     def _revoke(self, detail: str) -> None:
         self.failure = detail[:300]
         self._revoked.set()
         # Soltar SOLO lo propio: un token obsoleto produce STALE_RELEASE y no toca al holder nuevo.
-        for token in reversed(self._tokens):
+        for token in reversed(self._current()):
             with suppress(Exception):
                 self._ledger.release(token)
 
@@ -244,11 +323,16 @@ class LeaseRenewer:
 @dataclass(frozen=True, slots=True)
 class _ExecutionFence:
     renewer: LeaseRenewer
-    leases: LeaseFence
+    ledger: LeaseLedger
+    task_token: FencingToken
+    authority: ProviderAuthority
 
     def __call__(self) -> None:
         self.renewer.assert_live()
-        self.leases()
+        provider = self.authority.current()
+        if provider is None:
+            raise LeaseFencedError("la ejecución no sostiene ningún ProviderLease vigente")
+        LeaseFence(self.ledger, (self.task_token, provider))()
 
 
 TaskRunner = Callable[[ExecutionContext], ExecutionResult]
@@ -284,6 +368,7 @@ class _ActiveExecution:
     provider_token: FencingToken
     workspace: TaskWorkspace
     dispatch_key: str
+    authority: ProviderAuthority
 
 
 def ready_key(task: TaskRecord) -> tuple[datetime, str]:
@@ -632,6 +717,11 @@ class TwoTaskScheduler:
             provider_token=provider_token,
             workspace=workspace,
             dispatch_key=key,
+            authority=ProviderAuthority(
+                self._ledger,
+                provider_token,
+                on_transfer=partial(self._provider_transferred, task.task_id),
+            ),
         )
         self._persist()
         self._pool.submit(self._execute, task.task_id)
@@ -658,10 +748,9 @@ class TwoTaskScheduler:
                 workspace=active.workspace,
                 workspaces=self._workspaces,
                 ledger=self._ledger,
-                fence=_ExecutionFence(
-                    renewer, LeaseFence(self._ledger, (active.task_token, active.provider_token))
-                ),
+                fence=_ExecutionFence(renewer, self._ledger, active.task_token, active.authority),
                 dispatch_key=active.dispatch_key,
+                provider_authority=active.authority,
             )
             ran = True
             result = self._runner(context)
@@ -691,6 +780,7 @@ class TwoTaskScheduler:
             provider_token=active.provider_token,
             ttl_seconds=self._ttl_seconds,
             clock=self._clock,
+            authority=active.authority,
             check_seconds=self._renew_check_seconds,
         )
         with self._lock:
@@ -848,7 +938,31 @@ class TwoTaskScheduler:
         # Sin authority vigente no se muta el workspace: queda durable tal cual.
         with suppress(LeaseFencedError, TaskWorkspaceError):
             self._workspaces.release(active.workspace, active.task_token)
-        self._release(active.provider_token, active.task_token)
+        # El ProviderLease VIGENTE (tras un handoff de recovery, el del candidato); si ya no hay
+        # ninguno, solo el writer.
+        provider = active.authority.current()
+        if provider is not None:
+            self._ledger.release(provider)
+        self._ledger.release(active.task_token)
+
+    def _provider_transferred(self, task_id: UUID, token: FencingToken) -> None:
+        """Handoff de recovery (F14-G1): el provider de la Task pasa a ser el candidato.
+
+        Se persiste para que un restart nunca vuelva a despachar al causante, y se reevalúan las
+        esperas: el ProviderLease soltado puede desbloquear a otra Task (Fase 7).
+        """
+        provider = token.key.rsplit(":", maxsplit=1)[0]
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.scheduling.state is not SchedulingState.RUNNING:
+                return
+            scheduling = task.scheduling.model_copy(
+                update={"provider": ProviderReference(provider=provider)}
+            )
+            self._tasks[task_id] = self._with_scheduling(task, scheduling)
+            self._persist()
+            if not self._closed:
+                self._schedule()
 
     def _release(self, provider_token: FencingToken, task_token: FencingToken) -> None:
         # Provider antes que writer: el ProviderLease está subordinado al TaskWriterLease.

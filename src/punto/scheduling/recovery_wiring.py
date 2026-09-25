@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, Protocol
 from uuid import UUID
 
 from punto.api.console_state import TaskRecord
@@ -28,7 +28,14 @@ from punto.providers.contract import ProviderRequest, ProviderResult, ProviderRo
 from punto.providers.effective import CAPABILITY_VISION
 from punto.providers.failover import failover_cause_of
 from punto.providers.router import ProviderRouter
-from punto.scheduling.leases import FencingToken, LeaseHolder, LeaseKind, LeaseLedger, LeaseOutcome
+from punto.scheduling.leases import (
+    FencingToken,
+    LeaseHolder,
+    LeaseKind,
+    LeaseLedger,
+    LeaseOutcome,
+    LeaseResult,
+)
 from punto.scheduling.recovery_waits import RecoveryDecisionKind, RecoveryWaitCoordinator
 from punto.schemas.workflow import EffectStatus, WorkflowRun
 from punto.workflow.checkpoints import CheckpointStore
@@ -119,6 +126,18 @@ class RecoveryInvocationGuard:
         self.checkpoints.save(self.run)
 
 
+class ProviderLeaseHandoff(Protocol):
+    """Autoridad de provider de la ejecución en curso (``ProviderAuthority`` del scheduler).
+
+    ``transfer`` suelta el ProviderLease vigente (queda fenced) y adquiere el de ``provider`` con
+    ``acquire``: la Task nunca sostiene dos, y la renovación y el fence de la ejecución siguen al
+    nuevo token (F14-G1). Si el candidato no se puede ocupar, la ejecución conserva un lease nuevo
+    de su provider anterior.
+    """
+
+    def transfer(self, provider: str, acquire: Callable[[str], LeaseResult]) -> LeaseResult: ...
+
+
 @dataclass(slots=True)
 class RecoveryExecutor:
     """Cadena de recovery operacional real para UNA Task/ciclo: mismo ``task_id``, mismo ciclo.
@@ -146,6 +165,11 @@ class RecoveryExecutor:
     #: WAITING_RECOVERY): el llamante decide si y cómo persistirlo. ``None`` no persiste nada --
     #: el ejecutor sigue funcionando en memoria dentro de esta única llamada.
     on_state_change: Callable[[TaskRecord], None] | None = None
+    #: F14-G1: bajo el scheduler la Task ya sostiene el ProviderLease primario y el ledger admite
+    #: uno solo por Task. Con handoff, el lease del candidato se obtiene TRANSFIRIENDO el vigente
+    #: (solo tras un fallo operacional clasificado y un candidato decidido) y se conserva como
+    #: autoridad de la ejecución; sin él (``None``), el candidato tiene un lease propio por turno.
+    provider_handoff: ProviderLeaseHandoff | None = None
     _attempts_used: int = field(default=0, init=False, repr=False)
 
     def __call__(
@@ -166,6 +190,9 @@ class RecoveryExecutor:
         # aunque la invocación ya lo excluyera -- un candidato distinto al decidido podía acabar
         # siendo el realmente invocado. Un único conjunto, sembrado aquí, alimenta ambos pasos.
         chain_excluded: set[str] = {original_failed_provider}
+        # BUSY al adquirir: la realidad cambió, pero el candidato NO falló. Se salta en esta
+        # cadena y nunca se persiste en ``also_excluded`` (un wakeup/restart lo reconsidera).
+        transient: set[str] = set()
         current_failed = failed
         attempts = 0
         # La decisión (evaluate_recovery) y la invocación real (execute_recovery, más abajo)
@@ -192,6 +219,7 @@ class RecoveryExecutor:
                 failed_provider=immediate_cause,
                 failure_kind=failure_kind,
                 also_exclude=frozenset(chain_excluded - {immediate_cause}),
+                transient_exclude=frozenset(transient - chain_excluded),
             )
             self.task = evaluation.task
             if self.on_state_change is not None:
@@ -207,22 +235,31 @@ class RecoveryExecutor:
             if selected is None:  # pragma: no cover - invariante de RECOVER_TO
                 return current_failed
 
-            lease_result = self.ledger.acquire(
-                kind=LeaseKind.PROVIDER,
-                key=f"{selected}:0",
-                provider_id=selected,
-                slot=0,
-                holder=self.holder,
-                ttl_seconds=self.ttl_seconds,
-                task_id=self.task.task_id,
-                task_epoch=self.task_token.epoch,
-                task_token=self.task_token,
+            def acquire(candidate: str) -> LeaseResult:
+                return self.ledger.acquire(
+                    kind=LeaseKind.PROVIDER,
+                    key=f"{candidate}:0",
+                    provider_id=candidate,
+                    slot=0,
+                    holder=self.holder,
+                    ttl_seconds=self.ttl_seconds,
+                    task_id=self.task.task_id,
+                    task_epoch=self.task_token.epoch,
+                    task_token=self.task_token,
+                )
+
+            handoff = self.provider_handoff
+            lease_result = (
+                acquire(selected) if handoff is None else handoff.transfer(selected, acquire)
             )
             if lease_result.outcome is not LeaseOutcome.PASS or lease_result.token is None:
-                # §11: la realidad cambió entre decidir y adquirir (alguien más lo tomó, o el
-                # TaskWriterLease perdió autoridad) -- no se invoca ciegamente. Se excluye este
-                # candidato de la MISMA cadena y se reevalúa desde el principio.
-                chain_excluded.add(selected)
+                # §11: la realidad cambió entre decidir y adquirir -- no se invoca ciegamente y
+                # se reevalúa desde el principio. BUSY (otra Task lo ocupó) es transitorio; un
+                # TaskWriterLease sin autoridad sí saca al candidato de esta cadena.
+                if lease_result.outcome is LeaseOutcome.BUSY:
+                    transient.add(selected)
+                else:
+                    chain_excluded.add(selected)
                 continue
 
             # execute_recovery (más abajo) NO conoce ProviderLease/BUSY -- vuelve a recorrer
@@ -254,9 +291,11 @@ class RecoveryExecutor:
                 # IN_FLIGHT y un restart exige reconciliación en vez de repetir.
                 self.invocation_guard.resolve(key=invocation_key, result=result)
             finally:
-                # El ProviderLease de recovery nunca se conserva más allá de esta invocación: no
-                # es autoridad permanente, es un turno propio para este candidato.
-                self.ledger.release(lease_result.token)
+                # Sin handoff, el ProviderLease de recovery es un turno propio para esta
+                # invocación. Con handoff es LA autoridad de provider de la ejecución: la
+                # siguiente transferencia o el fin de la ejecución lo sueltan.
+                if handoff is None:
+                    self.ledger.release(lease_result.token)
 
             if result.ok:
                 return result

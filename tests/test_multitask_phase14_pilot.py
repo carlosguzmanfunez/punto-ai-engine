@@ -789,7 +789,11 @@ def test_5_dependency_wait_luego_resource_luego_ejecucion(
 
 # ===================================================================== 6 · fallo operacional (F8)
 def operational_failure(
-    pilot: Pilot, tmp_path: Path, *, candidate_connected: bool
+    pilot: Pilot,
+    tmp_path: Path,
+    *,
+    candidate_connected: bool,
+    candidate_steps: list[Any] | None = None,
 ) -> tuple[TaskRecord, TaskRecord, threading.Event, dict[str, Fake]]:
     """A: deepseek cae en el BUILDER (fallo operacional inyectado); B: independiente y retenida."""
     gate_b = threading.Event()
@@ -812,7 +816,9 @@ def operational_failure(
             _plan(CATALOG_FILE),
             ProviderUnavailableError("deepseek caído (fallo operacional inyectado)"),
         )
-        fakes["openai"] = Fake("openai", "gpt-5.6-sol", edit(CATALOG_FILE, "CATALOG-A"))
+        fakes["openai"] = Fake(
+            "openai", "gpt-5.6-sol", *(candidate_steps or [edit(CATALOG_FILE, "CATALOG-A")])
+        )
         for fake in fakes.values():
             router.register_provider(fake.provider, lambda _m, c=fake: c, model=fake.model)
         router.assign_role(ProviderRole.ARCHITECT, "deepseek")
@@ -826,7 +832,9 @@ def operational_failure(
         path=CATALOG_FILE,
         marker="CATALOG-A",
         configure=configure_a,
-        recovery=lambda context, router: recovery_executor(tmp_path, context, router),
+        recovery=lambda context, router: recovery_executor(
+            tmp_path, context, router, pilot.harness.clock
+        ),
     )
     pilot.scheduler.submit(a)
     pilot.scheduler.submit(b)
@@ -882,41 +890,68 @@ def test_6_fallo_operacional_real_aislado_waiting_recovery_y_la_otra_continua(
         no_human_gate(pilot)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "GAP ARQUITECTÓNICO F14-G1: bajo el TwoTaskScheduler la Task ya sostiene su ProviderLease "
-        "primario durante el ciclo y el ledger (F7) admite un único ProviderLease por Task; el "
-        "RecoveryExecutor (F8B) recibe BUSY sobre su propio candidato, lo persiste en "
-        "also_excluded y la Task queda en WAITING_RECOVERY sin salida aunque el candidato esté "
-        "libre y autorizado"
-    ),
-)
 def test_6g_recovery_hacia_candidato_autorizado_completa_bajo_el_scheduler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Contrato §11 con candidato conectado y libre: debería completar con ProviderLease propio."""
+    """§11 con candidato conectado y libre: handoff del ProviderLease y MISMO ciclo (F14-G1)."""
     with piloting(tmp_path, monkeypatch) as pilot:
-        a, _b, gate_b, fakes = operational_failure(pilot, tmp_path, candidate_connected=True)
-        gate_b.set()
-        assert pilot.scheduler.wait_idle(WAIT * 2)
-        eventually(
-            lambda: (
-                pilot.scheduler.task(a.task_id).scheduling.state is not (SchedulingState.RUNNING)
-            )
+        seen: dict[str, Any] = {}
+
+        def during_recovery() -> dict[str, Any]:
+            # Dentro de la invocación del candidato: el primario ya no tiene authority.
+            context = context_of(pilot, a)
+            authority = context.provider_authority
+            assert authority is not None
+            current = authority.current()
+            seen["current"] = current
+            with contextlib.suppress(LeaseFencedError):
+                pilot.harness.ledger.assert_fenced(context.provider_token)
+                seen["primary_alive"] = True
+            seen["deepseek"] = provider_state(pilot, "deepseek")
+            return edit(CATALOG_FILE, "CATALOG-A")
+
+        a, b, gate_b, fakes = operational_failure(
+            pilot, tmp_path, candidate_connected=True, candidate_steps=[during_recovery]
         )
-        record_a = pilot.scheduler.task(a.task_id)
-        assert completed(record_a), record_a.scheduling.waiting
+        eventually(lambda: pilot.scheduler.task(a.task_id).finished_at is not None)
+        assert state(pilot.harness, b) is SchedulingState.RUNNING  # B sigue en su ciclo
+
+        record_a = finished(pilot.harness, a)
+        assert completed(record_a), record_a.result
+        # Misma Task, mismo ciclo lógico: un único intento, sin reintento ni Task nueva.
+        assert record_a.runs == 1 and [item.status for item in record_a.attempts] == ["COMPLETED"]
+        assert record_a.result is not None and record_a.result.repair_rounds == 0
+        assert "CATALOG-A" in (pilot.workspace(a) / CATALOG_FILE).read_text(encoding="utf-8")
+        assert len(fakes["deepseek"].calls) == 2  # plan + el fallo; el causante no se reinvoca
         assert len(fakes["openai"].calls) == 1
+        # Handoff: el primario perdió authority ANTES de invocar al candidato, que la tenía.
+        assert "primary_alive" not in seen
+        assert seen["deepseek"] is LeaseState.RELEASED
+        context = context_of(pilot, a)
+        current = seen["current"]
+        assert current is not None and current.key == "openai:0"
+        assert current.task_id == a.task_id and current.task_epoch == context.task_token.epoch
+        assert current.holder_executor_id == context.holder.executor_id
         head = pilot.harness.ledger.head(
             kind=LeaseKind.PROVIDER, key="openai:0", provider_id="openai", slot=0
         )
         assert head is not None and head.task_id == a.task_id
+        assert head.state is LeaseState.RELEASED  # la ejecución lo soltó al terminar
+        assert record_a.scheduling.provider is not None
+        assert record_a.scheduling.provider.provider == "openai"  # el causante no se redespacha
+        assert pilot.durable()[a.task_id] == record_a
+
+        gate_b.set()
+        assert pilot.scheduler.wait_idle(WAIT * 2)
+        assert completed(finished(pilot.harness, b))
+        no_human_gate(pilot)
 
 
 def recovery_executor(
-    tmp_path: Path, context: ExecutionContext, router: ProviderRouter
+    tmp_path: Path,
+    context: ExecutionContext,
+    router: ProviderRouter,
+    clock: Callable[[], datetime] | None = None,
 ) -> RecoveryExecutor:
     run = WorkflowRun(
         workflow_id=context.task.task_id,
@@ -931,7 +966,10 @@ def recovery_executor(
     return RecoveryExecutor(
         router=router,
         ledger=context.ledger,
-        coordinator=RecoveryWaitCoordinator(router=router, ledger=context.ledger),
+        # El mismo reloj que el ledger: BUSY se juzga contra la misma expiración que lo decide.
+        coordinator=RecoveryWaitCoordinator(
+            router=router, ledger=context.ledger, clock=clock or (lambda: datetime.now(UTC))
+        ),
         task=context.task,
         holder=context.holder,
         task_token=context.task_token,
@@ -940,6 +978,7 @@ def recovery_executor(
             checkpoints=FileCheckpointStore(tmp_path / "recovery"),
             step_index=context.attempt,
         ),
+        provider_handoff=context.provider_authority,
     )
 
 
@@ -1031,6 +1070,10 @@ def test_7_fallo_de_calidad_va_por_quality_takeover_nunca_por_recovery(
         )
         assert not pilot.cycles.audit.by_type(AuditEventType.RECOVERY_WAIT_ENTERED)
         assert record_a.result is not None and record_a.result.failovers == ()
+        # Sin handoff de ProviderLease (F14-G1): la ruta de calidad no transfiere authority.
+        assert record_a.scheduling.provider is not None
+        assert record_a.scheduling.provider.provider == "primario"
+        assert provider_state(pilot, "primario") is LeaseState.RELEASED
 
         gate_b.set()
         assert pilot.scheduler.wait_idle(WAIT * 2)

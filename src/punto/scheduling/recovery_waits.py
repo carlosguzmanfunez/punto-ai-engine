@@ -36,7 +36,12 @@ from punto.providers.recovery_policy import RecoveryCandidateJudgment
 from punto.providers.router import ProviderRouter
 from punto.scheduling.leases import LeaseKind, LeaseLedger, LeaseState
 from punto.schemas.audit import AuditEventType
-from punto.schemas.scheduling import RecoveryWaitReason, SchedulingState, TaskSchedulingRecord
+from punto.schemas.scheduling import (
+    ProviderReference,
+    RecoveryWaitReason,
+    SchedulingState,
+    TaskSchedulingRecord,
+)
 
 
 def _utc_now() -> datetime:
@@ -183,11 +188,17 @@ class RecoveryWaitCoordinator:
         failure_kind: str,
         required_capabilities: tuple[str, ...] = (),
         also_exclude: frozenset[str] = frozenset(),
+        transient_exclude: frozenset[str] = frozenset(),
     ) -> RecoveryWaitEvaluation:
         """Evalúa una vez; el caller decide cuándo persistir el registro devuelto.
 
         ``also_exclude`` (Fase 8B) es el resto de una cadena de recovery ya intentada dentro de
-        esta MISMA recuperación causal -- vacío en Fase 8A (una sola exclusión).
+        esta MISMA recuperación causal -- vacío en Fase 8A (una sola exclusión). Es PERMANENTE:
+        se persiste en ``also_excluded`` y ningún wakeup lo reconsidera.
+
+        ``transient_exclude`` (F14-G1) son candidatos que no se pudieron ocupar AHORA (BUSY al
+        adquirir): se saltan en esta decisión como BUSY, pero nunca se persisten como exclusión,
+        así que la reevaluación de un wakeup/restart los vuelve a considerar.
         """
         with self._lock:
             return self._evaluate(
@@ -197,6 +208,7 @@ class RecoveryWaitCoordinator:
                 failure_kind=failure_kind,
                 required_capabilities=required_capabilities,
                 also_exclude=also_exclude,
+                transient_exclude=transient_exclude,
             )
 
     def _evaluate(
@@ -208,6 +220,7 @@ class RecoveryWaitCoordinator:
         failure_kind: str,
         required_capabilities: tuple[str, ...],
         also_exclude: frozenset[str] = frozenset(),
+        transient_exclude: frozenset[str] = frozenset(),
     ) -> RecoveryWaitEvaluation:
         if _is_terminal(task):
             return RecoveryWaitEvaluation(
@@ -234,6 +247,7 @@ class RecoveryWaitCoordinator:
             also_excluded=tuple(sorted(also_exclude)),
             judgments=judgments,
             now=now,
+            transient=transient_exclude,
         )
         if decision.decision is RecoveryDecisionKind.RECOVER_TO:
             return self._recovered(task, decision)
@@ -250,6 +264,7 @@ class RecoveryWaitCoordinator:
         also_excluded: tuple[str, ...],
         judgments: tuple[RecoveryCandidateJudgment, ...],
         now: datetime,
+        transient: frozenset[str] = frozenset(),
     ) -> RecoveryDecision:
         ordered = tuple(judgment.provider for judgment in judgments)
         excluded: list[tuple[str, str]] = []
@@ -260,7 +275,9 @@ class RecoveryWaitCoordinator:
                 continue
             # BUSY (§7): sano pero con el slot ocupado ahora -- no es failed, se salta y se
             # sigue evaluando al siguiente candidato del orden general.
-            if is_provider_lease_busy(self._ledger, judgment.provider, now):
+            if judgment.provider in transient or is_provider_lease_busy(
+                self._ledger, judgment.provider, now
+            ):
                 excluded.append((judgment.provider, "BUSY: ProviderLease vigente"))
                 continue
             selected = judgment.provider
@@ -305,11 +322,16 @@ class RecoveryWaitCoordinator:
                 detail=f"recuperar hacia {decision.selected_candidate}",
             )
         now = decision.evaluated_at
+        # F14-G1: la recuperación TRANSFIERE el provider de la Task al candidato decidido; el
+        # siguiente despacho ocupa su ProviderLease (Fase 7) y el causante no vuelve a despacharse.
+        selected = decision.selected_candidate
         scheduling = TaskSchedulingRecord(
             managed=True,
             state=SchedulingState.QUEUED,
             executor=task.scheduling.executor,
-            provider=task.scheduling.provider,
+            provider=(
+                ProviderReference(provider=selected) if selected else task.scheduling.provider
+            ),
             resources=task.scheduling.resources,
             dependencies=task.scheduling.dependencies,
         )

@@ -166,7 +166,7 @@ class ProviderAuthority:
         ledger: LeaseLedger,
         token: FencingToken,
         *,
-        on_transfer: Callable[[FencingToken], None] | None = None,
+        on_transfer: Callable[[str], None] | None = None,
     ) -> None:
         self._ledger = ledger
         self._token: FencingToken | None = token
@@ -184,10 +184,17 @@ class ProviderAuthority:
     def transfer(self, provider: str, acquire: Callable[[str], LeaseResult]) -> LeaseResult:
         """Suelta el lease actual (su token queda fenced) y adquiere el de ``provider``.
 
+        El destino se persiste ANTES de mutar el ledger. Así, una caída tras adquirir el candidato
+        nunca deja en disco al provider causal; y si la persistencia falla, el primario todavía
+        conserva toda su authority. ``TaskRecord.provider`` expresa el destino durable del
+        handoff, mientras el ledger sigue siendo la única verdad de authority.
+
         Si el candidato no se puede ocupar (p. ej. BUSY por otra Task), la ejecución recupera un
         lease NUEVO de su provider anterior: nunca queda sin authority a mitad del ciclo (el ciclo
         termina en WAITING_RECOVERY, no FENCED) y el token viejo sigue fenced.
         """
+        if self._on_transfer is not None:
+            self._on_transfer(provider)
         with self._lock:
             previous = self._token
             if previous is not None:
@@ -200,8 +207,6 @@ class ProviderAuthority:
                 self._token = back.token if back.outcome is LeaseOutcome.PASS else None
             else:
                 self._token = adopted
-        if adopted is not None and self._on_transfer is not None:
-            self._on_transfer(adopted)
         return result
 
 
@@ -945,13 +950,12 @@ class TwoTaskScheduler:
             self._ledger.release(provider)
         self._ledger.release(active.task_token)
 
-    def _provider_transferred(self, task_id: UUID, token: FencingToken) -> None:
-        """Handoff de recovery (F14-G1): el provider de la Task pasa a ser el candidato.
+    def _provider_transferred(self, task_id: UUID, provider: str) -> None:
+        """Persiste el destino del handoff antes de transferir el ProviderLease.
 
-        Se persiste para que un restart nunca vuelva a despachar al causante, y se reevalúan las
-        esperas: el ProviderLease soltado puede desbloquear a otra Task (Fase 7).
+        El orden durable cierra la ventana acquire->persist: un restart nunca vuelve a despachar al
+        causante. El ledger, no este campo, sigue gobernando qué token posee authority.
         """
-        provider = token.key.rsplit(":", maxsplit=1)[0]
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or task.scheduling.state is not SchedulingState.RUNNING:

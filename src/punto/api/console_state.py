@@ -24,16 +24,19 @@ Tres reglas gobiernan este módulo:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import tempfile
 import threading
-from collections.abc import Callable, Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, BinaryIO, Final, Literal, cast
 from uuid import UUID
 
 from pydantic import (
@@ -693,11 +696,66 @@ _PATH_LOCKS: dict[Path, threading.Lock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 
 
-def _path_lock(path: Path) -> threading.Lock:
-    """Exclusión por documento dentro del proceso: releer y escribir sin escritor intercalado."""
+@contextmanager
+def _path_lock(path: Path) -> Iterator[None]:
+    """Exclusión por documento entre hilos Y procesos durante read/merge/write.
+
+    El lock de archivo es advisory y estable (no se elimina): borrarlo al liberar permitiría que un
+    tercer proceso abriera otro inode mientras un waiter conserva el anterior. El SO libera el lock
+    al morir el proceso, así que no deja una exclusión huérfana.
+    """
     key = path.resolve()
     with _PATH_LOCKS_GUARD:
-        return _PATH_LOCKS.setdefault(key, threading.Lock())
+        local = _PATH_LOCKS.setdefault(key, threading.Lock())
+    lock_path = key.with_name(f".{key.name}.lock")
+    with local:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+b") as stream:
+                _acquire_file_lock(stream)
+                try:
+                    yield
+                finally:
+                    _release_file_lock(stream)
+        except OSError as exc:
+            raise ConsoleStateError(
+                "STATE_IO", f"no se pudo bloquear el estado de la consola: {type(exc).__name__}"
+            ) from exc
+
+
+def _acquire_file_lock(stream: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        while True:
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.01)
+    else:
+        fcntl = importlib.import_module("fcntl")
+        attributes = vars(fcntl)
+        flock = cast(Callable[[int, int], None], attributes["flock"])
+        flock(stream.fileno(), int(attributes["LOCK_EX"]))
+
+
+def _release_file_lock(stream: BinaryIO) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl = importlib.import_module("fcntl")
+        attributes = vars(fcntl)
+        flock = cast(Callable[[int, int], None], attributes["flock"])
+        flock(stream.fileno(), int(attributes["LOCK_UN"]))
 
 
 def _first_error(error: ValidationError) -> str:

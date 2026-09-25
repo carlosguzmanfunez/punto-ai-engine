@@ -508,6 +508,87 @@ def test_i_restart_tras_el_handoff_sin_authority_heredada_ni_doble_invocacion(
         assert leases.peak[a.task_id] == 1
 
 
+def test_k_crash_tras_acquire_antes_de_invocar_conserva_el_candidato_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El destino se hace durable ANTES de mutar authority: un crash no resucita al causal."""
+    with piloting(tmp_path, monkeypatch) as pilot:
+        died = threading.Event()
+        tokens: dict[str, FencingToken] = {}
+        run = recovering(
+            pilot,
+            tmp_path,
+            policy=("openai",),
+            connected=("openai",),
+            scripts={
+                "deepseek": [_plan(CATALOG_FILE), unavailable("deepseek")],
+                "openai": [_plan(CATALOG_FILE), edit(CATALOG_FILE, "CATALOG-A")],
+            },
+        )
+        a = run.task
+        original = LeaseLedger.acquire
+
+        def crash_after_candidate_acquire(self: LeaseLedger, **kwargs: Any) -> LeaseResult:
+            result = original(self, **kwargs)
+            if (
+                not died.is_set()
+                and kwargs.get("kind") is LeaseKind.PROVIDER
+                and kwargs.get("provider_id") == "openai"
+                and kwargs.get("task_id") == a.task_id
+                and result.outcome is LeaseOutcome.PASS
+                and result.token is not None
+            ):
+                tokens["candidate"] = result.token
+                died.set()
+                raise ProcessDeath("SIGKILL tras acquire del candidato y antes de invocation")
+            return result
+
+        monkeypatch.setattr(LeaseLedger, "acquire", crash_after_candidate_acquire)
+        pilot.scheduler.submit(a)
+        pilot.scheduler.wake()
+        assert died.wait(WAIT)
+        pilot.harness.scheduler.shutdown(wait=False)
+
+        on_disk = pilot.durable()[a.task_id]
+        assert on_disk.scheduling.state is SchedulingState.RUNNING
+        assert on_disk.scheduling.provider is not None
+        assert on_disk.scheduling.provider.provider == "openai"
+        assert run.fakes["openai"].calls == []
+
+        monkeypatch.setattr(LeaseLedger, "acquire", original)
+        pilot.restart(CycleRunner(base_target=pilot.cycles.base_target))
+        pilot.cycles.scripts[a.task_id] = TaskScript(
+            path=CATALOG_FILE,
+            marker="CATALOG-A",
+            configure=run_configure(pilot, a, run.fakes),
+            recovery=lambda context, router: recovery_executor(
+                tmp_path, context, router, pilot.harness.clock
+            ),
+        )
+        pilot.scheduler.wake()
+        assert state(pilot.harness, a) is SchedulingState.RUNNING
+        assert pilot.observed.calls == []
+
+        pilot.harness.clock.advance(900)
+        pilot.scheduler.wake()
+        assert pilot.scheduler.wait_idle(WAIT)
+        waiting = pilot.scheduler.task(a.task_id).scheduling.waiting
+        assert waiting is not None and waiting.code == "DISPATCH_RECONCILIATION_REQUIRED"
+        assert run.fakes["openai"].calls == []
+        with pytest.raises(LeaseFencedError):
+            pilot.harness.ledger.assert_fenced(tokens["candidate"])
+
+        pilot.scheduler.reconcile_dispatch(
+            a.task_id, status=EffectStatus.FAILED, detail="crash antes de invocar candidato"
+        )
+        assert pilot.scheduler.wait_idle(WAIT * 2)
+        record = finished(pilot.harness, a)
+        assert completed(record), record.result
+        assert record.runs == 2
+        assert len(run.fakes["deepseek"].calls) == 2
+        assert len(run.fakes["openai"].calls) == 2
+
+
 def run_configure(
     pilot: Pilot, a: TaskRecord, fakes: dict[str, Fake]
 ) -> Callable[[ProviderRouter], None]:

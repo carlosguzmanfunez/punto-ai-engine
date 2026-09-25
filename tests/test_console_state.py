@@ -20,6 +20,7 @@ comparte con el anterior el fichero durable.
 from __future__ import annotations
 
 import json
+import multiprocessing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,47 @@ SOLICITUD: dict[str, Any] = {
     "acceptance_criteria": ["una sola fuente de tipos"],
     "scope_paths": ["src"],
 }
+
+
+def _owned_task(task_id: UUID, *, managed: bool, stage: str) -> TaskRecord:
+    now = utc_now()
+    return TaskRecord(
+        task_id=task_id,
+        objective=f"writer {'scheduler' if managed else 'console'}",
+        target_id=TARGET_ID,
+        stage=stage,
+        created_at=now,
+        updated_at=now,
+        scheduling=TaskSchedulingRecord(managed=managed),
+    )
+
+
+def _save_owned_process(
+    path: str,
+    task_id: UUID,
+    managed: bool,
+    stage: str,
+    entered: Any,
+    release: Any,
+    started: Any,
+    done: Any,
+    block: bool,
+) -> None:
+    started.set()
+    task = _owned_task(task_id, managed=managed, stage=stage)
+    paused = False
+
+    def owns(record: TaskRecord) -> bool:
+        nonlocal paused
+        if block and not paused:
+            paused = True
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("timeout esperando liberar el writer intercalado")
+        return record.scheduling.managed is managed
+
+    ConsoleStateStore(path).save_owned(tasks=(task,), owns=owns, gates=())
+    done.set()
 
 
 # --------------------------------------------------------------------------- montaje
@@ -135,6 +177,70 @@ def _detalle_rechazo(audit: AuditLogger) -> str:
     eventos = audit.by_type(AuditEventType.CONSOLE_STATE_REJECTED)
     assert eventos, "el rechazo del estado tiene que quedar auditado"
     return str(dict(eventos[0].metadata).get("detail", ""))
+
+
+def test_save_owned_serializa_console_y_scheduler_entre_procesos(tmp_path: Path) -> None:
+    """Dos procesos no pueden leer la misma base y sobrescribir después el cambio del otro."""
+    path = tmp_path / "multi-writer.json"
+    managed_id, console_id = uuid4(), uuid4()
+    ConsoleStateStore(path).save(
+        tasks=(
+            _owned_task(managed_id, managed=True, stage="OLD_MANAGED"),
+            _owned_task(console_id, managed=False, stage="OLD_CONSOLE"),
+        ),
+        gates=(),
+    )
+    context = multiprocessing.get_context("spawn")
+    entered, release = context.Event(), context.Event()
+    first_started, second_started = context.Event(), context.Event()
+    first_done, second_done = context.Event(), context.Event()
+    first = context.Process(
+        target=_save_owned_process,
+        args=(
+            str(path),
+            managed_id,
+            True,
+            "NEW_MANAGED",
+            entered,
+            release,
+            first_started,
+            first_done,
+            True,
+        ),
+    )
+    second = context.Process(
+        target=_save_owned_process,
+        args=(
+            str(path),
+            console_id,
+            False,
+            "NEW_CONSOLE",
+            entered,
+            release,
+            second_started,
+            second_done,
+            False,
+        ),
+    )
+    try:
+        first.start()
+        assert entered.wait(10), "el primer writer no alcanzó su sección crítica"
+        second.start()
+        assert second_started.wait(10), "el segundo proceso no llegó a ejecutar"
+        assert not second_done.wait(1), "el segundo proceso atravesó la sección crítica del primero"
+    finally:
+        release.set()
+        first.join(10)
+        second.join(10)
+        if first.is_alive():
+            first.terminate()
+        if second.is_alive():
+            second.terminate()
+    assert first.exitcode == 0 and second.exitcode == 0
+    assert first_done.is_set() and second_done.is_set()
+    records = {task.task_id: task for task in ConsoleStateStore(path).load().tasks}
+    assert records[managed_id].stage == "NEW_MANAGED"
+    assert records[console_id].stage == "NEW_CONSOLE"
 
 
 # ------------------------------------------------- 1 · la tarea sobrevive al reinicio

@@ -98,10 +98,16 @@ def scheduler_document() -> tuple[TaskRecord, TaskRecord, TaskRecord, TaskRecord
 # ============================================================ A
 def test_a_montar_la_consola_no_cambia_ningun_campo_de_una_task_waiting_resource() -> None:
     a, b, _old, _new = scheduler_document()
-    mount_console()
+    client = mount_console()
     after = disk()
     assert after[str(b.task_id)] == dump(b)
     assert after[str(a.task_id)] == dump(a)
+    # Fase 14: la consola ya no escribe Tasks managed desde memoria, así que el disco por sí solo
+    # no revela una consolidación en memoria; su propia vista tampoco puede cambiarles el linaje.
+    for task in (a, b):
+        lineage = client.get(f"/console/tasks/{task.task_id}").json()["lineage"]
+        assert lineage["status"] == "ACTIVE" and lineage["superseded_by"] == ""
+        assert lineage["relations"] == []
 
 
 # ============================================================ B

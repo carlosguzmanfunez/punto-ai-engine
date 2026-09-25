@@ -27,7 +27,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Iterable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -638,6 +639,36 @@ class ConsoleStateStore:
         self._write_atomic(payload)
         return self._path
 
+    def save_owned(
+        self,
+        *,
+        tasks: Iterable[TaskRecord],
+        owns: Callable[[TaskRecord], bool],
+        gates: Iterable[GateRecord] | None = None,
+    ) -> Path:
+        """Escribe SOLO las Tasks que gobierna quien escribe; el resto queda como está en disco.
+
+        El documento tiene dos escritores de instantáneas completas (consola y scheduler, Fase 14):
+        cada uno conserva en memoria una copia de las Tasks del otro tomada al arrancar. Escribirla
+        haría ganar una instantánea vieja a una nueva (lost update entre escritores). Aquí las
+        Tasks ajenas (``owns`` falso) y, con ``gates=None``, los gates se toman del documento
+        durable vigente, releído bajo la misma exclusión que la escritura. Si el documento no se
+        puede recuperar, se conserva lo que el llamante sabía de ellas (comportamiento previo).
+        """
+        with _path_lock(self._path):
+            current = self._read(None, "punto-console")
+            given = tuple(tasks)
+            own = [task for task in given if owns(task)]
+            known = {task.task_id for task in own}
+            foreign = current.tasks if current.recovered else given
+            merged = [
+                *own,
+                *(task for task in foreign if not owns(task) and task.task_id not in known),
+            ]
+            if gates is None:
+                gates = current.gates if current.recovered else ()
+            return self.save(tasks=merged, gates=gates)
+
     def _write_atomic(self, payload: str) -> None:
         """Escribe el documento con temporal + ``os.replace`` (el patrón durable del motor)."""
         try:
@@ -656,6 +687,18 @@ class ConsoleStateStore:
             raise ConsoleStateError(
                 "STATE_IO", f"no se pudo escribir el estado de la consola: {type(exc).__name__}"
             ) from exc
+
+
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    """Exclusión por documento dentro del proceso: releer y escribir sin escritor intercalado."""
+    key = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
+
 
 def _first_error(error: ValidationError) -> str:
     """Primer problema de validación, en una línea y sin el volcado del documento."""

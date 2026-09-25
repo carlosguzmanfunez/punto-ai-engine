@@ -661,12 +661,14 @@ def register_human_console(
         try:
             # Instantánea y escritura bajo la MISMA exclusión: las escrituras quedan en el orden de
             # sus instantáneas, así que una persistencia más vieja (p. ej. la del handler de /run)
-            # nunca termina encima de una más nueva (la del worker que cerró el intento).
+            # nunca termina encima de una más nueva (la del worker que cerró el intento). Las Tasks
+            # managed se escriben tal como están en disco: su verdad es del scheduler y la copia
+            # de esta consola es la del arranque (Fase 14: si no, la regresaba y se re-ejecutaba).
             with state_lock:
                 snapshot = tuple(tasks.values())
                 records = [_task_record(task) for task in snapshot]
                 approvals = [_gate_record(item) for item in _console_gates(snapshot, dependencies)]
-                store.save(tasks=records, gates=approvals)
+                store.save_owned(tasks=records, owns=_console_owned, gates=approvals)
         except ConsoleStateError as exc:
             _log_state_event(
                 dependencies,
@@ -1882,6 +1884,11 @@ def _canonical_equivalent(
         if not _scheduler_owned(item) and (target is None or not _identity_block(item, target))
     ]
     return pick_canonical(equivalents) if equivalents else None
+
+
+def _console_owned(record: TaskRecord) -> bool:
+    """Registros que la consola escribe desde su memoria: todo lo que no es del scheduler."""
+    return not record.scheduling.managed
 
 
 def _scheduler_equivalent(candidate: ConsoleTask, tasks: Mapping[str, ConsoleTask]) -> str:

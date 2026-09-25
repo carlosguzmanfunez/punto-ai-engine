@@ -41,7 +41,6 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from punto.api.console_state import (
     ConsoleStateStatus,
     ConsoleStateStore,
-    GateRecord,
     TaskAttempt,
     TaskRecord,
 )
@@ -92,6 +91,9 @@ ADMISSIBLE_STATES: Final[frozenset[SchedulingState]] = frozenset(
 DISPATCH_RECONCILIATION_CODE: Final[str] = "DISPATCH_RECONCILIATION_REQUIRED"
 _DISPATCH_NAMESPACE: Final[UUID] = uuid5(NAMESPACE_URL, "punto:scheduler:dispatch")
 _DISPATCH_ACTION: Final[str] = "scheduler.dispatch"
+_LOST_OUTCOME: Final[str] = (
+    "DevelopmentCycle APPLIED sin desenlace durable (RUNNING en disco): no se repite a ciegas"
+)
 
 
 def _utc_now() -> datetime:
@@ -291,6 +293,10 @@ def ready_key(task: TaskRecord) -> tuple[datetime, str]:
     return (since if isinstance(since, datetime) else task.created_at, str(task.task_id))
 
 
+def _is_managed(task: TaskRecord) -> bool:
+    return task.scheduling.managed
+
+
 def _is_terminal(task: TaskRecord) -> bool:
     return task.finished_at is not None or task.lineage_status != "ACTIVE"
 
@@ -364,7 +370,6 @@ class TwoTaskScheduler:
         self._lock = threading.RLock()
         self._idle = threading.Condition(self._lock)
         self._tasks: dict[UUID, TaskRecord] = {}
-        self._gates: tuple[GateRecord, ...] = ()
         self._active: dict[UUID, _ActiveExecution] = {}
         self._renewers: dict[UUID, LeaseRenewer] = {}
         self._pool = ThreadPoolExecutor(
@@ -470,7 +475,6 @@ class TwoTaskScheduler:
         if not snapshot.recovered:
             raise SchedulerError("STATE_INVALID", snapshot.detail)
         self._tasks = {task.task_id: task for task in snapshot.tasks}
-        self._gates = snapshot.gates
         # Ninguna autoridad se hereda: un executor persistido en una Task no admitida se descarta.
         for task in tuple(self._tasks.values()):
             scheduling = task.scheduling
@@ -482,8 +486,10 @@ class TwoTaskScheduler:
                 self._tasks[task.task_id] = self._with_scheduling(task, self._queued(task))
 
     def _persist(self) -> None:
+        # Solo lo que gobierna este scheduler (managed); las Tasks de la consola y los gates se
+        # conservan tal como están en disco: su copia en memoria es la del arranque (Fase 14).
         ordered = sorted(self._tasks.values(), key=lambda item: str(item.task_id))
-        self._store.save(tasks=ordered, gates=self._gates)
+        self._store.save_owned(tasks=ordered, owns=_is_managed)
 
     # ------------------------------------------------------------------ admisión
     def _schedule(self) -> None:
@@ -766,6 +772,10 @@ class TwoTaskScheduler:
                 continue
             if self._dispatch_pending(task):
                 self._tasks[task.task_id] = self._reconciliation_wait(task)
+            elif self._dispatch_applied(task):
+                # El ciclo de ESTE intento ya corrió (APPLIED) pero su desenlace no llegó a disco:
+                # repetirlo sería una segunda ejecución a ciegas. Se reconcilia explícitamente.
+                self._tasks[task.task_id] = self._reconciliation_wait(task, detail=_LOST_OUTCOME)
             else:
                 self._tasks[task.task_id] = self._with_scheduling(task, self._queued(task))
             changed = True
@@ -805,11 +815,23 @@ class TwoTaskScheduler:
             return False
         return bool(self._effects.pending(self._checkpoints.load(workflow_id)))
 
-    def _reconciliation_wait(self, task: TaskRecord) -> TaskRecord:
+    def _dispatch_applied(self, task: TaskRecord) -> bool:
+        """True si el DevelopmentCycle del intento durable ``task.runs`` ya consta APPLIED."""
+        workflow_id = uuid5(_DISPATCH_NAMESPACE, str(task.task_id))
+        if task.runs < 1 or self._checkpoints.latest(workflow_id) is None:
+            return False
+        action = f"development-cycle:{task.task_id}:{task.runs}"
+        return any(
+            record.action == action and record.status is EffectStatus.APPLIED
+            for record in self._checkpoints.load(workflow_id).effects
+        )
+
+    def _reconciliation_wait(self, task: TaskRecord, *, detail: str = "") -> TaskRecord:
         reason = WaitingReason(
             kind=WaitingKind.RECOVERY,
             code=DISPATCH_RECONCILIATION_CODE,
-            detail="DevelopmentCycle interrumpido con intención IN_FLIGHT: no se repite a ciegas",
+            detail=detail
+            or "DevelopmentCycle interrumpido con intención IN_FLIGHT: no se repite a ciegas",
         )
         scheduling = TaskSchedulingRecord(
             managed=True,

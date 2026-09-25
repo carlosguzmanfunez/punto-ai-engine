@@ -7,8 +7,11 @@ producción.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -44,6 +47,48 @@ FIXTURE_PROJECT_DIR: Path = (
 
 #: Identidad usada al preparar los repositorios de prueba.
 FIXTURE_AUTHOR: tuple[str, str] = ("PUNTO Fixture", "fixture@punto.local")
+
+#: Variable documentada de pytest con la raíz bajo la que crea ``pytest-of-<user>/pytest-N``.
+PYTEST_TEMPROOT_ENV = "PYTEST_DEBUG_TEMPROOT"
+
+#: Raíz temporal corta de Windows, en la unidad del directorio temporal del sistema.
+SHORT_TEMPROOT_NAME = "pt"
+
+
+# ---------------------------------------------------------------------------
+# Infraestructura de pruebas: raíz temporal corta en Windows (MAX_PATH)
+# ---------------------------------------------------------------------------
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """En Windows, ``tmp_path`` cuelga de una raíz corta en lugar de ``%TEMP%``.
+
+    Los pilotos multi-task crean worktrees con instantáneas de reparación anidadas
+    (``workspaces/trees/<uuid>/.punto-repair-snapshots/<uuid>/...``) que, bajo la raíz por
+    defecto (``C:\\Users\\<user>\\AppData\\Local\\Temp\\pytest-of-<user>\\pytest-N``), superan los
+    260 caracteres de MAX_PATH: Git y Python fallan con ``FileNotFoundError`` y el ciclo real
+    termina sin resultado. Mover la raíz a ``<unidad>:\\pt`` recorta ~40 caracteres sin tocar
+    el producto.
+
+    Solo se cambia la raíz: pytest sigue creando un ``pytest-N`` único por ejecución, con su lock
+    y su retención, así que ejecuciones concurrentes no comparten ni limpian directorios ajenos.
+    ``--basetemp`` o un ``PYTEST_DEBUG_TEMPROOT`` explícito prevalecen; si la raíz corta no se
+    puede crear, se conserva el comportamiento por defecto. Fuera de Windows no hace nada.
+    """
+    if sys.platform != "win32" or config.option.basetemp or os.environ.get(PYTEST_TEMPROOT_ENV):
+        return
+    root = Path(Path(tempfile.gettempdir()).resolve().anchor) / SHORT_TEMPROOT_NAME
+    try:
+        root.mkdir(exist_ok=True)
+    except OSError:
+        return
+    os.environ[PYTEST_TEMPROOT_ENV] = str(root)
+    config.add_cleanup(lambda: os.environ.pop(PYTEST_TEMPROOT_ENV, None))
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    """Muestra la raíz temporal efectiva cuando se redirigió."""
+    root = os.environ.get(PYTEST_TEMPROOT_ENV)
+    return f"tmp root: {root}" if root and not config.option.basetemp else None
 
 
 def run_git(workspace: Path, *args: str) -> str:
